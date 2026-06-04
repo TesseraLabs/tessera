@@ -1,0 +1,27 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.idea/
+.vscode/
+*.swp
+.DS_Store
+/coverage/
+
+# Release artifacts (built locally; signed/published from release runners).
+/artifacts/release/
+
+# GOST test fixtures — regenerated via tests/fixtures/gen_gost.sh on
+# Linux+gost-engine.  Not committed because they cannot be produced on macOS
+# dev hosts (no engine available).  The directory itself is preserved by the
+# committed `.keep` placeholder.
+crates/pam_certauth_core/tests/fixtures/gost/*
+!crates/pam_certauth_core/tests/fixtures/gost/.keep
+.claude/scheduled_tasks.lock
+
+# Не для публичного репозитория (open-core split, design D6):
+# клиентский контекст, боевые логи, продуктовая стратегия.
+openspec/.bootstrap-notes/
+docs/PRODUCT_SPEC.md
+
+# Осиротевший сломанный worktree (кандидат на удаление).
+CertAuth-scopes-mofn/

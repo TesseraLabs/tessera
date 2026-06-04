@@ -1,0 +1,66 @@
+[package]
+name = "pam_tessera"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "PAM module for USB-certificate authentication on Astra Linux SE."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "pam_tessera"
+
+[features]
+default = []
+# See `tessera_core`'s `gost-tests` feature for details — this re-exports
+# it so `cargo test --workspace --features gost-tests` activates both crates'
+# integration tests in lockstep.
+gost-tests = ["tessera_core/gost-tests"]
+# Re-export of `tessera_core/pkcs11-tests` so `cargo test --workspace
+# --features pkcs11-tests` activates both crates' integration tests in lockstep.
+pkcs11-tests = ["tessera_core/pkcs11-tests"]
+# Enables МКЦ enforcement end-to-end: forwards `tessera_core/astra-mac`
+# (config validation + audit gating) and pulls in the closed
+# `tessera_mac_parsec` crate that provides the real libpdp `ParsecBackend`.
+astra-mac = ["tessera_core/astra-mac"]
+# Re-export of `tessera_core/mac-tests` so `--features mac-tests`
+# activates in-process MacBackend mocks across crates.
+mac-tests = ["tessera_core/mac-tests"]
+
+[dependencies]
+tessera_core = { path = "../tessera_core", version = "0.4.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.4.0" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+syslog = { workspace = true }
+thiserror = { workspace = true }
+secrecy = { workspace = true }
+openssl = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+nix = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pam-sys = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+toml = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+missing_safety_doc = "deny"

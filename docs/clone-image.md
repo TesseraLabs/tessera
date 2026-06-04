@@ -1,0 +1,343 @@
+# Развёртывание парка АРМ через клонированный образ
+
+Runbook end-to-end: от подготовки эталонного образа до per-host
+сертификата на каждом боевом АРМ. Сценарий применим, когда один
+образ Astra SE раскатывается на десятки/сотни машин (типично — парк
+терминалов), и `host_id` каждого АРМ известен только после первого
+бута на реальном железе.
+
+> Документы рядом:
+> - [install.md](install.md) — пошаговая установка `tessera` (выполняется на эталоне).
+> - [configuration.md](configuration.md) — справочник по `config.toml`.
+> - [cert-issuance.md](cert-issuance.md) — структура и выпуск сертификатов.
+> - [operations.md](operations.md) — runbook эксплуатации.
+
+## 1. Зачем bootstrap-режим
+
+Сертификат `tessera` привязан к `host_id_hash` АРМ-а
+(расширение `pam_cert_host_binding`). При клонировании эталона:
+
+- `machine_id` совпадает у всех клонов (если не сброшен на первой загрузке);
+- `dmi_board_serial` уникален у каждой железки;
+- `hostname` назначается оператором/Ansible.
+
+Эталонный образ не может содержать per-host сертификат — его не
+существует на момент сборки. Решение: bootstrap-сертификат с
+фиксированным `host_binding = "installation"` + `config.toml`,
+который резолвит `host_id` в это же значение через
+`[host_identity].sources = ["override"]`. Bootstrap проходит auth
+на любой машине, развёрнутой из образа. После первого бута оператор
+переводит АРМ на реальный источник (`dmi_board_serial` /
+`machine_id`) и снимает дамп — теперь известен настоящий
+`host_id_hash`, по которому CA выпускает per-host сертификат.
+
+## 2. Подготовка эталонного образа
+
+Шаги выполняются один раз, на эталонной машине, до снятия образа.
+
+### 2.1 Установка `tessera`
+
+См. [install.md §1–§8](install.md). Все секции выполняются
+полностью, кроме персонального USB-носителя (раздел 5):
+вместо per-user/.p12 на эталон кладётся **bootstrap-цепочка**.
+
+### 2.2 Bootstrap-сертификат
+
+Выпускается из admin-tools tarball'а (см. §6.1):
+
+```bash
+./issue-service-cert.sh --mode bootstrap \
+    --ca-dir /etc/ssl/pki \
+    --out-dir /etc/tessera/bootstrap
+```
+
+В `bootstrap`-режиме скрипт ставит в cert расширения:
+
+- `pam_cert_host_binding = "installation"` (строка-маркер, **не** хеш);
+- `pam_cert_user_binding = <service_user>`;
+- стандартные `extendedKeyUsage = clientAuth, emailProtection`.
+
+`emailProtection` обязателен — без него Astra-валидатор отвергает
+цепочку (см. [cert-issuance.md](cert-issuance.md)).
+
+### 2.3 `config.toml` на эталоне
+
+```toml
+# /etc/tessera/config.toml (фрагмент)
+
+[host_identity]
+sources = ["override"]
+override = "installation"
+
+[fly_dm_greeter]
+update_wallpaper = true     # см. §2.4
+```
+
+`sources = ["override"]` + `override = "installation"` заставляет
+демон резолвить `host_id` в строку `installation` на любой клон-машине
+— ровно то, что зашито в bootstrap-cert.
+
+### 2.4 Wallpaper-баннер (опционально, рекомендуется на МКЦ-3)
+
+На production fly-qdm 2.15+ под МКЦ-3 fly-modern theme hardcoded'но
+рендерит `"Усиленный уровень защищенности"` в headline место —
+PAM_TEXT_INFO с `host_id` **не виден** в greeter UI. Workaround:
+впечатать `host_id` прямо в JPG-фон, на который смотрит
+`[background].path` в `/etc/X11/fly-dm/fly-modern/settings.ini`.
+
+Включается одной строкой в `config.toml`:
+
+```toml
+[fly_dm_greeter]
+update_wallpaper = true
+```
+
+Дефолты (все переопределяемые):
+
+| Поле                  | Значение                                                |
+|-----------------------|---------------------------------------------------------|
+| `wallpaper_target`    | `/usr/share/wallpapers/fly-default-light.jpg`           |
+| `wallpaper_backup`    | `/var/lib/tessera/wallpaper.orig.jpg`              |
+| `wallpaper_font`      | `/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf`  |
+| `wallpaper_font_size` | `64`                                                    |
+| `wallpaper_text_color`| `#000000`                                               |
+| `wallpaper_gravity`   | `south`                                                 |
+| `wallpaper_offset_y`  | `120`                                                   |
+| `template_ru`         | `Устройство %n  host_id={host_id_short} ({source})`       |
+| `template_en`         | `Device %n  host_id={host_id_short} ({source})`            |
+
+При каждом старте `tessera.service`:
+
+1. Первый раз: `cp wallpaper_target → wallpaper_backup` (one-time оригинал).
+2. Открывает `wallpaper_backup` как source.
+3. Рендерит `template_ru`/`template_en` (по locale) с подстановкой
+   `{host_id_short}` (первые 8 hex), `{source}`, `%n` (hostname).
+4. Atomic save → `wallpaper_target`.
+
+Демон **не редактирует** `settings.ini` (operator/ansible управляет
+`blur`, `color_overlay`, `path`). На эталоне baseline:
+
+```ini
+# /etc/X11/fly-dm/fly-modern/settings.ini
+[background]
+path=/usr/share/wallpapers/fly-default-light.jpg
+color_overlay=0,0,0,30
+
+[background][blur]
+enable=false
+```
+
+При сильном `color_overlay` или включённом blur текст невидим —
+снизить alpha и отключить blur перед снятием образа.
+
+### 2.5 Validation эталона
+
+```bash
+sudo tessera check
+```
+
+Должен вернуть exit 0. На эталоне ожидаемы INFO/WARN-записи
+`fly_dm_greeter_*` и `host_identity_override_active`.
+
+### 2.6 Снятие образа
+
+Стандартный путь (`dd`, Clonezilla, vSphere template — на усмотрение
+интегратора). До снятия:
+
+- остановить `tessera.service` (`systemctl stop tessera`);
+- очистить `/var/lib/tessera/sessions.json` (опционально, не критично);
+- **не очищать** `/etc/machine-id` — после flip-а он перестанет
+  использоваться, но до этого момента нужен консистентный override.
+
+## 3. Раскатка клона на боевой АРМ
+
+Клон загружается, bootstrap-цепочка действует — auth работает.
+`host_id` всё ещё `installation` на каждой машине.
+
+> На этом этапе **не выпускать** per-host сертификаты:
+> `host_id_hash` ещё не известен.
+
+## 4. Flip → production: `finish-bootstrap.sh`
+
+Единственная команда, которую оператор запускает на каждом АРМ-е
+после первого бута:
+
+```bash
+sudo /usr/share/tessera/finish-bootstrap.sh
+```
+
+### 4.1 Что делает скрипт
+
+Atomic, single-pass:
+
+1. **Rewrite `config.toml`**:
+   - `[host_identity].sources = ["override"]` → `["dmi_board_serial", "machine_id"]` (default);
+   - строка `override = "..."` комментируется (`#override = "..."`).
+   - Backup → `/etc/tessera/config.toml.bak.<UTC-ISO8601>`.
+2. **Валидирует** новый конфиг: `tessera check`. Если ERROR —
+   rollback бекапа, exit ≠ 0.
+3. **Рестарт** `tessera.service`, ждёт `is-active=active` до 30 с.
+4. **Снимает дамп**: `tessera dump-host-id --usb` с ретраями
+   (~30 с на появление USB). Fallback: TSV в
+   `/var/lib/tessera/host-ids-<hostname>-<UTC>.tsv`.
+
+### 4.2 Флаги
+
+| Флаг                          | Назначение                                                                                                                          |
+|-------------------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+| `--non-interactive`           | Пропустить подтверждения. Для Ansible.                                                                                              |
+| `--sources "A,B"`             | Заменить production-список источников. Или переменная `POST_INSTALL_SOURCES`. Default: `dmi_board_serial,machine_id`.               |
+| `--no-restart`                | Только rewrite + check, без restart. Для dry-run.                                                                                   |
+| `--no-dump`                   | Пропустить шаг 4. Если оператор сам снимет дамп позже.                                                                              |
+
+### 4.3 Идемпотентность
+
+Скрипт детектит `sources = ["override"]` в текущем `config.toml`:
+
+- есть → выполняет полный pipeline;
+- нет → exit 0 без изменений (АРМ уже flipped).
+
+Безопасно перезапускать в любой Ansible-выкатке.
+
+### 4.4 Формат TSV-дампа
+
+Колонки:
+
+```
+source  status  hash_hex  hash_prefix  raw  normalized  active_under_current_config  reason
+```
+
+Одна строка на каждый **известный** источник (не только настроенные):
+`machine_id`, `dmi_board_serial`, `dmi_product_serial`, `dmi_chassis_serial`,
+`hostname`, `override`, `custom_command` (если в конфиге). Строка с
+`active_under_current_config=yes` — тот источник, что демон
+**сейчас** использует. Из неё CA-админ берёт `hash_hex`.
+
+`status` ∈ {`ok`, `empty`, `error`}. `reason` поясняет `empty`/`error`
+(`dmi_board_serial = 0` в VM, `custom_command exited 1` и т.п.).
+
+Exit ≠ 0 у `dump-host-id`, если **все** известные источники вернули
+пустое/ошибку — однозначный сигнал «не выписывать сертификат, пока
+не починен вход».
+
+## 5. Возврат флешки на эталонную сторону
+
+Оператор физически приносит USB CA-админу (или передаёт TSV через
+безопасный канал — это просто хеши, не секреты).
+
+## 6. CA-сторона: выпуск per-host сертификата
+
+### 6.1 Admin-tools tarball
+
+`admin-tools` распространяется **отдельным архивом** в GitHub
+Release (НЕ в `.deb`):
+
+```
+tessera-admin-tools-<ver>.tar.gz
+```
+
+Содержимое:
+
+- `issue-service-cert.sh` — выпуск сертификата (per-host / wildcard / bootstrap modes).
+- `vault-pki-setup.sh` — bootstrap Vault PKI engine (один раз на УЦ).
+- `prepare-usb-flash.sh` — упаковка cert + `.p12` на флешку оператора.
+- `README.md` — режимы, переменные, примеры.
+
+Хранится на CA-машине (HSM/Vault host), **не** на боевых АРМ.
+
+### 6.2 Выпуск
+
+Админ читает из TSV строку `active_under_current_config=yes`,
+берёт `hash_hex`:
+
+```bash
+./issue-service-cert.sh --mode per-host \
+    --host-id-hash 7f3a1c2e8b...d4a9 \
+    --user service \
+    --ca-dir /etc/ssl/pki \
+    --out-dir /tmp/issue-<hostname>
+```
+
+Скрипт выпускает cert с расширениями:
+
+- `pam_cert_host_binding = <host_id_hash>` (привязка к АРМ-у);
+- `pam_cert_user_binding = service`;
+- `pam_cert_max_integrity = <level>` если применимо (МКЦ).
+
+### 6.3 Упаковка на USB
+
+```bash
+./prepare-usb-flash.sh \
+    --cert-dir /tmp/issue-<hostname> \
+    --device /dev/sdX1 \
+    --p12-name service.p12 \
+    --p12-pass-file /tmp/pin.txt
+```
+
+Удаляет старые `.p12` (если есть), пишет новый с правильными
+правами `0600`, размонтирует.
+
+## 7. Возврат флешки на АРМ
+
+Оператор втыкает USB обратно в боевой АРМ.
+
+- bootstrap-cert на флешке стирается шагом 6.3;
+- per-host cert проходит auth → `host_binding` matches `host_id_hash`;
+- bootstrap-цепочка в trust store **остаётся валидной** (на случай
+  повторного flip-а после смены железа), но cert на USB её больше
+  не использует.
+
+### 7.1 Verification на АРМ
+
+```bash
+journalctl -u tessera -g 'host_identity: probe' -n 20
+journalctl -u tessera -g 'host_binding' -n 20
+```
+
+Первая команда — должна показывать `probe selected source=dmi_board_serial`
+(или то, что выставлено в `--sources`), **не** `override`. Вторая —
+`host_binding match` на следующей auth-сессии.
+
+## 8. Troubleshooting
+
+Clone-specific кейсы (`dump-host-id` пуст, USB не появляется,
+`active_under_current_config=no`, bootstrap-cert отвергается,
+повторный flip после замены материнки, wallpaper не обновляется)
+— см. [troubleshooting.md §7 Clone-image / golden image](troubleshooting.md#7-clone-image--golden-image).
+## 9. Ansible-выкатка
+
+Минимальный playbook-фрагмент:
+
+```yaml
+- name: Finish bootstrap on cloned terminal
+  ansible.builtin.command:
+    cmd: /usr/share/tessera/finish-bootstrap.sh --non-interactive --no-dump
+  register: finish
+  changed_when: "'no changes' not in finish.stdout"
+
+- name: Fetch host_id dump
+  ansible.builtin.command:
+    cmd: tessera dump-host-id --output /tmp/host-ids.tsv
+  changed_when: false
+
+- name: Pull TSV to control node
+  ansible.builtin.fetch:
+    src: /tmp/host-ids.tsv
+    dest: ./host-ids/{{ inventory_hostname }}.tsv
+    flat: true
+```
+
+Дальше TSV-файлы агрегируются на CA-машине, `issue-service-cert.sh`
+прогоняется в цикле, готовые `.p12` распространяются обратно
+(через `prepare-usb-flash.sh` или через защищённый канал на АРМ).
+
+## 10. См. также
+
+- [install.md §2.4¾](install.md) — короткая врезка про tooling.
+- [install.md §8.5.1](install.md) — wallpaper baseline в деталях.
+- [cert-issuance.md](cert-issuance.md) — расширения сертификатов,
+  per-host vs wildcard vs bootstrap.
+- [operations.md §2.4](operations.md) — место этого workflow в
+  runbook эксплуатации.
+- [configuration.md](configuration.md) — `[host_identity]`,
+  `[fly_dm_greeter]` поля целиком.

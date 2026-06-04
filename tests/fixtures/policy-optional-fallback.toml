@@ -1,0 +1,9 @@
+# Test policy fragment — MAC integrity OPTIONAL with explicit fallback.
+# Cert lacking MAX_INTEGRITY → label = level=0, categories={} (default low).
+
+[mac]
+cert_integrity = "optional"
+
+[mac.fallback_max_integrity]
+level = 0
+categories = ""

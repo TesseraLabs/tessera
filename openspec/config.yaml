@@ -1,0 +1,38 @@
+schema: spec-driven
+
+context: |
+  Language: Russian (ru-RU). Все артефакты пишутся на русском.
+  Ключевые слова требований: «ДОЛЖЕН/ДОЛЖНА/ДОЛЖНО (MUST)», «НЕ ДОЛЖЕН (MUST NOT)» —
+  английский дубль в скобках обязателен (валидатор ищет \b(SHALL|MUST)\b).
+  Маркеры сценариев WHEN/THEN — английские.
+
+  Tessera v0.3.19 — Rust PAM-модуль для Astra Linux SE 1.8:
+  аутентификация по X.509 на USB (PKCS#12) / токене (PKCS#11),
+  host-binding/user-binding через custom OID-расширения (арка 2.25.<UUID>),
+  МКЦ-интеграция (libpdp), monitord (udev removal -> lock/logout), ГОСТ через gost-engine.
+  Workspace: pam_tessera (cdylib), tessera_core (sync ядро, без tokio),
+  tessera_cli (daemon+CLI, tokio), tessera_proto (NDJSON IPC, v2).
+  Main-спеки в openspec/specs/ — bootstrap 2026-06-04 (код+сессии; intended-поведение
+  + маркеры "KNOWN GAP"). Индекс и топ известных gap'ов: openspec/specs/README.md.
+  Конвенции: fail-closed на auth-пути; секреты zeroize; PAM-коды только в cdylib;
+  правки PAM-стека только через integrate-pam.sh; Rust-код пишется через general-purpose
+  агента с явной верификацией (grep критичных символов в diff перед push).
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours

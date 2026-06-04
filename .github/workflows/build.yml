@@ -1,0 +1,262 @@
+name: build
+
+# Один workflow собирает .deb в двух вариантах через matrix:
+#
+#   - ubuntu — плоский ubuntu-22.04 runner. Быстрый
+#     PR-чек (~3 мин), не годится для прода на Astra.
+#   - astra (real) — внутри pre-built Astra builder image, --features
+#     открытая Astra-сборка (без МКЦ-FFI). Релизный артефакт.
+#
+# release-job ниже зависит ТОЛЬКО от astra-build и публикует Astra-.deb
+# в GitHub Release на push тега `v*`. Stub-.deb на странице релиза не
+# попадает — его нельзя ставить на терминалы.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  # Re-run после ребилда builder-образа: новый :latest, нужно
+  # пересобрать Tessera в нём.
+  workflow_run:
+    workflows: ["build-builder-image"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: build-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Skip когда триггер — упавший/cancelled upstream builder-image.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - id: ubuntu
+            container: ""
+            features: ""
+            test_cmd: "cargo test --workspace"
+            build_extra: ""
+            artifact_name: tessera-deb-ubuntu
+            skip_lintian: false
+          - id: astra
+            container: "ghcr.io/robonet/tessera-astra-builder:latest"
+            # Открытая сборка: без МКЦ-FFI (закрытый crate tessera_mac_parsec
+            # живёт в tessera-enterprise; коммерческий CI — там же).
+            features: ""
+            # NB: tests run in debug profile (no --release). Workflow-level
+            # env forces release builds to codegen-units=1 + LTO=thin which
+            # are needed for the final .deb but kill test compile time —
+            # baseline run #25 spent 510s compiling tests vs 56s on ubuntu.
+            # Production release-mode validation lives in a separate
+            # nightly workflow.
+            test_cmd: "cargo nextest run --workspace"
+            build_extra: "--skip-lintian"
+            artifact_name: tessera-deb-astra
+            skip_lintian: true
+    name: build (${{ matrix.target.id }})
+    # Workflow-level env: одинаковые knobs для cargo test и build-deb.sh,
+    # чтобы Swatinem кэш не инвалидировался между шагами.
+    env:
+      CARGO_HOME: ${{ github.workspace }}/debian/cargo_home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+    container:
+      image: ${{ matrix.target.container }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history для SOURCE_DATE_EPOCH
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Trust workspace as git repository
+        # Container-uid mismatch + GHA workspace mount → git отказывается
+        # дискаверить repo внутри контейнера. Mark safe чтобы
+        # build-deb.sh's `git describe`/`git log` сработали.
+        # Для ubuntu-runner без контейнера команда noop'ит, но безопасна.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify Cargo workspace version matches debian/changelog
+        run: |
+          set -euo pipefail
+          cargo_ver=$(grep -E '^version\s*=' Cargo.toml | head -1 \
+              | sed -E 's/.*"([^"]+)".*/\1/')
+          deb_ver=$(head -1 debian/changelog \
+              | sed -E 's/^[^(]+\(([^-]+).*/\1/')
+          echo "Cargo workspace version : ${cargo_ver}"
+          echo "debian/changelog version: ${deb_ver}"
+          if [ "${cargo_ver}" != "${deb_ver}" ]; then
+              echo "::error::Cargo.toml version (${cargo_ver}) != debian/changelog (${deb_ver}). Bump debian/changelog before releasing."
+              exit 1
+          fi
+
+      # ---- Ubuntu-only steps: ставим build deps + rustup (в astra-образе всё это уже есть)
+
+      - name: Install build deps (ubuntu only)
+        if: matrix.target.id == 'ubuntu'
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            debhelper dh-cargo \
+            libssl-dev libudev-dev libdbus-1-dev libpam0g-dev libsystemd-dev \
+            clang libclang-dev \
+            pkg-config lintian devscripts fakeroot build-essential
+
+      - name: Cache rustup toolchain (ubuntu only)
+        if: matrix.target.id == 'ubuntu'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-1.95.0
+
+      - name: Install Rust toolchain (ubuntu only)
+        if: matrix.target.id == 'ubuntu'
+        run: |
+          set -euxo pipefail
+          if ! command -v rustup >/dev/null; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain none --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install 1.95.0 \
+            --profile minimal --component clippy --component rustfmt
+
+      # ---- Astra-only diagnostics
+
+      - name: Probe Astra environment (astra only)
+        if: matrix.target.id == 'astra'
+        run: |
+          set -euxo pipefail
+          cat /etc/astra_version || true
+          uname -a
+          rustc --version
+          cargo --version
+          dpkg --version
+
+      # ---- Common: caches
+
+      - name: Print toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          dpkg --version
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        # shared-key привязан к matrix-target — кэш ubuntu и astra
+        # ни в коем случае не должен пересекаться (разные линкеры,
+        # разные ABI, разный target/).
+        # Pinned to v2.7.8 because GitHub codeload was returning 404 for
+        # the resolved @v2 SHA (e18b...) — see #30 build failure. The
+        # commit is reachable via API but not via the runner's codeload
+        # endpoint; pinning bypasses the broken tag resolution.
+        uses: Swatinem/rust-cache@aa7c1c80a07a27a84c0aa76d0cef0aad3830e330 # v2.7.8
+        with:
+          shared-key: build-deb-${{ matrix.target.id }}
+          cache-on-failure: true
+          cache-all-crates: true
+
+      - name: Configure sccache (compiler-level cache)
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # ---- Test + build
+
+      - name: Run tests (regression guard)
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: ${{ matrix.target.test_cmd }}
+
+      - name: Build .deb
+        env:
+          DEB_CARGO_EXTRA_OPTIONS: ${{ matrix.target.features && format('--features {0}', matrix.target.features) || '' }}
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: scripts/build-deb.sh --allow-dirty ${{ matrix.target.build_extra }}
+
+      - name: Show deb contents
+        run: dpkg -c ../tessera_*.deb
+
+      - name: Stage artifacts inside workspace
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          for f in ../tessera_*.deb ../tessera_*.changes ../tessera_*.buildinfo; do
+            [ -e "$f" ] || continue
+            base="$(basename "$f")"
+            cp "$f" "artifacts/$base"
+          done
+          ls -la artifacts/
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.artifact_name }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---- Релиз: оба артефакта (astra + ubuntu) уходят в GitHub Release.
+
+  release:
+    needs: build
+    # Только на тег v*, не на push в main и не на PR.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download astra artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tessera-deb-astra
+          path: ./artifacts/astra
+
+      - name: Download ubuntu artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tessera-deb-ubuntu
+          path: ./artifacts/ubuntu
+
+      - name: Suffix .deb files with target id
+        # Оба .deb называются одинаково (tessera_X.Y.Z-1_amd64.deb).
+        # Перед заливкой в Release дописываем '-astra' / '-ubuntu' в имя,
+        # чтобы они не перетёрли друг друга и админ видел, какой ставить.
+        run: |
+          set -euxo pipefail
+          mkdir -p release
+          for f in artifacts/astra/*.deb; do
+            base="$(basename "$f" .deb)"
+            cp "$f" "release/${base}-astra.deb"
+          done
+          for f in artifacts/ubuntu/*.deb; do
+            base="$(basename "$f" .deb)"
+            cp "$f" "release/${base}-ubuntu.deb"
+          done
+          # .changes/.buildinfo тоже кладём (без переименования —
+          # пусть будут под подкаталогами для аудита).
+          cp artifacts/astra/*.{changes,buildinfo} release/ 2>/dev/null || true
+          ls -la release/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: true
+          generate_release_notes: true

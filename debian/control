@@ -1,0 +1,79 @@
+Source: tessera
+Section: admin
+Priority: optional
+Maintainer: Mikhail Korolev <mikhail@robonet.me>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-cargo (>= 25),
+ cargo (>= 0.66),
+ rustc (>= 1.75),
+ libssl-dev,
+ libudev-dev,
+ libdbus-1-dev,
+ libpam0g-dev,
+ libsystemd-dev,
+ pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/RoboNET/tessera
+Vcs-Git: https://github.com/RoboNET/tessera.git
+Vcs-Browser: https://github.com/RoboNET/tessera
+Rules-Requires-Root: binary-targets
+
+Package: tessera
+Architecture: amd64
+Multi-Arch: foreign
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libpam0g,
+ lsb-base (>= 3.0-6),
+ adduser
+# libgost-engine: loaded lazily at runtime, only when the verified chain
+# contains GOST-signed certs. Pure RSA deployments do not need it; on
+# Astra hosts the package is named libgost-astra.
+# libudev1 / libdbus-1-3 / libsystemd0: pulled in automatically by
+# ${shlibs:Depends} from the binary's NEEDED entries when the daemon
+# subcommand is built.
+# polkitd: not invoked from the PAM module or daemon today, kept as
+# Suggests for future cert-management UI integration.
+# libpdp3 / libparsec-base3: required at runtime only when the binary is
+# built with the `astra-mac` feature; on non-Astra hosts (Debian/Ubuntu)
+# the package functions as a stub (postinst skips МКЦ setup). Both stay
+# as Recommends so apt on Astra still pulls them in, while standard
+# Debian/Ubuntu installs do not fail on a missing package. For an
+# Astra-specific deb build, promote these to hard Depends in the Astra
+# build script. `libparsec-base3` carries `parsec_capget` (verified on
+# Astra CI 2026-05-15, run 25903325006) — without it the astra-mac build
+# fails to link with `undefined symbol: parsec_capget`.
+Recommends:
+ libgost-engine | gost-engine | libgost-astra,
+ libpkcs11-helper1,
+ librtpkcs11ecp,
+ libpdp3 (>= 3.11+ci97~),
+ libparsec-base3 (>= 3.11+ci97~)
+Suggests:
+ opensc,
+ p11-kit,
+ pamtester,
+ polkitd | policykit-1
+Description: USB-token PKI authentication PAM module for Astra Linux SE
+ Tessera authenticates a local UNIX user by verifying a certificate
+ stored on a removable USB token (PKCS#12 file or PKCS#11 device such as
+ Rutoken / JaCarta). Russian GOST cryptography is supported via the
+ system-installed gost-engine OpenSSL provider.
+ .
+ The package ships:
+   * /lib/security/pam_tessera.so  - the PAM module
+   * /usr/bin/tessera - userspace CLI (daemon subcommand handles udev/D-Bus)
+     events, OCSP/CRL caching, and inter-session screen-lock hooks
+   * Example configuration under /etc/tessera/
+   * A drop-in PAM stack at /etc/pam.d/tessera
+ .
+ Designed for Astra Linux SE 1.7+ but builds on Debian 12 / Ubuntu 22.04.
+ .
+ Russian description:
+ .
+ PAM-модуль для аутентификации пользователей по сертификату на USB-токене.
+ Поддерживаются режимы PKCS#12 (файл с защитой парольной фразой) и PKCS#11
+ (Рутокен, JaCarta), включая криптографию ГОСТ через gost-engine. Назначен
+ для Astra Linux SE 1.7+, собирается также под Debian 12 и Ubuntu 22.04.

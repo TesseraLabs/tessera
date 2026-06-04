@@ -1,0 +1,87 @@
+.TH TESSERA 8 "2026-05-13" "0.1.1" "System Administration"
+.SH NAME
+tessera \- USB session monitor and CLI for Tessera
+.SH SYNOPSIS
+.B tessera daemon
+[\fB\-\-config\fR \fIFILE\fR]
+[\fB\-\-socket\fR \fIPATH\fR]
+[\fB\-\-state\-file\fR \fIPATH\fR]
+[\fB\-\-grace\-seconds\fR \fIN\fR]
+[\fB\-\-suspend\-grace\-seconds\fR \fIN\fR]
+[\fB\-\-no\-udev\fR]
+[\fB\-\-no\-dbus\fR]
+.SH DESCRIPTION
+.B tessera daemon
+is a privileged daemon that complements the
+.B pam_tessera
+PAM module. It listens on a Unix socket for session-open and session-close
+notifications from the PAM cdylib, watches udev for USB token removal events,
+and subscribes to logind D-Bus signals for suspend, resume, and
+session-removed transitions. When a registered token is removed (or the
+session ends/suspends past the configured grace window), the daemon enforces
+the configured
+.B removal-action
+(lock, logout, shutdown, or operator hook) for the affected session as
+declared in the
+.B [monitor]
+section of the shared TOML config.
+.SH OPTIONS
+.TP
+.B \-\-config \fIFILE\fR
+Path to the shared TOML config file (default
+.IR /etc/tessera/config.toml ).
+Fields under the
+.B [monitor]
+section populate the daemon's runtime knobs; the CLI flags below override
+the corresponding config values when supplied.
+.TP
+.B \-\-socket \fIPATH\fR
+Unix socket path used for IPC with the PAM cdylib. Overrides
+.BR monitor.socket_path .
+.TP
+.B \-\-state\-file \fIPATH\fR
+Path to the persisted session registry (JSON). Overrides
+.BR monitor.state_file_path .
+.TP
+.B \-\-grace\-seconds \fIN\fR
+Grace window in seconds between USB token removal and execution of the
+configured removal action. Overrides
+.BR monitor.usb_removed_grace_seconds .
+.TP
+.B \-\-suspend\-grace\-seconds \fIN\fR
+Grace window in seconds applied after system suspend/resume before
+re-evaluating token presence. Overrides
+.BR monitor.suspend_grace_seconds .
+.TP
+.B \-\-no\-udev
+Skip launching the udev monitor thread. The race-check udev query also
+degrades to an always-present stub, so end-to-end tests that disable the
+udev thread don't see spurious DEVICE_GONE rejections. Not for production
+use.
+.TP
+.B \-\-no\-dbus
+Skip connecting to D-Bus. The actions backend degrades to a no-op
+(lock/terminate/power-off requests are logged but never sent) and the
+logind signal listener is not started. Production deployments must NEVER
+set this \(em the entire purpose of monitord is to enforce removal via
+logind.
+.SH FILES
+.TP
+.I /etc/tessera/config.toml
+Shared validated configuration. The
+.B [monitor]
+section is consumed by this daemon and must agree with what the PAM
+cdylib reads from the same file.
+.TP
+.I /run/tessera/monitord.sock
+Default Unix socket path for IPC between the PAM module and the daemon.
+.TP
+.I /var/lib/tessera/registry.json
+Default persisted session registry; survives daemon restarts so in-flight
+sessions are reconciled on resume.
+.SH SEE ALSO
+.BR pam_tessera (8),
+.BR pam.conf (5),
+.BR logind.conf (5)
+.SH AUTHORS
+Mikhail Korolev <mikhail@robonet.me>

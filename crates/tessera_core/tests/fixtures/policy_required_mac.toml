@@ -1,0 +1,37 @@
+crypto_backend = "openssl"
+mode = "pkcs12"
+pkcs12_path_pattern = "certs/user.p12"
+pkcs12_pin_prompt = "PIN: "
+usb_wait_seconds = 5
+on_usb_removed = "lock"
+usb_removed_grace_seconds = 5
+suspend_grace_seconds = 30
+monitor_fail_mode = "permissive"
+
+[trust]
+anchors = []
+intermediates = []
+allowed_signature_algorithms = []
+max_chain_depth = 4
+clock_skew_seconds = 60
+
+[trust.revocation]
+mode = "none"
+crl_paths = []
+
+[trust.pinning]
+enabled = false
+allowed_root_spki_sha256 = []
+
+[host_identity]
+sources = ["machine_id"]
+fallback = "warn"
+custom_command_timeout_seconds = 5
+
+[logging]
+level = "info"
+syslog_facility = "auth"
+journald_priority = true
+
+[mac]
+cert_integrity = "required"

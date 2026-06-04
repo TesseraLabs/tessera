@@ -1,0 +1,21 @@
+# OpenSSL config — leaf WITHOUT MAX_INTEGRITY extension.
+# Used to test policy modes (required → reject, optional → fallback,
+# ignore → accept).
+[ req ]
+default_bits        = 2048
+default_md          = sha256
+prompt              = no
+distinguished_name  = dn
+req_extensions      = leaf_ext
+
+[ dn ]
+CN = mac-no-ext
+O  = pam_certauth-test
+C  = RU
+
+[ leaf_ext ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = clientAuth, emailProtection
+subjectKeyIdentifier   = hash
+1.3.6.1.4.1.99999.1.2 = ASN1:UTF8String:testuser

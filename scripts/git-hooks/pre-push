@@ -1,0 +1,21 @@
+#!/bin/sh
+# Block pushes that update refs/heads/main during working hours
+# (Mon-Fri 09:00-18:59 local time). Emergency override: git push --no-verify
+
+dow=$(date +%u)  # 1=Mon .. 7=Sun
+hour=$(date +%H)
+
+if [ "$dow" -gt 5 ] || [ "$hour" -lt 9 ] || [ "$hour" -ge 19 ]; then
+    exit 0
+fi
+
+# stdin: <local-ref> <local-sha> <remote-ref> <remote-sha> per ref being pushed
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -n "$remote_ref" ] || continue
+    if [ "$remote_ref" = "refs/heads/main" ]; then
+        echo "pre-push: pushing to 'main' is blocked on weekdays 09:00-19:00." >&2
+        echo "Push after 19:00, or use --no-verify for emergencies." >&2
+        exit 1
+    fi
+done
+exit 0

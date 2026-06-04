@@ -1,0 +1,51 @@
+[Unit]
+Description=Tessera USB-token monitor daemon
+Documentation=file:///usr/share/doc/tessera/README.md.gz
+Documentation=man:tessera(8)
+After=systemd-udevd.service systemd-logind.service dbus.service
+Wants=systemd-tmpfiles-setup.service
+Requires=systemd-logind.service
+
+[Service]
+Type=notify
+# Batch 4 (P1-D): the daemon reads its operational knobs from the SAME shared
+# config the PAM cdylib parses, so operators only edit one file. Keep CLI
+# flags in mind only as on-the-fly overrides for staging / debugging.
+ExecStart=/usr/bin/tessera daemon --config /etc/tessera/config.toml
+Restart=on-failure
+RestartSec=5s
+# Run as a dedicated system user (created by postinst). The daemon does
+# NOT need root: mount(2) is performed by pam_tessera.so inside the PAM
+# caller's context; the daemon's privileged actions (LockSession /
+# TerminateSession / PowerOff on logind) are gated by a polkit rule
+# shipped at /usr/share/polkit-1/rules.d/49-tessera.rules that
+# allows the `tessera` user to invoke those D-Bus methods.
+User=tessera
+Group=tessera
+RuntimeDirectory=tessera
+RuntimeDirectoryMode=0750
+StateDirectory=tessera
+StateDirectoryMode=0750
+CacheDirectory=tessera
+CacheDirectoryMode=0750
+ProtectSystem=strict
+ReadWritePaths=/run/tessera /var/cache/tessera /var/lib/tessera
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute is left off because OpenSSL/gost-engine may need W^X
+# relaxation for ASN.1 parser JIT in libcrypto. Stage 8 should benchmark with
+# =yes and flip if no measurable regression.
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,64 @@
+crypto_backend = "openssl"
+mode = "pkcs11"
+pkcs11_module = "/bin/sh"
+usb_wait_seconds = 10
+on_usb_removed = "lock"
+usb_removed_grace_seconds = 5
+suspend_grace_seconds = 5
+monitor_fail_mode = "strict"
+
+[trust]
+anchors = ["/bin/sh"]
+intermediates = []
+max_chain_depth = 5
+clock_skew_seconds = 60
+allowed_signature_algorithms = []
+
+[trust.revocation]
+mode = "none"
+crl_paths = []
+
+[trust.pinning]
+enabled = false
+allowed_root_spki_sha256 = []
+
+[host_identity]
+sources = ["machine_id", "hostname"]
+fallback = "warn"
+custom_command_timeout_seconds = 5
+
+[[user_mapping]]
+pam_user = "alice"
+cert_subject_cn = "Alice"
+
+[logging]
+level = "info"
+syslog_facility = "auth"
+journald_priority = true
+
+[[hooks]]
+stage = "pre_auth"
+command = ["/bin/sh", "-c", "true"]
+timeout_seconds = 10
+env = { PAM_USER = "${pam_user}" }
+
+[[hooks]]
+stage = "post_auth_success"
+command = ["/bin/sh", "-c", "true"]
+timeout_seconds = 10
+env = { CERT_CN = "${cert_cn}" }
+
+[[hooks]]
+stage = "session_open"
+command = ["/bin/sh", "-c", "true"]
+timeout_seconds = 10
+
+[[hooks]]
+stage = "session_close"
+command = ["/bin/sh", "-c", "true"]
+timeout_seconds = 10
+
+[[hooks]]
+stage = "usb_removed"
+command = ["/bin/sh", "-c", "true"]
+timeout_seconds = 10

@@ -1,0 +1,38 @@
+# /etc/pam.d/tessera — opt-in МКЦ activation stack.
+#
+# This is NOT the PAM stack that authenticates end users — that lives
+# at /etc/pam.d/tessera (and -optional / -only variants). This stack
+# is loaded by systemd because the `mac-integrity.conf.example`
+# drop-in declares `PAMName=tessera`. When the daemon is forked,
+# systemd opens a PAM session against this stack so the parsec session
+# modules can apply caps + ilevel from capdb/micdb to the daemon
+# process.
+#
+# Activation (full walkthrough: docs/install.md §«МКЦ — опциональная
+# активация»):
+#
+#     sudo install -m 0644 \
+#         /usr/share/tessera/pam.d/tessera.example \
+#         /etc/pam.d/tessera
+#
+# Prerequisites on Astra SE strict-mode:
+#   - /etc/parsec/capdb/<uid-of-tessera> must include PARSEC_CAP_CHMAC
+#     (bit 3): `sudo /sbin/usercaps -m "+3" tessera`.
+#   - /etc/parsec/micdb/<uid-of-tessera> must declare ilevel=63
+#     (otherwise the daemon will not be able to relabel high-ilevel
+#     state files): `sudo /sbin/pdpl-user --ilevel 63 tessera`.
+#
+# Why session-only:
+#   - auth/account phases are not meaningful for a service account
+#     started by systemd; we short-circuit them with pam_permit.so so
+#     PAM does not block service start.
+#   - The two parsec session modules are the actual workhorses: they
+#     read /etc/parsec/capdb and /etc/parsec/micdb keyed by the running
+#     uid (tessera) and apply the resulting caps + ilevel to the
+#     daemon process before ExecStart fires.
+
+auth       required   pam_permit.so
+account    required   pam_permit.so
+
+session    required   pam_parsec_cap.so
+session    required   pam_parsec_mac.so

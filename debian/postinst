@@ -1,0 +1,163 @@
+#!/bin/sh
+# postinst - finalize installation.
+
+set -e
+
+CONFIG_DIR=/etc/tessera
+CACHE_DIR=/var/cache/tessera/ocsp
+STATE_DIR=/var/lib/tessera
+
+case "$1" in
+    configure)
+        # Create the dedicated system user the daemon runs as. Idempotent:
+        # adduser --system is a no-op when the user already exists. The
+        # group is created with the same name (--group). No login shell,
+        # no home directory.
+        if ! getent passwd tessera >/dev/null; then
+            adduser --system --group --no-create-home \
+                    --home /nonexistent --shell /usr/sbin/nologin \
+                    --gecos "Tessera daemon" tessera
+        fi
+
+        # Tighten config-dir permissions (dh_installdirs ships 0755).
+        # Group set to tessera so the daemon can read CA bundle / CRL
+        # files via group ACL without needing root or CAP_DAC_OVERRIDE.
+        chmod 0750 "$CONFIG_DIR"
+        chmod 0750 "$CONFIG_DIR/ca"
+        chmod 0750 "$CONFIG_DIR/crl"
+        chown root:tessera "$CONFIG_DIR" "$CONFIG_DIR/ca" "$CONFIG_DIR/crl"
+        # Config file must be readable by the daemon group too.
+        if [ -f "$CONFIG_DIR/config.toml" ]; then
+            chown root:tessera "$CONFIG_DIR/config.toml"
+            chmod 0640 "$CONFIG_DIR/config.toml"
+        fi
+        if [ -f "$CONFIG_DIR/ca/bundle.pem" ]; then
+            chown root:tessera "$CONFIG_DIR/ca/bundle.pem"
+            chmod 0640 "$CONFIG_DIR/ca/bundle.pem"
+        fi
+
+        mkdir -p "$CACHE_DIR"
+        chmod 0750 "$CACHE_DIR"
+        chown tessera:tessera "$CACHE_DIR"
+        chown tessera:tessera "$(dirname "$CACHE_DIR")"
+
+        mkdir -p "$STATE_DIR"
+        chmod 0750 "$STATE_DIR"
+        chown tessera:tessera "$STATE_DIR"
+
+        # 0.3.0 migration: sessions registry moved from /var/lib to /run tmpfs.
+        # Remove stale file from previous installs if present.
+        if [ -e "$STATE_DIR/sessions.json" ]; then
+            rm -f "$STATE_DIR/sessions.json" || true
+        fi
+
+        # Marker for preinst to detect a clean prior install.
+        touch "$STATE_DIR/.installed-by-deb"
+        chmod 0640 "$STATE_DIR/.installed-by-deb"
+        chown root:tessera "$STATE_DIR/.installed-by-deb"
+
+        # systemd integration.
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/tessera.conf || true
+        fi
+
+        # ------------------------------------------------------------------
+        # МКЦ (MAC integrity) integration — Astra SE strict mode only.
+        # Skip gracefully on non-Astra hosts / when strict mode is disabled.
+        # `pdpl-file` ships with Astra's parsec userspace; absence => non-Astra
+        # build target (Debian/Ubuntu CI), so we simply skip.
+        if command -v pdpl-file >/dev/null 2>&1 \
+           && command -v astra-strictmode-control >/dev/null 2>&1 \
+           && astra-strictmode-control is-enabled >/dev/null 2>&1; then
+            # Allow root (level 0+) to read config directory regardless of the
+            # caller's hierarchical clearance — config has no secrets, only
+            # CA pins, policy, runtime knobs.
+            pdpl-file ":::iinh" "$CONFIG_DIR" || true
+            pdpl-file -R ":::iinh" "$CONFIG_DIR/ca" || true
+            pdpl-file -R ":::iinh" "$CONFIG_DIR/crl" || true
+
+            # Raise ilevel to 63 (Высокий) on configuration files: any
+            # subject at ilevel<63 (including ordinary root without
+            # CAP_MAC_ADMIN/PARSEC_CAP_SETMAC) cannot WRITE these files
+            # (no write-up in Biba). Read-down is allowed, so the daemon
+            # at default ilevel=0 still reads them fine. Editing the
+            # config requires a high-integrity admin session — see
+            # docs/install.md §«Защита конфига через МКЦ».
+            #
+            # Format: level:ilevel:cat:flags = 0:63::iinh
+            # The iinh flag on directories ensures newly-created children
+            # inherit the level.
+            if [ -f "$CONFIG_DIR/config.toml" ]; then
+                pdpl-file -v "0:63::iinh" "$CONFIG_DIR/config.toml" || true
+            fi
+            pdpl-file -R -v "0:63::iinh" "$CONFIG_DIR/ca" || true
+            pdpl-file -R -v "0:63::iinh" "$CONFIG_DIR/crl" || true
+            if [ -f "$CONFIG_DIR/host_acl.toml" ]; then
+                pdpl-file -v "0:63::iinh" "$CONFIG_DIR/host_acl.toml" || true
+            fi
+            if [ -f "$CONFIG_DIR/host_acl.toml.sig" ]; then
+                pdpl-file -v "0:63::iinh" "$CONFIG_DIR/host_acl.toml.sig" || true
+            fi
+            echo "  - integrity ilevel raised to 63 on config files (write requires CAP_MAC_ADMIN)" >&2
+
+            # State dir (host_id, caches) must be MAC-readable by
+            # the tessera daemon at any clearance the active user holds.
+            # NOTE: sessions.json now lives in /run/tessera/ (tmpfs);
+            # the RuntimeDirectory= unit setting creates the parent at boot
+            # with `iinh` inherited via systemd's runtime-dir handling.
+            # daemon.lock in $STATE_DIR is the daemon's write target — keep
+            # its ilevel at default (0), only the dir gets `iinh`.
+            pdpl-file ":::iinh" "$STATE_DIR" || true
+            pdpl-file ":::iinh" "$CACHE_DIR" || true
+
+            # host_id is rebind-protected: once written by host_identity probe
+            # we set the immutable bit so a tampered admin cannot silently
+            # repoint a deployed host's identity to a different binding.
+            if [ -f "$STATE_DIR/host_id" ]; then
+                chattr +i "$STATE_DIR/host_id" 2>/dev/null || true
+            fi
+        fi
+
+        # On Astra hosts, remind operators that МКЦ-label enforcement is
+        # opt-in. The daemon runs as `tessera` without CAP_MAC_ADMIN /
+        # PARSEC_CAP_CHMAC by default; activation requires the shipped
+        # drop-in. See docs/install.md for the full procedure.
+        if [ -f /etc/astra_version ]; then
+            echo "Note: МКЦ (MAC integrity) support is opt-in." >&2
+            echo "      See /usr/share/tessera/systemd/mac-integrity.conf.example" >&2
+            echo "      and docs/install.md for the activation procedure." >&2
+        fi
+
+        # Print one-time setup hint if no config has been deployed yet.
+        if [ ! -f "$CONFIG_DIR/config.toml" ]; then
+            cat <<EOF
+==============================================================
+tessera installed.
+
+Next steps:
+  1. cp /etc/tessera/config.toml.example /etc/tessera/config.toml
+     and edit it for your site (CA bundle, host_identity, user_mapping).
+  2. Drop CA bundle into /etc/tessera/ca/bundle.pem (mode 0640).
+  3. Authorisation is cert-driven (X.509 v3 extensions on the leaf):
+     pam_cert_host_binding + pam_cert_user_binding control which hosts
+     and which local accounts a cert may sign in to. See README.
+  4. systemctl enable --now tessera.service
+  5. Integrate the PAM stack:
+        sudo /usr/share/tessera/integrate-pam.sh /etc/pam.d/sudo
+        sudo /usr/share/tessera/integrate-pam.sh /etc/pam.d/fly-dm
+==============================================================
+EOF
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

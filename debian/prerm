@@ -1,0 +1,37 @@
+#!/bin/sh
+# prerm - runs before package removal.
+#
+# IMPORTANT: dpkg invokes `prerm upgrade <new-version>` during a package
+# upgrade. Stopping/disabling the service unconditionally here would cause
+# silent enforcement loss across upgrades because postinst does not
+# re-enable. Restrict service stop to genuine removal; debhelper's
+# #DEBHELPER# token expands to dh_installsystemd's deferred restart logic,
+# which honors `--no-restart-on-upgrade` from debian/rules. Disable+mask is
+# reserved for `purge`, handled in postrm per Debian convention.
+#
+# Service stop goes through deb-systemd-invoke rather than a direct
+# systemctl call: deb-systemd-invoke is the Debian-policy-blessed wrapper
+# that handles the systemd-vs-non-systemd dispatch (no-op when systemd is
+# not the active init), keeps lintian happy (avoids
+# maintainer-script-calls-systemctl), and respects policy-rc.d in chroots.
+
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        if command -v deb-systemd-invoke >/dev/null 2>&1; then
+            deb-systemd-invoke stop tessera.service >/dev/null 2>&1 || true
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        # No-op: dh_installsystemd handles restart-on-upgrade per policy.
+        ;;
+    *)
+        echo "prerm called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

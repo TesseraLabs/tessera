@@ -1,0 +1,8 @@
+# Test policy fragment — MAC integrity REQUIRED.
+#
+# This file is concatenated onto a base config.toml.example by the E2E
+# test harness (vagrant/scripts/test-mac.sh -> apply_policy "required").
+# It does NOT stand alone — it only contributes the [mac] section.
+
+[mac]
+cert_integrity = "required"

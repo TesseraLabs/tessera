@@ -1,0 +1,3 @@
+# Exclude artifacts that should never appear in the source package.
+extend-diff-ignore = "^(target/|Cargo\\.lock|\\.cargo/|\\.idea/|.*\\.deb|.*\\.changes|.*\\.buildinfo)"
+unapply-patches
