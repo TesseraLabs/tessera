@@ -1,0 +1,279 @@
+# /etc/tessera/config.toml.example
+#
+# Tessera main configuration. Copy this file to
+# /etc/tessera/config.toml and edit it for your site before enabling
+# tessera.service.
+#
+# This file is parsed by both libpam_tessera.so (the PAM module) and
+# tessera (the daemon). Both must read identical config.
+#
+# All keys are validated by `tessera_core::config::ValidatedConfig`.
+# If a key is missing here that the validator demands, the daemon and the
+# PAM module refuse to start. Do not rely on undocumented defaults.
+
+# --- Crypto backend ----------------------------------------------------------
+# "openssl"       — chain verification and challenge-response signing
+#                   happen via OpenSSL. Required for GOST signatures
+#                   provided by gost-engine.
+# "pkcs11_native" — verification keys live on the token; OpenSSL is bypassed
+#                   for signing. GOST via the token's own provider.
+crypto_backend = "openssl"
+
+# --- Mode --------------------------------------------------------------------
+# "pkcs12" : passphrase-protected PKCS#12 file on a USB filesystem.
+# "pkcs11" : token-resident keypair via PKCS#11 (Rutoken, JaCarta).
+mode = "pkcs11"
+
+# --- PKCS#11 -----------------------------------------------------------------
+# Required when mode = "pkcs11"; ignored otherwise.
+pkcs11_module = "/usr/lib/librtpkcs11ecp.so"
+# Optional CKA_LABEL filter for the token (≤ 64 bytes, no NUL). Omit to use
+# the first available token on the bus.
+# pkcs11_token_label = "RUTOKEN ECP"
+# Optional CKA_LABEL filter for the on-token cert / private-key object.
+# Omit to use the first end-entity cert found.
+# pkcs11_object_label = "user-cert"
+# Maximum number of consecutive PIN attempts before bailing. Range 1..=5.
+pkcs11_max_pin_attempts = 3
+# PKCS#11 locking mode: "os" (CKF_OS_LOCKING_OK, default) or "mutex".
+pkcs11_locking_mode = "os"
+# Localized PIN prompt shown to the user. Defaults to a Russian prompt at
+# runtime; uncomment to override.
+# pkcs11_pin_prompt = "Введите PIN-код токена: "
+# Maximum time wait_for_token will block waiting for the user to insert the
+# token, in seconds. Range 0..=60. 0 disables the wait entirely.
+pkcs11_slot_wait_seconds = 10
+
+# --- PKCS#12 -----------------------------------------------------------------
+# Used only when mode = "pkcs12".
+#
+# Относительный путь к .p12 от точки монтирования USB-носителя.
+# Поддерживает плейсхолдер ${user} (имя PAM-пользователя).
+# Не должен начинаться с / и не должен содержать сегментов ../ или ./.
+# Default: "certs/user.p12".
+# pkcs12_path_pattern = "certs/user.p12"
+# альтернативные варианты:
+# pkcs12_path_pattern = "bfs_service.p12"
+# pkcs12_path_pattern = "${user}.p12"
+# pkcs12_pin_prompt   = "Пароль PKCS#12: "
+
+# --- gost-engine -------------------------------------------------------------
+# Path to the gost-engine .so. When omitted, the engine is resolved by id
+# "gost" from the system OpenSSL engine search path. Only meaningful with
+# crypto_backend = "openssl".
+# gost_engine_path = "/usr/lib/x86_64-linux-gnu/engines-1.1/gost.so"
+
+# --- USB monitor -------------------------------------------------------------
+# Maximum time to block waiting for the user's USB token at auth time.
+usb_wait_seconds = 10
+# Максимальное число USB-партиций, перебираемых при поиске .p12.
+# Защита от DoS: атакующий с физическим доступом не сможет заставить
+# модуль mount/unmount слишком много FS подряд. Range 1..=64.
+max_usb_partitions = 8
+# Action to take after a confirmed USB removal. One of:
+#   "lock"    — lock the user's session via logind.
+#   "logout"  — terminate the user's session via logind.
+#   "hook"    — invoke the configured `usb_removed` hook(s).
+#   "shutdown" — power off the host.
+on_usb_removed = "lock"
+# Grace window between a USB removal event and the configured action.
+# A reinsertion of the same serial within this window cancels the action.
+usb_removed_grace_seconds = 5
+# After a system resume from sleep, ignore USB-removal events for this many
+# seconds (suspend transients on some hubs raise spurious removals).
+suspend_grace_seconds = 30
+# Daemon-failure handling for the PAM module.
+#   "strict"     — any daemon I/O / timeout error fails auth.
+#   "permissive" — transient I/O errors are tolerated; typed failures
+#                  (DeviceGone / Unauthorized) always propagate.
+monitor_fail_mode = "strict"
+
+# --- Monitor (PAM client + tessera daemon) -----------------------------
+# Both pam_tessera.so AND tessera read this section. Any field
+# left unset falls back to the legacy top-level option above (where one
+# exists) or to the documented default.
+[monitor]
+# Path to the monitor daemon Unix socket. Default
+# `/run/tessera/monitord.sock` (filename is kept for ABI compatibility).
+# socket_path = "/run/tessera/monitord.sock"
+# Per-RPC connect+IO timeout (PAM client side), in milliseconds. Default 2000.
+# timeout_ms = 2000
+# Per-section fail-mode override. When unset, falls back to the top-level
+# `monitor_fail_mode` above. One of "strict" | "permissive" | "degraded".
+# fail_mode = "strict"
+# Path to the session-registry JSON written by the daemon. Default
+# `/run/tessera/sessions.json` (tmpfs, volatile across reboot — the
+# registry only needs to survive daemon restart within a boot).
+# state_file_path = "/run/tessera/sessions.json"
+# Action the daemon takes after a confirmed USB removal past the grace
+# window. One of "lock" | "logout" | "shutdown" | "hook". Default "lock".
+# When unset, falls back to the top-level `on_usb_removed`.
+# on_usb_removed = "lock"
+# Grace window between a USB removal event and the configured action.
+# Default 5. Falls back to the top-level `usb_removed_grace_seconds`.
+# usb_removed_grace_seconds = 5
+# Suspend-grace window: removals within this many seconds after a resume
+# are ignored. Default 30. Falls back to top-level `suspend_grace_seconds`.
+# suspend_grace_seconds = 30
+# Required ONLY when `on_usb_removed = "hook"`: absolute path to the hook
+# executable invoked on USB removal. Validator rejects "hook" without it.
+# on_usb_removed_hook_path = "/usr/local/sbin/usb-removed-hook"
+# IPC server hardening (P1-F).
+#   idle_timeout_seconds       — max silence between client messages
+#                                before the server closes the connection.
+#                                Default 30.
+#   max_concurrent_connections — accept-loop semaphore cap. Default 64.
+# idle_timeout_seconds = 30
+# max_concurrent_connections = 64
+
+# --- Cert binding ------------------------------------------------------------
+# In 1.0.2 the host ACL is gone. Authorisation ("which user on which host")
+# is encoded in two X.509 extensions on each end-entity certificate:
+#   - 2.25.183976554325829274683049824615098  (pam_cert_host_binding)
+#   - 2.25.215438916728501023845629178354627  (pam_cert_user_binding)
+# Each is a SEQUENCE OF UTF8String. The cert alone decides which hosts /
+# users it authorises. See docs/cert-issuance.md for the openssl.cnf
+# cookbook used at issuance time.
+
+# --- Trust -------------------------------------------------------------------
+[trust]
+# PEM-encoded trust anchors (root CAs). At least one entry required.
+anchors = [
+    "/etc/tessera/ca/bundle.pem",
+]
+# Optional intermediates. PEM-encoded.
+intermediates = []
+# Maximum chain depth (1..=10 typical; must be > 0).
+max_chain_depth = 5
+# Tolerated clock skew when checking notBefore/notAfter, in seconds. Hard
+# upper bound is 600.
+clock_skew_seconds = 60
+# Allowed signature OIDs / friendly names. Empty list means "no constraint".
+# When set, each entry is matched **exactly** against the certificate's
+# OpenSSL display form (substring matching was removed in 1.0.1, P1-C).
+# Examples:
+#   "sha256WithRSAEncryption"
+#   "ecdsa-with-SHA384"
+#   "id-tc26-signwithdigest-gost3410-12-256"
+#   "id-tc26-signwithdigest-gost3410-12-512"
+allowed_signature_algorithms = []
+
+# --- Trust → revocation ------------------------------------------------------
+[trust.revocation]
+# "none" | "crl" | "ocsp" | "crl_then_ocsp"
+mode = "none"
+# CRL files (PEM/DER). Required when mode includes "crl".
+crl_paths = []
+# OCSP responder URL (must start with http:// or https://). Required when
+# mode includes "ocsp".
+# ocsp_responder_url = "http://ocsp.example.org"
+crl_max_age_hours = 0
+ocsp_timeout_seconds = 0
+ocsp_cache_ttl_seconds = 0
+
+# --- Trust → pinning ---------------------------------------------------------
+[trust.pinning]
+# When enabled, only chains anchored by one of the listed SPKI hashes pass.
+enabled = false
+# Lower-case hex SHA-256 of trust-anchor SubjectPublicKeyInfo (64 chars each).
+allowed_root_spki_sha256 = []
+
+# --- Trust overrides (optional) ---------------------------------------------
+# Per-host override of trust anchors. Each entry must list at least one host
+# id and (optionally) replacement anchors / intermediates.
+# [[trust_override]]
+# when_host_id_in = ["ws-001.example.org"]
+# anchors         = ["/etc/tessera/ca/site-foo.pem"]
+
+# --- Host identity -----------------------------------------------------------
+[host_identity]
+# Order matters: the first source that yields a non-empty value wins.
+# Allowed: "machine_id", "dmi_board_serial", "hostname", "tpm_ek_pubhash",
+#          "custom_command".
+sources = ["machine_id", "hostname"]
+# What to do when every source fails: "deny" | "warn" | "allow".
+fallback = "deny"
+# Optional explicit override (used mainly for testing).
+# override = "ws-test-001"
+# Optional path to a custom-command script that prints the host id on stdout.
+# custom_command = "/usr/local/sbin/host-id"
+# Bound on how long the custom command may take. Clamped to 1..=30 seconds.
+custom_command_timeout_seconds = 5
+
+# --- User mappings -----------------------------------------------------------
+# One entry per local UNIX user. Exactly one of cert_subject_cn,
+# cert_san_email, cert_san_upn must be set per entry.
+[[user_mapping]]
+pam_user        = "alice"
+cert_subject_cn = "Alice"
+
+# [[user_mapping]]
+# pam_user      = "bob"
+# cert_san_email = "bob@example.org"
+
+# --- Logging -----------------------------------------------------------------
+[logging]
+# error | warn | info | debug | trace
+level = "info"
+# syslog facility name (e.g. "auth", "authpriv", "daemon").
+syslog_facility = "auth"
+# Encode priority as a journald-friendly numeric for the daemon path.
+journald_priority = true
+
+# --- Hooks -------------------------------------------------------------------
+# Each hook is invoked with placeholders ${pam_user}, ${cert_cn},
+# ${cert_serial}, ${host_id}, etc. expanded at call time. Always run as
+# root; drop privileges via `run_as` if available.
+# Stages: "pre_auth" | "post_auth_success" | "post_auth_failure"
+#         "session_open" | "session_close" | "usb_removed"
+
+# [[hooks]]
+# stage           = "post_auth_success"
+# command         = ["/usr/local/sbin/log-auth", "${pam_user}"]
+# timeout_seconds = 10
+# env             = { PAM_USER = "${pam_user}", CERT_CN = "${cert_cn}" }
+
+# [[hooks]]
+# stage           = "usb_removed"
+# command         = ["/usr/local/sbin/lock-screen"]
+# timeout_seconds = 5
+
+# ------------------------------------------------------------------
+# [fly_dm_greeter] — fly-dm login-screen wallpaper banner
+# ------------------------------------------------------------------
+# On Astra МКЦ-3 (production ATM) fly-modern theme hardcoded'но
+# подставляет в headline place "Усиленный уровень защищенности"
+# из fly-dm_greet_modern.mo; GreetString игнорируется. Единственный
+# надёжный канал показать host_id оператору — впечатать его в
+# JPG-фон, на который указывает settings.ini [background].path.
+#
+# When update_wallpaper = true, tessera on each daemon start:
+#   1. cp wallpaper_target → wallpaper_backup (one-time)
+#   2. open wallpaper_backup as source
+#   3. render text overlay (template_ru / template_en по locale)
+#   4. atomic write → wallpaper_target
+#
+# tessera НЕ редактирует /etc/X11/fly-dm/fly-modern/settings.ini.
+# Operator/ansible управляет blur=false, color_overlay alpha,
+# и (если нужно) указывает кастомный path. Default Astra path:
+# /usr/share/wallpapers/fly-default-light.jpg.
+#
+# Templates support placeholders:
+#   {host_id_short}  - 8-char SHA-256 hex prefix of host_id
+#   {source}         - snake_case source kind (e.g. dmi_board_serial)
+#   %n               - local hostname (substituted by tessera)
+#
+# Opt-in: default false.
+
+[fly_dm_greeter]
+update_wallpaper = false
+# wallpaper_target     = "/usr/share/wallpapers/fly-default-light.jpg"
+# wallpaper_backup     = "/var/lib/tessera/wallpaper.orig.jpg"
+# wallpaper_font       = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+# wallpaper_font_size  = 64
+# wallpaper_text_color = "#000000"
+# wallpaper_gravity    = "south"   # north | south | east | west | center
+# wallpaper_offset_x   = 0
+# wallpaper_offset_y   = 120
+# template_ru          = "Банкомат %n  host_id={host_id_short} ({source})"
+# template_en          = "ATM %n  host_id={host_id_short} ({source})"

@@ -1,0 +1,5 @@
+# Test policy fragment — MAC integrity OPTIONAL, no fallback.
+# Cert lacking MAX_INTEGRITY → label step is skipped.
+
+[mac]
+cert_integrity = "optional"

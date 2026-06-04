@@ -1,0 +1,73 @@
+#!/usr/bin/make -f
+#
+# debian/rules for tessera.
+# Uses dh-cargo as the buildsystem. We override dh_auto_install because the
+# default places the cdylib in /usr/bin, which is wrong; we ship it as
+# /lib/security/pam_tessera.so.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+export CARGO_TARGET_DIR = $(CURDIR)/target
+
+# Reproducibility.
+export SOURCE_DATE_EPOCH ?= $(shell dpkg-parsechangelog -STimestamp)
+
+# Pin codegen-units=1, lto=thin (already set in workspace Cargo.toml release
+# profile - these are belt-and-braces).
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS = 1
+export CARGO_PROFILE_RELEASE_LTO = thin
+
+# Stable locale and timezone for any tooling that snapshots them.
+export LC_ALL = C.UTF-8
+export TZ = UTC
+
+# Optional extra cargo flags forwarded from the environment, e.g.
+# `DEB_CARGO_EXTRA_OPTIONS="--features astra-mac"` for Astra MAC builds.
+# Defaults to empty so the standard (stub) build path is unaffected.
+DEB_CARGO_EXTRA_OPTIONS ?=
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	# Skip dh-cargo configure: workspace + direct cargo invocation in build step.
+	@echo "(configure override) no-op"
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo_home
+
+override_dh_auto_build:
+	cargo build --release --workspace --offline $(DEB_CARGO_EXTRA_OPTIONS) \
+		|| cargo build --release --workspace $(DEB_CARGO_EXTRA_OPTIONS)
+
+override_dh_auto_install:
+	# Place the cdylib at the canonical PAM module path with the expected
+	# (no-`lib` prefix) basename. Using `install -D` here avoids any
+	# debhelper auto-renaming surprises and keeps the rule explicit.
+	install -D -m 0644 target/release/libpam_tessera.so \
+		debian/tessera/lib/security/pam_tessera.so
+	# The tessera CLI binary (with `daemon` subcommand replacing the
+	# legacy monitord entry point) goes to /usr/bin and gets stripped later
+	# by dh_strip.
+	install -D -m 0755 target/release/tessera \
+		debian/tessera/usr/bin/tessera
+
+override_dh_auto_test:
+	# We rely on `cargo test` having been run before invoking
+	# dpkg-buildpackage. Re-running here in the build chroot would require
+	# network access for proptest registry queries; skip.
+	@echo "(test override) skipping cargo test; ensure tests passed before packaging"
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --no-restart-on-upgrade tessera.service
+
+override_dh_installinit:
+	# SysV init script for hosts without systemd. --name selects the
+	# basename inside /etc/init.d so we get /etc/init.d/tessera
+	# (matching the systemd unit).
+	# --no-enable + --no-start mirrors the systemd policy: admin must
+	# drop a config file before bringing the service up.
+	dh_installinit --name=tessera --no-enable --no-start

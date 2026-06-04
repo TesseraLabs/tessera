@@ -1,0 +1,76 @@
+[package]
+name = "tessera_cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "User-space monitoring daemon for Tessera."
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
+
+[features]
+default = []
+# Pull in `testing` helpers (mock UdevQuery, in-process server) for use from
+# integration tests in this and dependent crates.
+test-support = []
+# Enables МКЦ enforcement for the monitord binary: forwards
+# `tessera_core/astra-mac` (config validation + audit gating) and pulls in
+# the closed `tessera_mac_parsec` crate that provides the real libpdp
+# `ParsecBackend` and kernel probes.
+astra-mac = ["tessera_core/astra-mac"]
+# Re-export of `tessera_core/mac-tests` for in-process MacBackend mocks.
+mac-tests = ["tessera_core/mac-tests"]
+
+[dependencies]
+tessera_core = { path = "../tessera_core", version = "0.4.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.4.0" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time", "sync", "process"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-journald = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+rustix = { workspace = true }
+parking_lot = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+sd-notify = { workspace = true }
+futures-util = { workspace = true }
+nix = { workspace = true }
+once_cell = { workspace = true }
+async-trait = "0.1"
+libc = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+signal-hook = { workspace = true }
+openssl = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ab_glyph = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+udev = { workspace = true }
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"

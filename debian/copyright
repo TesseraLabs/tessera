@@ -1,0 +1,47 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: tessera
+Upstream-Contact: Mikhail Korolev <mikhail@robonet.me>
+Source: https://github.com/RoboNET/tessera
+
+Files: *
+Copyright: 2024-2026 Mikhail Korolev
+License: AGPL-3.0-only or Commercial
+Comment:
+ Dual-licensed. Use under the GNU Affero General Public License v3.0
+ (see LICENSE) OR under a commercial license (see LICENSE.commercial).
+ Releases up to and including v0.3.19 were published under Apache-2.0
+ and remain available under that license.
+
+Files: debian/*
+Copyright: 2025-2026 Mikhail Korolev
+License: AGPL-3.0-only or Commercial
+
+License: AGPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it
+ under the terms of the GNU Affero General Public License as published by
+ the Free Software Foundation, version 3.
+ .
+ This program is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero
+ General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU Affero General Public
+ License version 3 can be found in /usr/share/common-licenses/AGPL-3.
+
+License: Commercial
+ Commercial licensing is available for organizations that cannot accept
+ the terms of the AGPL. See LICENSE.commercial in the source tree or
+ contact the upstream author.
+
+Comment:
+ Vendored Rust dependencies used at build time (not redistributed in this
+ binary package - the .so links them statically). License audit is enforced
+ by cargo-deny; see deny.toml in the source tree. Notable third-party
+ licenses encountered:
+   * MIT, Apache-2.0           (most crates)
+   * BSD-2-Clause, BSD-3-Clause (zeroize, subtle)
+   * ISC                        (rustix)
+ Astra-specific runtime dependencies (gost-engine, librtpkcs11ecp) are
+ dynamically linked via the system package manager and remain under their
+ respective licenses.

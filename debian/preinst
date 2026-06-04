@@ -1,0 +1,34 @@
+#!/bin/sh
+# preinst - runs before the new package is unpacked.
+# We use it to refuse install if a foreign /lib/security/pam_tessera.so
+# is present that we did not place there. Detected by a marker file we
+# install in postinst (/var/lib/tessera/.installed-by-deb).
+
+set -e
+
+case "$1" in
+    install|upgrade)
+        if [ -f /lib/security/pam_tessera.so ] && \
+           [ ! -f /var/lib/tessera/.installed-by-deb ]; then
+            cat >&2 <<EOF
+ERROR: /lib/security/pam_tessera.so exists but was not installed by this
+package. Refusing to overwrite a foreign module. Move or remove the file
+manually before retrying:
+
+    sudo mv /lib/security/pam_tessera.so /lib/security/pam_tessera.so.bak
+
+EOF
+            exit 1
+        fi
+        ;;
+    abort-upgrade)
+        ;;
+    *)
+        echo "preinst called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,11 @@
+[build]
+# rustflags applied to all crates; cdylib gets extra flags via crates/pam_certauth/build.rs (added later if needed)
+
+[target.'cfg(all())']
+rustflags = [
+    "-Wrust-2018-idioms",
+    "-Wfuture-incompatible",
+]
+
+[alias]
+ci = "clippy --workspace --all-targets -- -D warnings"

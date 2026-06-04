@@ -1,0 +1,27 @@
+# OpenSSL config — leaf with MAX_INTEGRITY level=0, categories=all 32 bits set.
+# Tests intersection: when runtime caps at fewer categories, effective
+# label drops to the runtime's set.
+# DER: SEQUENCE { INTEGER 0, BIT STRING 'FFFFFFFF'B }
+#   = 30 0A 02 01 00 03 05 00 FF FF FF FF
+#     ^^ ^^                                SEQUENCE, content length = 10 octets
+#        ^^ 02 01 00                       INTEGER 0                          (3 octets)
+#                  03 05 00 FF FF FF FF    BIT STRING (0 unused bits, 0xFFFFFFFF) (7 octets)
+[ req ]
+default_bits        = 2048
+default_md          = sha256
+prompt              = no
+distinguished_name  = dn
+req_extensions      = leaf_ext
+
+[ dn ]
+CN = mac-l0-fullcats
+O  = pam_certauth-test
+C  = RU
+
+[ leaf_ext ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = clientAuth, emailProtection
+subjectKeyIdentifier   = hash
+1.3.6.1.4.1.99999.1.2 = ASN1:UTF8String:testuser
+2.25.273824307386008814506455310913083078403 = critical,DER:30:0A:02:01:00:03:05:00:FF:FF:FF:FF

@@ -1,0 +1,13 @@
+# tessera lintian overrides - each must include a justification.
+#
+# Currently empty: lintian on Ubuntu 22.04 emits only warnings/info tags
+# we explicitly accept (no-manual-page on the daemon, initial-upload, and
+# maintainer-script-calls-systemctl in prerm — all expected for an
+# auth-stack binary). Add overrides here only after a fresh lintian run
+# proves the tag actually fires under the matching name.
+
+# Rust binaries do not call glibc's _FORTIFY_SOURCE wrappers (__*_chk),
+# so the lintian fortify check has no symbols to detect. Not actionable
+# without rewriting the relevant Rust crates in C.
+tessera: hardening-no-fortify-functions [lib/security/pam_tessera.so]
+tessera: hardening-no-fortify-functions [usr/bin/tessera]

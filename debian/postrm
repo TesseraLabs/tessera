@@ -1,0 +1,57 @@
+#!/bin/sh
+# postrm - runs after package removal.
+
+set -e
+
+cleanup_pam_includes() {
+    # P1-M: remove "@include tessera" / "@include tessera-optional" /
+    # "@include tessera-only" lines left behind by manual
+    # `integrate-pam.sh` invocations from common service files.
+    # Idempotent: missing files and missing lines are silently ignored.
+    # We do NOT touch files that admins haven't edited because they will
+    # not contain the include line.
+    for svc in /etc/pam.d/login \
+               /etc/pam.d/sshd \
+               /etc/pam.d/sudo \
+               /etc/pam.d/fly-dm \
+               /etc/pam.d/gdm-password \
+               /etc/pam.d/common-auth; do
+        [ -f "$svc" ] || continue
+        sed -i -E '/^[[:space:]]*@include[[:space:]]+tessera(-optional|-only)?[[:space:]]*$/d' \
+            "$svc" 2>/dev/null || true
+    done
+}
+
+case "$1" in
+    purge)
+        cleanup_pam_includes
+        rm -rf /etc/tessera
+        rm -rf /var/cache/tessera
+        rm -rf /var/lib/tessera
+        rm -rf /run/tessera || true
+        # Remove the dedicated system user and its group on purge.
+        # Idempotent: deluser exits 0 if the user is already gone.
+        if getent passwd tessera >/dev/null; then
+            deluser --system tessera >/dev/null 2>&1 || true
+        fi
+        if getent group tessera >/dev/null; then
+            delgroup --system tessera >/dev/null 2>&1 || true
+        fi
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+    *)
+        echo "postrm called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

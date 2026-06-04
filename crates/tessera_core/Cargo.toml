@@ -1,0 +1,86 @@
+[package]
+name = "tessera_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core types, config, and traits for Tessera."
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+# Enables the integration tests in `tests/gost_*_real.rs` that exercise real
+# GOST PKI fixtures. The fixtures themselves are produced by
+# `tests/fixtures/gen_gost.sh` and require a Linux host with `gost-engine`
+# installed.  When the feature is enabled but the fixtures are absent, every
+# test prints `skipped: ...` and passes.
+gost-tests = []
+# Enables the integration tests under `tests/pkcs11_*` that talk to a real
+# PKCS#11 provider (softhsm2, librtpkcs11ecp, etc.).  When the feature is on
+# but no module is available at runtime (e.g. on macOS dev hosts), each test
+# prints `skipped: ...` and returns `Ok`.
+pkcs11-tests = []
+# Toggles МКЦ enforcement behaviour in the open core: config validation
+# accepts `required` [mac] policies and audit/test cfg-gates activate. The
+# real libpdp FFI now lives in the `tessera_mac_parsec` crate; this
+# feature no longer links any native library. Required for Astra deb build
+# (alongside the parsec crate, wired up by the `pam_tessera`/`tessera_cli`
+# `astra-mac` features).
+astra-mac = []
+# Enables in-process MacBackend mock for unit tests on dev hosts without
+# libpdp. Independent of astra-mac.
+mac-tests = ["dep:mockall"]
+
+[dependencies]
+tessera_proto = { path = "../tessera_proto", version = "0.4.0" }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+syslog = { workspace = true }
+regex = { workspace = true }
+sha2 = { workspace = true }
+openssl = { workspace = true }
+openssl-sys = "0.9"
+foreign-types = "0.3"
+libc = { workspace = true }
+nix = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+rustix = { workspace = true }
+subtle = { workspace = true }
+chrono = { workspace = true }
+cryptoki = { workspace = true }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+mockall = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+udev = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+mockall = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"

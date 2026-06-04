@@ -1,0 +1,10 @@
+# Source-level overrides.
+#
+# We use 3.0 (quilt) because the changelog declares a Debian revision
+# (1.0.0-1, latest entry). Native format would forbid the revision and
+# dpkg-source -b would refuse the build. Quilt is the standard
+# Debian/Astra source format and supports the upstream + Debian-revision
+# split cleanly.
+# lintian normally does not warn when format is explicit, so this file
+# is intentionally a placeholder - re-evaluate after a real `lintian`
+# run on Ubuntu 22.04 / Astra SE and remove it if it never fires.

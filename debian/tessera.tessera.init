@@ -1,0 +1,107 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          tessera
+# Required-Start:    $remote_fs $syslog dbus udev
+# Required-Stop:     $remote_fs $syslog dbus udev
+# Should-Start:      $local_fs
+# Should-Stop:       $local_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Tessera USB-token monitor daemon
+# Description:       Monitors USB-token removal and host suspend events to
+#                    enforce the configured session-removal action
+#                    (lock, logout, shutdown, hook).
+### END INIT INFO
+
+# SysV init wrapper for hosts without systemd. On systemd hosts the
+# unit file at /lib/systemd/system/tessera.service is
+# authoritative; this script is only invoked when /sbin/init is not
+# systemd. Do not duplicate hardening directives here — without
+# systemd we lose the cgroup-based sandbox; operators on legacy hosts
+# accept that trade-off explicitly by enabling this script.
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+DESC="Tessera USB-token monitor daemon"
+NAME=tessera
+DAEMON=/usr/bin/$NAME
+DAEMON_ARGS="daemon --config /etc/tessera/config.toml"
+PIDFILE=/run/tessera/$NAME.pid
+SCRIPTNAME=/etc/init.d/$NAME
+
+[ -x "$DAEMON" ] || exit 0
+
+[ -r /etc/default/$NAME ] && . /etc/default/$NAME
+
+. /lib/init/vars.sh
+. /lib/lsb/init-functions
+
+# /run/tessera is a tmpfs entry created by tmpfiles.d on systemd hosts;
+# on SysV hosts we create it on demand here.
+ensure_runtime_dir() {
+    if [ ! -d /run/tessera ]; then
+        mkdir -p /run/tessera
+        chmod 0750 /run/tessera
+        chown root:root /run/tessera
+    fi
+}
+
+do_start() {
+    ensure_runtime_dir
+    start-stop-daemon --start --quiet --pidfile $PIDFILE \
+        --exec $DAEMON --test > /dev/null || return 1
+    start-stop-daemon --start --quiet --background --make-pidfile \
+        --pidfile $PIDFILE --exec $DAEMON -- $DAEMON_ARGS || return 2
+}
+
+do_stop() {
+    start-stop-daemon --stop --quiet --retry=TERM/30/KILL/5 \
+        --pidfile $PIDFILE --name $NAME
+    RETVAL="$?"
+    [ "$RETVAL" = 2 ] && return 2
+    rm -f $PIDFILE
+    return "$RETVAL"
+}
+
+case "$1" in
+    start)
+        log_daemon_msg "Starting $DESC" "$NAME"
+        do_start
+        case "$?" in
+            0|1) log_end_msg 0 ;;
+            *)   log_end_msg 1 ;;
+        esac
+        ;;
+    stop)
+        log_daemon_msg "Stopping $DESC" "$NAME"
+        do_stop
+        case "$?" in
+            0|1) log_end_msg 0 ;;
+            *)   log_end_msg 1 ;;
+        esac
+        ;;
+    status)
+        status_of_proc -p "$PIDFILE" "$DAEMON" "$NAME" && exit 0 || exit $?
+        ;;
+    restart|force-reload)
+        log_daemon_msg "Restarting $DESC" "$NAME"
+        do_stop
+        case "$?" in
+            0|1)
+                do_start
+                case "$?" in
+                    0) log_end_msg 0 ;;
+                    *) log_end_msg 1 ;;
+                esac
+                ;;
+            *)
+                log_end_msg 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "Usage: $SCRIPTNAME {start|stop|status|restart|force-reload}" >&2
+        exit 3
+        ;;
+esac
+
+exit 0

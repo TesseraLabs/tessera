@@ -1,0 +1,625 @@
+tessera (0.4.0-1) unstable; urgency=medium
+
+  * Project renamed pam_certauth -> Tessera. The source and binary package
+    is now `tessera`; the PAM module ships as /lib/security/pam_tessera.so
+    and the control-plane binary as /usr/bin/tessera.
+  * Paths moved: /etc/pam_certauth -> /etc/tessera, /run/pam_certauth ->
+    /run/tessera, /var/lib/pam_certauth -> /var/lib/tessera,
+    /var/cache/pam_certauth -> /var/cache/tessera.
+  * systemd unit pam-certauth.service -> tessera.service; dedicated system
+    user pamcertauth -> tessera; tmpfiles drop-in, polkit rule, SysV init
+    and PAM stack snippets (tessera, tessera-optional, tessera-only)
+    renamed to match.
+  * Hook environment contract PAM_CERTAUTH_* -> TESSERA_*; log filter env
+    PAM_CERTAUTH_LOG -> TESSERA_LOG; tracing/audit targets pam_certauth.*
+    -> tessera.* (mac.audit unchanged).
+  * Unchanged contracts: X.509 extension OIDs and their names
+    (pam_cert_host_binding / pam_cert_user_binding / pam_cert_max_integrity),
+    config.toml schema, and the IPC wire protocol.
+  * admin-tools tarball is no longer shipped from this repository.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Thu, 04 Jun 2026 16:45:04 +0000
+
+pam-certauth (0.3.19-1) unstable; urgency=medium
+
+  * fly-dm greeter pivot #2: GreetString.desktop writer was no-op
+    on production МКЦ-3 ATM (fly-modern hardcodes "Усиленный
+    уровень защищенности" in the headline place). Replaced by a
+    wallpaper writer that bakes host_id into the JPG that
+    settings.ini [background].path points to. Opt-in via
+    [fly_dm_greeter].update_wallpaper. Pure Rust (image + ab_glyph),
+    no native deps added. See PR #36.
+  * New CLI subcommand `pam-certauth dump-host-id` — probes EVERY
+    canonical host_identity source (not only the subset in
+    [host_identity].sources) and emits a TSV report. The
+    `active_under_current_config=yes` column marks the source the
+    daemon currently picks. `--output FILE` or `--usb` to write
+    atomically. Used by operators after the clone-image bootstrap
+    flip to discover what host_id_hash the hardware ended up with.
+    See PR #38.
+  * New /usr/share/pam-certauth/finish-bootstrap.sh — single-command
+    transition from clone-image bootstrap state to production:
+    atomic config rewrite (sources = ["override"] → real sources)
+    with backup, pam-certauth check validation, daemon restart,
+    automatic dump-host-id --usb. Flags --non-interactive
+    (ansible), --no-restart, --no-dump, --sources. Idempotent.
+    See PR #38.
+  * New admin-tools release tarball
+    pam-certauth-admin-tools-<ver>.tar.gz uploaded to GitHub Release
+    alongside the .deb (NOT packaged into the .deb). Contains
+    issue-service-cert.sh (per-host / wildcard / bootstrap modes),
+    vault-pki-setup.sh, prepare-usb-flash.sh, README. Project-
+    neutral naming throughout. See PR #37.
+  * docs/install.md, docs/operations.md, docs/cert-issuance.md —
+    cross-linked clone-image workflow.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Wed, 27 May 2026 19:45:00 +0300
+
+pam-certauth (0.3.18-1) unstable; urgency=medium
+
+  * Packaging cleanup: drop the fly-dm greeter debconf prompt added
+    in 0.3.16. Operators deploy this with prepared config.toml files
+    via Ansible / centralized rollout; the debconf step at dpkg
+    install time was only ever flipping a flag in config.toml and
+    added moving parts (debconf templates, debconf dep, postinst
+    branching) without changing production behaviour.
+  * Daemon-side feature is unchanged: setting
+    [fly_dm_greeter].update_greet_string = true in config.toml still
+    makes pam-certauth rewrite /etc/X11/fly-dm/override/GreetString.
+    desktop at startup. See dist/config/config.toml.example.
+  * Removed: debian/templates, debian/config, the debconf branch in
+    debian/postinst, debconf from debian/control Depends, and
+    confmodule sourcing at the top of postinst.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 17:15:00 +0300
+
+pam-certauth (0.3.17-1) unstable; urgency=medium
+
+  * CI-only release: cut per-build pipeline time.
+    - astra job now runs `cargo nextest run --workspace --features
+      astra-mac` in debug profile. The previous --release run took
+      510s vs ubuntu's 56s (9.1×) because the workflow-level
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 + LTO=thin env (needed
+      for the production .deb) makes release-mode test compilation
+      catastrophically slow. Tests still exercise the astra-mac
+      feature gate; the final .deb is unchanged and continues to
+      build in release with LTO via dpkg-buildpackage.
+    - scripts/build-deb.sh no longer runs `cargo clean && cargo
+      build --release` before `dpkg-buildpackage`. debian/rules
+      already wiped target/ via override_dh_auto_clean and rebuilt
+      via override_dh_auto_build, so the pre-build was pure
+      duplicated work (~60s per pipeline). dpkg-buildpackage now
+      drives the release build end to end.
+  * No source-code changes vs 0.3.16. Same .deb behaviour, faster
+    CI.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 16:35:00 +0300
+
+pam-certauth (0.3.16-1) unstable; urgency=medium
+
+  * fly-dm greeter pivot: revert the fly-dmrc `greeter-show-messages`
+    cargo-cult from 0.3.15 and switch to the mechanism that actually
+    works on Astra fly-qdm 2.15+ — /etc/X11/fly-dm/override/
+    GreetString.desktop (freedesktop i18n .desktop file). The
+    previous patch targeted a KDM/LightDM legacy key that fly-qdm
+    does not parse; live testing on the Astra VM confirmed the new
+    path renders host_id directly in the login-form headline.
+  * New opt-in feature: when [fly_dm_greeter].update_greet_string =
+    true, pam-certauth resolves the host identity on each daemon
+    start and rewrites GreetString.desktop with the short hash and
+    source, e.g.
+        Банкомат astra184 · host_id=abc12345 (dmi_board_serial)
+    The original file is preserved as .orig on first run. Atomic
+    write (tmpfile + rename). Silent skip on hosts without
+    /etc/X11/fly-dm/. Failures log-and-continue (auth never blocked
+    by a greeter write).
+  * debconf prompt added to debian/postinst (en + ru) so dpkg
+    install asks the operator whether to enable the banner;
+    defaults to off. debconf added to Depends.
+  * `pam-certauth check` validator pivoted to the new file: reports
+    fly_dm_greeter_greet_string_customized / _default /
+    _override_missing / _read_failed as Info records.
+  * integrate-pam.sh: removed the --enable-greeter-messages /
+    --no-greeter-messages flags and the fly-dmrc patcher introduced
+    in 0.3.15. Script is back to PAM-stack-editing only.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 15:30:00 +0300
+
+pam-certauth (0.3.15-1) unstable; urgency=medium
+
+  * fly-dm greeter: surface PAM_TEXT_INFO on the lock screen.
+    pam_certauth sends "Этот банкомат: host_id=..." and the
+    p12_wrong_pin_diagnostic via io.show_info(), but fly-dm only
+    forwards info-messages to the greeter UI when
+    `greeter-show-messages = true` is set under `[greeter]` in
+    /etc/X11/fly-dm/fly-dmrc. Without that, operators saw these
+    messages only in journalctl. Two changes address this:
+      - integrate-pam.sh now patches fly-dmrc when the target is
+        /etc/pam.d/fly-dm or fly-dm-np. Idempotent, backs up to
+        fly-dmrc.bak.<UTC>, preserves attrs. Flags
+        --enable-greeter-messages (default ON for fly-dm*) and
+        --no-greeter-messages (CI / non-interactive deploys).
+        --unintegrate does NOT touch fly-dmrc.
+      - New startup-check module `fly_dm_greeter` reads fly-dmrc
+        and emits an Info record on every daemon start / `check`
+        run: fly_dm_greeter_messages_on / _off / _default /
+        _read_failed. Silent skip when the file is absent
+        (sshd-only hosts, server stands). Wired into
+        run_startup_checks and re-exported as check_fly_dm_greeter.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 10:05:00 +0300
+
+pam-certauth (0.3.14-1) unstable; urgency=medium
+
+  * Build hotfix: 0.3.13 debian/changelog timestamp (12:00 +0300) was
+    earlier than 0.3.12 (18:00 +0300), tripping lintian
+    `latest-changelog-entry-without-new-date` and failing the Ubuntu
+    .deb build. Astra .deb in 0.3.13 release built fine (Astra
+    pipeline skips lintian). This release bumps version + timestamp
+    so both .debs build.
+  * No functional changes vs 0.3.13.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 19:00:00 +0300
+
+pam-certauth (0.3.13-1) unstable; urgency=high
+
+  * Hotfix: ACTUALLY implement XDG_SESSION_ID capture in
+    `pam_sm_open_session`. The 0.3.10/0.3.11/0.3.12 release notes
+    declared the feature but the cdylib code path was never added —
+    `pam_sm_open_session` never read `XDG_SESSION_ID` and never called
+    `MonitordClient::send_update_session_target`, so monitord kept the
+    auth-phase placeholder target on every login. Bankers' terminals
+    continued to fail the USB-removal Logout/Lock action because
+    `terminate_session` had no logind id to target.
+
+  * Adds `crate::pam_helpers::pam_get_env_string` (thin `pam_getenv`
+    wrapper) and a new `crate::xdg_capture` module containing a pure
+    decision helper (`capture_xdg`) covered by unit tests for the
+    three branches (XDG missing / present / IPC failure). The
+    production cdylib calls `capture_xdg` after the MAC pipeline and
+    before session_open hooks; an IPC failure logs WARN and never
+    aborts session-open (best-effort semantics).
+
+  * No daemon-side changes; relies on the `UpdateSessionTarget` wire
+    contract already shipped in 0.3.10.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 12:00:00 +0300
+
+pam-certauth (0.3.12-1) unstable; urgency=medium
+
+  * Critical fix (Astra SE 1.8.3 production): USB-removal Logout/Lock
+    action was silently dropped on banker terminals because our
+    `session required pam_certauth.so` ran BEFORE `pam_systemd.so`.
+    `XDG_SESSION_ID` was not yet in PAM env when `pam_sm_open_session`
+    fired → `UpdateSessionTarget` never sent → monitord retained the
+    auth-phase placeholder target (Tty/Display) → action handler could
+    not call `terminate_session` and bailed with
+    "Logout requested but session has no logind id".
+
+  * Snippet split: `dist/pam.d/certauth`, `certauth-only`, and
+    `certauth-optional` no longer carry the `session` line. The
+    auth/account block stays inside the snippet so `@include certauth*`
+    keeps working for the auth-stack integration that
+    `integrate-pam.sh` plants near the top of the file. Existing
+    manual integrations that referenced the snippet by path will lose
+    the session-phase line — operators must re-run `integrate-pam.sh`
+    after upgrade (the script now adds the session line explicitly).
+
+  * `dist/scripts/integrate-pam.sh` two-include pattern: in addition
+    to the auth-block `@include`, it now inserts
+    `session    required   pam_certauth.so` AFTER
+    `@include common-session` (anchor priority: common-session →
+    last session-phase line → EOF). `--unintegrate` strips both
+    lines. Idempotent on both passes; single backup per invocation.
+
+  * Startup check `pam_stack_session_misorder`: scans each known PAM
+    service file (`login`, `fly-dm`, `fly-dm-np`, `sshd`, `sudo`,
+    `su`) and ERRORs when `session required pam_certauth.so` precedes
+    pam_systemd.so / @include common-session. Fail-fast on daemon
+    start, surfaced by `pam-certauth check` subcommand for
+    pre-deployment validation. Adds INFO records
+    `pam_stack_session_ok` and `pam_stack_session_no_systemd` for the
+    common healthy and sysvinit/OpenRC layouts respectively.
+
+  * Docs (`docs/install.md` §8 + §10): documents the two-include
+    pattern, explains the snippet split, and rewrites the
+    "Logout requested but session has no logind id" troubleshooting
+    entry for the 0.3.12 placement model. The §10 entry now points
+    operators at the new startup-check ID and the
+    `integrate-pam.sh` re-run as the canonical fix.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 18:00:00 +0300
+
+pam-certauth (0.3.11-1) unstable; urgency=medium
+
+  * Hotfix: добавлен метод `MonitordClient::send_update_session_target`
+    в `crates/pam_certauth_core/src/ipc/client.rs`. В 0.3.10 этот метод
+    был забыт — proto-варианты `ClientMessage::UpdateSessionTarget`
+    и `ServerMessage::SessionTargetUpdated` существовали, тесты на
+    него ссылались (`crates/pam_certauth_cli/tests/update_session_target.rs`),
+    но client struct реализации не имел → `cargo test --workspace
+    --features astra-mac` на CI падал с E0599. Релиз 0.3.10 был отгружен
+    без .deb артефактов (release job skipped because build failed).
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 17:00:00 +0300
+
+pam-certauth (0.3.10-1) unstable; urgency=medium
+
+  * Боевой фикс: `pam_sm_open_session` теперь подтягивает
+    `XDG_SESSION_ID` из PAM environment (через `pam_getenv`) и пушит
+    его в monitord новой IPC-командой `UpdateSessionTarget`. До этого
+    monitord-запись оставалась с placeholder-target'ом, который
+    PAM-модуль захватывал на auth-фазе (`Tty("/dev/tty1")` /
+    `Display(":0")` / `Unknown`); action-runner физически не мог
+    вызвать `terminate_session` без logind id, и при извлечении
+    USB-токена logout НЕ происходил — `WARN pam_certauth.monitord:
+    Logout requested but session has no logind id`. Воспроизведено на
+    Astra SE 1.8.3 production-банкомате.
+  * IPC v2 расширен обратно совместимо: добавлены `ClientMessage::
+    UpdateSessionTarget { session_id, new_target }` и
+    `ServerMessage::SessionTargetUpdated { session_id }`. Старые
+    клиенты (которые не отправляют новую команду) работают как раньше;
+    старые daemon'ы (которые не понимают команду) отвечают
+    `BAD_REQUEST`, PAM-модуль это переживает с warn-логом, без
+    propagation в auth-вердикт.
+  * `SessionRegistry::update_target(id, new_target)` — новый
+    публичный метод; обновление выполняется под существующим mutex'ом,
+    `by_uid` reverse-index НЕ перестраивается (target ортогонален uid).
+    `state_manager` персистит snapshot после успешного update, чтобы
+    новый target пережил рестарт daemon'а.
+  * Action-runner: при дропе Lock/Logout из-за отсутствия logind id
+    теперь печатает actionable WARN с (action, session_id, target,
+    pam_user, pam_service) и INFO-tip с указанием на §10
+    install.md — оператор сразу понимает, в каком сервисе и как
+    переставлять `pam_systemd.so`.
+  * docs/install.md §8: добавлено явное требование — `session ...
+    pam_systemd.so` обязан идти ДО `@include certauth` в любом
+    `/etc/pam.d/<service>`. §10: новая статья «Logout requested but
+    session has no logind id» с тремя причинами (pam_systemd
+    отсутствует / ordering / sysvinit) и verify-шагами.
+  * docs/operations.md §3.6.1: новая статья с матрицей поведения
+    action-runner'а без logind id; hook/shutdown работают как
+    запасной путь, lock/logout — нет. §6.1: новые log-теги.
+  * Tests: +4 (registry unit `update_target_*`, dispatch unit
+    `derive_session_target_from_env_*`, end-to-end IPC
+    `update_session_target_*`). `cargo test --workspace`: 547 passed,
+    4 ignored (прежде: 543/4).
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 00:00:00 +0000
+
+pam-certauth (0.3.8-1) unstable; urgency=medium
+
+  * Критично: integrate-pam.sh теперь вставляет `@include certauth*`
+    ПОСЛЕ существующей строки `auth ... pam_parsec_mac.so`, а не перед
+    первой `auth`-строкой. На Astra SE `/etc/pam.d/login` и
+    `/etc/pam.d/fly-dm` штатно начинаются с `auth required
+    pam_parsec_mac.so`; placement до неё приводил к тому, что
+    `success=done` jump из `certauth-only` snippet'а обходил
+    auth-инстанс pam_parsec_mac, и account/session-инстансы валились
+    с `"Can't obtain required data"` → login deny несмотря на
+    успешную cert-аутентификацию. Подтверждено на боевом банкомате
+    (Astra SE 1.8.3, kernel 6.1.141): после ручного reordering и
+    автоматически с новым скриптом login проходит до конца.
+  * Test harness обновлён: `tests/scripts/test_integrate_pam.sh`
+    проверяет инвариант «`@include certauth-only` строго ПОСЛЕ
+    `pam_parsec_mac.so`».
+  * docs/install.md §8 обновлён: документирована логика placement
+    anchor.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 15:40:00 +0300
+pam-certauth (0.3.9-1) unstable; urgency=medium
+
+  * Startup validation pipeline: daemon на старте прогоняет шесть
+    проверок (PAM-стек ordering против `pam_parsec_mac.so`,
+    `[mac].runtime` vs ядро, trust anchors / intermediates,
+    `/etc/pam_certauth/ca/` permissions, `PARSEC_CAP_CHMAC`,
+    `host_identity` probe). Каждая запись помечена стабильным
+    `check` ID; ERROR → fail-fast, заметный в `systemctl status`,
+    а не в первой неудачной auth-сессии.
+  * Новый subcommand `pam-certauth check`: standalone preflight,
+    тот же pipeline без открытия socket'а. Exit 0/1, может быть
+    навешан на `ExecStartPre=` для hard-gate boot'а. Документация в
+    `docs/install.md` §2.4½.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 16:00:00 +0300
+
+pam-certauth (0.3.8-1) unstable; urgency=medium
+
+  * `integrate-pam.sh` placement fix для Astra SE: `@include certauth-*`
+    теперь вставляется ПОСЛЕ `auth required pam_parsec_mac.so`, если
+    эта строка уже есть в `/etc/pam.d/*` (Astra SE 1.8.x). Прежняя
+    логика вставляла перед первой `auth`-строкой, и `success=done` jump
+    из `certauth-only` snippet'а обходил auth-инстанс
+    `pam_parsec_mac` → account/session валились
+    `"Can't obtain required data"`. Этот же боевой случай детектится
+    новой 0.3.9 startup-проверкой `pam_stack_misorder`.
+  * docs/install.md §10 «Что делать, если…» расширен боевой
+    troubleshooting-секцией по `pam_parsec_mac`, `parsec.mac=0`,
+    legacy `[mac].enabled`, `mac_caps_missing`, USB candidate тишина,
+    DMI host_id drift, fly-dm greeter banner и DIGSIG enforce без
+    подписи.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 15:50:00 +0300
+
+pam-certauth (0.3.7-1) unstable; urgency=medium
+
+  * Критично: новое поле `[mac].runtime` (required|auto|disabled,
+    default auto) разводит compile-time `astra-mac` от runtime-выбора
+    Parsec backend'а. Один и тот же `.deb` теперь работает на машинах
+    с МКЦ и без — поведение управляется через `config.toml`, не
+    пересборкой. `runtime = "disabled"` гарантирует `StubBackend`
+    (события `mac_runtime_disabled`); `auto` пробует
+    `parsec_strict_mode()` и при отсутствии ядра падает на stub с
+    `mac_runtime_fallback` (WARN); `required` fail-closed
+    отвергает аутентификацию с `mac_runtime_required` при отсутствии
+    активного МКЦ. Снимает блокер банкомата
+    «pam_parsec_mac: Can't obtain required data» без пересборки .deb.
+  * Диагностика: `HostIdentityResolver::probe_all()` + cdylib теперь
+    на старте каждой auth-сессии логирует по строке INFO на каждый
+    источник из `[host_identity].sources` (target
+    `pam_certauth.host_identity`, тег `host_identity: probe`).
+    Источник истины для регистрации банкомата в реестре — этот лог.
+  * Диагностика: `ResolvedHostId::hash_prefix()` (первые 8 hex).
+    `PAM_TEXT_INFO` при `host_binding` mismatch теперь показывает
+    `host_id=a1b2c3d4 (source=…)` вместо 64-char hash; полный hash
+    остаётся в syslog.
+  * Диагностика: fly-dm greeter baseline — в начале
+    `pam_sm_authenticate` отправляется `PAM_TEXT_INFO` с короткой
+    идентификацией машины. Показывается в greeter UI при
+    `greeter-show-messages = true` в `/etc/X11/fly-dm/fly-dmrc`.
+  * Валидация конфига: `runtime = "disabled"` +
+    `cert_integrity = "required"` отвергается на старте; `runtime =
+    "required"` без `astra-mac` отвергается на старте.
+  * Документация: `configuration.md` MAC integrity — новая подсекция
+    «Семантика `runtime`» + матрица. `install.md` §8.5 переписан под
+    runtime-переключатель (три сценария вместо двух); добавлен §8.5.1
+    про fly-dm greeter. Troubleshooting обновлён под новый
+    `host_identity: probe` лог.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 15:00:00 +0300
+
+pam-certauth (0.3.6-1) unstable; urgency=medium
+
+  * Диагностика: при resolve `host_id` в syslog логируется source/raw/
+    `host_id_hash` (target `pam_certauth.host_identity`). Fallback на
+    `unknown` тоже логируется. Источник истины для регистрации
+    банкомата в реестре — этот лог, а не ручной
+    `sha256sum /etc/machine-id` (устраняет drift между скриптом
+    выпуска и развёрнутым `[host_identity].sources`).
+  * Диагностика: при отказе `host_binding` модуль показывает на экране
+    (PAM_TEXT_INFO) `host_id_hash` этой машины и тип источника, чтобы
+    инженер мог сразу сверить с реестром без захода в логи. Текст
+    дублируется в syslog на уровне warn.
+  * Диагностика: при исчерпании PIN-цикла (`MAC verify`) модуль
+    пытается прочитать leaf-cert из `.p12` без пароля (новый
+    issuance-скрипт кладёт его в незашифрованный SafeBag) и
+    показывает на экране host/user, для которых cert был выпущен —
+    инженер видит «не та флешка» против «не тот PIN». Для legacy
+    `.p12` (cert тоже зашифрован) — обычное «пароль неверный».
+  * Диагностика: пошаговое INFO-логирование per-candidate USB
+    итерации (mount → discovery → envelope → chain → outcome). После
+    0.3.5 у админов был 14-секундный «провал тишины» между «trying
+    USB candidate» и concluding PAM-модулем — теперь каждая стадия
+    видна в `journalctl -t pam_certauth`.
+  * Тест: `wrong_pin_does_not_fall_back_to_next_partition` фиксирует
+    fail-closed-инвариант — неверный PIN не запускает перебор USB
+    разделов (иначе создавал бы PIN-oracle).
+  * Тест: `empty_usb_device_list_returns_p12_not_found` —
+    `wait_for_usb` без устройств не должен иницировать `mount()`.
+  * Тест: `rmdir_calls` assertion'ы добавлены к существующим
+    partition-iteration тестам — гарантирует, что failed-партиция
+    полностью разнесена (umount + rmdir), а не только размонтирована.
+  * Документация: install.md — раздел «Сертификат не принимается на
+    банкомате» (чек-лист host_id из syslog + чтение cert plaintext
+    из .p12), обновлён раздел host_binding mismatch (cert в новом
+    формате читается без PIN), новая секция 8.5 про PAM-стек на
+    Astra SE с/без МКЦ (PARSEC MAC).
+  * Документация: threat-model.md — фиксирует, что multi-source
+    matching по host_identity намеренно отключён (weakest-link
+    bypass), `[host_identity].sources` остаётся упорядоченным
+    fallback'ом.
+  * Документация: changelog отмечает отложенные пункты к 0.3.7 —
+    runtime-переключатель `[mac].runtime`, `probe_all()` для
+    host_identity, host_id_hash_prefix в PAM_TEXT_INFO, baseline-
+    строка для fly-dm greeter.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 14:00:00 +0300
+
+pam-certauth (0.3.5-1) unstable; urgency=medium
+
+  * Fix: USB partition iteration теперь делает fallback на следующий
+    раздел при ASN.1-ошибке парсинга PKCS#12 (т.е. «файл по нашему
+    пути есть, но это не P12»). Раньше такая коллизия имён —
+    типичная для USB-устройств с несколькими разделами и
+    Apple-устройств — мгновенно роняла auth с
+    `asn1_check_tlen: wrong tag, Type=PKCS12`.
+  * Безопасность: fallback срабатывает ТОЛЬКО на ASN.1-fail (parse
+    БЕЗ пароля). Ошибки MAC verify / decrypt / chain validation
+    (всё, что требует пароля или валидации сертификата) по-прежнему
+    fail-closed без перебора — не создаёт PIN-oracle и не позволяет
+    chain-probing по разделам.
+  * Новая ошибка `FlowError::P12Envelope` мапится на
+    `PAM_AUTHINFO_UNAVAIL` (9), как и остальные «нет валидного
+    credential на шине» состояния.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Sun, 25 May 2026 12:00:00 +0300
+
+pam-certauth (0.3.4-1) unstable; urgency=medium
+
+  * Catch debian/changelog up with the workspace versions shipped in 0.3.2
+    and 0.3.3 (PR #11, #12). Earlier releases shipped a .deb whose
+    Version field said 0.3.1-1 even though the binaries were built from
+    0.3.2/0.3.3 source — apt refused to upgrade because dpkg saw no
+    version increase. This release fixes the metadata and tags 0.3.4.
+  * 0.3.2 — USB partitioned-flash support: when the whole-device has no
+    filesystem, pam_certauth enumerates partitions and accepts those
+    whose ID_FS_TYPE is in the allowlist.
+  * 0.3.3 — drop the LABEL=PAMCERT requirement; iterate all USB
+    partitions with allowed FS until a .p12 is found. New config
+    `max_usb_partitions` (default 8, anti-DoS). Fix:
+    `pkcs12_path_pattern` is now honoured by discovery instead of being
+    silently ignored; semantics changed to "relative path from mount",
+    `${user}` placeholder supported, path-traversal rejected by the
+    validator. Default remains `certs/user.p12`.
+  * CI: new guardrail step that fails the build if Cargo workspace
+    version and debian/changelog top entry disagree (prevents recurrence
+    of the metadata mismatch above).
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 11:30:00 +0300
+
+pam-certauth (0.3.1-1) unstable; urgency=medium
+
+  * Packaging: relax runtime dependencies so the package installs on
+    Astra hosts and minimal Debian/Ubuntu deployments out of the box.
+    - libgost-engine moved from Depends to Recommends with the Astra
+      alternative: `libgost-engine | gost-engine | libgost-astra`. The
+      GOST engine is loaded lazily and only when the verified cert
+      chain contains GOST-signed certs, so pure RSA deployments no
+      longer fail to install.
+    - libudev1, libdbus-1-3, libsystemd0 dropped from the explicit
+      Depends list — they are populated automatically by
+      ${shlibs:Depends} from the binary's NEEDED entries.
+    - polkitd | policykit-1 moved from Depends to Suggests; the PAM
+      module and daemon do not invoke pkexec today.
+    - Mandatory Depends are now limited to libpam0g, lsb-base and
+      adduser (plus shlibs/misc substvars).
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Fri, 22 May 2026 16:07:06 +0300
+
+pam-certauth (0.3.0-1) unstable; urgency=medium
+
+  * MAC integrity (МКЦ): new `[mac]` config section, `pam_cert_max_integrity`
+    X.509 extension (OID 2.25.273824307386008814506455310913083078403),
+    libpdp FFI binding under the `astra-mac` cargo feature. Orchestrator
+    intersects cert max integrity with the user's МНКЦ and applies the
+    resulting label to the session via fd-based labeling, closing the
+    path-based TOCTOU window. Verified end-to-end on Astra Linux SE 1.8.4
+    strict-mode kernel.
+  * Strip: removed M-of-N approval, scope policies, and the `execute`
+    subcommand path that shipped in 0.2.x. The remaining surface is base
+    USB+X.509 PAM auth plus MAC integrity labelling.
+  * FFI fixes: libpdp text grammar corrected to "level:ilevel:cat[:flags]",
+    dropped `irelax` flag on `pdp_set_fd` (kernel rejects it through the
+    fd-based API), link against `libparsec-mic` for `getmicnam`,
+    `getmicnam` no longer free'd via `freemicent_r` — per man page the
+    returned pointer is library-private static memory; the bogus free
+    previously caused `free(): invalid pointer` SIGABRT in
+    `pam_sm_open_session`.
+  * Daemon: session registry moved from /var/lib/pam_certauth/sessions.json
+    to /run/pam_certauth/sessions.json (tmpfs, volatile across reboot).
+    Removes stale-state-after-reboot foot-gun and MAC-labelling churn.
+    postinst removes the stale /var/lib file on upgrade; daemon.lock and
+    caches stay in /var/lib.
+  * postinst: raises ilevel=63 on /etc/pam_certauth/config.toml, ca/,
+    crl/, host_acl.toml[.sig] when Astra strict mode is enabled (no-op
+    on non-Astra / non-strict). Prints opt-in МКЦ activation notice.
+  * МКЦ activation: shipped drop-in (mac-integrity.conf.example) now
+    uses `PAMName=pam-certauth` with a paired session PAM stack
+    (`pam-certauth.example` shipped to /usr/share/pam-certauth/pam.d/)
+    that loads pam_parsec_cap.so + pam_parsec_mac.so. Replaces the
+    earlier execaps-wrapper approach which failed under
+    User=pamcertauth (no PARSEC_CAP_CAP → EPERM in execaps).
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Fri, 15 May 2026 14:43:40 +0300
+
+pam-certauth (0.2.1-1) unstable; urgency=medium
+
+  * Security: RFC 3161 TimeStampToken is now actually enforced when
+    scope policy sets `require_timestamp_token = true` (was a silent
+    no-op in 0.2.0). Both chain validation against the [tsa_trust]
+    store and RFC 3161 §2.4.1 messageImprint binding to the signer's
+    signature octets are checked (SHA-256/384/512).
+  * Fix(cms): argv_pattern is now read from the signed
+    encapContentInfo.eContent (breaking) rather than the
+    tamper-vulnerable sidecar; re-issue work orders with
+    `openssl cms -sign -nodetach`.
+  * Fix(cms): signing-time is paired with each signer by
+    SubjectKeyIdentifier / issuerAndSerialNumber rather than by
+    positional index.
+  * Fix(packaging): postinst enables pam-certauth-gc.timer and sets
+    0750 root:root on /var/lib/pam_certauth/work_orders/.
+  * Fix(misc): hooks docstring path corrected; scope-match dedup
+    stable; fail-closed host_id_hash; monitord runs non-root cleanly.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Thu, 14 May 2026 00:00:00 +0000
+
+pam-certauth (0.2.0-1) unstable; urgency=medium
+
+  * feat(x509): new `pam_cert_scopes` v3 extension. Certificates now
+    declare an explicit list of scopes (e.g. `bios.flash`,
+    `cluster.drain`). The PAM module gains a `require_scope=...`
+    parameter with `scope_match=any|all` to fail login unless the
+    cert's scopes satisfy the configured set.
+  * feat(execute): new `pam-certauth execute --scope=… --work-order=…
+    -- <cmd>` subcommand performs per-action M-of-N authorisation
+    against a CMS SignedData work order. Each signer must hold an
+    approver cert (separate trust anchor `[approver_trust]`) with
+    matching `pam_cert_scopes` and `pam_cert_host_binding`.
+  * feat(policy): new `pam_certauth_policy` crate + TOML schema at
+    `/etc/pam_certauth/policy.toml`. Scope rules declare `m_of_n`,
+    `require_argv_pattern`, `pre_hooks`, `audit_level`. CLI helpers:
+    `pam-certauth policy validate`, `pam-certauth policy explain`.
+  * feat(retention): CMS work-order artefacts are retained under
+    `/var/lib/pam_certauth/work_orders/` for forensic review.
+    `pam-certauth gc --retention-days=N` plus systemd timer
+    `pam-certauth-gc.timer` reap older entries.
+  * feat(audit): every audit event carries `policy_sha256` so a
+    sysadmin can detect post-deploy drift of `policy.toml`. Events
+    flow via structured journald fields with strict sanitisation.
+  * feat(hooks): hooks become a static enum keyed by name with one
+    bundled builtin (`audit_critical`). No more arbitrary
+    fork+execve from policy.
+  * refactor(cli): `pam-certauth-monitord` is gone — the binary is
+    now `/usr/bin/pam-certauth` with subcommands `daemon`,
+    `execute`, `policy`, `gc`. systemd unit is `pam-certauth.service`
+    `ExecStart=/usr/bin/pam-certauth daemon`.
+  * refactor(ipc): IPC protocol bumped 1 → 2. `SessionOpen` carries
+    `engineer_ski`, `engineer_cert_sha256`, `scopes`, `uid`. New
+    message `GetActiveSessionByUid` lets `execute` look up an
+    authenticated session by uid. v1 payloads still parse.
+  * refactor(config): new sections `[approver_trust]`, `[tsa_trust]`,
+    `[policy]`. Old configs still parse. See
+    `docs/migration.md` for upgrade.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Wed, 13 May 2026 00:00:00 +0000
+
+pam-certauth (0.1.1-1) unstable; urgency=medium
+
+  * fix(pam): wire syslog backend for tracing subscriber. Auth-flow
+    errors now land in /var/log/auth.log under syslog ident
+    "pam_certauth" (LOG_AUTH facility). Production diagnosis no longer
+    blind.
+  * fix(pam): cert-binding X.509 extensions take precedence over
+    [[user_mapping]]. pam_cert_user_binding / pam_cert_host_binding
+    are the sole source of authorisation when present; the TOML
+    mapping list is a legacy fallback for certs without the
+    user_binding extension.
+  * feat(deb): ship SysV init script (/etc/init.d/pam-certauth-monitord)
+    via dh_installinit so non-systemd hosts are supported. Adds
+    lsb-base dependency.
+  * feat(deb): ship man(8) for pam-certauth-monitord.
+  * feat(deb): three PAM-stack snippets (certauth / certauth-optional /
+    certauth-only) and integrate-pam.sh --mode=2fa|optional|cert-only.
+    Cert-only mode bypasses password chain entirely (lockout-strict).
+  * docs: USBGuard / Astra ЗПС interop, USB-lockout pre-deploy
+    checklist, on_usb_removed mode reference, three operational auth
+    modes.
+  * test: add leaf_no_user_binding fixture + un-ignore the legacy
+    [[user_mapping]] regression test.
+  * security: pam-certauth-monitord no longer runs as root. A dedicated
+    `pamcertauth` system user is created in postinst; the systemd unit
+    runs under this user with CAP_DAC_READ_SEARCH only. Privileged
+    logind methods (LockSession, TerminateSession, PowerOff) are gated
+    by an explicit polkit allowlist shipped at
+    /usr/share/polkit-1/rules.d/49-pam-certauth.rules. Adds adduser and
+    polkitd to package Depends. pam_certauth.so itself still runs in
+    PAM-caller context (root for sudo/login) — that is an architectural
+    constraint of Linux PAM and outside this change.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Wed, 06 May 2026 19:30:00 +0000
+
+pam-certauth (0.1.0-1) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Mikhail Korolev <mikhail@robonet.me>  Tue, 05 May 2026 00:00:00 +0000

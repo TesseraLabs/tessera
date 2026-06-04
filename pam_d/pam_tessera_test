@@ -1,0 +1,3 @@
+auth     required  /tmp/pam_tessera_smoke/libpam_tessera.so config=/tmp/pam_tessera_smoke/config.toml
+account  required  /tmp/pam_tessera_smoke/libpam_tessera.so
+session  required  /tmp/pam_tessera_smoke/libpam_tessera.so

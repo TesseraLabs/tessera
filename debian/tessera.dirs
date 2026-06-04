@@ -1,0 +1,8 @@
+etc/tessera
+etc/tessera/ca
+etc/tessera/crl
+var/cache/tessera/ocsp
+var/lib/tessera
+usr/share/tessera
+usr/share/tessera/pam.d
+usr/share/tessera/systemd

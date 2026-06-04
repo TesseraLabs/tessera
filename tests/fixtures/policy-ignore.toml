@@ -1,0 +1,6 @@
+# Test policy fragment — MAC integrity IGNORED.
+# Cert MAX_INTEGRITY extension is parsed for diagnostics only, never
+# applied. Useful for staged rollouts on hosts without МКЦ runtime.
+
+[mac]
+cert_integrity = "ignore"
