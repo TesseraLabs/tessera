@@ -190,7 +190,7 @@ default_ca = test_ca
 database = crl_db/index.txt
 crlnumber = crl_db/crlnumber
 default_md = sha256
-default_crl_days = 30
+default_crl_days = 3650
 policy = policy_any
 
 [ policy_any ]
@@ -205,7 +205,7 @@ printf 'R\t%s\t%s\t99\tunknown\t/CN=mallory\n' "$EXP" "$NOW" > crl_db/index.txt
 
 openssl ca -gencrl -keyfile int.key -cert int.pem \
     -config crl_openssl.cnf \
-    -crldays 30 \
+    -crldays 3650 \
     -out crl_valid.pem 2>/dev/null
 
 # Foreign-issuer CRL: signed by the *root* CA over an empty revocation list.
@@ -215,7 +215,7 @@ openssl ca -gencrl -keyfile int.key -cert int.pem \
 # point at the root key/cert.
 openssl ca -gencrl -keyfile ca.key -cert ca.pem \
     -config crl_openssl.cnf \
-    -crldays 30 \
+    -crldays 3650 \
     -out crl_foreign.pem 2>/dev/null
 
 # PKCS#12 bundles for stage-2 tests (T11+).
