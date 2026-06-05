@@ -1,5 +1,5 @@
 #!/bin/sh
-# Block commits to main during working hours (Mon-Fri 09:00-18:59 local time).
+# Block commits to main during working hours (Mon-Fri 08:00-18:59 local time).
 # Rationale: main history should only move outside business hours.
 # Emergency override: git commit --no-verify
 
@@ -9,8 +9,8 @@ branch=$(git symbolic-ref --quiet --short HEAD) || exit 0 # detached HEAD (rebas
 dow=$(date +%u)  # 1=Mon .. 7=Sun
 hour=$(date +%H)
 
-if [ "$dow" -le 5 ] && [ "$hour" -ge 9 ] && [ "$hour" -lt 19 ]; then
-    echo "pre-commit: commits to 'main' are blocked on weekdays 09:00-19:00." >&2
+if [ "$dow" -le 5 ] && [ "$hour" -ge 8 ] && [ "$hour" -lt 19 ]; then
+    echo "pre-commit: commits to 'main' are blocked on weekdays 08:00-19:00." >&2
     echo "Use a feature branch, or commit after 19:00 (--no-verify to override)." >&2
     exit 1
 fi
