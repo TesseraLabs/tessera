@@ -61,11 +61,11 @@ fn rejects_revoked_cert() {
 
 #[test]
 fn strict_rejects_expired_crl() {
-    // Our valid CRL has nextUpdate ~30d into the future. Pretend "now" is
-    // a year ahead so the CRL appears expired.
+    // Our valid CRL has nextUpdate ~10y into the future. Pretend "now" is
+    // eleven years ahead so the CRL appears expired.
     let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
     let cfg = RevocationConfig { crl_strict: true };
-    let future = SystemTime::now() + Duration::from_secs(365 * 24 * 3600);
+    let future = SystemTime::now() + Duration::from_secs(11 * 365 * 24 * 3600);
     let err = check_revocation(&chain(LEAF), &store, &cfg, future).unwrap_err();
     assert!(matches!(err, TrustError::Crl(_)), "{err:?}");
 }
@@ -74,7 +74,7 @@ fn strict_rejects_expired_crl() {
 fn lenient_skips_expired_crl() {
     let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
     let cfg = RevocationConfig { crl_strict: false };
-    let future = SystemTime::now() + Duration::from_secs(365 * 24 * 3600);
+    let future = SystemTime::now() + Duration::from_secs(11 * 365 * 24 * 3600);
     // No error: lenient mode logs and continues.
     check_revocation(&chain(LEAF), &store, &cfg, future).unwrap();
 }
