@@ -238,7 +238,7 @@ cargo test --workspace
 ## Git hooks
 
 The repo ships hooks in `scripts/git-hooks/` that block commits and pushes to
-`main` on weekdays between 09:00 and 19:00 local time. Enable them once per
+`main` on weekdays between 08:00 and 19:00 local time. Enable them once per
 clone:
 
 ```sh
