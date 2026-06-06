@@ -186,8 +186,7 @@ DER здесь — три TLV: `SEQUENCE`, `INTEGER 2`, `BIT STRING '01'B`.
 
 Полный end-to-end runbook (эталон → клон → flip → выпуск per-host) —
 в **[docs/clone-image.md](clone-image.md)**. Здесь — только CA-сторона:
-как читать TSV-дамп и какие параметры подаются в
-`issue-service-cert.sh`.
+как читать TSV-дамп и что попадает в выпускаемый сертификат.
 
 ### TSV-дамп от оператора
 
@@ -210,22 +209,17 @@ source  status  hash_hex  hash_prefix  raw  normalized  active_under_current_con
 
 ### Выпуск per-host сертификата
 
-`hash_hex` подаётся в `issue-service-cert.sh` (из admin-tools
-tarball'а, см. [clone-image.md §6.1](clone-image.md)):
-
-```bash
-./issue-service-cert.sh --mode per-host \
-    --host-id-hash <hash_hex> \
-    --user <service_user>
-```
+`hash_hex` подаётся в CA-инструмент выпуска (см.
+[clone-image.md §6.1](clone-image.md) — CA-инструменты поставляются
+отдельно, не в этом репозитории).
 
 Cert получает `pam_cert_host_binding = <hash_hex>`,
 `pam_cert_user_binding = <service_user>` и стандартный
 `extendedKeyUsage = clientAuth, emailProtection`. На МКЦ-АРМ
 дополнительно `pam_cert_max_integrity` (см. §«Поле MaxIntegrity»).
 
-Готовый `.p12` упаковывается на ту же флешку через
-`prepare-usb-flash.sh` и возвращается на АРМ.
+Готовый `.p12` упаковывается на ту же флешку CA-инструментом
+и возвращается на АРМ.
 
 ### Pre-flight checks
 

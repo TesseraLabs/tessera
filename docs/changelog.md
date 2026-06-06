@@ -38,11 +38,10 @@
   Opt-in: `[fly_dm_greeter].update_wallpaper = true`. Pure Rust
   (`image` + `ab_glyph`), без native deps. Templates `template_ru` /
   `template_en` (по locale), one-time backup оригинала. Atomic save.
-- **Admin-tools release tarball** `pam-certauth-admin-tools-<ver>.tar.gz`
-  загружается в GitHub Release **рядом** с `.deb` (НЕ упакован в `.deb`):
-  `issue-service-cert.sh` (per-host / wildcard / bootstrap modes),
-  `vault-pki-setup.sh`, `prepare-usb-flash.sh`, README. Project-neutral
-  naming. Хранится на CA-машине, не на боевых АРМ.
+- **CA-инструменты** (выпуск per-host / wildcard / bootstrap
+  сертификатов, настройка PKI, подготовка USB) вынесены из `.deb`:
+  не должны лежать на боевых АРМ, поставляются отдельно и хранятся
+  на CA-машине.
 
 ### Docs
 

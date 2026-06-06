@@ -190,9 +190,9 @@ Ansible-выкатка, troubleshooting.
 3. На каждом АРМ-е: `sudo /usr/share/tessera/finish-bootstrap.sh`
    (или Ansible с `--non-interactive`). Flip + дамп host_id на USB.
 4. CA-админ выписывает per-host сертификат по `hash_hex` из строки
-   `active_under_current_config=yes` (`issue-service-cert.sh` из
-   admin-tools tarball).
-5. USB возвращается на АРМ через `prepare-usb-flash.sh` — bootstrap
+   `active_under_current_config=yes` (CA-инструментом; поставляется
+   отдельно, см. [clone-image.md §6.1](clone-image.md)).
+5. USB с новым `.p12` возвращается на АРМ — bootstrap
    больше не используется, работает per-host цепочка.
 
 ## 3. Действия при инцидентах
