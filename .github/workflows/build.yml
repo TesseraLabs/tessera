@@ -77,7 +77,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0   # full history для SOURCE_DATE_EPOCH
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -117,7 +117,7 @@ jobs:
 
       - name: Cache rustup toolchain (ubuntu only)
         if: matrix.target.id == 'ubuntu'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.rustup/toolchains
@@ -164,7 +164,7 @@ jobs:
         # the resolved @v2 SHA (e18b...) — see #30 build failure. The
         # commit is reachable via API but not via the runner's codeload
         # endpoint; pinning bypasses the broken tag resolution.
-        uses: Swatinem/rust-cache@aa7c1c80a07a27a84c0aa76d0cef0aad3830e330 # v2.7.8
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           shared-key: build-deb-${{ matrix.target.id }}
           cache-on-failure: true
@@ -203,7 +203,7 @@ jobs:
           ls -la artifacts/
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target.artifact_name }}
           path: artifacts/*
@@ -220,16 +220,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download astra artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: tessera-deb-astra
           path: ./artifacts/astra
 
       - name: Download ubuntu artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: tessera-deb-ubuntu
           path: ./artifacts/ubuntu
@@ -255,7 +255,7 @@ jobs:
           ls -la release/
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release/*
           draft: true

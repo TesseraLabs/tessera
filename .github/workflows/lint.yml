@@ -1,0 +1,81 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  clippy:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libssl-dev libudev-dev libdbus-1-dev libpam0g-dev libsystemd-dev \
+            clang libclang-dev pkg-config
+
+      - name: Cache rustup toolchain
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-1.95.0-clippy
+
+      - name: Install Rust toolchain
+        run: |
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install 1.95.0 \
+            --profile minimal \
+            --component clippy
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+
+      - name: cargo clippy (workspace, all targets, -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  supply-chain:
+    # cargo-deny + cargo-audit работают по lockfile, компиляция crate-графа
+    # не нужна (нет C-зависимостей) — job быстрый и идёт параллельно clippy.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (stable, no components)
+        run: |
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo tools
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin
+          key: cargo-tools-${{ runner.os }}-deny016-audit
+
+      - name: Install cargo-deny + cargo-audit
+        run: |
+          command -v cargo-deny >/dev/null || \
+            cargo install --locked cargo-deny@0.16 || cargo install --locked cargo-deny
+          command -v cargo-audit >/dev/null || \
+            cargo install --locked cargo-audit
+
+      - name: cargo deny check
+        # Advisories, bans, licenses, sources — по deny.toml.
+        run: cargo deny check
+
+      - name: cargo audit
+        run: cargo audit
