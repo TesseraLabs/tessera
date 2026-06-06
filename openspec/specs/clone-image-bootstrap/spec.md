@@ -4,7 +4,7 @@
 
 Раскатка парка из клонированного эталонного образа: bootstrap-cert валиден на любом клоне; первый запуск на железе атомарно «привязывает» машину и убивает bootstrap-cert. Выбран override-механизм (vs TTL): не зависит от часов, отключение атомарно через config-flip, не требует правок модуля.
 
-Состав: `dump-host-id` (см. [cli-diagnostics](../cli-diagnostics/spec.md)), `dist/scripts/finish-bootstrap.sh`, admin-tools tarball, wallpaper banner (см. [fly-dm-greeter](../fly-dm-greeter/spec.md)).
+Состав: `dump-host-id` (см. [cli-diagnostics](../cli-diagnostics/spec.md)), `dist/scripts/finish-bootstrap.sh`, wallpaper banner (см. [fly-dm-greeter](../fly-dm-greeter/spec.md)). CA-сторона (выпуск удостоверений, подготовка USB) — закрытые инструменты вне этого репозитория.
 
 ## Requirements
 
@@ -31,16 +31,13 @@
 - **WHEN** config переключён на реальные источники
 - **THEN** host_id_hash меняется → bootstrap-cert «installation» больше не совпадает → reject на этом хосте (атомарная инвалидация); параллельно CA выпускает per-host cert по hash_hex из TSV
 
-### Requirement: Admin-tools tarball (CA-сторона)
+### Requirement: CA-сторона (контракт)
 
-Admin-tools ДОЛЖЕН (MUST) распространяться отдельным `tessera-admin-tools-<ver>.tar.gz` в GitHub Release, НЕ в .deb (CA-инструменты не должны лежать на банкомате). Состав: `vault-pki-setup.sh`, `issue-service-cert.sh` (режимы per-host / wildcard / bootstrap), `prepare-usb-flash.sh`, README. Сборка — только на тегах `v*`.
+CA-инструменты (настройка PKI, выпуск удостоверений per-host / wildcard / bootstrap, подготовка USB-носителя) НЕ ДОЛЖНЫ (MUST NOT) входить в `.deb` и в этот репозиторий — они не должны лежать на устройстве; поставляются отдельно. Контракт со стороны устройства: CA выпускает per-host удостоверение по `hash_hex` из строки `active_under_current_config=yes` TSV-дампа `dump-host-id`.
 
-#### Scenario: Сборка tarball
-- **WHEN** пушится тег `v*`
-- **THEN** собирается `tessera-admin-tools-<ver>.tar.gz` и публикуется в GitHub Release, но НЕ кладётся в .deb
-
-- ⚠ KNOWN GAP (docs, КРУПНОЕ): clone-image.md показывает неинтерактивные флаги (`--mode/--ca-dir/--host-id-hash/--device/...`) — фактически оба скрипта ИНТЕРАКТИВНЫЕ (`read -rp`), параметры через env (CA_DIR/OUTPUT_BASE/...). admin-tools/README.md соответствует коду; clone-image.md — нет.
-- Guard: `prepare-usb-flash.sh` ДОЛЖЕН (MUST) отказываться копировать PEM-файл (начинается с `-----BEGIN`) как .p12.
+#### Scenario: Выпуск per-host удостоверения
+- **WHEN** CA-админ получает TSV-дамп от устройства после flip
+- **THEN** per-host удостоверение выпускается по `hash_hex` активного источника и доставляется на устройство на USB-носителе (старые `.p12` удаляются)
 
 ### Requirement: Смежный деплой-констрейнт (информативно)
 

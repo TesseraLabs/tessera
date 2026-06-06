@@ -33,11 +33,11 @@ CI ДОЛЖЕН (MUST) проверять `Cargo.toml` workspace version == `deb
 
 ### Requirement: Release job
 
-`release` job ДОЛЖНА (MUST) только на тегах `v*` публиковать astra+ubuntu `.deb` + admin-tools tarball в draft GitHub Release.
+`release` job ДОЛЖНА (MUST) только на тегах `v*` публиковать astra+ubuntu `.deb` в draft GitHub Release. CA-инструменты в открытую поставку НЕ входят (поставляются отдельно, вне этого репозитория).
 
 #### Scenario: Push тега
 - **WHEN** пушится тег `v*`
-- **THEN** публикуются astra+ubuntu `.deb` и admin-tools tarball в draft GitHub Release
+- **THEN** публикуются astra+ubuntu `.deb` в draft GitHub Release
 
 ### Requirement: Доставка на парк
 
