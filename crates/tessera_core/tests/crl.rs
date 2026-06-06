@@ -87,6 +87,18 @@ fn empty_store_is_noop() {
 }
 
 #[test]
+fn foreign_issuer_crl_does_not_revoke_matching_serial() {
+    // crl_foreign.pem is signed by the *root* CA but lists serial 0x99 as
+    // revoked.  revoked_leaf.pem is issued by the *intermediate* and also
+    // carries serial 0x99.  Because the CRL issuer DN (root) does not match
+    // the certificate issuer DN (intermediate), RFC 5280 § 6.3.3 says the
+    // CRL is out of scope and must not revoke the leaf.
+    let store = CrlStore::from_pems(&[CRL_FOREIGN]).unwrap();
+    let cfg = RevocationConfig { crl_strict: true };
+    check_revocation(&chain(REVOKED), &store, &cfg, SystemTime::now()).unwrap();
+}
+
+#[test]
 fn crl_signature_validates_against_correct_issuer() {
     let crl = Crl::from_pem(CRL_VALID).unwrap();
     let int = Certificate::from_pem(INT).unwrap();
