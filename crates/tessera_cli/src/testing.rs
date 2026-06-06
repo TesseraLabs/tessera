@@ -64,6 +64,10 @@ impl LogindActionsTrait for RecordingActions {
         self.calls.lock().push("PowerOff".to_string());
         Ok(())
     }
+    async fn reboot(&self) -> anyhow::Result<()> {
+        self.calls.lock().push("Reboot".to_string());
+        Ok(())
+    }
 }
 
 /// Spawn an in-process server backed by stub udev/logind. The accept loop

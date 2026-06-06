@@ -1,5 +1,5 @@
 //! Action helpers calling logind's `LockSession` / `TerminateSession` /
-//! `PowerOff` methods. The trait abstraction lets tests inject a
+//! `PowerOff` / `Reboot` methods. The trait abstraction lets tests inject a
 //! `RecordingActions` stub.
 
 /// Actions monitord can ask logind to perform.
@@ -11,6 +11,8 @@ pub trait LogindActionsTrait: Send + Sync {
     async fn terminate_session(&self, id: &str) -> anyhow::Result<()>;
     /// Power off the host.
     async fn power_off(&self) -> anyhow::Result<()>;
+    /// Reboot the host.
+    async fn reboot(&self) -> anyhow::Result<()>;
 }
 
 /// No-op implementation for tests / non-Linux dev builds.
@@ -29,6 +31,10 @@ impl LogindActionsTrait for NoopActions {
     }
     async fn power_off(&self) -> anyhow::Result<()> {
         tracing::info!(target: "tessera.monitord", "noop power_off");
+        Ok(())
+    }
+    async fn reboot(&self) -> anyhow::Result<()> {
+        tracing::info!(target: "tessera.monitord", "noop reboot");
         Ok(())
     }
 }
@@ -81,6 +87,13 @@ mod real {
             self.proxy()
                 .await?
                 .call_method("PowerOff", &(false,))
+                .await?;
+            Ok(())
+        }
+        async fn reboot(&self) -> anyhow::Result<()> {
+            self.proxy()
+                .await?
+                .call_method("Reboot", &(false,))
                 .await?;
             Ok(())
         }

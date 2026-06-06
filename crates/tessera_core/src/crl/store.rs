@@ -249,6 +249,15 @@ pub fn check_revocation(
             }
         }
         for cert in chain {
+            // RFC 5280 § 6.3.3: a CRL only covers certificates issued by the
+            // CRL issuer.  Compare the certificate's issuer DN against the
+            // CRL's issuer DN byte-for-byte; on mismatch (or on a DER-encode
+            // failure that leaves the scope unprovable) this CRL is not
+            // applicable to this certificate.
+            match cert.x509().issuer_name().to_der() {
+                Ok(issuer_der) if issuer_der == crl.issuer_dn_der => {}
+                _ => continue,
+            }
             let serial = cert.serial_hex().to_lowercase();
             if crl.revoked.iter().any(|s| s == &serial) {
                 return Err(TrustError::Revoked(serial));

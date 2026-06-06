@@ -106,7 +106,12 @@ fn timeout_kills_long_running_hook() {
 }
 
 #[test]
-fn nonexistent_command_yields_127() {
+fn nonexistent_command_is_rejected_before_exec() {
+    // The pre-exec security walk canonicalizes argv[0] before fork. A command
+    // whose path (or any ancestor) does not exist cannot be canonicalized, so
+    // the executor fails closed with CommandUnusable rather than forking and
+    // letting execve surface a 127 exit. Rejecting an unresolvable hook path up
+    // front is the intended fail-closed behavior.
     let executor = ForkExecExecutor::new();
     let hook = make_hook(
         HookStage::PreAuth,
@@ -114,14 +119,14 @@ fn nonexistent_command_yields_127() {
         5,
         OnFailure::Abort,
     );
-    let outcome = executor
-        .execute(
-            &hook,
-            &HookVars::empty().with_pam_user("u").with_pam_service("s"),
-        )
-        .expect("execute returns Ok with 127 exit");
-    assert_eq!(outcome.exit_code, 127);
-    assert!(!outcome.killed_by_timeout);
+    let res = executor.execute(
+        &hook,
+        &HookVars::empty().with_pam_user("u").with_pam_service("s"),
+    );
+    assert!(
+        matches!(res, Err(HookError::CommandUnusable { .. })),
+        "unresolvable hook path must be rejected before exec, got {res:?}"
+    );
 }
 
 #[test]

@@ -63,6 +63,15 @@ pub enum DiscoveryError {
         /// Observed file size.
         actual: u64,
     },
+
+    /// A discovered path resolved (via symlink or `..`) outside the
+    /// mountpoint. The USB filesystem is attacker-controlled, so reads
+    /// must stay confined to the mount to avoid host-file disclosure.
+    #[error("path escapes mountpoint: {path}")]
+    EscapesMount {
+        /// Path (relative to the mountpoint) that resolved outside it.
+        path: PathBuf,
+    },
 }
 
 /// Expand the `${user}` placeholder in `pattern` using `pam_user`.
@@ -71,6 +80,41 @@ pub enum DiscoveryError {
 /// don't form `${user}` pass through unchanged.
 fn expand_user(pattern: &str, pam_user: &str) -> String {
     pattern.replace("${user}", pam_user)
+}
+
+/// Resolve `candidate` and confirm it stays inside `mountpoint`.
+///
+/// The USB filesystem is attacker-formatted; on symlink-capable
+/// filesystems (e.g. ext4) a crafted symlink or `..` component would
+/// otherwise let the root PAM process read host files. We canonicalize
+/// both the mountpoint and the candidate (which follows every symlink
+/// and normalises `..`) and require the result to be prefixed by the
+/// canonical mountpoint. `rel` is the mount-relative path used only for
+/// diagnostics.
+///
+/// Returns `Ok(None)` when the candidate does not exist (caller decides
+/// whether that is an error), `Ok(Some(path))` for a confined path, and
+/// `Err(EscapesMount)` when it resolves outside the mountpoint.
+fn safe_resolve(
+    mountpoint: &Path,
+    candidate: &Path,
+    rel: &Path,
+) -> Result<Option<PathBuf>, DiscoveryError> {
+    let real = match fs::canonicalize(candidate) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(DiscoveryError::Io(e)),
+    };
+    let mount_real = fs::canonicalize(mountpoint)?;
+    if !real.starts_with(&mount_real) {
+        return Err(DiscoveryError::EscapesMount {
+            path: rel.to_path_buf(),
+        });
+    }
+    if !real.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(real))
 }
 
 /// Look for credentials under `mountpoint` using `pattern` (relative path
@@ -89,11 +133,14 @@ pub fn discover_credentials(
 ) -> Result<DiscoveredCreds, DiscoveryError> {
     let resolved = expand_user(pattern, pam_user);
     let p12_path = mountpoint.join(&resolved);
-    if !p12_path.is_file() {
-        return Err(DiscoveryError::P12NotFound {
-            path: PathBuf::from(resolved),
-        });
-    }
+    let p12_path = match safe_resolve(mountpoint, &p12_path, Path::new(&resolved))? {
+        Some(p) => p,
+        None => {
+            return Err(DiscoveryError::P12NotFound {
+                path: PathBuf::from(resolved),
+            })
+        }
+    };
 
     let p12_meta = fs::metadata(&p12_path)?;
     if p12_meta.len() > MAX_P12_BYTES {
@@ -104,7 +151,10 @@ pub fn discover_credentials(
     let p12_bytes = fs::read(&p12_path)?;
 
     let chain_path = mountpoint.join("certs").join("chain.pem");
-    let chain_pem = if chain_path.is_file() {
+    let chain_rel = Path::new("certs").join("chain.pem");
+    let chain_pem = if let Some(chain_path) =
+        safe_resolve(mountpoint, &chain_path, &chain_rel)?
+    {
         let meta = fs::metadata(&chain_path)?;
         if meta.len() > MAX_CHAIN_BYTES {
             return Err(DiscoveryError::ChainTooLarge { actual: meta.len() });
@@ -236,6 +286,29 @@ mod tests {
         match err {
             DiscoveryError::ChainTooLarge { actual } => assert_eq!(actual, MAX_CHAIN_BYTES + 1),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_p12_symlink_escaping_mount() {
+        // An attacker-formatted ext4 USB can carry symlinks. A symlink at
+        // the expected p12 location pointing at a host file outside the
+        // mount must be refused, not read.
+        let mount = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("host-secret");
+        write_file(&secret, b"HOST-ONLY");
+
+        std::fs::create_dir_all(mount.path().join("certs")).unwrap();
+        std::os::unix::fs::symlink(&secret, mount.path().join("certs/user.p12")).unwrap();
+
+        let err = discover_credentials(mount.path(), "certs/user.p12", "alice").unwrap_err();
+        match err {
+            DiscoveryError::EscapesMount { path } => {
+                assert_eq!(path, PathBuf::from("certs/user.p12"));
+            }
+            other => panic!("expected EscapesMount, got: {other:?}"),
         }
     }
 }

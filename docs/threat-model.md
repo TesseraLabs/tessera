@@ -507,3 +507,67 @@ level. Угроза признана in-scope и явно out-of-mitigation дл
 | 9.1.3  | malformed DER → parse-failed event                     | `crates/tessera_core/tests/cert_extensions_parse.rs`                     |
 | 9.1.4  | fd-based irelax label on atomic write                  | `crates/tessera_core/tests/mount_guard_tmpfs.rs`                         |
 | 9.1.5  | host_id immutability after install                     | E2E manual: `vagrant/scripts/test-mac.sh` T12                                 |
+
+## 10. Реестр угроз (систематический проход 2026-06)
+
+Результат полного bootstrap-прохода по коду @ 14b828e (исследовательский swarm:
+docs/поверхности/активы/инфраструктура/git-история, затем кластеризация и
+STRIDE gap-fill) с уточнением у владельца. Формат совместим со schema
+THREAT_MODEL.md (downstream-инструменты парсят таблицу регексом). Угроза —
+это класс, переживающий патч конкретного бага; найденные баги указаны в
+`evidence` и лишь повышают likelihood.
+
+Статический триаж-проход (2026-06-06, 25 сырых находок → 5 подтверждённых) верифицировал
+инстансы этого реестра. Важная ось: `impact`/`likelihood` в реестре — оценка **класса**
+угрозы в наихудшем сценарии; конкретный инстанс при стекe прекондиций может быть instance-severity
+**LOW** при class-impact **critical**. Оба числа нужны: класс — приоритет инвестиций в
+митигации, инстанс — срочность патча. Проход также вскрыл два класса, отсутствовавших
+в bootstrap: ложный отзыв через issuer-scope (добавлен в T1/T8) и path-confusion на
+смонтированном носителе (новый T12).
+
+Этот раздел дополняет §3–§6: §3 описывает механизмы защиты per-угроза,
+здесь — единый ранжированный реестр (impact × likelihood, по убыванию).
+
+### 10.1 Threats
+
+| id | threat | actor | surface | asset | impact | likelihood | status | controls | evidence |
+|---|---|---|---|---|---|---|---|---|---|
+| T1 | Вход по отозванному удостоверению: механизм отзыва молча деградирует (просроченная CRL пропускается при crl_strict=false, OCSP-режим — no-op, подпись CRL не проверяется, CRL без nextUpdate вечно «свежая») | insider | Обработка CRL | Решение об аутентификации, состояние отзыва | critical | likely | partially_mitigated | короткий TTL удостоверений ограничивает окно; crl_strict=true opt-in; issuer-DN binding в check_revocation (RFC 5280 §6.3.3) реализован 2026-06 — CRL применяется только к сертификатам своего издателя, cross-CA коллизия серийников больше не отзывает чужой cert | 14b828e, openspec/revocation, F-001 (закрыт) |
+| T2 | Обход авторизационной политики через fail-open дефолты и тихие fallback-пути: malformed user_binding → fallback в legacy mapping, extractable PKCS#11-ключ лишь WARN | insider | Проверка цепи и challenge-response; Парсинг X.509/PKCS#12 с носителя; config.toml | Решение об аутентификации, fail-closed инвариант | critical | possible | partially_mitigated | mandatory-extension policy (host/user_binding); строгий DER-парсинг МКЦ-меток; пустой/опущенный sig-whitelist с 2026-06 подменяется безопасным дефолтом (SHA-256/384/512 RSA + ECDSA, без SHA-1/ГОСТ) на этапе валидации конфига — accept-all дефолт устранён | pre_validate.rs:28, flow.rs:662, F-002 (закрыт) |
+| T3 | RCE/повреждение памяти в root-логин-процессе при парсинге злонамеренного носителя: DER/PKCS#12 в OpenSSL до верификации и образ ФС в ядре при mount(2) | local_user | Парсинг X.509/PKCS#12 с носителя; USB mount | Host process integrity | critical | possible | partially_mitigated | Rust-обвязка; panic guard (не спасает от UB в C); mount с nosuid,nodev,noexec; история CVE парсеров ASN.1/ФС-драйверов как прецедент | |
+| T4 | Evil-maid вне Astra: подмена config.toml, нативных .so (PKCS#11/gost-engine), host_id — без МКЦ-меток, DIGSIG и immutable-бита Debian/Ubuntu защищены только DAC | local_user | Динамическая загрузка нативного кода; config.toml; Host identity резолв; Установка/удаление пакета | Host process integrity, конфигурация, host identity | critical | possible | partially_mitigated | на Astra: МКЦ ilevel=63, chattr +i, DIGSIG/ЗПС; вне Astra: 0640/0750 root:tessera | |
+| T5 | Компрометация цепочки сборки/поставки: бэкдор в .so логин-стека всего парка через незапиненную базу builder-image, инструменты без checksum, неподписанные .deb, crates.io-зависимость | supply_chain | CI / supply chain сборки; Зависимости Cargo | Целостность release-артефактов, Host process integrity | critical | possible | partially_mitigated | reproducible build (.buildinfo), rust-cache pinned by hash, cargo-deny, draft-релизы; Astra DIGSIG отклонит неподписанный .so; GPG-подпись .deb и apt-репозиторий запланированы | |
+| T6 | Нарушение memory-safety на PAM FFI границе: manual ownership AuthContext (Box::into_raw), conv-указатели, unsafe-блоки cdylib | local_user | PAM ABI (pam_sm_*); PAM data (AuthContext между фазами) | Host process integrity | critical | rare | partially_mitigated | Rust; panic_guard → PAM_AUTHINFO_UNAVAIL; forbid(unsafe) в proto; no-alloc между fork/execve | |
+| T7 | Сессия переживает извлечение носителя: путь мониторинга не fail-closed (SessionOpen-ошибка не фатальна при strict) | local_user | IPC сокет monitord; udev события; sessions.json персист | Активная сессия, контроль извлечения носителя | high | likely | partially_mitigated | udev REMOVE → grace → lock/logout/hook/shutdown; race-check на SessionOpen; фикс XDG_SESSION_ID-пути в 0.3.13; с 2026-06 Lock/Logout без logind id fail-closed: error-лог + reboot хоста (сессия уничтожается, машина возвращается на экран входа) вместо тихого дропа действия | flow.rs:742, actions.rs:51, F-006 (закрыт) |
+| T8 | Недоступность устройства (DoS/lockout): cert-only без rescue-канала, намеренная блокировка чужого токена (3 PIN-попытки), USB-timeout, monitord strict, ложный expiry при дрейфе часов, ложный отзыв валидного удостоверения при cross-CA коллизии серийников (issuer-DN не проверяется, F-001) | local_user | PAM ABI (pam_sm_*); IPC сокет monitord; udev события; Обработка CRL | Решение об аутентификации (availability) | high | likely | partially_mitigated | режимы 2fa/optional с парольным fallback; rescue-канал для cert-only задокументирован, но не enforce'ится; grace-окна | entry.rs:126 (clock_skew отсутствует), F-001 |
+| T9 | Некорректный PAM-стек после установки/обновления/удаления: bypass (остатки optional-режима, недочищенные @include) или полный lockout | local_admin | Установка/удаление пакета (postinst/postrm, integrate-pam.sh, finish-bootstrap.sh); PAM ABI | PAM-стек системы, Решение об аутентификации | high | possible | unmitigated | backup bak.<ts>; интерактивный y/N в finish-bootstrap; синтаксической валидации PAM после правки нет | |
+| T10 | Эскалация привилегий через hook-механизм: PAM-derived переменные в окружении child-процесса | local_user | Хуки fork+execve | Host process integrity, активная сессия | high | rare | partially_mitigated | placeholders как отдельные argv (без shell), setuid/setgid в child, таймауты; с 2026-06 pre-exec проверка прав hook-файла и всех родительских каталогов (как sudo/ssh): S_IWOTH — всегда отказ, S_IWGRP — отказ кроме группы root/egid, нечитаемый stat — отказ (fail-closed); остаточное TOCTOU-окно stat→execve эквивалентно sudo/ssh | F-004 (закрыт), validator.rs:71, child_setup.rs:335 |
+| T11 | Разведка через раскрытие состояния: реестр сессий (кто залогинен), диагностика на экране входа, аудит-журнал | local_user | sessions.json персист; PAM ABI | Реестр сессий, аудит-события | low | possible | partially_mitigated | 0660/0750, tmpfs; диагностика «выпущен для другого устройства» — осознанный UX trade-off | |
+| T12 | Path-confusion на смонтированном USB-носителе: symlink в ext4 (или другой symlink-capable FS) на USB → чтение файлов хоста под root; MS_NOSYMFOLLOW не выставлен в mount-флагах | physical_user | USB mount; tessera_core/discovery.rs | Конфиденциальность файлов хоста (частичная) | medium | rare | partially_mitigated | с 2026-06 discover_credentials делает canonicalize + boundary check (starts_with канонического mountpoint) для p12 и chain.pem; выход за mountpoint → отказ (EscapesMount, fail-closed); закрывает и mid-path symlink, и `..`; MS_NOSYMFOLLOW в mount-флагах по-прежнему не выставлен (defense-in-depth, открыто) | F-016 (закрыт), discovery.rs:92, usb.rs:85 |
+
+### 10.2 Deprioritized
+
+| threat | reason |
+|---|---|
+| Spoofing/Tampering сетевых каналов | Устройства офлайн, сетевых интерфейсов входа нет |
+| Root на устройстве, полный офлайн-доступ к диску | Вне модели по построению — слой целостности среды (см. §2, §4.1) |
+| Repudiation многопользовательских действий | Частично закрыто структурированным аудитом; корреляция с серверной сессией — задача серверной части, не PAM-модуля |
+| Подделка udev-событий | Требует root или CAP_NET_ADMIN на netlink — эквивалент root-нарушителя |
+| Side-channel/HW-атаки на токен | Свойство сертифицированного носителя (СКЗИ), вне TOE (см. §4.3, §4.6) |
+| Timing-атаки на challenge-response | Подпись выполняет OpenSSL/токен; secret-зависимых сравнений в коде tessera не найдено |
+| DoS физическим повреждением устройства | Вне модели (физзащита среды) |
+
+### 10.3 Рекомендованные митигации (class-level)
+
+| mitigation | threat_ids | closes_class | effort | статус |
+|---|---|---|---|---|
+| Новая CRL-семантика: отзыв вечен для серийников из просроченной CRL; просроченность бьёт только доверие к полноте списка + audit-событие; verify_signature обязательно в check_revocation; OCSP no-op = ошибка конфига | T1 | yes | M | открыто |
+| Конфиг-инвариант fail-closed: пустой sig-whitelist = ошибка валидации; malformed binding-расширение = отказ (не fallback); CKA_EXTRACTABLE=true = блок при hardware-policy | T2 | yes | S | sig-whitelist реализован 2026-06 (вариант: безопасный дефолт вместо ошибки валидации — не ломает существующие конфиги); binding/EXTRACTABLE — открыто |
+| Привести код к docs в мониторинге: strict → SessionOpen-ошибка фатальна; сессия без logind id — деградация в tty-target вместо дропа действия | T7 | yes | S | logind-id-часть реализована 2026-06 (вариант: fail-closed reboot вместо tty-деградации); strict→fatal — открыто |
+| Подпись .deb (GPG) + pin базового образа builder по digest + checksum для curl-загружаемых инструментов | T5 | yes | S | открыто |
+| Пост-валидация PAM-конфига после каждой правки (синтакс-чек, smoke-тест) + атомарный rollback в integrate-pam.sh | T9 | yes | M | открыто |
+| Debian-профиль целостности: dpkg-statoverride на критичные пути, рекомендация AIDE/IMA, проверка прав hook-файлов на старте демона | T4, T10 | partial | M | hook-права реализованы 2026-06 (вариант: pre-exec проверка в fork_exec, строже чем на старте демона); остальной профиль — открыто |
+| Изоляция парсинга носителя: privilege-separated helper для PKCS#12/DER до верификации; размерные лимиты | T3 | partial | L | открыто (лимиты p12/chain есть) |
+| clock_skew-допуск в acct_mgmt + проверка rescue-канала в finish-bootstrap.sh для cert-only | T8 | partial | S | открыто |
+| MS_NOSYMFOLLOW в mount(2) + canonicalize/boundary check в discover_credentials перед fs::read | T12 | yes | S | canonicalize/boundary check реализован 2026-06; MS_NOSYMFOLLOW — открыто (defense-in-depth) |
+| CRL issuer-DN binding в check_revocation: сравнивать issuer_dn_der cert'а с issuer CRL до match по серийнику (RFC 5280 §6.3.3) | T1, T8 | yes | S | реализовано 2026-06 |

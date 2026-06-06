@@ -97,7 +97,7 @@ async fn shutdown_calls_poweroff() {
 }
 
 #[tokio::test]
-async fn missing_logind_id_yields_no_call_for_lock() {
+async fn missing_logind_id_fails_closed_with_reboot_for_lock() {
     let recorder = Arc::new(RecordingActions::default());
     let actions: Arc<dyn LogindActionsTrait> = recorder.clone();
     let shutdown = CancellationToken::new();
@@ -112,6 +112,29 @@ async fn missing_logind_id_yields_no_call_for_lock() {
     .expect("send");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let calls = recorder.calls.lock();
-    assert!(calls.is_empty(), "no call expected, got {:?}", *calls);
+    // A TTY-targeted Lock cannot reach logind; the daemon must fail closed
+    // by rebooting rather than silently dropping the action and leaving
+    // the engineer logged in with the token unplugged.
+    assert_eq!(calls.as_slice(), &["Reboot".to_string()]);
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn missing_logind_id_fails_closed_with_reboot_for_logout() {
+    let recorder = Arc::new(RecordingActions::default());
+    let actions: Arc<dyn LogindActionsTrait> = recorder.clone();
+    let shutdown = CancellationToken::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let _h = spawn_action_runner(rx, actions, shutdown.clone());
+    let mut s = sample_logind_session("c5");
+    s.target = SessionTarget::tty("/dev/tty2");
+    tx.send(ActionRequest::HandleUsbRemoved {
+        session: s,
+        action: OnUsbRemoved::Logout,
+    })
+    .expect("send");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let calls = recorder.calls.lock();
+    assert_eq!(calls.as_slice(), &["Reboot".to_string()]);
     shutdown.cancel();
 }

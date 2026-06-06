@@ -779,6 +779,25 @@ fn validate_pkcs12_path_pattern(raw: Option<&str>) -> Result<Option<String>, Err
     Ok(Some(value.to_owned()))
 }
 
+/// Safe-by-default signature algorithms applied when
+/// `trust.allowed_signature_algorithms` is omitted or empty.
+///
+/// Entries are the OpenSSL display forms compared by `pre_validate_end_entity`
+/// (exact, case-sensitive equality). The list intentionally excludes SHA-1 and
+/// every other deprecated algorithm: an unconfigured deployment must still
+/// reject weak signatures rather than fall through to "accept anything".
+/// GOST is excluded so an unconfigured deployment does not pull in the
+/// gost-engine (`needs_gost` stays `false`); operators that need GOST must opt
+/// in explicitly.
+const DEFAULT_SIGNATURE_ALGORITHMS: &[&str] = &[
+    "sha256WithRSAEncryption",
+    "sha384WithRSAEncryption",
+    "sha512WithRSAEncryption",
+    "ecdsa-with-SHA256",
+    "ecdsa-with-SHA384",
+    "ecdsa-with-SHA512",
+];
+
 fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
     if raw.max_chain_depth == 0 {
         return Err(TrustError::MaxChainDepthZero.into());
@@ -840,7 +859,14 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
             },
             crl_paths: raw.revocation.crl_paths.clone(),
         },
-        allowed_signature_algorithms: raw.allowed_signature_algorithms.iter().cloned().collect(),
+        allowed_signature_algorithms: if raw.allowed_signature_algorithms.is_empty() {
+            DEFAULT_SIGNATURE_ALGORITHMS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        } else {
+            raw.allowed_signature_algorithms.iter().cloned().collect()
+        },
         pinning: PinningSection {
             enabled: raw.pinning.enabled,
             // Hex strings have already been validated above when

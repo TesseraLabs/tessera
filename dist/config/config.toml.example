@@ -148,7 +148,9 @@ max_chain_depth = 5
 # Tolerated clock skew when checking notBefore/notAfter, in seconds. Hard
 # upper bound is 600.
 clock_skew_seconds = 60
-# Allowed signature OIDs / friendly names. Empty list means "no constraint".
+# Allowed signature OIDs / friendly names. An empty (or omitted) list falls
+# back to a safe default set: sha256/384/512WithRSAEncryption and
+# ecdsa-with-SHA256/384/512 — no SHA-1, no GOST (GOST requires explicit opt-in).
 # When set, each entry is matched **exactly** against the certificate's
 # OpenSSL display form (substring matching was removed in 1.0.1, P1-C).
 # Examples:

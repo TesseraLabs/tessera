@@ -21,6 +21,7 @@
 
 use std::ffi::CString;
 use std::os::fd::{IntoRawFd, RawFd};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -58,6 +59,86 @@ pub(crate) fn build_groups_box(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     }
+}
+
+/// Reject a hook executable (and every parent directory) that an
+/// unprivileged user could rewrite before it runs as root.
+///
+/// The child path execs `argv[0]` at the parent's privilege (typically root
+/// for `run_as = Root`). A world-writable — or non-root/non-egid
+/// group-writable — hook file, or any such directory on its path, lets a
+/// local user swap the script for one of their choosing and have the daemon
+/// run it as root. `sudo` and `ssh` perform this same pre-exec ownership /
+/// permission walk for the identical reason.
+///
+/// This is a self-defending check: although `validate_hook` is expected to
+/// pass an absolute path, a non-absolute `path` is rejected here rather than
+/// trusted, because a relative path would make the ancestor walk meaningless
+/// (it would resolve against the daemon's cwd) and `canonicalize` could turn
+/// it into something unexpected. The path is then canonicalized once, so the
+/// canonical (symlink-free) file and every canonical ancestor up to `/` are
+/// the components actually checked — the same tree `execve` would resolve.
+/// Walking lexical parents would let a symlinked component hide the real
+/// parents from the permission walk. `S_IWOTH` is always fatal; `S_IWGRP`
+/// is fatal unless the owning group is root (gid 0) or this process's
+/// effective gid (a deliberately granted, trusted admin group).
+///
+/// # Errors
+///
+/// [`HookError::CommandUnusable`] when `path` is not absolute, when it cannot
+/// be canonicalized (fail closed), or for the first canonical component that
+/// is world-writable or group-writable by an untrusted group, or whose
+/// metadata cannot be read.
+fn check_exec_path_security(path: &Path) -> Result<(), HookError> {
+    // Self-defending: refuse a relative path rather than trusting the caller.
+    // A relative path makes the ancestor walk meaningless and canonicalize
+    // would resolve it against the daemon's cwd. Fail closed.
+    if !path.is_absolute() {
+        return Err(HookError::CommandUnusable {
+            path: path.to_path_buf(),
+        });
+    }
+
+    // Canonicalize once so the walk sees the real, symlink-free tree that
+    // execve would resolve. std::fs::metadata follows symlinks per-stat, so
+    // walking lexical `.parent()` of a symlinked path would skip the real
+    // parents of the resolved file. Resolving up front closes that gap.
+    // A path that cannot be canonicalized (missing, unreadable component)
+    // fails closed.
+    let real = std::fs::canonicalize(path).map_err(|_| HookError::CommandUnusable {
+        path: path.to_path_buf(),
+    })?;
+
+    // SAFETY: getegid is always successful and async-signal-safe; we are in
+    // the parent so any libc call is fine here.
+    #[allow(unsafe_code)]
+    let egid = unsafe { libc::getegid() } as u32;
+
+    let mut current = Some(real.as_path());
+    while let Some(component) = current {
+        let meta = std::fs::metadata(component).map_err(|_| HookError::CommandUnusable {
+            path: component.to_path_buf(),
+        })?;
+        let mode = meta.permissions().mode();
+        // S_IWOTH: writable by any local user — never acceptable.
+        if mode & 0o002 != 0 {
+            return Err(HookError::CommandUnusable {
+                path: component.to_path_buf(),
+            });
+        }
+        // S_IWGRP: acceptable only when the owning group is root or this
+        // process's effective gid (a trusted, admin-controlled group).
+        if mode & 0o020 != 0 {
+            let gid = meta.gid();
+            if gid != 0 && gid != egid {
+                return Err(HookError::CommandUnusable {
+                    path: component.to_path_buf(),
+                });
+            }
+        }
+        current = component.parent();
+    }
+    Ok(())
 }
 
 /// Real fork+execve hook executor. Stateless.
@@ -101,6 +182,12 @@ impl HookExecutor for ForkExecExecutor {
                 path: std::path::PathBuf::new(),
             });
         }
+        // Reject a hook executable (or any directory on its path) that a
+        // local user could rewrite before it runs as root. Done in the
+        // parent, before fork, exactly where sudo/ssh do their pre-exec
+        // permission walk.
+        check_exec_path_security(Path::new(&hook.command[0]))?;
+
         let mut argv_cstrings: Vec<CString> = Vec::with_capacity(hook.command.len());
         for arg in &hook.command {
             let c = CString::new(arg.as_str()).map_err(|_| HookError::ChildSetup {
@@ -359,6 +446,74 @@ mod tests {
         // dangling sentinel for empty boxes but here len == 4 so the
         // allocation is real and the slice is safe to pass to libc.
         let _addr = b.as_ptr();
+    }
+
+    /// A world-writable hook file must be rejected before exec: an
+    /// unprivileged user could otherwise rewrite it and have it run as root.
+    #[test]
+    fn world_writable_hook_is_rejected() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook = dir.path().join("hook.sh");
+        {
+            let mut f = std::fs::File::create(&hook).expect("create hook");
+            f.write_all(b"#!/bin/sh\nexit 0\n").expect("write hook");
+        }
+        // 0o777 sets S_IWOTH — the bit a local attacker abuses.
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod world-writable");
+
+        let res = check_exec_path_security(&hook);
+        assert!(
+            matches!(res, Err(HookError::CommandUnusable { .. })),
+            "world-writable hook must be rejected, got {res:?}"
+        );
+
+        // No positive (tighten-then-passes) assertion: check_exec_path_security
+        // now canonicalizes and walks every real ancestor, and the system temp
+        // dir's ancestors are world-writable on common platforms (e.g.
+        // /private/tmp is sticky 1777 on macOS, /tmp is 1777 on Linux), so a
+        // 0o755 file under it would still be rejected by the ancestor walk.
+        // That rejection is correct, just not deterministic to assert here, so
+        // we only assert the file-mode rejection above.
+    }
+
+    /// Group-writable by an untrusted (non-root, non-egid) group is rejected;
+    /// this is the second half of the recommendation. We can only assert the
+    /// untrusted-group path deterministically when not running as a member of
+    /// gid 0, so the file is owned by its creator's gid which is neither 0 nor
+    /// (in CI) the egid 0 case — kept minimal and self-contained.
+    #[test]
+    fn group_writable_untrusted_group_is_rejected_when_gid_nonzero() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook = dir.path().join("hook.sh");
+        {
+            let mut f = std::fs::File::create(&hook).expect("create hook");
+            f.write_all(b"#!/bin/sh\nexit 0\n").expect("write hook");
+        }
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o770))
+            .expect("chmod group-writable");
+
+        #[allow(unsafe_code)]
+        let egid = unsafe { libc::getegid() } as u32;
+        let gid = std::fs::metadata(&hook).expect("stat").gid();
+        let res = check_exec_path_security(&hook);
+        // When the file's owning group is untrusted, rejection is required.
+        // (Under the canonical ancestor walk the world-writable system temp
+        // dir would also trip the S_IWOTH check, so rejection is guaranteed
+        // either way — but the case we specifically want to pin down is the
+        // file's own untrusted group-writable bit.)
+        if gid != 0 && gid != egid {
+            assert!(
+                matches!(res, Err(HookError::CommandUnusable { .. })),
+                "group-writable by untrusted group must be rejected, got {res:?}"
+            );
+        }
     }
 
     /// End-to-end exercise of the no-alloc child path. Forks a real
