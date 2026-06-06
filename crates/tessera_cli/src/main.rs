@@ -29,7 +29,7 @@ enum Cmd {
     Check(CheckArgs),
     /// Probe every `[host_identity]` source and emit a TSV report of the
     /// resulting `host_id_hash` values. Use on freshly cloned ATM images
-    /// to learn which host_id the daemon will resolve so the CA admin can
+    /// to learn which `host_id` the daemon will resolve so the CA admin can
     /// issue a per-host service cert. Output destinations: `--output PATH`,
     /// `--usb` (writes to first viable USB partition), or stdout.
     DumpHostId(DumpHostIdArgs),

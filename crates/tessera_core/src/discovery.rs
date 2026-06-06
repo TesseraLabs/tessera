@@ -100,21 +100,21 @@ fn safe_resolve(
     candidate: &Path,
     rel: &Path,
 ) -> Result<Option<PathBuf>, DiscoveryError> {
-    let real = match fs::canonicalize(candidate) {
+    let canonical = match fs::canonicalize(candidate) {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(DiscoveryError::Io(e)),
     };
-    let mount_real = fs::canonicalize(mountpoint)?;
-    if !real.starts_with(&mount_real) {
+    let mount_canonical = fs::canonicalize(mountpoint)?;
+    if !canonical.starts_with(&mount_canonical) {
         return Err(DiscoveryError::EscapesMount {
             path: rel.to_path_buf(),
         });
     }
-    if !real.is_file() {
+    if !canonical.is_file() {
         return Ok(None);
     }
-    Ok(Some(real))
+    Ok(Some(canonical))
 }
 
 /// Look for credentials under `mountpoint` using `pattern` (relative path
@@ -133,13 +133,10 @@ pub fn discover_credentials(
 ) -> Result<DiscoveredCreds, DiscoveryError> {
     let resolved = expand_user(pattern, pam_user);
     let p12_path = mountpoint.join(&resolved);
-    let p12_path = match safe_resolve(mountpoint, &p12_path, Path::new(&resolved))? {
-        Some(p) => p,
-        None => {
-            return Err(DiscoveryError::P12NotFound {
-                path: PathBuf::from(resolved),
-            })
-        }
+    let Some(p12_path) = safe_resolve(mountpoint, &p12_path, Path::new(&resolved))? else {
+        return Err(DiscoveryError::P12NotFound {
+            path: PathBuf::from(resolved),
+        });
     };
 
     let p12_meta = fs::metadata(&p12_path)?;

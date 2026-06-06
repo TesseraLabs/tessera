@@ -1,4 +1,4 @@
-//! XDG_SESSION_ID capture: pushes a fresh `SessionTarget::LogindSession`
+//! `XDG_SESSION_ID` capture: pushes a fresh `SessionTarget::LogindSession`
 //! to monitord during `pam_sm_open_session` so the action handler can
 //! later target the real logind id on USB removal.
 //!
@@ -94,7 +94,7 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
