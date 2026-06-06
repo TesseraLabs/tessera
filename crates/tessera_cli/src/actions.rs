@@ -41,20 +41,14 @@ async fn handle(actions: &Arc<dyn LogindActionsTrait>, req: ActionRequest) -> an
         ActionRequest::HandleUsbRemoved { session, action } => {
             let logind_id = session.target.logind_id().map(str::to_string);
             match action {
-                OnUsbRemoved::Lock => {
-                    let id = logind_id.ok_or_else(|| {
-                        log_missing_logind_id("Lock", &session);
-                        anyhow::anyhow!("Lock requested but session has no logind id")
-                    })?;
-                    actions.lock_session(&id).await?;
-                }
-                OnUsbRemoved::Logout => {
-                    let id = logind_id.ok_or_else(|| {
-                        log_missing_logind_id("Logout", &session);
-                        anyhow::anyhow!("Logout requested but session has no logind id")
-                    })?;
-                    actions.terminate_session(&id).await?;
-                }
+                OnUsbRemoved::Lock => match logind_id {
+                    Some(id) => actions.lock_session(&id).await?,
+                    None => fail_closed_no_logind_id(actions, "Lock", &session).await?,
+                },
+                OnUsbRemoved::Logout => match logind_id {
+                    Some(id) => actions.terminate_session(&id).await?,
+                    None => fail_closed_no_logind_id(actions, "Logout", &session).await?,
+                },
                 OnUsbRemoved::Hook { path } => {
                     let session_clone = session.clone();
                     let path_clone = path.clone();
@@ -76,20 +70,31 @@ async fn handle(actions: &Arc<dyn LogindActionsTrait>, req: ActionRequest) -> an
     Ok(())
 }
 
-/// Emit an actionable diagnostic when a Lock/Logout action is dropped
-/// because the session has no `LogindSession` target. Prints the actual
-/// target and a one-line tip so the operator can resolve the PAM-stack
-/// misconfiguration that caused `XDG_SESSION_ID` to be missing during
-/// `pam_sm_open_session`.
-fn log_missing_logind_id(action: &str, session: &crate::registry::ActiveSession) {
-    tracing::warn!(
+/// Fail closed when a configured Lock/Logout action cannot reach logind
+/// because the session has no `LogindSession` target (Tty/Display/Unknown,
+/// e.g. `pam_systemd.so` missing or ordered after `pam_tessera.so`).
+///
+/// Dropping the action here would leave the engineer logged in with the
+/// authorising token unplugged — the exact access the USB-removal policy
+/// exists to revoke. Instead we escalate to an `error` diagnostic and
+/// reboot the host: this destroys the session just like the fail-closed
+/// mechanism used by [`OnUsbRemoved::Shutdown`], but the workstation comes
+/// back up to the login screen rather than staying powered off. The operator
+/// still gets the PAM-stack tip so the root misconfiguration
+/// (`XDG_SESSION_ID` absent during `pam_sm_open_session`) can be corrected.
+async fn fail_closed_no_logind_id(
+    actions: &Arc<dyn LogindActionsTrait>,
+    action: &str,
+    session: &crate::registry::ActiveSession,
+) -> anyhow::Result<()> {
+    tracing::error!(
         target: "tessera.monitord",
         action,
         session_id = %session.session_id,
         target = ?session.target,
         pam_user = %session.pam_user,
         pam_service = %session.pam_service,
-        "USB-removal action dropped: session has no logind id"
+        "ALERT: USB-removal {action} has no logind id; failing closed with reboot"
     );
     tracing::info!(
         target: "tessera.monitord",
@@ -98,6 +103,7 @@ fn log_missing_logind_id(action: &str, session: &crate::registry::ActiveSession)
          (see docs/install.md §10)",
         service = session.pam_service,
     );
+    actions.reboot().await
 }
 
 fn run_hook(

@@ -37,7 +37,15 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
     //    script that touches a marker file.
     let usb_tmp = stage_mount("leaf_rsa.p12", false);
 
-    let work = tempfile::tempdir().unwrap();
+    // The hook executor canonicalizes the script path and rejects it if the
+    // file or ANY canonical ancestor directory is world-writable (S_IWOTH).
+    // The system temp dir is 1777 on Linux, so a script under /tmp would be
+    // refused by that pre-exec security walk. CARGO_TARGET_TMPDIR lives under
+    // the build tree (target/tmp) whose ancestors are the checkout, owned by
+    // the build user and not world-writable, so a hook placed here passes the
+    // walk. tempfile creates the subdir 0o700 (neither group- nor
+    // world-writable), which the check also accepts.
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let marker = work.path().join("hook.log");
     let script = work.path().join("hook.sh");
     std::fs::write(

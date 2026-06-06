@@ -148,6 +148,28 @@ fn fixture_with_anchor_and_sig_algs(anchor: &Path, algs: &[&str]) -> String {
 }
 
 #[test]
+fn empty_sig_alg_list_falls_back_to_safe_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    // The fixture sets `allowed_signature_algorithms = []`. An empty list must
+    // NOT become an empty whitelist (which pre-validate treats as "accept any
+    // algorithm, including SHA-1"); it must be replaced by a safe default set.
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let raw: RawConfig = toml::from_str(&fixture_with_anchor(&anchor))?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    let algs = &v.trust.allowed_signature_algorithms;
+    assert!(
+        !algs.is_empty(),
+        "empty config must not yield an empty (accept-all) whitelist"
+    );
+    assert!(algs.contains("sha256WithRSAEncryption"));
+    assert!(
+        !algs.iter().any(|a| a.contains("sha1") || a.contains("SHA1")),
+        "default whitelist must not admit SHA-1: {algs:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn validated_config_needs_gost_false_when_empty() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
