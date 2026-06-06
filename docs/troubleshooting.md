@@ -52,8 +52,8 @@ openssl x509 -in /etc/tessera/<atm>.pem -noout -text \
     | grep -A1 '2\.25\.183976554325829274683049824615098'
 ```
 
-**Фикс:** перевыпустить cert через `issue-service-cert.sh` (admin-tools
-tarball) с правильным `host_id_hash`. **НЕ** считать hash вручную
+**Фикс:** перевыпустить cert CA-инструментом
+с правильным `host_id_hash`. **НЕ** считать hash вручную
 через `sha256sum /etc/machine-id` — source-of-truth определяется
 развёрнутым `[host_identity].sources`. См.
 [architecture.md](architecture.md#host-identity-chain).

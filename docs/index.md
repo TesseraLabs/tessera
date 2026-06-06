@@ -27,7 +27,7 @@
    `pam_cert_host_binding`, `pam_cert_user_binding`,
    `pam_cert_max_integrity`, сценарии выпуска.
 2. [clone-image.md §6](clone-image.md) — CA-сторона clone-image
-   workflow (admin-tools tarball, выпуск per-host).
+   workflow (выпуск per-host).
 
 ### Безопасник
 
@@ -57,7 +57,7 @@
   на production.
 - `[fly_dm_greeter].update_wallpaper` — впечатать `host_id` в JPG-фон
   fly-dm.
-- Admin-tools tarball отдельно от `.deb` (GitHub Release).
+- CA-инструменты вынесены из `.deb` (поставляются отдельно).
 
 См. [changelog.md](changelog.md).
 

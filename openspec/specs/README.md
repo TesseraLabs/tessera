@@ -34,7 +34,7 @@ Bootstrap-спеки текущей реализации **v0.3.19** (main @ 916
 ### Astra / fleet
 | [mac-integrity](mac-integrity/spec.md) | МКЦ: потолок из серта, min(cert, МНКЦ), libpdp FFI |
 | [fly-dm-greeter](fly-dm-greeter/spec.md) | Wallpaper banner (3 pivot'а) |
-| [clone-image-bootstrap](clone-image-bootstrap/spec.md) | override-bootstrap, finish-bootstrap.sh, admin-tools |
+| [clone-image-bootstrap](clone-image-bootstrap/spec.md) | override-bootstrap, finish-bootstrap.sh, CA-контракт |
 | [pam-integration](pam-integration/spec.md) | Режимы, parsec_mac/two-include ordering, postinst |
 | [build-release](build-release/spec.md) | CI matrix, packaging, тестовые gap'ы |
 
@@ -50,7 +50,7 @@ Security-класс:
 Функциональный класс:
 6. `pkcs12_pin_prompt` — мёртвый конфиг; `monitor.idle_timeout/max_connections` не доходят до accept-loop; `[logging]` демоном игнорируется; re-mount в open_session обещан комментарием, не реализован; sticky mount при crash (нет startup-cleanup).
 
-Docs-класс: configuration.md (17 расхождений), architecture.md (PROTOCOL_VERSION, коды ошибок, monitord fail-closed), clone-image.md (интерфейс admin-tools), mac-integrity.md (default cert_integrity).
+Docs-класс: configuration.md (17 расхождений), architecture.md (PROTOCOL_VERSION, коды ошибок, monitord fail-closed), mac-integrity.md (default cert_integrity).
 
 Testing-класс: ГОСТ E2E, реальный parsec, hook-security, release-профиль — не покрыты CI (см. [build-release](build-release/spec.md)).
 
