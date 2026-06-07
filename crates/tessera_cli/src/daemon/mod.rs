@@ -13,6 +13,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod singleton;
+use singleton::{DaemonLock, LockError};
+
 use clap::Args;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -191,6 +194,50 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         .suspend_grace_seconds
         .unwrap_or(monitor_cfg.suspend_grace.as_secs());
 
+    // Singleton-защита: захватываем эксклюзивный flock(2) на daemon.lock
+    // ДО загрузки реестра и привязки сокета. Так второй экземпляр демона
+    // (ручной запуск рядом с systemd-юнитом либо двойной старт из-за ошибки
+    // оператора) отвалится здесь, а не позже — когда уже начал бы бороться
+    // за тот же сокет, файл состояния и enforcement-канал.
+    //
+    // Замок кладётся рядом с файлом состояния; каталог создаётся при
+    // необходимости (демон может стартовать раньше tmpfiles.d); фолбэк
+    // /var/lib/tessera/daemon.lock — для патологического случая пути без
+    // родителя. `lock_path` вычисляем ДО `RegistryStore::new`, который
+    // забирает `state_file_path` во владение.
+    let lock_path = state_file_path.parent().map_or_else(
+        || PathBuf::from("/var/lib/tessera/daemon.lock"),
+        |dir| dir.join("daemon.lock"),
+    );
+    if let Some(lock_dir) = lock_path.parent() {
+        std::fs::create_dir_all(lock_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "не удалось создать каталог для daemon.lock: {} ({e})",
+                lock_dir.display()
+            )
+        })?;
+    }
+    let daemon_lock = match DaemonLock::acquire(&lock_path) {
+        Ok(lock) => lock,
+        Err(LockError::AlreadyHeld { path, pid }) => {
+            tracing::error!(
+                target: "tessera.daemon.singleton",
+                event = "daemon_already_running",
+                lock_path = %path.display(),
+                conflicting_pid = ?pid,
+                audit_level = "CRITICAL",
+                "another tessera daemon already holds the singleton lock; refusing to start"
+            );
+            return Err(LockError::AlreadyHeld { path, pid }.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    tracing::info!(
+        target: "tessera.daemon.singleton",
+        lock_path = %daemon_lock.path().display(),
+        "acquired daemon singleton lock"
+    );
+
     let store = RegistryStore::new(state_file_path);
     let initial = store.load().unwrap_or_default();
     let registry = SessionRegistry::from_snapshot(initial);
@@ -345,6 +392,16 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         handles.push(h);
     }
     shutdown::graceful_finish(handles, Duration::from_secs(5), &socket_path).await;
+
+    // Удерживаем singleton-замок живым до самого конца run_async. `daemon_lock`
+    // не помечен `_`, чтобы компилятор не вздумал считать его временным и
+    // уронить раньше времени: Drop у `Flock` отпускает kernel-held flock, и
+    // ранний дроп открыл бы окно, в котором второй демон смог бы стартовать
+    // ещё до завершения graceful-shutdown первого. Эта строка — нагруженная
+    // привязка: ссылаемся на замок здесь, чтобы зафиксировать его время жизни.
+    // Имя `_lock_kept_alive` (а не `let _ = …`) обязательно: `DaemonLock`
+    // помечен `#[must_use]`, и non-binding `let _` уронил бы значение сразу.
+    let _lock_kept_alive = &daemon_lock;
 
     // Reference unused symbols to silence dead-code in the binary build.
     let _ = registry::ActiveSession {
