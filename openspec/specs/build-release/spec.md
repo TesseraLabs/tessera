@@ -49,7 +49,7 @@ CI ДОЛЖЕН (MUST) проверять `Cargo.toml` workspace version == `deb
 
 ### Requirement: Тестовое покрытие (evidence)
 
-Тестовый набор ДОЛЖЕН (MUST) включать 362 объявленных теста (core 253 / cli 66 / proto 27 / pam 16). Negative PAM-flow на фикстурах в CI: wrong-PIN→MAXTRIES, subject mismatch, revoked (±CRL), expired; happy-path RSA/ECDSA p12.
+Тестовый набор ДОЛЖЕН (MUST) покрывать negative PAM-flow на фикстурах в CI: wrong-PIN→MAXTRIES, subject mismatch, revoked (±CRL), expired; happy-path RSA/ECDSA p12. (Информативно: на момент bootstrap спеки — ~360 тестов across core/cli/proto/pam; точное число дрейфует и не нормируется.)
 
 #### Scenario: Negative PAM-flow в CI
 - **WHEN** прогоняется CI
@@ -61,17 +61,14 @@ CI ДОЛЖЕН (MUST) проверять `Cargo.toml` workspace version == `deb
 3. Полный flow с реальным USB/токеном (`#[ignore]`, ручной runbook `tests/scripts/install-and-test.sh`).
 4. Hook-security инварианты (no_new_privs/uid-drop/fd-leak) — `#[ignore]` из-за RLIMIT_NPROC на GH-раннерах.
 5. Release-профиль тестов (nightly workflow упомянут в комментарии, не существует).
-6. Lint-гейт (clippy/cargo-deny/audit) на main отсутствует — живёт на неслитой ветке `fix/daemon-singleton-and-audit-trail` (37 коммитов, кандидат на ревью).
-7. vagrant/README ссылается на test-happy/negative/gost/setup-mof-n скрипты — их НЕТ в репо (фантом; реально только test-mac.sh, bench-mac.sh).
+6. vagrant/README ссылается на test-happy/negative/gost скрипты — их НЕТ в репо (фантом; реально только test-mac.sh, bench-mac.sh). Там же упоминание `setup-mof-n-scenario.sh` и mof-n box — мёртвая функциональность (M-of-N выпилен в 0.3.0), README ждёт чистки.
 
-### Requirement: Гигиена репозитория (зафиксированные хвосты)
+### Requirement: Lint-гейт
 
-Репозиторий ДОЛЖЕН (MUST) быть очищен от зафиксированных хвостов:
+CI ДОЛЖЕН (MUST) гонять на каждом push/PR в main workflow `lint.yml`: `cargo clippy --workspace --all-targets -- -D warnings` (toolchain из rust-toolchain.toml) и supply-chain job (`cargo deny check` по deny.toml + `cargo audit`).
 
-- `CertAuth-scopes-mofn/` — осиротевший сломанный worktree со старым снапшотом M-of-N; кандидат на удаление.
-- `fix/usb-p12-asn1-fallback` — стало (26 коммитов позади main, фичи давно в main); мусор.
-- Реальный кандидат на перенос — `fix/daemon-singleton-and-audit-trail` (lint workflow, unsafe-hardening, zbus 5). Требует решения человека.
+Линт linux-only кода (`#[cfg(target_os = "linux")]` модули pam_tessera) проверяется ТОЛЬКО CI — локальный clippy на macOS эти модули не видит.
 
-#### Scenario: Осиротевший worktree
-- **WHEN** в репозитории присутствует `CertAuth-scopes-mofn/` или устаревшая ветка `fix/usb-p12-asn1-fallback`
-- **THEN** они помечаются кандидатами на удаление как мусор
+#### Scenario: PR с clippy-warning
+- **WHEN** PR вносит код с clippy-предупреждением (включая linux-only модули)
+- **THEN** job `clippy` падает (`-D warnings`), PR не мержится
