@@ -216,23 +216,33 @@ impl EngineHandle {
             ));
         };
 
-        // Helper: run an ENGINE_ctrl_cmd_string and convert non-1 return
-        // into LoadFailed.  We close over `raw` and `_guard` by reference;
-        // any failure must drop the engine before returning.
-        //
-        // SAFETY: every pointer passed to `ENGINE_ctrl_cmd_string` below
-        // is a valid NUL-terminated string from a `CString` whose lifetime
-        // outlives the call; `raw` is a valid ENGINE handle we hold a
-        // reference to.
-        let cmd_results = unsafe {
-            let r1 = ENGINE_ctrl_cmd_string(raw.as_ptr(), so_path_cmd.as_ptr(), path_c.as_ptr(), 0);
+        // Run the SO_PATH/ID/LOAD ctrl sequence, stopping at the first
+        // non-1 return.  We close over `raw` and `_guard` by reference;
+        // any failure must drop the engine before returning.  Each
+        // ENGINE_ctrl_cmd_string call gets its own `unsafe` block.
+        let cmd_results = {
+            // SAFETY: `so_path_cmd`/`path_c` are valid NUL-terminated
+            // strings from `CString`s outliving the call; `raw` is a valid
+            // ENGINE handle we hold a reference to.
+            let r1 = unsafe {
+                ENGINE_ctrl_cmd_string(raw.as_ptr(), so_path_cmd.as_ptr(), path_c.as_ptr(), 0)
+            };
             let r2 = if r1 == 1 {
-                ENGINE_ctrl_cmd_string(raw.as_ptr(), id_cmd.as_ptr(), id_c.as_ptr(), 0)
+                // SAFETY: `id_cmd`/`id_c` are valid NUL-terminated strings
+                // from `CString`s outliving the call; `raw` is a valid
+                // ENGINE handle we hold a reference to.
+                unsafe { ENGINE_ctrl_cmd_string(raw.as_ptr(), id_cmd.as_ptr(), id_c.as_ptr(), 0) }
             } else {
                 0
             };
             let r3 = if r2 == 1 {
-                ENGINE_ctrl_cmd_string(raw.as_ptr(), load_cmd.as_ptr(), std::ptr::null(), 0)
+                // SAFETY: `load_cmd` is a valid NUL-terminated string from a
+                // `CString` outliving the call; the value argument is NULL
+                // as the LOAD command expects; `raw` is a valid ENGINE
+                // handle we hold a reference to.
+                unsafe {
+                    ENGINE_ctrl_cmd_string(raw.as_ptr(), load_cmd.as_ptr(), std::ptr::null(), 0)
+                }
             } else {
                 0
             };
@@ -299,12 +309,18 @@ impl Drop for EngineHandle {
         // mutex.
         let _guard = LOAD_MUTEX.lock();
 
+        // The matching pair of (`ENGINE_finish`, `ENGINE_free`) releases the
+        // functional and structural references taken in the constructors;
+        // each call gets its own `unsafe` block.
+        //
         // SAFETY: `self.raw` is a valid ENGINE handle that we initialised;
-        // the matching pair of (`ENGINE_finish`, `ENGINE_free`) releases
-        // the functional and structural references taken in the
-        // constructors.
+        // `ENGINE_finish` releases the functional reference.
         unsafe {
             let _ = ENGINE_finish(self.raw.as_ptr());
+        }
+        // SAFETY: `self.raw` is a valid ENGINE handle; `ENGINE_free`
+        // releases the structural reference taken in the constructor.
+        unsafe {
             let _ = ENGINE_free(self.raw.as_ptr());
         }
     }

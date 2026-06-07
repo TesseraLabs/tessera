@@ -1489,6 +1489,8 @@ fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
     clippy::unwrap_used,
     clippy::err_expect,
     clippy::panic,
+    clippy::panic_in_result_fn,
+    clippy::indexing_slicing,
     clippy::duration_suboptimal_units
 )]
 mod tests {

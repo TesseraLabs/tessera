@@ -5,7 +5,12 @@
 //! these into [`run_startup_checks`]; the tests drive each helper
 //! independently with deterministic injected inputs.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::fs;
 use std::io::Write;

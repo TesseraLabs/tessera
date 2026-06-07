@@ -177,16 +177,14 @@ impl HookExecutor for ForkExecExecutor {
         let groups_box: Box<[libc::gid_t]> = build_groups_box(user_info.as_ref());
 
         // Step 3: build argv.
-        if hook.command.is_empty() {
-            return Err(HookError::CommandUnusable {
-                path: std::path::PathBuf::new(),
-            });
-        }
+        let command0 = hook.command.first().ok_or(HookError::CommandUnusable {
+            path: std::path::PathBuf::new(),
+        })?;
         // Reject a hook executable (or any directory on its path) that a
         // local user could rewrite before it runs as root. Done in the
         // parent, before fork, exactly where sudo/ssh do their pre-exec
         // permission walk.
-        check_exec_path_security(Path::new(&hook.command[0]))?;
+        check_exec_path_security(Path::new(command0))?;
 
         let mut argv_cstrings: Vec<CString> = Vec::with_capacity(hook.command.len());
         for arg in &hook.command {
@@ -221,8 +219,8 @@ impl HookExecutor for ForkExecExecutor {
         let err_w = stderr_pipe_w.into_raw_fd();
 
         // Compute basename for log tagging.
-        let basename = Path::new(&hook.command[0]).file_name().map_or_else(
-            || hook.command[0].clone(),
+        let basename = Path::new(command0).file_name().map_or_else(
+            || command0.clone(),
             |s| s.to_string_lossy().into_owned(),
         );
 
@@ -250,10 +248,16 @@ impl HookExecutor for ForkExecExecutor {
             Err(e) => Err(HookError::Fork(e)),
             Ok(ForkResult::Child) => {
                 // Close our copies of read ends; child only needs write ends.
-                // SAFETY: child path; close is async-signal-safe.
+                // SAFETY: child path; close is async-signal-safe; out_r is a
+                // valid pipe read end inherited from the parent.
                 #[allow(unsafe_code)]
                 unsafe {
                     libc::close(out_r);
+                }
+                // SAFETY: child path; close is async-signal-safe; err_r is a
+                // valid pipe read end inherited from the parent.
+                #[allow(unsafe_code)]
+                unsafe {
                     libc::close(err_r);
                 }
                 // Hand off to child_setup. Never returns. The `groups_box`
@@ -324,10 +328,14 @@ fn supervise_parent(args: SuperviseArgs) -> Result<HookOutcome, HookError> {
     } = args;
 
     // Close write ends; spawn readers; supervise.
-    // SAFETY: out_w/err_w are pipe write ends owned by parent.
+    // SAFETY: out_w is a pipe write end owned by the parent.
     #[allow(unsafe_code)]
     unsafe {
         libc::close(out_w);
+    }
+    // SAFETY: err_w is a pipe write end owned by the parent.
+    #[allow(unsafe_code)]
+    unsafe {
         libc::close(err_w);
     }
 
@@ -342,13 +350,17 @@ fn supervise_parent(args: SuperviseArgs) -> Result<HookOutcome, HookError> {
     let stderr_handle = spawn_reader("tessera.hook.stderr", Arc::clone(&stderr_state))?;
 
     // Best-effort: ensure pgid == child pid (race with child's setpgid).
-    let _ = nix::unistd::setpgid(child, child);
+    // An error here means the child already won the race (or exited), which
+    // is harmless — the result is intentionally ignored.
+    let _setpgid = nix::unistd::setpgid(child, child);
 
     let wait_outcome = wait_with_timeout(child, child, timeout)?;
 
-    // After child exits, write ends are closed; readers see EOF.
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
+    // After child exits, write ends are closed; readers see EOF. A panicked
+    // reader thread is surfaced via its drained line count, not here, so the
+    // join result is intentionally ignored.
+    drop(stdout_handle.join());
+    drop(stderr_handle.join());
 
     let stdout_lines = stdout_state.lock().map_or(0, |g| g.line_count());
     let stderr_lines = stderr_state.lock().map_or(0, |g| g.line_count());
@@ -398,7 +410,10 @@ fn spawn_reader(
         .name(name.to_string())
         .spawn(move || {
             if let Ok(mut g) = state.lock() {
-                let _ = g.drain();
+                // Drain to EOF; a read error just ends the drain early and is
+                // reflected in the line count, so the result is intentionally
+                // ignored here.
+                drop(g.drain());
             }
         })
         .map_err(|_| HookError::ChildSetup {
@@ -413,7 +428,8 @@ mod tests {
 
     #[test]
     fn executor_constructs_via_new() {
-        let _ = ForkExecExecutor::new();
+        let exec = ForkExecExecutor::new();
+        let _ = exec;
     }
 
     #[test]
@@ -499,6 +515,8 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o770))
             .expect("chmod group-writable");
 
+        // SAFETY: getegid is always successful and async-signal-safe; called
+        // here in a single-threaded test on the parent side.
         #[allow(unsafe_code)]
         let egid = unsafe { libc::getegid() } as u32;
         let gid = std::fs::metadata(&hook).expect("stat").gid();

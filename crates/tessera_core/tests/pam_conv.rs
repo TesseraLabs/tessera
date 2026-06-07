@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unnecessary_wraps)] // mocks must match the trait signature
+#![allow(clippy::panic_in_result_fn)]
 
 use tessera_core::pam_conv::{prompt_pin_via_callback, PamConvError};
 use secrecy::ExposeSecret;

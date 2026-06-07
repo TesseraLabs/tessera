@@ -22,8 +22,10 @@ pub fn verify_chain_signatures(chain: &[Certificate]) -> Result<(), TrustError> 
     }
 
     for (depth, pair) in chain.windows(2).enumerate() {
-        let child = &pair[0];
-        let parent = &pair[1];
+        // `windows(2)` всегда отдаёт срез ровно из двух элементов.
+        let [child, parent] = pair else {
+            return Err(TrustError::PathBuild("internal: bad window"));
+        };
         let pk = parent.public_key()?;
         let ok = child.x509().verify(&pk).map_err(TrustError::Openssl)?;
         if !ok {

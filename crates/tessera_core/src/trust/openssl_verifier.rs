@@ -215,6 +215,9 @@ impl OpensslVerifier {
         let end_entity = end_entity_ref.clone();
         let anchor = anchor_ref.clone();
         // intermediates: chain[1..len-1]
+        // Ветка достижима только при chain.len() > 2, поэтому диапазон
+        // 1..len-1 всегда в границах.
+        #[allow(clippy::indexing_slicing)]
         let middle: Vec<Certificate> = if chain.len() > 2 {
             chain[1..chain.len() - 1].to_vec()
         } else {

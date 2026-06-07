@@ -155,6 +155,9 @@ pub fn is_available() -> bool {
 /// "can we run GOST tests now?".
 #[must_use]
 pub fn is_available_after_attempt(path: Option<&Path>) -> bool {
+    // Ошибку загрузки намеренно отбрасываем: на этом гейте важен только
+    // итоговый булев ответ is_available() (см. док-комментарий выше).
+    #[allow(clippy::let_underscore_must_use)]
     let _ = ensure_loaded_with_path(path);
     is_available()
 }

@@ -29,3 +29,4 @@ CertAuth-scopes-mofn/
 # Local working notes — not for the repo
 docs/superpowers/plans/
 notes/bootstrap-notes/
+/target-linux/

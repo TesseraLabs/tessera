@@ -170,6 +170,8 @@ fn resolved(source_kind: HostIdSourceKind, raw: String, normalized: String) -> R
     let hash = Sha256::digest(normalized.as_bytes());
     let mut hash_hex = String::with_capacity(64);
     for byte in hash {
+        // Запись в String инфаллибельна, результат игнорируем намеренно.
+        #[allow(clippy::let_underscore_must_use)]
         let _ = write!(hash_hex, "{byte:02x}");
     }
     ResolvedHostId {
@@ -181,7 +183,7 @@ fn resolved(source_kind: HostIdSourceKind, raw: String, normalized: String) -> R
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::config::validated::HostIdFallback;

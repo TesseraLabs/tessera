@@ -58,7 +58,7 @@ unsafe extern "C" fn auth_context_cleanup(
         return;
     }
     // SAFETY: caller contract — `data` came from `Box::into_raw`.
-    let _ = Box::from_raw(data.cast::<AuthContext>());
+    drop(unsafe { Box::from_raw(data.cast::<AuthContext>()) });
 }
 
 /// Errors raised by [`set_auth_context`] / [`get_auth_context`].
@@ -90,12 +90,14 @@ pub unsafe fn set_auth_context(
     let raw = Box::into_raw(boxed).cast::<c_void>();
     // SAFETY: `pamh` is live; `raw` is owned by PAM after this call —
     // the cleanup callback `auth_context_cleanup` will free it.
-    let rc = pam_set_data(pamh, key.as_ptr(), raw, Some(auth_context_cleanup));
+    let rc = unsafe { pam_set_data(pamh, key.as_ptr(), raw, Some(auth_context_cleanup)) };
     if rc == PAM_SUCCESS {
         Ok(())
     } else {
         // PAM didn't take ownership; drop the box ourselves.
-        let _ = Box::from_raw(raw.cast::<AuthContext>());
+        // SAFETY: `raw` came from `Box::into_raw` above and PAM did not
+        // adopt it (non-success rc), so we reclaim sole ownership here.
+        drop(unsafe { Box::from_raw(raw.cast::<AuthContext>()) });
         Err(DataHandleError::PamRc(rc))
     }
 }
@@ -114,11 +116,11 @@ pub unsafe fn get_auth_context<'a>(pamh: *mut pam_sys::pam_handle_t) -> Option<&
     let key = CString::new(DATA_KEY).ok()?;
     let mut data_ptr: *const c_void = std::ptr::null();
     // SAFETY: `pamh` is live; `data_ptr` is a valid out-pointer.
-    let rc = pam_get_data(pamh.cast_const(), key.as_ptr(), &raw mut data_ptr);
+    let rc = unsafe { pam_get_data(pamh.cast_const(), key.as_ptr(), &raw mut data_ptr) };
     if rc != PAM_SUCCESS || data_ptr.is_null() {
         return None;
     }
     // SAFETY: contract — the only setter is `set_auth_context`, which
     // stores a `Box<AuthContext>`; PAM hands the same pointer back here.
-    Some(&*data_ptr.cast::<AuthContext>())
+    Some(unsafe { &*data_ptr.cast::<AuthContext>() })
 }

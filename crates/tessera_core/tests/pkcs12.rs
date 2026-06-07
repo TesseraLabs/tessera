@@ -1,6 +1,7 @@
 #![allow(missing_docs)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
+#![allow(clippy::indexing_slicing)]
 
 use tessera_core::pkcs12::{
     validate_p12_envelope, LoadedKeyMaterial, P12EnvelopeError, Pkcs12Error,
