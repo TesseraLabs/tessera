@@ -91,7 +91,7 @@ pub struct ValidatedConfig {
 /// (local hostname).
 #[derive(Debug, Clone)]
 pub struct FlyDmGreeterSection {
-    /// When true, the daemon bakes the host_id banner into the fly-dm
+    /// When true, the daemon bakes the `host_id` banner into the fly-dm
     /// wallpaper on start. Default false (opt-in, Astra-specific).
     pub update_wallpaper: bool,
     /// Absolute path to the wallpaper image written by the daemon
@@ -507,45 +507,45 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
     }
 }
 
+fn fly_dm_absolute_path(
+    field: &str,
+    value: Option<&String>,
+    default: PathBuf,
+) -> Result<PathBuf, Error> {
+    match value {
+        Some(p) => {
+            let pb = PathBuf::from(p);
+            if !pb.is_absolute() {
+                return Err(Error::ConfigInvalid {
+                    reason: format!(
+                        "fly_dm_greeter.{field} must be absolute (got {})",
+                        pb.display()
+                    ),
+                });
+            }
+            Ok(pb)
+        }
+        None => Ok(default),
+    }
+}
+
 fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeterSection, Error> {
     let defaults = FlyDmGreeterSection::default();
     let Some(raw) = raw else {
         return Ok(defaults);
     };
 
-    fn absolute_path(
-        field: &str,
-        value: Option<&String>,
-        default: PathBuf,
-    ) -> Result<PathBuf, Error> {
-        match value {
-            Some(p) => {
-                let pb = PathBuf::from(p);
-                if !pb.is_absolute() {
-                    return Err(Error::ConfigInvalid {
-                        reason: format!(
-                            "fly_dm_greeter.{field} must be absolute (got {})",
-                            pb.display()
-                        ),
-                    });
-                }
-                Ok(pb)
-            }
-            None => Ok(default),
-        }
-    }
-
-    let wallpaper_target = absolute_path(
+    let wallpaper_target = fly_dm_absolute_path(
         "wallpaper_target",
         raw.wallpaper_target.as_ref(),
         defaults.wallpaper_target,
     )?;
-    let wallpaper_backup = absolute_path(
+    let wallpaper_backup = fly_dm_absolute_path(
         "wallpaper_backup",
         raw.wallpaper_backup.as_ref(),
         defaults.wallpaper_backup,
     )?;
-    let wallpaper_font = absolute_path(
+    let wallpaper_font = fly_dm_absolute_path(
         "wallpaper_font",
         raw.wallpaper_font.as_ref(),
         defaults.wallpaper_font,
@@ -594,24 +594,24 @@ fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeter
     })
 }
 
-fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
-    let s = s.strip_prefix('#')?;
-    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+fn parse_hex_color(input: &str) -> Option<[u8; 4]> {
+    let hex = input.strip_prefix('#')?;
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    match s.len() {
+    match hex.len() {
         6 => {
-            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-            Some([r, g, b, 255])
+            let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some([red, green, blue, 255])
         }
         8 => {
-            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-            let a = u8::from_str_radix(&s[6..8], 16).ok()?;
-            Some([r, g, b, a])
+            let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let alpha = u8::from_str_radix(&hex[6..8], 16).ok()?;
+            Some([red, green, blue, alpha])
         }
         _ => None,
     }

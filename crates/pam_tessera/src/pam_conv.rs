@@ -162,7 +162,7 @@ pub unsafe fn prompt_pin(
 /// Emit a `PAM_TEXT_INFO` message to the live PAM conversation handle.
 ///
 /// Used by the flow to surface admin-actionable diagnostics on auth
-/// failures (e.g. the host_id_hash of the running machine when the cert
+/// failures (e.g. the `host_id_hash` of the running machine when the cert
 /// is bound to a different host) directly on the lock screen / terminal.
 ///
 /// Returns the conv response code if non-success; the caller treats this
@@ -173,6 +173,15 @@ pub unsafe fn prompt_pin(
 /// Same contract as [`prompt_pin`]: `pamh` must be the live handle from a
 /// `pam_sm_*` callback. Multi-line messages are passed verbatim — PAM
 /// modules / display managers handle wrapping.
+///
+/// # Errors
+///
+/// * [`PamConvError::NoConv`] — PAM did not return a `pam_conv` item.
+/// * [`PamConvError::ConvFailed`] — the message had an interior NUL or the
+///   conv callback returned non-success.
+///
+/// Callers treat both as best-effort: a failed info message MUST NOT change
+/// the auth verdict.
 pub unsafe fn show_info(pamh: *mut pam_sys::pam_handle_t, msg: &str) -> Result<(), PamConvError> {
     let mut conv_ptr: *const c_void = std::ptr::null();
     let rc = pam_get_item(pamh, PAM_CONV, &raw mut conv_ptr);

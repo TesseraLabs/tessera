@@ -15,6 +15,17 @@
 //! start from a pristine source even if an apt upgrade restored the
 //! stock image.
 
+// Пиксельная математика рендера: координаты и каналы ограничены размерами
+// изображения (< 2^23), потери точности/знака здесь невозможны по построению.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    clippy::manual_midpoint
+)]
+
 use std::fs;
 use std::io;
 use std::path::PathBuf;
