@@ -61,7 +61,7 @@ CI ДОЛЖЕН (MUST) проверять `Cargo.toml` workspace version == `deb
 3. Полный flow с реальным USB/токеном (`#[ignore]`, ручной runbook `tests/scripts/install-and-test.sh`).
 4. Hook-security инварианты (no_new_privs/uid-drop/fd-leak) — `#[ignore]` из-за RLIMIT_NPROC на GH-раннерах.
 5. Release-профиль тестов (nightly workflow упомянут в комментарии, не существует).
-6. vagrant/README ссылается на test-happy/negative/gost скрипты — их НЕТ в репо (фантом; реально только test-mac.sh, bench-mac.sh). Там же упоминание `setup-mof-n-scenario.sh` и mof-n box — мёртвая функциональность (M-of-N выпилен в 0.3.0), README ждёт чистки.
+6. Vagrant-риг покрывает только MAC-runtime (test-mac.sh, bench-mac.sh); E2E-скриптов текущего auth-flow в vagrant нет (старые test-happy/negative/gost были про выпиленный M-of-N `execute`; ручной runbook — `tests/scripts/install-and-test.sh`, см. п. 3).
 
 ### Requirement: Lint-гейт
 
