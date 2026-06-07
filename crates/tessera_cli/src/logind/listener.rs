@@ -72,7 +72,7 @@ mod linux_impl {
         let conn = match bus {
             BusAddress::System => zbus::Connection::system().await?,
             BusAddress::Custom(addr) => {
-                zbus::ConnectionBuilder::address(addr.as_str())?
+                zbus::connection::Builder::address(addr.as_str())?
                     .build()
                     .await?
             }
