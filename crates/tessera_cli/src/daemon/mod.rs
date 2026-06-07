@@ -149,10 +149,10 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
             std::path::PathBuf::from("/"),
         );
         match resolver.resolve() {
-            Ok(resolved) => {
+            Ok(host_identity) => {
                 match crate::fly_dm_wallpaper_writer::update(
                     &validated.fly_dm_greeter,
-                    &resolved,
+                    &host_identity,
                 ) {
                     Ok(outcome) => tracing::info!(
                         target: "tessera.fly_dm_greeter",

@@ -694,9 +694,9 @@ mod tests {
     /// Write a minimal config.toml under `dir` that sets host_identity.sources
     /// to `[source_kind]` and stubs the rest with sane defaults. Returns
     /// the path.
-    fn write_minimal_config(_dir: &Path, source_kind: &str) -> PathBuf {
-        let cfg_path = _dir.join("config.toml");
-        let anchor_path = _dir.join("anchor.pem");
+    fn write_minimal_config(dir: &Path, source_kind: &str) -> PathBuf {
+        let cfg_path = dir.join("config.toml");
+        let anchor_path = dir.join("anchor.pem");
         fs::write(
             &anchor_path,
             "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
