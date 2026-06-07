@@ -18,6 +18,8 @@ pub fn init() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .try_init()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let _ = INIT.set(());
+    // Идемпотентно: гонку с параллельным init разрешает сам OnceLock,
+    // проигравший просто игнорирует результат.
+    let _already_set = INIT.set(());
     Ok(())
 }

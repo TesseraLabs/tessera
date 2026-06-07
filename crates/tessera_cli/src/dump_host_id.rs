@@ -134,7 +134,8 @@ pub fn render_tsv(
     active_kind: Option<HostIdSourceKind>,
 ) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "# tessera host identity probe — {hostname} — {ts}");
+    // Запись в String инфаллибельна, fmt::Result игнорируем намеренно.
+    let _fmt = writeln!(out, "# tessera host identity probe — {hostname} — {ts}");
     out.push_str("# probes EVERY known source kind (not just [host_identity].sources).\n");
     out.push_str("# active_under_current_config=yes marks the source the daemon currently picks.\n");
     out.push_str(
@@ -145,7 +146,8 @@ pub fn render_tsv(
         let active = if active_kind == Some(p.source) { "yes" } else { "no" };
         match &p.outcome {
             Ok(r) => {
-                let _ = writeln!(
+                // Запись в String инфаллибельна, fmt::Result игнорируем намеренно.
+                let _fmt = writeln!(
                     out,
                     "{src}\tok\t{hash}\t{prefix}\t{raw}\t{norm}\t{active}\t-",
                     src = source,
@@ -156,7 +158,8 @@ pub fn render_tsv(
                 );
             }
             Err(reason) => {
-                let _ = writeln!(
+                // Запись в String инфаллибельна, fmt::Result игнорируем намеренно.
+                let _fmt = writeln!(
                     out,
                     "{src}\terr\t-\t-\t-\t-\t{active}\t{reason}",
                     src = source,
@@ -219,7 +222,8 @@ fn override_probe(override_value: Option<&str>) -> ProbeResult {
                 let digest = Sha256::digest(normalized.as_bytes());
                 let mut hash_hex = String::with_capacity(64);
                 for byte in digest {
-                    let _ = write!(hash_hex, "{byte:02x}");
+                    // Запись в String инфаллибельна, fmt::Result игнорируем намеренно.
+                    let _fmt = write!(hash_hex, "{byte:02x}");
                 }
                 ProbeResult {
                     source: kind,
@@ -330,7 +334,8 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644));
+        // Best-effort: на FS без unix-прав (FAT32 на USB) chmod не критичен.
+        drop(fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)));
     }
     fs::rename(&tmp, path)?;
     Ok(())
@@ -372,7 +377,8 @@ fn write_to_usb(dev: &UsbDevice, filename: &str, content: &str) -> Result<PathBu
         .map_err(|e| DumpError::Usb(format!("mkdir {}: {e}", base.display())))?;
     let mp = base.join(format!("mnt-{}", std::process::id()));
     if mp.exists() {
-        let _ = fs::remove_dir_all(&mp);
+        // Best-effort: подчищаем стухший mountpoint от прошлого запуска.
+        drop(fs::remove_dir_all(&mp));
     }
     fs::create_dir_all(&mp).map_err(|e| DumpError::Usb(format!("mkdir {}: {e}", mp.display())))?;
 
@@ -385,7 +391,8 @@ fn write_to_usb(dev: &UsbDevice, filename: &str, content: &str) -> Result<PathBu
         None::<&str>,
     )
     .map_err(|errno| {
-        let _ = fs::remove_dir(&mp);
+        // Best-effort: убираем пустой mountpoint после неудачного mount.
+        drop(fs::remove_dir(&mp));
         DumpError::Usb(format!(
             "mount {} ({fs}) at {}: {errno}",
             dev.devnode.display(),
@@ -413,7 +420,8 @@ fn write_to_usb(dev: &UsbDevice, filename: &str, content: &str) -> Result<PathBu
     let umount_res = umount(&mp).map_err(|e| {
         DumpError::Usb(format!("umount {}: {e}", mp.display()))
     });
-    let _ = fs::remove_dir(&mp);
+    // Best-effort: rmdir после umount, чтобы /run не накапливал mountpoint'ы.
+    drop(fs::remove_dir(&mp));
 
     write_res?;
     umount_res?;
@@ -505,7 +513,12 @@ pub fn run_cli(args: DumpHostIdArgs) -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use tessera_core::host_identity::chain::{ProbeResult, ResolvedHostId};

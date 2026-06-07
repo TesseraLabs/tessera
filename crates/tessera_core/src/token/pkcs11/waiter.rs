@@ -92,6 +92,7 @@ mod tests {
         clippy::expect_used,
         clippy::err_expect,
         clippy::panic,
+        clippy::panic_in_result_fn,
         clippy::unwrap_used
     )]
 

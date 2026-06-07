@@ -37,6 +37,9 @@ pub fn self_check(cfg: &ValidatedConfig) -> Result<(), SelfCheckError> {
         }
     }
     for hook in &cfg.hooks {
+        // `validate_hook` отвергает пустой command (EmptyCommand), поэтому
+        // в валидированном HookConfig первый элемент всегда присутствует.
+        #[allow(clippy::indexing_slicing)]
         let path = std::path::PathBuf::from(&hook.command[0]);
         if !path.exists() {
             return Err(SelfCheckError::HookCommandMissing {

@@ -35,11 +35,9 @@ pub(crate) struct Tlv<'a> {
 /// Returns [`TrustError::CertParse`] if the buffer is truncated or uses an
 /// unsupported (indefinite or > 4-byte) length form.
 pub(crate) fn read_tlv(input: &[u8]) -> Result<Tlv<'_>, TrustError> {
-    if input.len() < 2 {
+    let [tag, len_byte, ..] = *input else {
         return Err(TrustError::CertParse("der: header truncated".into()));
-    }
-    let tag = input[0];
-    let len_byte = input[1];
+    };
     let (len, header_len) = if len_byte & 0x80 == 0 {
         (usize::from(len_byte), 2)
     } else {
@@ -53,7 +51,10 @@ pub(crate) fn read_tlv(input: &[u8]) -> Result<Tlv<'_>, TrustError> {
             return Err(TrustError::CertParse("der: length truncated".into()));
         }
         let mut acc: usize = 0;
-        for &b in &input[2..2 + n_bytes] {
+        let len_bytes = input
+            .get(2..2 + n_bytes)
+            .ok_or_else(|| TrustError::CertParse("der: length truncated".into()))?;
+        for &b in len_bytes {
             acc = (acc << 8) | usize::from(b);
         }
         (acc, 2 + n_bytes)
@@ -61,14 +62,13 @@ pub(crate) fn read_tlv(input: &[u8]) -> Result<Tlv<'_>, TrustError> {
     let end = header_len
         .checked_add(len)
         .ok_or_else(|| TrustError::CertParse("der: length overflow".into()))?;
-    if input.len() < end {
-        return Err(TrustError::CertParse("der: value truncated".into()));
-    }
-    Ok(Tlv {
-        tag,
-        value: &input[header_len..end],
-        rest: &input[end..],
-    })
+    let value = input
+        .get(header_len..end)
+        .ok_or_else(|| TrustError::CertParse("der: value truncated".into()))?;
+    let rest = input
+        .get(end..)
+        .ok_or_else(|| TrustError::CertParse("der: value truncated".into()))?;
+    Ok(Tlv { tag, value, rest })
 }
 
 /// Reads a tag-checked TLV from `input`.
@@ -93,7 +93,9 @@ pub(crate) fn oid_to_dotted(content: &[u8]) -> Result<String, TrustError> {
     if content.is_empty() {
         return Err(TrustError::CertParse("der: empty oid".into()));
     }
-    let first = content[0];
+    let first = *content
+        .first()
+        .ok_or_else(|| TrustError::CertParse("der: empty oid".into()))?;
     let arc1 = u128::from(first / 40);
     let arc2 = u128::from(first % 40);
     let mut parts: Vec<u128> = Vec::with_capacity(8);
@@ -107,10 +109,9 @@ pub(crate) fn oid_to_dotted(content: &[u8]) -> Result<String, TrustError> {
     while i < content.len() {
         let mut value: u128 = 0;
         loop {
-            if i >= content.len() {
+            let Some(&b) = content.get(i) else {
                 return Err(TrustError::CertParse("der: truncated oid arc".into()));
-            }
-            let b = content[i];
+            };
             i += 1;
             // Detect overflow before the shift would lose high bits.
             if value > (u128::MAX >> 7) {

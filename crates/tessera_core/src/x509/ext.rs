@@ -54,11 +54,9 @@ pub(crate) fn key_usage_bit(cert: &X509, bit: u8) -> Result<bool, TrustError> {
         return Ok(false);
     };
     let bs = read_tlv_expect(&value, TAG_BIT_STRING)?;
-    if bs.value.is_empty() {
+    let Some((&unused, bytes)) = bs.value.split_first() else {
         return Ok(false);
-    }
-    let unused = bs.value[0];
-    let bytes = &bs.value[1..];
+    };
     if bytes.is_empty() {
         return Ok(false);
     }
@@ -74,7 +72,8 @@ pub(crate) fn key_usage_bit(cert: &X509, bit: u8) -> Result<bool, TrustError> {
         // bit is in the unused portion
         return Ok(false);
     }
-    Ok(bytes[byte_index] & mask != 0)
+    // `byte_index < bytes.len()` проверено выше, поэтому байт всегда есть.
+    Ok(bytes.get(byte_index).is_some_and(|b| b & mask != 0))
 }
 
 /// Parses the `basicConstraints` extension if present.

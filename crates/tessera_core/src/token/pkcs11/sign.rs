@@ -197,8 +197,9 @@ fn ecdsa_raw_to_der(raw: &[u8]) -> Result<Vec<u8>, CryptoError> {
         return Err(CryptoError::BadSignature);
     }
     let half = raw.len() / 2;
-    let r = BigNum::from_slice(&raw[..half])?;
-    let s = BigNum::from_slice(&raw[half..])?;
+    let (r_bytes, s_bytes) = raw.split_at(half);
+    let r = BigNum::from_slice(r_bytes)?;
+    let s = BigNum::from_slice(s_bytes)?;
     let sig = EcdsaSig::from_private_components(r, s)?;
     let der = sig.to_der()?;
     Ok(der)

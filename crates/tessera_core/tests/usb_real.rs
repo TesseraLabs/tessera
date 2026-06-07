@@ -9,6 +9,7 @@
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(clippy::indexing_slicing)]
 
 use tessera_core::usb::{wait_for_usb_devices, UsbError};
 use std::time::Duration;

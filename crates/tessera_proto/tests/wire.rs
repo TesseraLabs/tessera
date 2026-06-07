@@ -4,6 +4,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::missing_panics_doc,
+    clippy::indexing_slicing,
     clippy::pedantic
 )]
 

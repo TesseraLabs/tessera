@@ -94,6 +94,9 @@ impl IntegrityLabel {
             // encoding) but keep at least one byte.
             let bytes = self.categories.to_be_bytes();
             let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
+            // `start` гарантированно < 8 (position в массиве из 8 байт либо
+            // unwrap_or(7)), поэтому срез всегда в границах.
+            #[allow(clippy::indexing_slicing)]
             let payload = &bytes[start..];
             inner.push(0x03);
             inner.push(
@@ -115,63 +118,72 @@ impl IntegrityLabel {
     /// `Malformed` on bad tags/lengths, `LevelOutOfRange` if INTEGER не
     /// помещается в `i8`.
     pub fn from_der(der: &[u8]) -> Result<Self, LabelDerError> {
-        if der.len() < 2 || der[0] != 0x30 {
+        let [0x30, len_byte, ..] = *der else {
             return Err(LabelDerError::Malformed("not a SEQUENCE"));
-        }
-        let seq_len = usize::from(der[1]);
-        if 2 + seq_len > der.len() || der[1] & 0x80 != 0 {
+        };
+        let seq_len = usize::from(len_byte);
+        if 2 + seq_len > der.len() || len_byte & 0x80 != 0 {
             return Err(LabelDerError::Malformed("bad seq length"));
         }
         if 2 + seq_len != der.len() {
             return Err(LabelDerError::Malformed("trailing bytes after SEQUENCE"));
         }
-        let body = &der[2..2 + seq_len];
+        let body = der
+            .get(2..2 + seq_len)
+            .ok_or(LabelDerError::Malformed("bad seq length"))?;
         // INTEGER
-        if body.len() < 3 || body[0] != 0x02 {
+        let [0x02, int_len_byte, ..] = *body else {
+            return Err(LabelDerError::Malformed("missing INTEGER tag"));
+        };
+        if body.len() < 3 {
             return Err(LabelDerError::Malformed("missing INTEGER tag"));
         }
-        let int_len = usize::from(body[1]);
+        let int_len = usize::from(int_len_byte);
         if int_len == 0 || 2 + int_len > body.len() {
             return Err(LabelDerError::Malformed("bad INTEGER length"));
         }
-        let int_bytes = &body[2..2 + int_len];
-        if int_bytes.len() != 1 {
+        let int_bytes = body
+            .get(2..2 + int_len)
+            .ok_or(LabelDerError::Malformed("bad INTEGER length"))?;
+        let level = match int_bytes {
+            [b] => b.cast_signed(),
             // INTEGER не помещается в один байт → не помещается в i8.
-            return Err(LabelDerError::LevelOutOfRange);
-        }
-        let level = int_bytes[0].cast_signed();
+            _ => return Err(LabelDerError::LevelOutOfRange),
+        };
         // BIT STRING (optional, default empty)
         let after_int = 2 + int_len;
         let categories = if after_int == body.len() {
             0u64
         } else {
-            let bs = &body[after_int..];
-            if bs.len() < 2 || bs[0] != 0x03 {
+            let bs = body
+                .get(after_int..)
+                .ok_or(LabelDerError::Malformed("bad INTEGER length"))?;
+            let [0x03, bs_len_byte, ..] = *bs else {
                 return Err(LabelDerError::Malformed("missing BIT STRING tag"));
-            }
-            let bs_len = usize::from(bs[1]);
+            };
+            let bs_len = usize::from(bs_len_byte);
             if bs_len == 0 || 2 + bs_len > bs.len() {
                 return Err(LabelDerError::Malformed("bad BIT STRING length"));
             }
             if 2 + bs_len != bs.len() {
                 return Err(LabelDerError::Malformed("trailing bytes after BIT STRING"));
             }
-            let payload = &bs[2..2 + bs_len];
-            if payload.is_empty() {
-                return Err(LabelDerError::Malformed(
-                    "BIT STRING missing unused-bits byte",
-                ));
-            }
-            if payload[0] > 7 {
+            let payload = bs
+                .get(2..2 + bs_len)
+                .ok_or(LabelDerError::Malformed("bad BIT STRING length"))?;
+            let (&unused, bits) = payload
+                .split_first()
+                .ok_or(LabelDerError::Malformed("BIT STRING missing unused-bits byte"))?;
+            if unused > 7 {
                 return Err(LabelDerError::Malformed("BIT STRING unused-bits > 7"));
             }
-            // payload[0] = unused bits
-            let bits = &payload[1..];
             if bits.len() > 8 {
                 return Err(LabelDerError::Malformed("categories > 64 bits"));
             }
             let mut buf = [0u8; 8];
-            buf[8 - bits.len()..].copy_from_slice(bits);
+            buf.get_mut(8 - bits.len()..)
+                .ok_or(LabelDerError::Malformed("categories > 64 bits"))?
+                .copy_from_slice(bits);
             u64::from_be_bytes(buf)
         };
         // N3: emit Notice for >32-bit categories (see audit::emit_categories_above_32bit).

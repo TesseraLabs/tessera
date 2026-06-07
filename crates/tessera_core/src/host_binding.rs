@@ -92,6 +92,7 @@ pub fn sha256_hex(input: &str) -> String {
     let mut out = String::with_capacity(64);
     for b in digest {
         // write! into String never fails.
+        #[allow(clippy::let_underscore_must_use)]
         let _ = write!(out, "{b:02x}");
     }
     out

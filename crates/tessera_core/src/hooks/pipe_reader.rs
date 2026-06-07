@@ -144,7 +144,11 @@ impl PipeReader {
         match self.inner.get_mut().read(&mut buf) {
             Ok(0) => Ok(0),
             Ok(n) => {
-                self.process_chunk(&buf[..n]);
+                // `n` is the byte count returned by `read` into a 4096-byte
+                // buffer, so `n <= buf.len()`; `.get(..n)` never fails here.
+                if let Some(chunk) = buf.get(..n) {
+                    self.process_chunk(chunk);
+                }
                 Ok(n)
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
@@ -188,7 +192,10 @@ impl PipeReader {
         let already = self.bytes_ingested.saturating_sub(chunk.len());
         let remaining_budget = MAX_CAPTURED_BYTES.saturating_sub(already);
         let head_len = chunk.len().min(remaining_budget);
-        let head = &chunk[..head_len];
+        // `head_len = chunk.len().min(..)` so `head_len <= chunk.len()`;
+        // `.get(..head_len)` never fails. Empty slice on the impossible miss
+        // preserves behavior (nothing to emit).
+        let head = chunk.get(..head_len).unwrap_or(&[]);
 
         for byte in head {
             if *byte == b'\n' {
@@ -225,8 +232,10 @@ impl PipeReader {
     fn emit_line(&mut self, raw: &[u8]) {
         // Truncate if necessary.
         let truncated = raw.len() > MAX_LINE_BYTES;
+        // When `truncated`, `raw.len() > MAX_LINE_BYTES`, so `.get(..MAX_LINE_BYTES)`
+        // is in-bounds; fall back to the whole slice on the impossible miss.
         let slice: &[u8] = if truncated {
-            &raw[..MAX_LINE_BYTES]
+            raw.get(..MAX_LINE_BYTES).unwrap_or(raw)
         } else {
             raw
         };

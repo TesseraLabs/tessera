@@ -5,7 +5,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::missing_panics_doc,
-    clippy::pedantic
+    clippy::pedantic,
+    clippy::let_underscore_must_use
 )]
 
 use std::os::unix::fs::PermissionsExt;

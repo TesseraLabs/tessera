@@ -90,7 +90,7 @@ fn count_pem_blocks(bytes: &[u8]) -> usize {
     let mut n = 0;
     let mut i = 0;
     while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
+        if bytes.get(i..i + needle.len()) == Some(needle.as_slice()) {
             n += 1;
             i += needle.len();
         } else {

@@ -333,7 +333,9 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     let mut notify_handle = notify::NotifyHandle::system_default();
     notify::notify_ready(&mut notify_handle);
 
-    let _ = shutdown::install_signal_handlers(shutdown_tok.clone()).await;
+    // Результат не важен: к этому моменту токен уже отменён сигналом либо
+    // ошибкой установки обработчика, и дальше мы в любом случае гасим демон.
+    let _signal_wait = shutdown::install_signal_handlers(shutdown_tok.clone()).await;
 
     let mut handles = vec![accept_handle, state_handle, action_handle];
     if let Some(h) = udev_handle {

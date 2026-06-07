@@ -63,7 +63,9 @@ impl Write for &SyslogWriter {
         let line = String::from_utf8_lossy(buf);
         for piece in line.lines().filter(|l| !l.trim().is_empty()) {
             if let Ok(mut g) = self.inner.lock() {
-                let _ = g.info(piece.to_string());
+                // Запись в syslog — best-effort: сбой логирования не должен
+                // ломать поток PAM, результат намеренно игнорируем.
+                let _info = g.info(piece.to_string());
             }
         }
         Ok(buf.len())
