@@ -100,7 +100,8 @@ pub fn bind_with_label<B: MacBackend>(
     // Safe: tmp_path embeds our PID, so any leftover here is from a
     // prior aborted run of THIS process — never from a concurrent
     // observer. We deliberately drop the `if path.exists()` race.
-    let _ = std::fs::remove_file(&tmp_path);
+    // Best-effort: файла может не быть — это нормальный путь.
+    drop(std::fs::remove_file(&tmp_path));
 
     let listener = std::os::unix::net::UnixListener::bind(&tmp_path)?;
     // DAC: 0660 before publish so peers never observe a world-accessible
@@ -323,7 +324,9 @@ pub async fn serve_connection_with(
                     message: format!("idle timeout after {}s", idle_timeout.as_secs()),
                 })
                 .map_err(ServerError::Encode)?;
-                let _ = write.write_all(&bytes).await;
+                // Best-effort: соединение всё равно закрываем, ошибка записи
+                // финального ответа клиенту значения уже не имеет.
+                drop(write.write_all(&bytes).await);
                 return Ok(());
             }
         };
@@ -335,7 +338,9 @@ pub async fn serve_connection_with(
                     message: format!("frame exceeds {MAX_FRAME_BYTES} bytes"),
                 })
                 .map_err(ServerError::Encode)?;
-                let _ = write.write_all(&bytes).await;
+                // Best-effort: соединение всё равно закрываем, ошибка записи
+                // финального ответа клиенту значения уже не имеет.
+                drop(write.write_all(&bytes).await);
                 return Ok(());
             }
             FrameOutcome::Frame => {}
@@ -348,7 +353,9 @@ pub async fn serve_connection_with(
                     message: "frame is not valid UTF-8".into(),
                 })
                 .map_err(ServerError::Encode)?;
-                let _ = write.write_all(&bytes).await;
+                // Best-effort: соединение всё равно закрываем, ошибка записи
+                // финального ответа клиенту значения уже не имеет.
+                drop(write.write_all(&bytes).await);
                 return Ok(());
             }
         };
@@ -361,7 +368,9 @@ pub async fn serve_connection_with(
                     message: format!("{e}"),
                 })
                 .map_err(ServerError::Encode)?;
-                let _ = write.write_all(&bytes).await;
+                // Best-effort: соединение всё равно закрываем, ошибка записи
+                // финального ответа клиенту значения уже не имеет.
+                drop(write.write_all(&bytes).await);
                 return Ok(());
             }
         };

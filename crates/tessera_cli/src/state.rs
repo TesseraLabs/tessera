@@ -235,13 +235,15 @@ async fn handle_ipc(
 ) {
     match req {
         IpcRequest::Hello { reply } => {
-            let _ = reply.send(ServerMessage::HelloAck {
+            // Best-effort: если клиент уже отвалился, ответ слать некому.
+            drop(reply.send(ServerMessage::HelloAck {
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol_version: tessera_proto::PROTOCOL_VERSION,
-            });
+            }));
         }
         IpcRequest::Ping { reply } => {
-            let _ = reply.send(ServerMessage::Pong);
+            // Best-effort: клиент мог отключиться, ответ можно потерять.
+            drop(reply.send(ServerMessage::Pong));
         }
         IpcRequest::GetActiveSessionByUid { uid, reply } => {
             let msg = match registry.find_by_uid(uid) {
@@ -257,24 +259,27 @@ async fn handle_ipc(
                     message: format!("no active session for uid {uid}"),
                 },
             };
-            let _ = reply.send(msg);
+            // Best-effort: клиент мог отключиться, ответ можно потерять.
+            drop(reply.send(msg));
         }
         IpcRequest::SessionOpen { session, reply } => {
             // SessionOpen vs Remove race (T19): if the device was already
             // unplugged between PAM completing and us receiving, refuse.
             if let Some(serial) = session.usb_serial.as_deref() {
                 if !udev_query.is_serial_present(serial) {
-                    let _ = reply.send(ServerMessage::Error {
+                    // Best-effort: клиент мог отключиться, ответ можно потерять.
+                    drop(reply.send(ServerMessage::Error {
                         code: tessera_proto::error_codes::DEVICE_GONE,
                         message: format!("usb serial {serial} not present"),
-                    });
+                    }));
                     return;
                 }
             }
             let s = *session;
             registry.add(s);
             persist_async(&cfg.registry_store, registry.snapshot()).await;
-            let _ = reply.send(ServerMessage::Ack);
+            // Best-effort: клиент мог отключиться, ответ можно потерять.
+            drop(reply.send(ServerMessage::Ack));
         }
         IpcRequest::SessionClose {
             session_id,
@@ -291,7 +296,8 @@ async fn handle_ipc(
                 }
             }
             persist_async(&cfg.registry_store, registry.snapshot()).await;
-            let _ = reply.send(ServerMessage::Ack);
+            // Best-effort: клиент мог отключиться, ответ можно потерять.
+            drop(reply.send(ServerMessage::Ack));
         }
         IpcRequest::UpdateSessionTarget {
             session_id,
@@ -322,7 +328,8 @@ async fn handle_ipc(
                     message: format!("update_session_target {session_id}: {err}"),
                 },
             };
-            let _ = reply.send(msg);
+            // Best-effort: клиент мог отключиться, ответ можно потерять.
+            drop(reply.send(msg));
         }
     }
 }
@@ -364,10 +371,12 @@ fn handle_udev(
                     _ = tokio::time::sleep(grace) => {
                         tracing::info!(target: "tessera.monitord", serial = serial_for_log, "grace window expired, dispatching action");
                         for s in sessions {
-                            let _ = action_tx.send(ActionRequest::HandleUsbRemoved {
+                            // Best-effort: если приёмник действий уже закрыт,
+                            // демон всё равно завершается — терять нечего.
+                            drop(action_tx.send(ActionRequest::HandleUsbRemoved {
                                 session: s,
                                 action: action.clone(),
-                            });
+                            }));
                         }
                     }
                     _ = token.cancelled() => {

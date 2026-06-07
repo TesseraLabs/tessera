@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::doc_markdown)]
+#![allow(clippy::panic_in_result_fn)]
 
 use tessera_core::config::{RawConfig, ValidatedConfig};
 use tessera_core::Error;

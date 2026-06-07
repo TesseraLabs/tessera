@@ -140,7 +140,8 @@ mod tests {
                 );
             }
         }
-        // Restore limits where possible.
-        let _ = setrlimit(Resource::RLIMIT_NOFILE, cur.0, cur.1);
+        // Restore limits where possible; failure is harmless in a test, so
+        // the result is intentionally ignored.
+        let _restore = setrlimit(Resource::RLIMIT_NOFILE, cur.0, cur.1);
     }
 }

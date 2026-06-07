@@ -208,25 +208,38 @@ mod tests {
     /// process group so the test exercises the same `killpg` path used in
     /// production. We mem-forget the resulting `Child` to reap via our own
     /// `waitpid` calls.
+    #[allow(unsafe_code)] // test helper installs a `pre_exec` setpgid hook
     fn spawn_isolated_sh(script: &str) -> Pid {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.arg("-c").arg(script);
-        // SAFETY: pre_exec runs only in the child after fork, before exec.
-        // Calling setpgid is async-signal-safe.
-        #[allow(unsafe_code)]
+        // Defined in a safe context so its body is not lexically nested inside
+        // the `pre_exec` unsafe block below; the closure carries its own
+        // dedicated unsafe block for the single syscall it performs.
+        let set_own_pgid = || {
+            // SAFETY: setpgid is async-signal-safe and is called in the child
+            // between fork and exec, where performing only this single syscall
+            // is permitted.
+            let rc = unsafe { libc::setpgid(0, 0) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        // SAFETY: the registered closure runs only in the child after fork and
+        // before exec, and performs only the async-signal-safe setpgid call,
+        // satisfying `pre_exec`'s contract.
         unsafe {
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            cmd.pre_exec(set_own_pgid);
         }
         let child = cmd.spawn().expect("spawn child");
         let raw_pid = i32::try_from(child.id()).expect("pid fits in i32");
         let pid = Pid::from_raw(raw_pid);
-        std::mem::forget(child);
+        // Suppress `Child`'s drop without `mem::forget`: we reap the pid via
+        // our own `waitpid` calls, so `Child` must not be dropped (which would
+        // close its stdio handles). `ManuallyDrop` leaks it for the test's
+        // lifetime exactly as the previous `mem::forget` did.
+        let _child = std::mem::ManuallyDrop::new(child);
         pid
     }
 

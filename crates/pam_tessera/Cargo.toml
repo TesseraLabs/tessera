@@ -54,6 +54,7 @@ toml = { workspace = true }
 [lints.rust]
 missing_docs = "deny"
 unused_must_use = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -64,3 +65,18 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 missing_safety_doc = "deny"
+# Футган-ловушки (порт unsafe-hardening пака из ветки 2026-05-14).
+mem_forget = "deny"
+panic_in_result_fn = "deny"
+let_underscore_must_use = "deny"
+let_underscore_lock = "deny"
+indexing_slicing = "deny"
+# Каждый unsafe-блок обязан нести // SAFETY: и одну операцию.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+# Гигиена указателей и кастов.
+transmute_ptr_to_ptr = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+ref_as_ptr = "warn"
+exit = "warn"

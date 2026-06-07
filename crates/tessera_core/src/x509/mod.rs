@@ -92,6 +92,8 @@ impl From<&VerifiedX509> for CertIdent {
                 use std::fmt::Write as _;
                 d.iter()
                     .fold(String::with_capacity(d.len() * 2), |mut acc, b| {
+                        // Запись в String инфаллибельна, результат игнорируем намеренно.
+                        #[allow(clippy::let_underscore_must_use)]
                         let _ = write!(&mut acc, "{b:02x}");
                         acc
                     })

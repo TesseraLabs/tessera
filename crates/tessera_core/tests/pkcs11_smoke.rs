@@ -11,7 +11,8 @@
     clippy::expect_used,
     clippy::err_expect,
     clippy::panic,
-    clippy::unwrap_used
+    clippy::unwrap_used,
+    clippy::let_underscore_must_use
 )]
 
 use std::path::Path;

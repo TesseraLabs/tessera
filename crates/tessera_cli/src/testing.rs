@@ -37,9 +37,11 @@ impl TestServerHandle {
     /// Cancel and wait for all tasks. Best-effort.
     pub async fn shutdown_and_join(self) {
         self.shutdown.cancel();
-        let _ = self.accept_handle.await;
-        let _ = self.state_handle.await;
-        let _ = self.action_handle.await;
+        // Best-effort: ждём завершения задач, исход join (в т.ч. panic/abort)
+        // в тестовом teardown нас не интересует.
+        drop(self.accept_handle.await);
+        drop(self.state_handle.await);
+        drop(self.action_handle.await);
     }
 }
 

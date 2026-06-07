@@ -76,9 +76,13 @@ pub fn decode_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(WireError::FrameTooLarge(bytes.len()));
     }
-    let mut end = bytes.len();
-    while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
-        end -= 1;
+    let mut trimmed = bytes;
+    while let Some((&last, rest)) = trimmed.split_last() {
+        if last == b'\n' || last == b'\r' {
+            trimmed = rest;
+        } else {
+            break;
+        }
     }
-    serde_json::from_slice(&bytes[..end]).map_err(WireError::Decode)
+    serde_json::from_slice(trimmed).map_err(WireError::Decode)
 }

@@ -52,10 +52,15 @@ pub unsafe fn collect_args(
         return args;
     }
     for i in 0..argc {
-        let ptr = unsafe { *argv.add(i as usize) };
+        // SAFETY: `argv` points to `argc` valid pointers (caller contract);
+        // `i` is in `0..argc`, so `add` stays in bounds.
+        let slot = unsafe { argv.add(i as usize) };
+        // SAFETY: `slot` is a valid pointer within the `argv` array.
+        let ptr = unsafe { *slot };
         if ptr.is_null() {
             continue;
         }
+        // SAFETY: non-null `ptr` is a NUL-terminated C string from PAM.
         let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
         if let Some((k, v)) = s.split_once('=') {
             args.insert(k.to_string(), v.to_string());
@@ -125,6 +130,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     crate::panic_guard::run_pam(|| {
         crate::logging::init_once();
         // 1. Args + config.
+        // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
         let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
@@ -140,6 +146,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         }
 
         // 2. PAM_USER / PAM_SERVICE.
+        // SAFETY: `pamh` is the live PAM handle for this callback.
         let pam_user = match unsafe { crate::pam_helpers::pam_get_user_string(pamh) } {
             Ok(s) => s,
             Err(err) => {
@@ -147,11 +154,13 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 return PAM_AUTH_ERR;
             }
         };
+        // SAFETY: `pamh` is the live PAM handle for this callback.
         let pam_service = unsafe { crate::pam_helpers::pam_get_service_string(pamh) }
             .unwrap_or_else(|err| {
                 tracing::warn!(target: "tessera.auth", error = %err, "pam_get_item(PAM_SERVICE) failed; using 'unknown'");
                 "unknown".to_string()
             });
+        // SAFETY: `pamh` is the live PAM handle for this callback.
         let pam_tty_value =
             unsafe { crate::pam_helpers::pam_get_tty_string(pamh) }.unwrap_or_else(|err| {
                 tracing::debug!(
@@ -187,6 +196,8 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // are the sole source of authorisation. See docs/cert-issuance.md.
 
         // 6. Build the PIN prompter against the live PAM handle.
+        // SAFETY: `pamh` is the live PAM handle; the closure does not outlive
+        // this `pam_sm_authenticate` frame (see `closure_from_pamh` contract).
         let mut prompt_pin = unsafe { crate::pam_conv::closure_from_pamh(pamh) };
 
         // 7. RealFlowIo wires udev + mount(2).
@@ -240,6 +251,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 let crate::flow::FlowOutcome { auth_ctx, mount } = out;
                 // For PKCS#11 mode `mount` is `None`; for PKCS#12 it
                 // owns the USB mountpoint.
+                // SAFETY: `pamh` is the live PAM handle for this callback.
                 if let Err(err) = unsafe { crate::data_handle::set_auth_context(pamh, auth_ctx) } {
                     tracing::error!(target: "tessera.auth", error = %err, "set_auth_context failed");
                     return PAM_SYSTEM_ERR;
@@ -293,6 +305,7 @@ pub unsafe extern "C" fn pam_sm_acct_mgmt(
 ) -> i32 {
     crate::panic_guard::run_pam(|| {
         crate::logging::init_once();
+        // SAFETY: `pamh` is the live PAM handle for this callback.
         let Some(ctx) = (unsafe { crate::data_handle::get_auth_context(pamh) }) else {
             return PAM_AUTHINFO_UNAVAIL;
         };
@@ -331,6 +344,7 @@ pub unsafe extern "C" fn pam_sm_open_session(
     crate::panic_guard::run_pam(|| {
         crate::logging::init_once();
         // 1. Args + config.
+        // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
         let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
@@ -341,11 +355,13 @@ pub unsafe extern "C" fn pam_sm_open_session(
             }
         };
 
+        // SAFETY: `pamh` is the live PAM handle for this callback.
         let Some(ctx) = (unsafe { crate::data_handle::get_auth_context(pamh) }) else {
             return PAM_AUTHINFO_UNAVAIL;
         };
 
         // PAM user (best-effort: fall back to cert_cn if PAM_USER is gone).
+        // SAFETY: `pamh` is the live PAM handle for this callback.
         let pam_user = unsafe { crate::pam_helpers::pam_get_user_string(pamh) }
             .unwrap_or_else(|_| ctx.cert_cn.clone().unwrap_or_default());
 
@@ -367,6 +383,7 @@ pub unsafe extern "C" fn pam_sm_open_session(
         // common-session) sees it set. Both are best-effort: an IPC
         // failure logs WARN but never breaks PAM auth.
         {
+            // SAFETY: `pamh` is the live PAM handle for this callback.
             let xdg = match unsafe {
                 crate::pam_helpers::pam_get_env_string(pamh, "XDG_SESSION_ID")
             } {
@@ -447,6 +464,7 @@ pub unsafe extern "C" fn pam_sm_close_session(
 ) -> i32 {
     crate::panic_guard::run_pam(|| {
         crate::logging::init_once();
+        // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
         let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
@@ -457,7 +475,9 @@ pub unsafe extern "C" fn pam_sm_close_session(
             }
         };
 
+        // SAFETY: `pamh` is the live PAM handle for this callback.
         if let Some(ctx) = unsafe { crate::data_handle::get_auth_context(pamh) } {
+            // SAFETY: `pamh` is the live PAM handle for this callback.
             let pam_user = unsafe { crate::pam_helpers::pam_get_user_string(pamh) }
                 .unwrap_or_else(|_| ctx.cert_cn.clone().unwrap_or_default());
 

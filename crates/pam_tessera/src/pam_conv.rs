@@ -99,17 +99,17 @@ pub unsafe fn prompt_pin(
     pamh: *mut pam_sys::pam_handle_t,
     prompt: &str,
 ) -> Result<SecretString, PamConvError> {
+    let mut conv_ptr: *const c_void = std::ptr::null();
     // SAFETY: PAM guarantees `pamh` is non-null and `pam_get_item` accepts a
     // valid out-pointer.  We initialise `conv_ptr` to NULL and check the rc
     // before dereferencing.
-    let mut conv_ptr: *const c_void = std::ptr::null();
-    let rc = pam_get_item(pamh, PAM_CONV, &raw mut conv_ptr);
+    let rc = unsafe { pam_get_item(pamh, PAM_CONV, &raw mut conv_ptr) };
     if rc != PAM_SUCCESS || conv_ptr.is_null() {
         return Err(PamConvError::NoConv);
     }
     // SAFETY: `conv_ptr` is non-null and points to a `struct pam_conv`
     // owned by the PAM application.  The lifetime is tied to `pamh`.
-    let conv: &PamConv = &*(conv_ptr.cast::<PamConv>());
+    let conv: &PamConv = unsafe { &*(conv_ptr.cast::<PamConv>()) };
     let Some(conv_fn) = conv.conv else {
         return Err(PamConvError::NoConv);
     };
@@ -128,20 +128,22 @@ pub unsafe fn prompt_pin(
 
     // SAFETY: `msg_arr` and `resp_ptr` are both valid for the duration of
     // this call.  PAM allocates `*resp_ptr` on success — we own freeing it.
-    let rc = conv_fn(1, msg_arr.as_mut_ptr(), &raw mut resp_ptr, conv.appdata_ptr);
+    let rc = unsafe { conv_fn(1, msg_arr.as_mut_ptr(), &raw mut resp_ptr, conv.appdata_ptr) };
     if rc != PAM_SUCCESS || resp_ptr.is_null() {
         return Err(PamConvError::ConvFailed);
     }
 
     // SAFETY: `resp_ptr` is non-null and points to a `pam_response` owned by
     // PAM.  `resp.resp` may be NULL if the user cancelled the prompt.
-    let resp = &*resp_ptr;
+    let resp = unsafe { &*resp_ptr };
     if resp.resp.is_null() {
-        free(resp_ptr.cast::<c_void>());
+        // SAFETY: `resp_ptr` is a PAM-allocated `pam_response` we own.
+        unsafe { free(resp_ptr.cast::<c_void>()) };
         return Err(PamConvError::ConvFailed);
     }
 
-    let pin_cstr = CStr::from_ptr(resp.resp);
+    // SAFETY: `resp.resp` is a non-null PAM-allocated NUL-terminated buffer.
+    let pin_cstr = unsafe { CStr::from_ptr(resp.resp) };
     let pin_result = pin_cstr.to_str().map(str::to_string);
 
     // Always overwrite the PAM-allocated buffer before freeing — even on the
@@ -150,10 +152,14 @@ pub unsafe fn prompt_pin(
     // terminator).
     let len = pin_cstr.to_bytes().len();
     if len > 0 {
-        std::ptr::write_bytes(resp.resp.cast::<u8>(), 0_u8, len);
+        // SAFETY: `resp.resp` is a PAM-allocated buffer of at least `len`
+        // bytes; we own it until the `free` calls below.
+        unsafe { std::ptr::write_bytes(resp.resp.cast::<u8>(), 0_u8, len) };
     }
-    free(resp.resp.cast::<c_void>());
-    free(resp_ptr.cast::<c_void>());
+    // SAFETY: `resp.resp` is a non-null PAM-allocated buffer we own.
+    unsafe { free(resp.resp.cast::<c_void>()) };
+    // SAFETY: `resp_ptr` is the PAM-allocated `pam_response` we own.
+    unsafe { free(resp_ptr.cast::<c_void>()) };
 
     let pin_str = pin_result.map_err(|_| PamConvError::NonUtf8)?;
     Ok(SecretString::from(pin_str))
@@ -184,11 +190,15 @@ pub unsafe fn prompt_pin(
 /// the auth verdict.
 pub unsafe fn show_info(pamh: *mut pam_sys::pam_handle_t, msg: &str) -> Result<(), PamConvError> {
     let mut conv_ptr: *const c_void = std::ptr::null();
-    let rc = pam_get_item(pamh, PAM_CONV, &raw mut conv_ptr);
+    // SAFETY: PAM guarantees `pamh` is non-null and `pam_get_item` accepts a
+    // valid out-pointer; `conv_ptr` is checked before dereferencing.
+    let rc = unsafe { pam_get_item(pamh, PAM_CONV, &raw mut conv_ptr) };
     if rc != PAM_SUCCESS || conv_ptr.is_null() {
         return Err(PamConvError::NoConv);
     }
-    let conv: &PamConv = &*(conv_ptr.cast::<PamConv>());
+    // SAFETY: `conv_ptr` is non-null and points to a `struct pam_conv`
+    // owned by the PAM application.  The lifetime is tied to `pamh`.
+    let conv: &PamConv = unsafe { &*(conv_ptr.cast::<PamConv>()) };
     let Some(conv_fn) = conv.conv else {
         return Err(PamConvError::NoConv);
     };
@@ -202,15 +212,21 @@ pub unsafe fn show_info(pamh: *mut pam_sys::pam_handle_t, msg: &str) -> Result<(
     let mut msg_arr: [*const PamMessage; 1] = [msg_ptr];
     let mut resp_ptr: *mut PamResponse = std::ptr::null_mut();
 
-    let rc = conv_fn(1, msg_arr.as_mut_ptr(), &raw mut resp_ptr, conv.appdata_ptr);
+    // SAFETY: `msg_arr` and `resp_ptr` are valid for the duration of this
+    // call; PAM allocates `*resp_ptr` (if any) and we own freeing it.
+    let rc = unsafe { conv_fn(1, msg_arr.as_mut_ptr(), &raw mut resp_ptr, conv.appdata_ptr) };
     // Some applications return a NULL response array for PAM_TEXT_INFO
     // (since there is no reply); free only if non-null.
     if !resp_ptr.is_null() {
-        let resp = &*resp_ptr;
+        // SAFETY: `resp_ptr` is non-null and points to a PAM-allocated
+        // `pam_response` we own.
+        let resp = unsafe { &*resp_ptr };
         if !resp.resp.is_null() {
-            free(resp.resp.cast::<c_void>());
+            // SAFETY: `resp.resp` is a non-null PAM-allocated buffer we own.
+            unsafe { free(resp.resp.cast::<c_void>()) };
         }
-        free(resp_ptr.cast::<c_void>());
+        // SAFETY: `resp_ptr` is the PAM-allocated `pam_response` we own.
+        unsafe { free(resp_ptr.cast::<c_void>()) };
     }
     if rc != PAM_SUCCESS {
         return Err(PamConvError::ConvFailed);

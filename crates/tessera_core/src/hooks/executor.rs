@@ -207,7 +207,12 @@ pub fn apply_on_failure(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::hooks::placeholder::Template;

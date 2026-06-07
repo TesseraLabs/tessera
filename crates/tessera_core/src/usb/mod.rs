@@ -186,7 +186,7 @@ pub fn wait_for_usb_with<E: UsbEnumerator>(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

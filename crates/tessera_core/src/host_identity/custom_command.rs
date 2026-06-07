@@ -28,6 +28,10 @@ impl HostIdSource for CustomCommandSource {
         HostIdSourceKind::CustomCommand
     }
 
+    // Все игнорируемые результаты ниже — best-effort очистка на путях таймаута
+    // и ошибки (drain stdout/stderr, kill/wait/reap, join потоков-читателей):
+    // диагностику уже сформировал основной путь, реагировать на сбой cleanup нечем.
+    #[allow(clippy::let_underscore_must_use)]
     fn fetch(&self, _fs_root: &Path) -> Result<String, HostIdentityError> {
         // Spawn the child with piped stdout/stderr so we can drain them
         // even if the child outlives our wait window. On timeout we kill

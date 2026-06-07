@@ -51,14 +51,19 @@ use crate::hooks::user::UserInfo;
 /// May only be called from a child process after `fork()`. Performs
 /// async-signal-safe `write(2)` and `_exit(2)` only.
 unsafe fn die(msg: &[u8]) -> ! {
-    // SAFETY: write/_exit are async-signal-safe; we pass a stable byte
-    // slice we own and a small length.
+    // SAFETY: write is async-signal-safe; we pass a stable byte slice we own
+    // and a small length. Результат write игнорируется намеренно — это
+    // best-effort диагностика в child-контексте, где логирование запрещено.
+    #[allow(clippy::let_underscore_must_use)]
     unsafe {
         let _ = libc::write(
             2,
             msg.as_ptr().cast::<libc::c_void>(),
             msg.len() as libc::size_t,
         );
+    }
+    // SAFETY: _exit is async-signal-safe and never returns.
+    unsafe {
         libc::_exit(127);
     }
 }
@@ -199,6 +204,8 @@ unsafe fn close_high_fds_via_rlimit() {
 /// The function will not allocate, will not call any non-async-signal-safe
 /// libc/nix function, and will either `execve()` or `_exit(127)`.
 #[allow(clippy::too_many_arguments)]
+// линейная последовательность шагов child-setup; дробление на хелперы ухудшит читаемость signal-safe кода.
+#[allow(clippy::too_many_lines)]
 pub unsafe fn child_setup(
     argv_ptrs: &[*const c_char],
     env_ptrs: &[*const c_char],
@@ -211,8 +218,10 @@ pub unsafe fn child_setup(
 ) -> ! {
     // Step 1: own process group.
     // SAFETY: setpgid is async-signal-safe.
-    unsafe {
-        if libc::setpgid(0, 0) != 0 {
+    let setpgid_rc = unsafe { libc::setpgid(0, 0) };
+    if setpgid_rc != 0 {
+        // SAFETY: die is async-signal-safe.
+        unsafe {
             die(b"hook child: setpgid failed\n");
         }
     }
@@ -226,32 +235,68 @@ pub unsafe fn child_setup(
 
     // Step 3: redirect stdin to /dev/null, stdout/stderr to provided FDs.
     // open(/dev/null) is async-signal-safe.
-    // SAFETY: open/dup2/close are async-signal-safe.
-    unsafe {
-        let devnull_path = b"/dev/null\0";
-        let dn_fd = libc::open(
+    let devnull_path = b"/dev/null\0";
+    // SAFETY: open is async-signal-safe; devnull_path is a NUL-terminated
+    // static byte string we own.
+    let dn_fd = unsafe {
+        libc::open(
             devnull_path.as_ptr().cast::<c_char>(),
             libc::O_RDONLY | libc::O_CLOEXEC,
-        );
-        if dn_fd < 0 {
+        )
+    };
+    if dn_fd < 0 {
+        // SAFETY: die is async-signal-safe.
+        unsafe {
             die(b"hook child: open(/dev/null) failed\n");
         }
-        if libc::dup2(dn_fd, 0) < 0 {
+    }
+    // SAFETY: dup2 is async-signal-safe; dn_fd is a valid open FD.
+    let dup_stdin_rc = unsafe { libc::dup2(dn_fd, 0) };
+    if dup_stdin_rc < 0 {
+        // SAFETY: die is async-signal-safe.
+        unsafe {
             die(b"hook child: dup2(devnull, 0) failed\n");
         }
+    }
+    // SAFETY: close is async-signal-safe; dn_fd is now duplicated onto FD 0.
+    // Результат close игнорируется намеренно — закрытие неиспользуемого FD.
+    #[allow(clippy::let_underscore_must_use)]
+    unsafe {
         let _ = libc::close(dn_fd);
+    }
 
-        if libc::dup2(stdout_write_fd, 1) < 0 {
+    // SAFETY: dup2 is async-signal-safe; stdout_write_fd is a valid open FD
+    // (caller contract).
+    let dup_stdout_rc = unsafe { libc::dup2(stdout_write_fd, 1) };
+    if dup_stdout_rc < 0 {
+        // SAFETY: die is async-signal-safe.
+        unsafe {
             die(b"hook child: dup2(stdout, 1) failed\n");
         }
-        if libc::dup2(stderr_write_fd, 2) < 0 {
+    }
+    // SAFETY: dup2 is async-signal-safe; stderr_write_fd is a valid open FD
+    // (caller contract).
+    let dup_stderr_rc = unsafe { libc::dup2(stderr_write_fd, 2) };
+    if dup_stderr_rc < 0 {
+        // SAFETY: die is async-signal-safe.
+        unsafe {
             die(b"hook child: dup2(stderr, 2) failed\n");
         }
-        // Close original copies if they were not already FD 1/2.
-        if stdout_write_fd > 2 {
+    }
+    // Close original copies if they were not already FD 1/2.
+    if stdout_write_fd > 2 {
+        // SAFETY: close is async-signal-safe; stdout_write_fd already dup'd
+        // onto FD 1. Результат игнорируется намеренно.
+        #[allow(clippy::let_underscore_must_use)]
+        unsafe {
             let _ = libc::close(stdout_write_fd);
         }
-        if stderr_write_fd > 2 && stderr_write_fd != stdout_write_fd {
+    }
+    if stderr_write_fd > 2 && stderr_write_fd != stdout_write_fd {
+        // SAFETY: close is async-signal-safe; stderr_write_fd already dup'd
+        // onto FD 2. Результат игнорируется намеренно.
+        #[allow(clippy::let_underscore_must_use)]
+        unsafe {
             let _ = libc::close(stderr_write_fd);
         }
     }
@@ -283,10 +328,15 @@ pub unsafe fn child_setup(
 
     // Step 7: PR_SET_NO_NEW_PRIVS on Linux. macOS has no equivalent.
     #[cfg(target_os = "linux")]
-    // SAFETY: prctl is async-signal-safe.
-    unsafe {
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) != 0 {
-            die(b"hook child: prctl(NO_NEW_PRIVS) failed\n");
+    {
+        // SAFETY: prctl is async-signal-safe.
+        let prctl_rc =
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) };
+        if prctl_rc != 0 {
+            // SAFETY: die is async-signal-safe.
+            unsafe {
+                die(b"hook child: prctl(NO_NEW_PRIVS) failed\n");
+            }
         }
     }
 
@@ -295,51 +345,77 @@ pub unsafe fn child_setup(
     // NO allocations — Vec::clone here would deadlock on the heap mutex if a
     // sibling parent thread held it at fork() time.
     if let Some(user) = run_as {
-        // SAFETY: setgroups/setgid/setuid are async-signal-safe. `groups_ptr`
-        // points into stable parent-owned memory for `groups_len` `gid_t`
-        // values (caller contract).
-        unsafe {
-            if groups_len > 0 {
-                #[cfg(target_os = "linux")]
-                let rc = libc::setgroups(groups_len as libc::size_t, groups_ptr);
-                #[cfg(not(target_os = "linux"))]
-                let rc = {
-                    let len_int = libc::c_int::try_from(groups_len).unwrap_or(libc::c_int::MAX);
-                    libc::setgroups(len_int, groups_ptr)
-                };
+        if groups_len > 0 {
+            // SAFETY: setgroups is async-signal-safe. `groups_ptr` points into
+            // stable parent-owned memory for `groups_len` `gid_t` values
+            // (caller contract).
+            #[cfg(target_os = "linux")]
+            let rc = unsafe { libc::setgroups(groups_len as libc::size_t, groups_ptr) };
+            #[cfg(not(target_os = "linux"))]
+            let rc = {
+                let len_int = libc::c_int::try_from(groups_len).unwrap_or(libc::c_int::MAX);
+                // SAFETY: setgroups is async-signal-safe; `groups_ptr` points
+                // into stable parent-owned memory for `groups_len` `gid_t`
+                // values (caller contract).
+                unsafe { libc::setgroups(len_int, groups_ptr) }
+            };
 
-                if rc != 0 {
+            if rc != 0 {
+                // SAFETY: die is async-signal-safe.
+                unsafe {
                     die(b"hook child: setgroups failed\n");
                 }
             }
+        }
 
-            if libc::setgid(user.gid as libc::gid_t) != 0 {
+        // SAFETY: setgid is async-signal-safe.
+        let setgid_rc = unsafe { libc::setgid(user.gid as libc::gid_t) };
+        if setgid_rc != 0 {
+            // SAFETY: die is async-signal-safe.
+            unsafe {
                 die(b"hook child: setgid failed\n");
             }
-            if libc::setuid(user.uid as libc::uid_t) != 0 {
+        }
+        // SAFETY: setuid is async-signal-safe.
+        let setuid_rc = unsafe { libc::setuid(user.uid as libc::uid_t) };
+        if setuid_rc != 0 {
+            // SAFETY: die is async-signal-safe.
+            unsafe {
                 die(b"hook child: setuid failed\n");
             }
         }
     }
 
     // Step 9: execve.
-    if argv_ptrs.is_empty() || argv_ptrs[0].is_null() {
-        // SAFETY: die is async-signal-safe.
-        unsafe {
-            die(b"hook child: empty argv\n");
+    let argv0 = match argv_ptrs.first() {
+        Some(&p) if !p.is_null() => p,
+        _ => {
+            // SAFETY: die is async-signal-safe.
+            unsafe {
+                die(b"hook child: empty argv\n");
+            }
         }
-    }
+    };
 
-    // SAFETY: execve is async-signal-safe.
+    // SAFETY: execve is async-signal-safe; argv0 is the non-null first entry
+    // and argv_ptrs/env_ptrs are NULL-terminated (caller contract).
     unsafe {
-        libc::execve(argv_ptrs[0], argv_ptrs.as_ptr(), env_ptrs.as_ptr());
-        // execve returned ⇒ failure.
+        libc::execve(argv0, argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+    }
+    // execve returned ⇒ failure.
+    // SAFETY: die is async-signal-safe.
+    unsafe {
         die(b"hook child: execve failed\n");
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

@@ -67,7 +67,7 @@ pub unsafe fn pam_get_user_string(
 ) -> Result<String, PamHelperError> {
     let mut user_ptr: *const c_char = std::ptr::null();
     // SAFETY: `pamh` is owned by PAM; `user_ptr` is a valid out-pointer.
-    let rc = pam_get_user(pamh, &raw mut user_ptr, std::ptr::null());
+    let rc = unsafe { pam_get_user(pamh, &raw mut user_ptr, std::ptr::null()) };
     if rc != PAM_SUCCESS {
         return Err(PamHelperError::PamRc(rc));
     }
@@ -76,7 +76,7 @@ pub unsafe fn pam_get_user_string(
     }
     // SAFETY: PAM guarantees `user_ptr` is a NUL-terminated C string for
     // the lifetime of `pamh`.
-    let cstr = CStr::from_ptr(user_ptr);
+    let cstr = unsafe { CStr::from_ptr(user_ptr) };
     cstr.to_str()
         .map(str::to_owned)
         .map_err(|_| PamHelperError::NonUtf8)
@@ -96,7 +96,7 @@ pub unsafe fn pam_get_service_string(
 ) -> Result<String, PamHelperError> {
     let mut item_ptr: *const c_void = std::ptr::null();
     // SAFETY: `pamh` is owned by PAM; `item_ptr` is a valid out-pointer.
-    let rc = pam_get_item(pamh, PAM_SERVICE, &raw mut item_ptr);
+    let rc = unsafe { pam_get_item(pamh, PAM_SERVICE, &raw mut item_ptr) };
     if rc != PAM_SUCCESS {
         return Err(PamHelperError::PamRc(rc));
     }
@@ -105,7 +105,7 @@ pub unsafe fn pam_get_service_string(
     }
     // SAFETY: For PAM_SERVICE the item is a `const char *` valid for the
     // lifetime of `pamh`.
-    let cstr = CStr::from_ptr(item_ptr.cast::<c_char>());
+    let cstr = unsafe { CStr::from_ptr(item_ptr.cast::<c_char>()) };
     cstr.to_str()
         .map(str::to_owned)
         .map_err(|_| PamHelperError::NonUtf8)
@@ -132,7 +132,7 @@ pub unsafe fn pam_get_tty_string(
 ) -> Result<Option<String>, PamHelperError> {
     let mut item_ptr: *const c_void = std::ptr::null();
     // SAFETY: `pamh` is owned by PAM; `item_ptr` is a valid out-pointer.
-    let rc = pam_get_item(pamh, PAM_TTY, &raw mut item_ptr);
+    let rc = unsafe { pam_get_item(pamh, PAM_TTY, &raw mut item_ptr) };
     if rc != PAM_SUCCESS {
         return Err(PamHelperError::PamRc(rc));
     }
@@ -141,7 +141,7 @@ pub unsafe fn pam_get_tty_string(
     }
     // SAFETY: For PAM_TTY the item is a `const char *` valid for the
     // lifetime of `pamh`.
-    let cstr = CStr::from_ptr(item_ptr.cast::<c_char>());
+    let cstr = unsafe { CStr::from_ptr(item_ptr.cast::<c_char>()) };
     let s = cstr
         .to_str()
         .map(str::to_owned)
@@ -179,13 +179,13 @@ pub unsafe fn pam_get_env_string(
     // SAFETY: `pamh` is owned by PAM; `c_name` is a valid NUL-terminated
     // C string whose lifetime covers this call. `pam_getenv` returns a
     // pointer into PAM-owned storage; we must not free it.
-    let ptr = pam_getenv(pamh, c_name.as_ptr());
+    let ptr = unsafe { pam_getenv(pamh, c_name.as_ptr()) };
     if ptr.is_null() {
         return Ok(None);
     }
     // SAFETY: PAM guarantees `ptr` is a NUL-terminated C string valid
     // for the lifetime of `pamh`.
-    let cstr = CStr::from_ptr(ptr);
+    let cstr = unsafe { CStr::from_ptr(ptr) };
     let s = cstr
         .to_str()
         .map(str::to_owned)

@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::indexing_slicing)]
 
 //! Verifies each MAC audit event emitter produces a tracing record with
 //! the canonical `F_event` field and the expected level.  Captures
