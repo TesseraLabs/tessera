@@ -24,3 +24,13 @@ pub const USER_BINDING_OID: &str = "2.25.215438916728501023845629178354627";
 /// Marks the upper bound of Astra МКЦ integrity for the engineer session.
 /// Non-critical. See `docs/superpowers/specs/2026-05-14-mac-integrity-design.md`.
 pub const MAX_INTEGRITY_OID: &str = "2.25.273824307386008814506455310913083078403";
+
+// Planned (openspec/changes/role-format/): OID for the `pam_cert_allowed_roles`
+// extension (`extnValue ::= SEQUENCE OF UTF8String` of role_id values the leaf
+// certificate is allowed to activate).
+
+// Planned (openspec/changes/tags-delegation/): OIDs for the critical extensions
+// `pam_cert_delegation_constraints` (requireTags / allowRoles / maxLevel /
+// maxTtl delegation envelope, valid only on CA=TRUE certs) and
+// `pam_cert_profile_version` (integer version gate; certs above
+// `max_supported_profile_version` reject the whole chain, fail-closed).

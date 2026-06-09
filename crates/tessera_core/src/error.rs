@@ -266,6 +266,9 @@ pub enum TrustError {
     /// Verifier is not implemented.
     #[error("trust verification is not implemented")]
     NotImplemented,
+    /// No trust anchors configured.
+    #[error("trust.anchors must not be empty: at least one trust anchor is required")]
+    AnchorsEmpty,
     /// Anchor missing.
     #[error("anchor missing: {path:?}")]
     AnchorMissing {

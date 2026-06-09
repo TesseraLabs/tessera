@@ -55,13 +55,15 @@ CI ДОЛЖЕН (MUST) проверять `Cargo.toml` workspace version == `deb
 - **WHEN** прогоняется CI
 - **THEN** покрываются negative-сценарии (wrong-PIN→MAXTRIES, subject mismatch, revoked ±CRL, expired) и happy-path RSA/ECDSA p12
 
-⚠ KNOWN GAP — НЕ проверяется автоматически:
-1. ГОСТ end-to-end (фикстуры не закоммичены, `gost-tests` не в CI).
-2. Реальный libpdp/parsec enforcement (CI только компилит; runtime — ручной test-mac.sh).
-3. Полный flow с реальным USB/токеном (`#[ignore]`, ручной runbook `tests/scripts/install-and-test.sh`).
-4. Hook-security инварианты (no_new_privs/uid-drop/fd-leak) — `#[ignore]` из-за RLIMIT_NPROC на GH-раннерах.
-5. Release-профиль тестов (nightly workflow упомянут в комментарии, не существует).
-6. Vagrant-риг покрывает только MAC-runtime (test-mac.sh, bench-mac.sh); E2E-скриптов текущего auth-flow в vagrant нет (старые test-happy/negative/gost были про выпиленный M-of-N `execute`; ручной runbook — `tests/scripts/install-and-test.sh`, см. п. 3).
+### Requirement: Nightly release-профиль тестов
+
+Тесты в release-профиле ДОЛЖНЫ (MUST) гоняться ежедневно workflow `.github/workflows/nightly.yml` (cron `17 2 * * *` UTC + `workflow_dispatch`, только в основном репо): та же matrix, что в build.yml (ubuntu stub / astra builder-контейнер), с теми же release-knobs, что у продового `.deb` (`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`, `CARGO_PROFILE_RELEASE_LTO=thin`) — release-only ошибки (кодоген, LTO, timing-чувствительные тесты) ловятся не позднее чем через сутки. `.deb` в nightly не собирается — это делает build.yml.
+
+#### Scenario: Release-only регрессия
+- **WHEN** изменение ломает тесты только в release-профиле (кодоген/LTO/timing)
+- **THEN** ближайший nightly-прогон (ubuntu или astra) падает
+
+Проверки, выполняемые вручную (runbook'и `tests/scripts/install-and-test.sh`, `vagrant/scripts/test-mac.sh`): ГОСТ end-to-end, реальный libpdp/parsec enforcement, полный flow с реальным USB/токеном, hook-security инварианты (no_new_privs/uid-drop/fd-leak, `#[ignore]` из-за RLIMIT_NPROC на GH-раннерах), vagrant E2E auth-flow. Их автоматизация — proposal [ci-hardening](../../changes/ci-hardening/).
 
 ### Requirement: Lint-гейт
 

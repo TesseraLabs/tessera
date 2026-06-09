@@ -131,6 +131,23 @@ pub enum Pkcs11Error {
     /// which makes mechanism selection impossible.
     #[error("pkcs#11 private key has no CKA_KEY_TYPE")]
     KeyTypeAttributeMissing,
+    /// The matched private key reports `CKA_EXTRACTABLE = TRUE` and the
+    /// operator did not opt in via `pkcs11_allow_extractable_keys`.  An
+    /// extractable key breaks the mode-B invariant (key never leaves the
+    /// token), so the default is to refuse it (fail-closed).  Carries only
+    /// log-safe metadata: the key type and a short `CKA_ID` hex prefix —
+    /// never key material.
+    #[error(
+        "pkcs#11 private key is extractable (CKA_EXTRACTABLE=TRUE), rejected: \
+         key_type={key_type}, cka_id prefix {cka_id_hex}; \
+         set pkcs11_allow_extractable_keys = true to override"
+    )]
+    ExtractableKeyRejected {
+        /// Stringified `CKA_KEY_TYPE` of the offending key.
+        key_type: String,
+        /// Short hex prefix of the key's `CKA_ID` (never the full bytes).
+        cka_id_hex: String,
+    },
     /// `read_token_serial` (T10) found `CK_TOKEN_INFO.serialNumber`
     /// empty after trimming.  Some providers blank this on cleared
     /// tokens; we abort because the serial is required to populate

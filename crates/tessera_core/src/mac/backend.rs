@@ -151,3 +151,9 @@ impl MacBackend for StubBackend {
         Ok(())
     }
 }
+
+// Planned (openspec/changes/backend-plugins/): `PluginBackend` — bridges a
+// C-ABI plugin vtable (`tessera_plugin_entry` envelope with a strict
+// abi_version check) onto the `MacBackend` trait, verifying the `.so`
+// signature against build-time-embedded keys before dlopen and wrapping
+// every FFI boundary in `catch_unwind`.

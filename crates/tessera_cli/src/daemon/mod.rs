@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod singleton;
+mod stale_mounts;
 use singleton::{DaemonLock, LockError};
 
 use clap::Args;
@@ -120,6 +121,11 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
                 args.config.display()
             )
         })?;
+
+    // Logging came up before the config could be read; now that
+    // `[logging].level` is known, swap it into the live filter.  The
+    // `TESSERA_LOG` environment variable keeps precedence (no-op then).
+    logging::apply_config_level(validated.logging.level)?;
 
     // Run the startup-validation sweep once per boot. Log every record at
     // its severity level; if any check reported `Error`, refuse to start
@@ -370,11 +376,32 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         }))
     };
 
+    // Sweep stale USB mountpoints before binding the IPC socket. Leftovers
+    // appear when a PAM process crashes (MountGuard::drop never runs) or
+    // when its rmdir lost the EBUSY race; /run is tmpfs and only resets on
+    // reboot while the fleet runs for weeks. Best-effort: failures are
+    // logged by the sweep itself and MUST NOT block startup.
+    let stale_removed = stale_mounts::cleanup_stale_mounts(
+        &tessera_core::mount_guard::RealMountOps,
+        std::path::Path::new(tessera_core::mount::usb::MOUNTPOINT_BASE),
+    );
+    if stale_removed > 0 {
+        tracing::info!(
+            target: "tessera.mount",
+            removed = stale_removed,
+            "removed stale USB mountpoints left over from previous runs"
+        );
+    }
+
     let listener = server::bind_listener(&socket_path).await?;
     let accept_event_tx = event_tx.clone();
     let accept_token = shutdown_tok.clone();
+    // Plumb the validated `[monitor]` IPC knobs (idle timeout, connection
+    // cap) into the accept loop; without this the daemon silently ran on
+    // AcceptConfig::default() and ignored the operator's config.
+    let accept_cfg = server::AcceptConfig::from_monitor(monitor_cfg);
     let accept_handle = tokio::spawn(async move {
-        server::run_accept_loop(listener, accept_event_tx, accept_token).await;
+        server::run_accept_loop_with(listener, accept_event_tx, accept_token, accept_cfg).await;
     });
 
     let mut notify_handle = notify::NotifyHandle::system_default();

@@ -47,15 +47,16 @@ pub struct UsbDevice {
 pub trait UsbEnumerator {
     /// Enumerate USB block devices currently attached to the system.
     ///
-    /// `vid_pid_filter`, when set, restricts the result to devices whose
-    /// `(vid, pid)` matches exactly.
+    /// `vid_pid_filter`, when non-empty, restricts the result to devices
+    /// whose `(vid, pid)` matches one of the entries exactly.  An empty
+    /// slice means "no filter".
     ///
     /// # Errors
     ///
     /// Returns [`UsbError::Udev`] on udev failures, [`UsbError::Io`] on raw
     /// I/O failures and [`UsbError::MissingProperty`] when a device record
     /// is too partial to be useful.
-    fn enumerate(&self, vid_pid_filter: Option<(u16, u16)>) -> Result<Vec<UsbDevice>, UsbError>;
+    fn enumerate(&self, vid_pid_filter: &[(u16, u16)]) -> Result<Vec<UsbDevice>, UsbError>;
 }
 
 /// Default Linux enumerator backed by `udev::Enumerator`.
@@ -66,7 +67,7 @@ pub trait UsbEnumerator {
 pub struct UdevEnumerator;
 
 impl UsbEnumerator for UdevEnumerator {
-    fn enumerate(&self, vid_pid_filter: Option<(u16, u16)>) -> Result<Vec<UsbDevice>, UsbError> {
+    fn enumerate(&self, vid_pid_filter: &[(u16, u16)]) -> Result<Vec<UsbDevice>, UsbError> {
         #[cfg(target_os = "linux")]
         {
             linux_impl::enumerate_once(vid_pid_filter)
@@ -95,25 +96,22 @@ pub struct MockEnumerator {
 }
 
 impl UsbEnumerator for MockEnumerator {
-    fn enumerate(&self, vid_pid_filter: Option<(u16, u16)>) -> Result<Vec<UsbDevice>, UsbError> {
+    fn enumerate(&self, vid_pid_filter: &[(u16, u16)]) -> Result<Vec<UsbDevice>, UsbError> {
         if let Some(msg) = &self.error {
             return Err(UsbError::Udev(msg.clone()));
         }
         let out: Vec<UsbDevice> = self
             .devices
             .iter()
-            .filter(|d| match vid_pid_filter {
-                Some((v, p)) => d.vid == v && d.pid == p,
-                None => true,
-            })
+            .filter(|d| vid_pid_filter.is_empty() || vid_pid_filter.contains(&(d.vid, d.pid)))
             .cloned()
             .collect();
         Ok(out)
     }
 }
 
-/// Wait for one or more USB block devices, optionally filtered by
-/// `(vid, pid)`.
+/// Wait for one or more USB block devices, optionally filtered by an
+/// allow-list of `(vid, pid)` pairs (empty slice = no filter).
 ///
 /// On Linux this enumerates currently attached devices and then falls back
 /// to a blocking udev monitor with the caller's `timeout` budget.  On
@@ -139,7 +137,7 @@ impl UsbEnumerator for MockEnumerator {
 /// - [`UsbError::UnsupportedPlatform`] — on non-Linux targets.
 pub fn wait_for_usb_devices(
     timeout: Duration,
-    vid_pid_filter: Option<(u16, u16)>,
+    vid_pid_filter: &[(u16, u16)],
     max_usb_partitions: usize,
 ) -> Result<Vec<UsbDevice>, UsbError> {
     #[cfg(target_os = "linux")]
@@ -166,7 +164,7 @@ pub fn wait_for_usb_devices(
 pub fn wait_for_usb_with<E: UsbEnumerator>(
     enumerator: &E,
     timeout: Duration,
-    vid_pid_filter: Option<(u16, u16)>,
+    vid_pid_filter: &[(u16, u16)],
     poll_interval: Duration,
 ) -> Result<Vec<UsbDevice>, UsbError> {
     use std::time::Instant;
@@ -206,7 +204,7 @@ mod tests {
             devices: vec![device(0x1, 0x2, "vfat"), device(0x3, 0x4, "ext4")],
             error: None,
         };
-        let out = m.enumerate(Some((0x3, 0x4))).unwrap();
+        let out = m.enumerate(&[(0x3, 0x4)]).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].vid, 0x3);
         assert_eq!(out[0].pid, 0x4);
@@ -218,8 +216,19 @@ mod tests {
             devices: vec![device(0x1, 0x2, "vfat"), device(0x3, 0x4, "ext4")],
             error: None,
         };
-        let out = m.enumerate(None).unwrap();
+        let out = m.enumerate(&[]).unwrap();
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn mock_enumerator_filter_matches_any_listed_pair() {
+        let m = MockEnumerator {
+            devices: vec![device(0x1, 0x2, "vfat"), device(0x3, 0x4, "ext4")],
+            error: None,
+        };
+        let out = m.enumerate(&[(0x9, 0x9), (0x3, 0x4)]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].vid, 0x3);
     }
 
     #[test]
@@ -232,7 +241,7 @@ mod tests {
         let devs = wait_for_usb_with(
             &m,
             Duration::from_secs(5),
-            Some((0x1, 0x2)),
+            &[(0x1, 0x2)],
             Duration::from_millis(10),
         )
         .unwrap();
@@ -250,7 +259,7 @@ mod tests {
         let devs = wait_for_usb_with(
             &m,
             Duration::from_millis(100),
-            Some((0x1, 0x2)),
+            &[(0x1, 0x2)],
             Duration::from_millis(10),
         )
         .unwrap();
@@ -269,7 +278,7 @@ mod tests {
         let err = wait_for_usb_with(
             &m,
             Duration::from_millis(100),
-            None,
+            &[],
             Duration::from_millis(20),
         )
         .unwrap_err();
@@ -288,7 +297,7 @@ mod tests {
         let err = wait_for_usb_with(
             &m,
             Duration::from_millis(80),
-            Some((0x1, 0x2)),
+            &[(0x1, 0x2)],
             Duration::from_millis(20),
         )
         .unwrap_err();
@@ -304,7 +313,7 @@ mod tests {
         let err = wait_for_usb_with(
             &m,
             Duration::from_millis(100),
-            None,
+            &[],
             Duration::from_millis(10),
         )
         .unwrap_err();

@@ -60,6 +60,7 @@ pub fn build_verifier(crl_pems: Vec<Vec<u8>>) -> OpensslVerifier {
         intermediates: vec![int_],
         crl_pems,
         crl_strict: false,
+        crl_max_age: None,
         clock_skew: Duration::from_secs(60),
         signature_alg_whitelist: vec!["sha256WithRSAEncryption".into(), "ecdsa-with-SHA256".into()],
         spki_pins: vec![],
@@ -71,6 +72,10 @@ pub fn build_verifier(crl_pems: Vec<Vec<u8>>) -> OpensslVerifier {
 
 /// Build a minimal validated config for tests via TOML round-trip.
 pub fn minimal_cfg() -> ValidatedConfig {
+    // Config validation rejects empty `[trust].anchors`, so point at a
+    // real PEM fixture.
+    let anchor = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../tessera_core/tests/fixtures/ca.pem");
     let raw_toml = r#"
 crypto_backend = "openssl"
 mode = "pkcs12"
@@ -83,7 +88,7 @@ suspend_grace_seconds = 30
 monitor_fail_mode = "permissive"
 
 [trust]
-anchors = []
+anchors = [@ANCHOR@]
 intermediates = []
 allowed_signature_algorithms = []
 max_chain_depth = 4
@@ -108,7 +113,8 @@ level = "info"
 syslog_facility = "auth"
 journald_priority = false
 "#;
-    let raw: tessera_core::config::raw::RawConfig = toml::from_str(raw_toml).unwrap();
+    let raw_toml = raw_toml.replace("@ANCHOR@", &format!("{:?}", anchor.to_string_lossy()));
+    let raw: tessera_core::config::raw::RawConfig = toml::from_str(&raw_toml).unwrap();
     ValidatedConfig::try_from(&raw).unwrap()
 }
 

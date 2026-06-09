@@ -83,7 +83,8 @@ wallpaper_font        = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 wallpaper_font_size   = 64
 wallpaper_text_color  = "#000000"
 wallpaper_gravity     = "south"     # north | south | east | west | center
-wallpaper_offset_y    = 120         # пиксели от gravity-anchor
+wallpaper_offset_x    = 0           # пиксели от gravity-anchor по горизонтали
+wallpaper_offset_y    = 120         # пиксели от gravity-anchor (для south — вверх)
 template_ru           = "Банкомат %n  host_id={host_id_short} ({source})"
 template_en           = "ATM %n  host_id={host_id_short} ({source})"
 ```
@@ -133,10 +134,13 @@ sudo systemctl restart tessera
 sudo journalctl -u tessera -g fly_dm_greeter -n 20
 ```
 
-Ожидаемые INFO-записи: `wallpaper_rendered`,
-`wallpaper_backup_created` (первый запуск). Если в логе
-`fly_dm_greeter_font_missing` — поставить шрифт-пакет
-(`apt install fonts-dejavu-core`).
+Ожидаемая запись — одна INFO `fly-dm wallpaper update finished`
+(target `tessera.fly_dm_greeter`) с полем `outcome`: `Wrote {
+backed_up: true }` на первом запуске, дальше `backed_up: false`;
+`Disabled` — если `update_wallpaper = false`. Любая ошибка (нет
+прав, битый JPG, отсутствующий шрифт — поставить
+`fonts-dejavu-core`) — WARN `fly-dm wallpaper update failed
+(continuing)`, демон продолжает работу.
 
 Затем визуально на экране login fly-dm: внизу должна появиться
 строка `Банкомат astra184  host_id=a1b2c3d4 (DmiBoardSerial)`.

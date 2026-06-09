@@ -322,6 +322,7 @@ mod tests {
             host_id_source: HostIdSourceKind::Override,
             authenticated_at: std::time::SystemTime::UNIX_EPOCH,
             cert_not_after: None,
+            clock_skew_seconds: 0,
             cert_max_integrity: None,
             cert_ident: None,
             home_dir: None,

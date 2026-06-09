@@ -172,6 +172,25 @@ impl Default for AcceptConfig {
     }
 }
 
+impl AcceptConfig {
+    /// Build an [`AcceptConfig`] from the validated `[monitor]` config
+    /// section.
+    ///
+    /// The validator has already applied defaults and range checks to
+    /// `idle_timeout` / `max_concurrent_connections`, so the values are
+    /// taken as-is. Peer-cred enforcement stays on: it is a production
+    /// invariant, not an operator knob — tests that need it off construct
+    /// [`AcceptConfig`] directly.
+    #[must_use]
+    pub fn from_monitor(monitor: &tessera_core::config::validated::MonitorSection) -> Self {
+        Self {
+            enforce_peercred: true,
+            idle_timeout: monitor.idle_timeout,
+            max_concurrent_connections: monitor.max_concurrent_connections,
+        }
+    }
+}
+
 /// Outcome of a bounded frame read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameOutcome {

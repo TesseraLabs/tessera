@@ -106,7 +106,7 @@ fn startup_check_pam_misorder_emits_error() {
     let mut f = fs::File::create(&svc).expect("svc");
     writeln!(
         f,
-        "@include certauth-only\nauth required pam_parsec_mac.so\naccount required pam_parsec_mac.so"
+        "@include tessera-only\nauth required pam_parsec_mac.so\naccount required pam_parsec_mac.so"
     )
     .expect("write");
 
@@ -136,7 +136,7 @@ fn startup_check_pam_correct_order_emits_info() {
     let mut f = fs::File::create(&svc).expect("svc");
     writeln!(
         f,
-        "auth required pam_parsec_mac.so\n@include certauth-only\naccount required pam_parsec_mac.so"
+        "auth required pam_parsec_mac.so\n@include tessera-only\naccount required pam_parsec_mac.so"
     )
     .expect("write");
 
@@ -157,7 +157,7 @@ fn startup_check_pam_no_parsec_mac_is_silent() {
     let tmp = tempfile::tempdir().expect("tmp");
     let svc = tmp.path().join("login");
     let mut f = fs::File::create(&svc).expect("svc");
-    writeln!(f, "@include certauth-only\nauth required pam_unix.so").expect("write");
+    writeln!(f, "@include tessera-only\nauth required pam_unix.so").expect("write");
 
     let mut report = StartupCheckReport::default();
     startup_check::pam_stack::check(tmp.path(), &mut report);
@@ -293,7 +293,32 @@ fn startup_check_pam_comments_are_ignored() {
     // The `@include` is commented out so should not register.
     writeln!(
         f,
-        "# @include certauth-only\nauth required pam_parsec_mac.so"
+        "# @include tessera-only\nauth required pam_parsec_mac.so"
+    )
+    .expect("write");
+
+    let mut report = StartupCheckReport::default();
+    startup_check::pam_stack::check(tmp.path(), &mut report);
+    assert!(report.records.is_empty(), "got: {report:#?}");
+}
+
+#[test]
+fn startup_check_pam_legacy_certauth_include_not_recognized() {
+    // Pre-rename `@include certauth-*` snippets never shipped — the
+    // matcher must not treat them as a Tessera integration. With no
+    // recognized include the scanner stays silent even though
+    // pam_parsec_mac is present (would be pam_stack_misorder if the
+    // legacy name were still matched).
+    let tmp = tempfile::tempdir().expect("tmp");
+    let svc = tmp.path().join("login");
+    let mut f = fs::File::create(&svc).expect("svc");
+    writeln!(
+        f,
+        "@include certauth-only\n\
+         @include certauth\n\
+         @include certauth-optional\n\
+         auth required pam_parsec_mac.so\n\
+         account required pam_parsec_mac.so"
     )
     .expect("write");
 

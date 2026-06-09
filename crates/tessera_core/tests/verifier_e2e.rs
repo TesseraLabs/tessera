@@ -27,6 +27,7 @@ fn config_builder() -> OpensslVerifierConfig {
         intermediates: vec![Certificate::from_pem(INT).unwrap()],
         crl_pems: vec![CRL_VALID.to_vec()],
         crl_strict: true,
+        crl_max_age: None,
         clock_skew: Duration::from_secs(60),
         signature_alg_whitelist: whitelist(),
         spki_pins: vec![],

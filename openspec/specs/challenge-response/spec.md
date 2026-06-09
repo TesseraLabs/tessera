@@ -41,7 +41,7 @@
 #### Scenario: GOST через PKCS#11
 - **WHEN** на токене ключ GOSTR3410
 - **THEN** `MechanismNotSupported` → отказ (mechanism.rs:160–167)
-- ⚠ KNOWN GAP: architecture.md перечисляет JaCarta/Рутокен (ГОСТ-СКЗИ) как поддерживаемые носители, но GOST-подпись на PKCS#11-пути не работает (cryptoki 0.7 без CKM_GOSTR3410). GOST работает только на PKCS#12-пути через gost-engine.
+- Design-граница: GOST поддерживается только на PKCS#12-пути через gost-engine; на PKCS#11-пути GOST-подпись не выполняется (cryptoki 0.7 без CKM_GOSTR3410), Рутокен/JaCarta применимы для RSA/ECDSA-сертификатов (так и зафиксировано в architecture.md). Поддержка GOST через PKCS#11 — proposal [gost-pkcs11](../../changes/gost-pkcs11/).
 
 ### Requirement: Отсутствие replay-protection — by design
 

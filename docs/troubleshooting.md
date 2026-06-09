@@ -117,13 +117,19 @@ openssl pkcs12 -in service.p12 -nokeys -nomacver -passin pass: \
     | openssl x509 -noout -text
 ```
 
-### `revocation: ocsp unavailable`
+### `[trust.revocation] mode = "ocsp"` — конфиг не загружается
 
-**Симптом:** при `[trust.revocation] mode = "ocsp"` отказ
-`OCSP unavailable`.
+**Симптом:** демон/модуль отказывает на загрузке конфига при
+`mode = "ocsp"` / `mode = "crl_then_ocsp"` или при любых
+`ocsp_*`-ключах в `[trust.revocation]`.
 
-**Фикс:** проверить сетевую доступность OCSP-ответчика. Офлайн-контур
-— `mode = "crl"` с локальным CRL.
+**Причина:** OCSP не реализован — такие значения отвергаются
+валидацией конфига (fail-closed). Поддерживаются только `"none"` и
+`"crl"`.
+
+**Фикс:** `mode = "crl"` с регулярно обновляемым локальным CRL;
+свежесть контролировать через `crl_max_age_hours`. См.
+[configuration.md](configuration.md#секция-trustrevocation).
 
 ---
 
@@ -483,7 +489,7 @@ sudo /sbin/pdpl-user --ilevel 63 service
 ```toml
 [mac]
 runtime        = "disabled"
-cert_integrity = "ignored"
+cert_integrity = "ignore"
 ```
 
 ```bash
@@ -522,7 +528,7 @@ cert_integrity = "optional"
 # или (для МКЦ-ядра ВЫКЛ)
 [mac]
 runtime        = "disabled"
-cert_integrity = "ignored"
+cert_integrity = "ignore"
 ```
 
 ### WARN `mac_caps_missing` / `pdp_set_fd rc=-1`
@@ -622,7 +628,9 @@ sudo systemctl restart fly-dm           # подхватит новый JPG
 
 - Демон не имеет прав на `wallpaper_target`: `ls -l` источника. Демон
   под root, права 0644 достаточно.
-- Шрифт не найден: WARN `fly_dm_greeter_font_missing`. Поставить
+- Любая ошибка (включая отсутствующий шрифт): WARN `fly-dm wallpaper
+  update failed (continuing)` с полем `error` (target
+  `tessera.fly_dm_greeter`). Для шрифта — поставить
   `fonts-dejavu-core`.
 - Текст не видно: `color_overlay` слишком плотный, blur включён —
   см. fix выше.
@@ -633,8 +641,7 @@ sudo systemctl restart fly-dm           # подхватит новый JPG
 
 ### `dump-host-id`: все источники пусты
 
-**Симптом:** TSV содержит только `status=empty` или `status=error`,
-exit ≠ 0.
+**Симптом:** TSV содержит только `status=err`, exit ≠ 0.
 
 **Причины:**
 
@@ -649,8 +656,8 @@ exit ≠ 0.
 
 ### USB не появляется во время `--usb`
 
-`finish-bootstrap.sh` / `dump-host-id --usb` ретраит ~30 с. Если
-флешка не определилась:
+`finish-bootstrap.sh` / `dump-host-id --usb` ретраит до 60 с
+(опрос каждые 5 с). Если флешка не определилась:
 
 - `lsblk` параллельно;
 - FS из allowlist (`vfat`/`exfat`/`ext4`/`ntfs`);

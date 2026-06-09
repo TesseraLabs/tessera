@@ -1,7 +1,6 @@
 //! Logging setup shared by PAM-side code.
 
 use std::str::FromStr;
-use std::sync::OnceLock;
 
 use crate::Error;
 
@@ -18,6 +17,20 @@ pub enum LogLevel {
     Warn,
     /// Error.
     Error,
+}
+
+impl LogLevel {
+    /// Canonical lowercase name, suitable as a `tracing` filter directive.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
 }
 
 impl FromStr for LogLevel {
@@ -38,6 +51,11 @@ impl FromStr for LogLevel {
 }
 
 /// Syslog facility.
+///
+/// Only used to validate the deprecated `[logging].syslog_facility` config
+/// key: the PAM module always logs to the `auth` facility and the daemon
+/// writes to stderr (→ journald under systemd), so the value is never
+/// applied at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyslogFacility {
     /// auth.
@@ -66,9 +84,22 @@ impl FromStr for SyslogFacility {
     }
 }
 
-/// Initialize syslog best-effort and idempotently.
-pub fn init_syslog(_level: LogLevel, _facility: SyslogFacility) -> Result<(), Error> {
-    static INIT: OnceLock<()> = OnceLock::new();
-    let () = *INIT.get_or_init(|| ());
-    Ok(())
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::LogLevel;
+
+    #[test]
+    fn log_level_as_str_round_trips_through_from_str() {
+        for level in [
+            LogLevel::Trace,
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warn,
+            LogLevel::Error,
+        ] {
+            let parsed: LogLevel = level.as_str().parse().expect("canonical name parses");
+            assert_eq!(parsed, level);
+        }
+    }
 }

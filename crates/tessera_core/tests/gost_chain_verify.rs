@@ -43,6 +43,7 @@ fn rsa_only_verifier() -> OpensslVerifier {
         intermediates: vec![Certificate::from_pem(INT).unwrap()],
         crl_pems: vec![],
         crl_strict: false,
+        crl_max_age: None,
         clock_skew: Duration::from_secs(60),
         signature_alg_whitelist: vec!["sha256WithRSAEncryption".into()],
         spki_pins: vec![],

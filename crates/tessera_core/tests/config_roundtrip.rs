@@ -95,6 +95,55 @@ fn validated_config_omits_gost_engine_path_when_absent() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn validated_config_accepts_logging_without_deprecated_keys(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_anchor(&anchor)
+        .replace("syslog_facility = \"auth\"\n", "")
+        .replace("journald_priority = true\n", "");
+    let raw: RawConfig = toml::from_str(&body)?;
+    assert!(raw.logging.syslog_facility.is_none());
+    assert!(raw.logging.journald_priority.is_none());
+    let validated = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(validated.logging.level, tessera_core::LogLevel::Info);
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_unsupported_syslog_facility() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // local0..7 are intentionally unsupported even though the key itself
+    // is deprecated-and-ignored: a typo should still surface at load time.
+    let body = fixture_with_anchor(&anchor).replace(
+        "syslog_facility = \"auth\"",
+        "syslog_facility = \"local0\"",
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("must reject local0");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason } if reason.contains("syslog facility")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_empty_trust_anchors() -> Result<(), Box<dyn std::error::Error>> {
+    let original = include_str!("fixtures/full_valid.toml");
+    let body = original.replace("anchors = [\"/bin/sh\"]", "anchors = []");
+    let raw: RawConfig = toml::from_str(&body)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("must reject empty anchors");
+    assert!(
+        matches!(err, Error::Trust(tessera_core::error::TrustError::AnchorsEmpty)),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn validated_config_rejects_missing_gost_engine_path() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
@@ -307,6 +356,167 @@ fn validated_config_rejects_hook_mode_without_hook_path() -> Result<(), Box<dyn 
     assert!(
         matches!(err, Error::ConfigInvalid { ref reason }
             if reason.contains("on_usb_removed_hook_path")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+/// Replace the `[trust.revocation]` section body of the fixture.
+fn fixture_with_revocation(anchor: &Path, revocation_body: &str) -> String {
+    fixture_with_anchor(anchor).replace(
+        "[trust.revocation]\nmode = \"none\"\ncrl_paths = []",
+        &format!("[trust.revocation]\n{revocation_body}"),
+    )
+}
+
+#[test]
+fn validated_config_rejects_ocsp_mode() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    for mode in ["ocsp", "crl_then_ocsp"] {
+        let body = fixture_with_revocation(&anchor, &format!("mode = {mode:?}\ncrl_paths = []"));
+        let raw: RawConfig = toml::from_str(&body)?;
+        let err = ValidatedConfig::try_from(&raw).expect_err("OCSP modes must be rejected");
+        assert!(
+            matches!(err, Error::ConfigInvalid { ref reason }
+                if reason.contains("OCSP is not implemented")),
+            "unexpected error for mode {mode}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_ocsp_keys_in_any_mode() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    for key_line in [
+        "ocsp_responder_url = \"https://ocsp.example.org\"",
+        "ocsp_timeout_seconds = 5",
+        "ocsp_cache_ttl_seconds = 600",
+    ] {
+        let body = fixture_with_revocation(
+            &anchor,
+            &format!("mode = \"none\"\ncrl_paths = []\n{key_line}"),
+        );
+        let raw: RawConfig = toml::from_str(&body)?;
+        let err = ValidatedConfig::try_from(&raw).expect_err("ocsp_* keys must be rejected");
+        assert!(
+            matches!(err, Error::ConfigInvalid { ref reason }
+                if reason.contains("OCSP is not implemented")),
+            "unexpected error for {key_line}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn validated_config_passes_crl_max_age_through() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_revocation(
+        &anchor,
+        "mode = \"none\"\ncrl_paths = []\ncrl_max_age_hours = 24",
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(
+        v.trust.revocation.crl_max_age,
+        Some(std::time::Duration::from_hours(24))
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_crl_max_age_defaults_to_none() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let raw: RawConfig = toml::from_str(&fixture_with_anchor(&anchor))?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(v.trust.revocation.crl_max_age, None);
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_crl_max_age_out_of_range() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    for hours in [0u64, 8761] {
+        let body = fixture_with_revocation(
+            &anchor,
+            &format!("mode = \"none\"\ncrl_paths = []\ncrl_max_age_hours = {hours}"),
+        );
+        let raw: RawConfig = toml::from_str(&body)?;
+        let err = ValidatedConfig::try_from(&raw).expect_err("out-of-range max age must fail");
+        assert!(
+            matches!(err, Error::ConfigInvalid { ref reason }
+                if reason.contains("crl_max_age_hours")),
+            "unexpected error for {hours}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn usb_allowed_devices_roundtrip_to_pairs() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_anchor(&anchor);
+    let injected = format!("usb_allowed_devices = [\"0951:1666\", \"ABCD:0001\"]\n{body}");
+    let raw: RawConfig = toml::from_str(&injected)?;
+    assert_eq!(raw.usb_allowed_devices.len(), 2);
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(v.usb_allowed_devices, vec![(0x0951, 0x1666), (0xABCD, 0x0001)]);
+    Ok(())
+}
+
+#[test]
+fn usb_allowed_devices_absent_means_no_filter() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let raw: RawConfig = toml::from_str(&fixture_with_anchor(&anchor))?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert!(v.usb_allowed_devices.is_empty());
+    Ok(())
+}
+
+#[test]
+fn usb_allowed_devices_rejects_malformed_entry() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_anchor(&anchor);
+    let injected = format!("usb_allowed_devices = [\"951:1666\"]\n{body}");
+    let raw: RawConfig = toml::from_str(&injected)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("must reject 3-digit vid");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("usb_allowed_devices")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn usb_wait_seconds_accepts_upper_bound() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_anchor(&anchor).replace("usb_wait_seconds = 10", "usb_wait_seconds = 300");
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(v.usb_wait, std::time::Duration::from_mins(5));
+    Ok(())
+}
+
+#[test]
+fn usb_wait_seconds_rejects_301() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_anchor(&anchor).replace("usb_wait_seconds = 10", "usb_wait_seconds = 301");
+    let raw: RawConfig = toml::from_str(&body)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("must reject above-range wait");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("usb_wait_seconds")),
         "unexpected error: {err:?}"
     );
     Ok(())
