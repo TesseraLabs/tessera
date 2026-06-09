@@ -18,13 +18,16 @@
 
 ### Requirement: acct_mgmt — проверка истечения серта
 
-`pam_sm_acct_mgmt` ДОЛЖЕН (MUST): при отсутствии AuthContext → `PAM_AUTHINFO_UNAVAIL`; при `now > cert_not_after` → `PAM_ACCT_EXPIRED` (13); иначе `PAM_SUCCESS` (lib.rs:126–133).
+`pam_sm_acct_mgmt` ДОЛЖЕН (MUST): при отсутствии AuthContext → `PAM_AUTHINFO_UNAVAIL`; при `now > cert_not_after + clock_skew_seconds` → `PAM_ACCT_EXPIRED` (13); иначе `PAM_SUCCESS` (lib.rs `acct_mgmt_core`). Допуск `clock_skew_seconds` ДОЛЖЕН (MUST) фиксироваться в `AuthContext` в момент `pam_sm_authenticate` из `[trust].clock_skew_seconds` (flow.rs, Step 11 — оба пути: PKCS#12 и PKCS#11), чтобы acct_mgmt применял тот же допуск, что и trust-verifier, без перечитывания конфига.
 
 #### Scenario: Сертификат истёк
-- **WHEN** AuthContext присутствует и `now > cert_not_after`
+- **WHEN** AuthContext присутствует и `now > cert_not_after + clock_skew_seconds`
 - **THEN** возвращается `PAM_ACCT_EXPIRED` (13)
 
-- ⚠ KNOWN GAP: docs/architecture.md:191 обещает допуск `clock_skew_seconds` в acct_mgmt — код делает голое сравнение без допуска.
+#### Scenario: Истёк в пределах допуска часов
+- **WHEN** AuthContext присутствует, `cert_not_after < now`, но `now <= cert_not_after + clock_skew_seconds`
+- **THEN** возвращается `PAM_SUCCESS`
+
 - Замечание: `cert_not_after = None` → SUCCESS (fail-open по этому полю).
 
 ### Requirement: open_session — MAC pipeline + hooks, fail-closed

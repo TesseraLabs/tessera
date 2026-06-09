@@ -109,6 +109,21 @@ impl<O: MountOps> MountGuard<O> {
     }
 }
 
+/// How many extra `rmdir` attempts `Drop` makes when the kernel still
+/// reports the mountpoint busy after the lazy (`MNT_DETACH`) umount.
+const RMDIR_BUSY_RETRIES: u32 = 5;
+/// Delay between busy-`rmdir` retries.
+const RMDIR_BUSY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `true` when the error is an `EBUSY` coming from `rmdir(2)`.
+fn rmdir_is_busy(err: &MountGuardError) -> bool {
+    matches!(
+        err,
+        MountGuardError::Rmdir { source, .. }
+            if source.raw_os_error() == Some(libc::EBUSY)
+    )
+}
+
 impl<O: MountOps> Drop for MountGuard<O> {
     fn drop(&mut self) {
         if self.mounted {
@@ -116,8 +131,25 @@ impl<O: MountOps> Drop for MountGuard<O> {
                 tracing::warn!(target: "tessera.mount", error = %err, "umount failed");
             }
         }
-        if let Err(err) = self.ops.rmdir(&self.target) {
-            tracing::warn!(target: "tessera.mount", error = %err, "rmdir failed");
+        // `MNT_DETACH` is lazy: the kernel may finalise the unmount slightly
+        // after `umount2` returns (or only once the last open descriptor
+        // goes away), so the first `rmdir` can hit `EBUSY` even after a
+        // successful umount.  Poll a few times before giving up; a leftover
+        // directory is picked up by the daemon's startup sweep of
+        // `/run/tessera/mounts` otherwise.
+        let mut attempts = 0;
+        loop {
+            match self.ops.rmdir(&self.target) {
+                Ok(()) => break,
+                Err(err) if attempts < RMDIR_BUSY_RETRIES && rmdir_is_busy(&err) => {
+                    attempts += 1;
+                    std::thread::sleep(RMDIR_BUSY_RETRY_DELAY);
+                }
+                Err(err) => {
+                    tracing::warn!(target: "tessera.mount", error = %err, "rmdir failed");
+                    break;
+                }
+            }
         }
     }
 }
@@ -171,5 +203,84 @@ impl MountOps for RealMountOps {
             path: path.to_path_buf(),
             source,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Mock ops whose `rmdir` fails `fail_times` times with the given raw OS
+    /// error before succeeding; counts every call.
+    struct FlakyRmdirOps {
+        rmdir_calls: AtomicU32,
+        fail_times: u32,
+        raw_os_error: i32,
+    }
+
+    impl FlakyRmdirOps {
+        fn new(fail_times: u32, raw_os_error: i32) -> Self {
+            Self {
+                rmdir_calls: AtomicU32::new(0),
+                fail_times,
+                raw_os_error,
+            }
+        }
+    }
+
+    impl MountOps for FlakyRmdirOps {
+        fn mount(
+            &self,
+            _source: &Path,
+            _target: &Path,
+            _fs_type: &str,
+            _flags: MountFlags,
+            _data: Option<&str>,
+        ) -> Result<(), MountGuardError> {
+            Ok(())
+        }
+        fn umount(&self, _target: &Path) -> Result<(), MountGuardError> {
+            Ok(())
+        }
+        fn mkdir_mode_0700(&self, _path: &Path) -> Result<(), MountGuardError> {
+            Ok(())
+        }
+        fn rmdir(&self, path: &Path) -> Result<(), MountGuardError> {
+            let n = self.rmdir_calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                return Err(MountGuardError::Rmdir {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::from_raw_os_error(self.raw_os_error),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn drop_retries_rmdir_on_ebusy_until_success() {
+        let ops = Arc::new(FlakyRmdirOps::new(2, libc::EBUSY));
+        drop(MountGuard::adopt(ops.clone(), PathBuf::from("/tmp/x")));
+        assert_eq!(ops.rmdir_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn drop_gives_up_after_max_ebusy_retries() {
+        let ops = Arc::new(FlakyRmdirOps::new(u32::MAX, libc::EBUSY));
+        drop(MountGuard::adopt(ops.clone(), PathBuf::from("/tmp/x")));
+        // Initial attempt + RMDIR_BUSY_RETRIES retries, then WARN (no panic).
+        assert_eq!(
+            ops.rmdir_calls.load(Ordering::SeqCst),
+            1 + RMDIR_BUSY_RETRIES
+        );
+    }
+
+    #[test]
+    fn drop_does_not_retry_non_ebusy_rmdir_errors() {
+        let ops = Arc::new(FlakyRmdirOps::new(u32::MAX, libc::ENOENT));
+        drop(MountGuard::adopt(ops.clone(), PathBuf::from("/tmp/x")));
+        assert_eq!(ops.rmdir_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -31,6 +31,10 @@ const PAM_AUTH_ERR: i32 = 7;
 /// `PAM_SESSION_ERR` — keep in lock-step with `entry.rs`.
 const PAM_SESSION_ERR: i32 = 14;
 
+// Planned (openspec/changes/backend-plugins/): the compile-time `astra-mac`
+// dispatch below is replaced by runtime loading of signed enforcement plugins
+// from /usr/lib/tessera/plugins, selected via `[mac] backend = "<name>"`;
+// StubBackend stays the default when no plugin is configured or valid.
 /// Build the active backend, honouring `[mac].runtime` at runtime
 /// (independent of the compile-time `astra-mac` feature).
 ///

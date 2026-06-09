@@ -28,8 +28,6 @@ TSV: 3 строки `#`-комментариев + header `source/status/hash_he
 - **WHEN** ни один probe не дал ok
 - **THEN** `NoActiveHostId` → exit ≠ 0 — сигнал «не выписывать серт, чинить вход» (fail-closed)
 
-- ⚠ KNOWN GAP (docs): clone-image.md:218 заявляет status ∈ {ok, empty, error} — реально {ok, err}; clone-image.md:213 называет несуществующие имена источников.
-
 ### Requirement: Историческое
 
 Удалённые подкоманды НЕ ДОЛЖНЫ (MUST NOT) присутствовать в CLI: подкоманды 0.2.x (`execute`, `policy`, `gc`) удалены в 0.3.0. Отдельный бинарь `tessera-hostid` отвергнут (May 26) — дублировал dump-host-id/probe_all.

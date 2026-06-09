@@ -65,6 +65,15 @@ pub enum TrustError {
     #[error("certificate revoked: serial={0}")]
     Revoked(String),
 
+    /// A CRL's signature failed to verify under its issuer's public key.
+    ///
+    /// Treated as the same class of refusal as [`TrustError::Revoked`]:
+    /// a CRL whose signature cannot be proven authentic must not be
+    /// trusted, and authentication fails closed rather than silently
+    /// skipping the revocation check.
+    #[error("CRL signature invalid: {0}")]
+    CrlSignatureInvalid(String),
+
     /// SPKI pin mismatch — the trust anchor's `SubjectPublicKeyInfo` SHA-256
     /// is not in the configured set of pinned hashes.
     #[error("SPKI pin mismatch")]

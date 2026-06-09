@@ -48,5 +48,5 @@ Engine ДОЛЖЕН (MUST) загружаться once-per-process (OnceLock) и
 - **WHEN** проект собирается без feature-флага `gost-tests`
 - **THEN** интеграционные тесты `gost_*_real.rs` исключаются, но runtime-код engine компилируется как обычно
 
-- ⚠ KNOWN GAP (testing): GOST-фикстуры не закоммичены (`tests/fixtures/gost/` пуст), `gost-tests` не включается в CI → ГОСТ-путь end-to-end автоматически НЕ проверяется (только локально/Vagrant вручную).
-- ⚠ KNOWN GAP: GOST через PKCS#11 не подписывает (`MechanismNotSupported`) — см. [challenge-response](../challenge-response/spec.md).
+- ГОСТ-путь end-to-end проверяется вручную (локально/Vagrant): фикстуры `tests/fixtures/gost/` не закоммичены, `gost-tests` не включается в CI. Автоматизация — proposal [ci-hardening](../../changes/ci-hardening/).
+- GOST через PKCS#11 не подписывает (`MechanismNotSupported`) — design-граница, см. [challenge-response](../challenge-response/spec.md); реализация — proposal [gost-pkcs11](../../changes/gost-pkcs11/).

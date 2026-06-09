@@ -28,6 +28,26 @@
 - **WHEN** pipeline даёт только Info/Warn-записи без Error
 - **THEN** демон стартует, записи попадают только в лог
 
+### Requirement: Singleton через flock
+
+Демон ДОЛЖЕН (MUST) до загрузки реестра и привязки сокета захватить эксклюзивный неблокирующий `flock(2)` (`LOCK_EX | LOCK_NB`) на `<state_dir>/daemon.lock` (mode 0600, O_CLOEXEC; фолбэк-путь `/var/lib/tessera/daemon.lock`) — `daemon/singleton.rs`, `daemon/mod.rs:197–240`, коммит ec4185b. При контенции (EWOULDBLOCK) второй экземпляр ДОЛЖЕН (MUST) эмитнуть CRITICAL audit-событие `daemon_already_running` (target `tessera.daemon.singleton`, поле `conflicting_pid` — best-effort PID из lock-файла) и завершиться с ошибкой. При успехе PID пишется через тот же fd, что держит flock (truncate+write+sync), закрывая TOCTOU-окно чтения PID предшественника. Замок ДОЛЖЕН (MUST) удерживаться до самого конца graceful-shutdown (`run_async` держит `DaemonLock` живым после `graceful_finish`); ядро освобождает flock при выходе/краше процесса автоматически.
+
+#### Scenario: Второй экземпляр демона
+- **WHEN** `tessera daemon` запускается, пока другой экземпляр держит flock на daemon.lock
+- **THEN** второй экземпляр эмитит CRITICAL-событие `daemon_already_running` с конфликтующим PID и немедленно завершается с ошибкой, не трогая сокет/состояние
+
+#### Scenario: Замок живёт до конца shutdown
+- **WHEN** демон получает сигнал и проходит graceful shutdown
+- **THEN** flock удерживается до завершения `run_async` — новый экземпляр не может стартовать, пока первый не закончил shutdown
+
+### Requirement: Startup-cleanup остаточных USB mountpoint
+
+При старте, ДО bind IPC-сокета, демон ДОЛЖЕН (MUST) пройтись по `/run/tessera/mounts/*` (константа `mount::usb::MOUNTPOINT_BASE`, общая с PAM-модулем) и для каждого остаточного каталога выполнить best-effort `umount2(MNT_DETACH)` + rmdir, логируя WARN на каждый найденный остаток (target `tessera.mount`, daemon/stale_mounts.rs). Остатки возникают при crash PAM-процесса (Drop MountGuard не выполняется) и при исчерпании EBUSY-ретраев rmdir; `/run` — tmpfs и чистится только на reboot. Сбой очистки (включая отсутствие привилегий на umount/rmdir) НЕ ДОЛЖЕН (MUST NOT) блокировать старт.
+
+#### Scenario: Остатки после crash PAM-процесса
+- **WHEN** под `/run/tessera/mounts/` остались каталоги от упавшего PAM-процесса и демон стартует
+- **THEN** демон до bind сокета выполняет lazy-umount + rmdir каждого остатка и эмитит WARN на каждый; старт продолжается независимо от исхода очистки
+
 ### Requirement: sd_notify
 
 После bind listener + spawn всех тасков демон ДОЛЖЕН (MUST) послать `READY=1` (идемпотентно); отсутствие NOTIFY_SOCKET — не фатально (notify.rs:54–71).
@@ -61,4 +81,4 @@ Fly-dm wallpaper update при старте — best-effort и НЕ ДОЛЖЕН
 - **THEN** старт демона продолжается, шаг считается best-effort
 
 - Замечание: tokio runtime жёстко `worker_threads(2)` — docs утверждают «системный default», неверно (daemon/mod.rs:82–84).
-- Замечание (история): flock-singleton и `execute_attempt` audit существовали в 0.2.3 (ветка fix/daemon-singleton-and-audit-trail, 37 коммитов не в main) — в текущем main flock НЕ обнаружен. Ветка — кандидат на ревью человеком.
+- Замечание (история): flock-singleton существовал в 0.2.3 (ветка fix/daemon-singleton-and-audit-trail), затем отсутствовал в main и заново реализован в ec4185b (см. Requirement «Singleton через flock»). `execute_attempt` audit из той же ветки в main по-прежнему отсутствует.

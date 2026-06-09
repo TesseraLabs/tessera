@@ -209,13 +209,13 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             }
         };
         let usb_wait = wired.cfg.usb_wait;
-        let mountpoint_base = PathBuf::from("/run/tessera/mounts");
+        let mountpoint_base = PathBuf::from(tessera_core::mount::usb::MOUNTPOINT_BASE);
         if let Err(err) = std::fs::create_dir_all(&mountpoint_base) {
             tracing::warn!(target: "tessera.auth", error = %err, base = %mountpoint_base.display(), "create mountpoint base failed");
         }
         let real_io = crate::flow::RealFlowIo::new(
             usb_wait,
-            None,
+            wired.cfg.usb_allowed_devices.clone(),
             wired.cfg.max_usb_partitions as usize,
             mountpoint_base,
             session_id.clone(),
@@ -256,10 +256,13 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                     tracing::error!(target: "tessera.auth", error = %err, "set_auth_context failed");
                     return PAM_SYSTEM_ERR;
                 }
-                // Drop the mount guard at end of `pam_sm_authenticate`; the
-                // session cleanup will re-mount on `pam_sm_open_session`
-                // via a future stage.  For now we explicitly drop to keep
-                // semantics obvious.
+                // Drop the mount guard here: the USB stick is only needed
+                // during the auth phase (the .p12 has been read and the
+                // chain verified), so it is unmounted before
+                // `pam_sm_authenticate` returns. The session phase never
+                // re-mounts — by design, the auth context travels via
+                // pam_data instead (see
+                // openspec/specs/cert-authentication-flow/spec.md).
                 drop(mount);
                 PAM_SUCCESS
             }

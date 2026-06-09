@@ -113,7 +113,7 @@ mod host_identity {
 }
 
 use tessera_core::pam_data::AuthContext;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// PAM `pam_sm_acct_mgmt` core, decoupled from the PAM handle for testing.
 ///
@@ -121,13 +121,19 @@ use std::time::SystemTime;
 ///
 /// - `PAM_ACCT_EXPIRED` (`13`) if the certificate's `notAfter` (captured at
 ///   `pam_sm_authenticate` time and stored in [`AuthContext::cert_not_after`])
-///   is before `now`.
+///   plus the `[trust].clock_skew_seconds` tolerance (captured at the same
+///   moment in [`AuthContext::clock_skew_seconds`]) is before `now`.
 /// - `PAM_SUCCESS` (`0`) otherwise.
 #[must_use]
 pub fn acct_mgmt_core(ctx: &AuthContext, now: SystemTime) -> i32 {
     if let Some(na) = ctx.cert_not_after {
-        if now > na {
-            return PAM_ACCT_EXPIRED;
+        let skew = Duration::from_secs(ctx.clock_skew_seconds);
+        // `notAfter` near the upper bound of `SystemTime` can overflow on
+        // `+ skew` (which panics); a deadline past that bound is infinitely
+        // far in the future, so overflow means "not expired".
+        match na.checked_add(skew) {
+            Some(deadline) if now > deadline => return PAM_ACCT_EXPIRED,
+            _ => {}
         }
     }
     panic_guard::PAM_SUCCESS
@@ -153,6 +159,10 @@ mod tests {
     use std::time::Duration;
 
     fn ctx_with_not_after(not_after: Option<SystemTime>) -> AuthContext {
+        ctx_with_skew(not_after, 0)
+    }
+
+    fn ctx_with_skew(not_after: Option<SystemTime>, clock_skew_seconds: u64) -> AuthContext {
         AuthContext {
             session_id: "sess-acct".to_string(),
             cert_cn: Some("alice".into()),
@@ -164,6 +174,7 @@ mod tests {
             host_id_source: HostIdSourceKind::Override,
             authenticated_at: SystemTime::UNIX_EPOCH,
             cert_not_after: not_after,
+            clock_skew_seconds,
             cert_max_integrity: None,
             cert_ident: None,
             home_dir: None,
@@ -189,5 +200,21 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let ctx = ctx_with_not_after(None);
         assert_eq!(acct_mgmt_core(&ctx, now), panic_guard::PAM_SUCCESS);
+    }
+
+    #[test]
+    fn acct_mgmt_returns_success_when_expired_within_clock_skew() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        // Expired 30s ago, but the 60s skew tolerance still covers it.
+        let ctx = ctx_with_skew(Some(now - Duration::from_secs(30)), 60);
+        assert_eq!(acct_mgmt_core(&ctx, now), panic_guard::PAM_SUCCESS);
+    }
+
+    #[test]
+    fn acct_mgmt_returns_expired_when_past_clock_skew() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        // Expired 61s ago — one second beyond the 60s skew tolerance.
+        let ctx = ctx_with_skew(Some(now - Duration::from_secs(61)), 60);
+        assert_eq!(acct_mgmt_core(&ctx, now), PAM_ACCT_EXPIRED);
     }
 }

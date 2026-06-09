@@ -27,7 +27,7 @@ const DEFAULT_MAX_USB_PARTITIONS: usize = 64;
 /// child partition (FS in the allow-list), capped at
 /// [`DEFAULT_MAX_USB_PARTITIONS`].
 pub(super) fn enumerate_once(
-    vid_pid_filter: Option<(u16, u16)>,
+    vid_pid_filter: &[(u16, u16)],
 ) -> Result<Vec<UsbDevice>, UsbError> {
     enumerate_once_with_limit(vid_pid_filter, DEFAULT_MAX_USB_PARTITIONS)
 }
@@ -35,7 +35,7 @@ pub(super) fn enumerate_once(
 /// Variant of [`enumerate_once`] that takes an explicit cap on the
 /// number of partitions accepted per whole-disk.
 pub(super) fn enumerate_once_with_limit(
-    vid_pid_filter: Option<(u16, u16)>,
+    vid_pid_filter: &[(u16, u16)],
     max_usb_partitions: usize,
 ) -> Result<Vec<UsbDevice>, UsbError> {
     let mut e = udev::Enumerator::new().map_err(|e| UsbError::Udev(e.to_string()))?;
@@ -57,7 +57,7 @@ pub(super) fn enumerate_once_with_limit(
 /// Two-phase wait: enumerate, then monitor "add" events.
 pub(super) fn wait_for_usb_real(
     timeout: Duration,
-    vid_pid_filter: Option<(u16, u16)>,
+    vid_pid_filter: &[(u16, u16)],
     max_usb_partitions: usize,
 ) -> Result<Vec<UsbDevice>, UsbError> {
     // Phase 1 — already attached?
@@ -133,7 +133,7 @@ pub(super) fn wait_for_usb_real(
 /// the function returns [`UsbError::TooManyPartitions`] (fail-closed).
 fn devices_from(
     d: &udev::Device,
-    filter: Option<(u16, u16)>,
+    filter: &[(u16, u16)],
     max_usb_partitions: usize,
 ) -> Result<Vec<UsbDevice>, UsbError> {
     let Some(devnode) = d.devnode() else {
@@ -144,10 +144,8 @@ fn devices_from(
     let vid = parse_hex16(d.property_value("ID_VENDOR_ID"))?;
     let pid = parse_hex16(d.property_value("ID_MODEL_ID"))?;
 
-    if let Some((fv, fp)) = filter {
-        if vid != fv || pid != fp {
-            return Ok(Vec::new());
-        }
+    if !filter.is_empty() && !filter.contains(&(vid, pid)) {
+        return Ok(Vec::new());
     }
 
     let serial = d

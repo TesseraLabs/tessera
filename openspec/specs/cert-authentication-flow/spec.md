@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Оркестрация аутентификации в `pam_sm_authenticate`: от загрузки конфига до выдачи PAM-кода. Два пути — PKCS#12 (USB-носитель) и PKCS#11 (аппаратный токен). Описывает intended-поведение v0.3.19 (main @ 916c41e).
+Оркестрация аутентификации в `pam_sm_authenticate`: от загрузки конфига до выдачи PAM-кода. Два пути — PKCS#12 (USB-носитель) и PKCS#11 (аппаратный токен). Описывает intended-поведение v0.4.0.
 
 Код: `crates/pam_tessera/src/entry.rs`, `crates/pam_tessera/src/flow.rs`.
 
@@ -47,7 +47,8 @@
 #### Scenario: monitord недоступен при SessionOpen
 - **WHEN** `monitor.open_session` вернул ошибку на auth-пути
 - **THEN** только WARN, auth-вердикт не меняется (flow.rs:742–747)
-- ⚠ KNOWN GAP: docs/architecture.md:542–543 обещает fail-closed при `monitor_fail_mode="strict"` — в коде flow ошибка monitord на этом call-site non-fatal. Расхождение docs↔код.
+
+Недоступность monitord на этом call-site НЕ ДОЛЖНА (MUST NOT) менять auth-вердикт даже при `monitor_fail_mode="strict"`: фатальны (меняют вердикт) только `DEVICE_GONE` и `UNAUTHORIZED` (`ipc/failmode.rs`); уведомление monitord идёт после уже состоявшегося успеха аутентификации, транспортные ошибки IPC — non-fatal. `strict`/`permissive` управляют лишь тем, пробрасывает ли `FailModeWrapper` нефатальные ошибки IPC вызывающему коду.
 
 ### Requirement: PKCS#11 путь
 
@@ -57,7 +58,7 @@
 - **WHEN** токен присутствует, PIN верный, найдены сертификат и приватный ключ, подпись на токене и trust verify прошли
 - **THEN** host_binding и user auth выполняются, сессия закрывается через `drop(session)` (C_Logout) до возврата управления
 
-- ⚠ KNOWN GAP (T18): intermediates с токена не снимаются — trust-цепь строится только из конфига (flow.rs:1000–1009).
+- Design-граница: intermediates с токена НЕ снимаются — trust-цепь строится только из anchors/intermediates конфига (flow.rs:1000–1009); носитель не участвует в формировании доверия, источник trust-материала — администрируемый конфиг.
 
 ### Requirement: Маппинг FlowError → PAM-код
 
@@ -75,26 +76,25 @@
 - **WHEN** `flow::authenticate` завершился `FlowError` (например, MaxTries)
 - **THEN** возвращается соответствующий классу PAM rc (для MaxTries — 8 PAM_MAXTRIES), а не единый PAM_AUTH_ERR
 
-- ⚠ KNOWN GAP: docs/architecture.md:535–541 схлопывает всё в PAM_AUTH_ERR — код различает PERM_DENIED(6)/AUTH_ERR(7)/MAXTRIES(8)/SYSTEM_ERR(4). Docs устарели.
-
 ### Requirement: User-авторизация — приоритет cert-driven
 
-Если `user_binding_ext::parse(x509).is_ok()` — модуль ДОЛЖЕН (MUST) использовать `verify_user_binding` (cert-driven); иначе ДОЛЖЕН (MUST) откатиться на legacy `[[user_mapping]]` из конфига (flow.rs:662–667).
+Результат `user_binding_ext::parse(x509)` ДОЛЖЕН (MUST) различаться по трём исходам: Ok → cert-driven `verify_user_binding`; расширение ОТСУТСТВУЕТ → legacy `[[user_mapping]]` из конфига; расширение присутствует, но malformed/empty → отказ (fail-closed), БЕЗ отката в legacy-mapping (соответствует docs/architecture.md:540).
 
-#### Scenario: malformed user_binding extension
+#### Scenario: malformed user_binding extension → отказ
 - **WHEN** расширение `pam_cert_user_binding` присутствует, но malformed/empty
-- **THEN** `parse()` = Err → код ТИХО уходит в legacy TOML-mapping вместо отказа
-- ⚠ KNOWN GAP (security): docs/architecture.md:540 требует отказ при невалидном расширении. Код fail-open в legacy-путь. Кандидат на фикс.
+- **THEN** auth отклоняется (fail-closed); legacy TOML-mapping НЕ применяется — fallback в legacy допустим только при полном отсутствии расширения
 
-### Requirement: Mount drop после auth
+#### Scenario: user_binding отсутствует
+- **WHEN** в серте нет расширения `pam_cert_user_binding`
+- **THEN** авторизация идёт через legacy `[[user_mapping]]` из конфига
 
-`pam_sm_authenticate` ДОЛЖЕН (MUST) дропать MountGuard сразу после успешного auth (entry.rs:251) — USB размонтируется по завершении auth-фазы.
+### Requirement: Mount живёт только в auth-фазе
+
+`pam_sm_authenticate` ДОЛЖЕН (MUST) дропать MountGuard сразу после успешного auth (entry.rs) — USB размонтируется по завершении auth-фазы. Re-mount в session-фазе ОТСУТСТВУЕТ by design и не планируется: после auth `.p12` больше не нужен (ключ уже использован для challenge, контекст аутентификации передаётся в open_session через pam_data).
 
 #### Scenario: Размонтирование USB после успешного auth
 - **WHEN** auth-фаза завершилась успешно
-- **THEN** MountGuard дропается сразу (entry.rs:251), USB размонтируется
-
-- ⚠ KNOWN GAP: комментарий entry.rs:247–250 обещает re-mount в open_session «in a future stage» — re-mount нигде не реализован. После auth `.p12` недоступен.
+- **THEN** MountGuard дропается сразу (entry.rs), USB размонтируется; `pam_sm_open_session` носитель не перемонтирует
 
 ### Requirement: Fail-closed резюме auth
 

@@ -9,6 +9,8 @@
 //! - `pkcs11_max_pin_attempts` must be in `1..=5`.
 //! - `pkcs11_slot_wait_seconds` must be in `0..=60`.
 //! - `pkcs11_locking_mode` is a strict enum (`os` | `mutex`).
+//! - `pkcs11_allow_extractable_keys` defaults to `false` (fail-closed)
+//!   and passes through to the validated config when set.
 //! - `deny_unknown_fields` is honoured for unknown PKCS#11-prefixed
 //!   keys.
 //! - `mode = "pkcs12"` keeps working without any PKCS#11 fields set.
@@ -74,6 +76,22 @@ fn defaults_apply_when_minimal_pkcs11() {
     assert_eq!(cfg.pkcs11_locking_mode, LockingMode::Os);
     assert_eq!(cfg.pkcs11_slot_wait, std::time::Duration::from_secs(10));
     assert!(cfg.pkcs11_object_label.is_none());
+    assert!(
+        !cfg.pkcs11_allow_extractable_keys,
+        "extractable keys must be refused by default (fail-closed)"
+    );
+}
+
+#[test]
+fn allow_extractable_keys_opt_in_passes_through() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let anchor = write_anchor(dir.path());
+    let extras = "pkcs11_allow_extractable_keys = true";
+    let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", extras);
+    let raw: RawConfig = toml::from_str(&body).expect("parse");
+    assert!(raw.pkcs11_allow_extractable_keys);
+    let cfg = ValidatedConfig::try_from(&raw).expect("validate");
+    assert!(cfg.pkcs11_allow_extractable_keys);
 }
 
 #[test]

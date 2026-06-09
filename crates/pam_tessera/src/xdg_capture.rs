@@ -4,7 +4,7 @@
 //!
 //! The PAM module is called twice per login (see `integrate-pam.sh`):
 //!
-//! 1. From the `@include certauth-only` block — runs BEFORE
+//! 1. From the `@include tessera-only` block — runs BEFORE
 //!    `pam_systemd.so`, so `XDG_SESSION_ID` is NULL. We log debug and
 //!    no-op.
 //! 2. From the explicit `session required pam_tessera.so` after

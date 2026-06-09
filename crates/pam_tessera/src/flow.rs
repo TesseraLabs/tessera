@@ -577,23 +577,29 @@ where
         )));
     };
 
-    // Step 5 — PIN-retry loop.
-    let loaded: LoadedKeyMaterial =
-        match acquire_p12_material_with_prompter(&creds.p12_bytes, 3, &mut prompt_pin) {
-            Ok(m) => m,
-            Err(AcquireError::MaxTries) => {
-                // Try to read the cert plaintext from the .p12 (newer issuance
-                // tooling embeds the leaf cert outside the encrypted SafeContents
-                // so it can be inspected without the PIN). When that works, we
-                // can surface the host/user binding the cert is bound to so the
-                // engineer can match it against the deployment registry. If the
-                // .p12 predates that change and the cert is still encrypted,
-                // parsing fails gracefully and we fall back to a generic message.
-                io.show_info(&p12_wrong_pin_diagnostic(&creds.p12_bytes));
-                return Err(FlowError::MaxTries);
-            }
-            Err(e) => return Err(FlowError::from(e)),
-        };
+    // Step 5 — PIN-retry loop.  When the operator configured
+    // `pkcs12_pin_prompt` it replaces the default "Smart-card PIN: "
+    // prompt, mirroring `pkcs11_pin_prompt` on the PKCS#11 path.
+    let loaded: LoadedKeyMaterial = match acquire_p12_material_with_prompter(
+        &creds.p12_bytes,
+        3,
+        deps.cfg.pkcs12_pin_prompt.as_deref(),
+        &mut prompt_pin,
+    ) {
+        Ok(m) => m,
+        Err(AcquireError::MaxTries) => {
+            // Try to read the cert plaintext from the .p12 (newer issuance
+            // tooling embeds the leaf cert outside the encrypted SafeContents
+            // so it can be inspected without the PIN). When that works, we
+            // can surface the host/user binding the cert is bound to so the
+            // engineer can match it against the deployment registry. If the
+            // .p12 predates that change and the cert is still encrypted,
+            // parsing fails gracefully and we fall back to a generic message.
+            io.show_info(&p12_wrong_pin_diagnostic(&creds.p12_bytes));
+            return Err(FlowError::MaxTries);
+        }
+        Err(e) => return Err(FlowError::from(e)),
+    };
 
     // Step 6 — challenge-response (proves we hold the private key).
     let priv_key = loaded.private_key()?;
@@ -658,13 +664,9 @@ where
 
     // Step 10 — user authorisation. Cert-driven path (user_binding
     // extension present) wins over the legacy `[[user_mapping]]`. Only
-    // certs without `pam_cert_user_binding` fall through to TOML.
-    if tessera_core::x509::user_binding_ext::parse(loaded.end_entity.x509()).is_ok() {
-        verify_user_binding(loaded.end_entity.x509(), pam_user)?;
-    } else {
-        let _matched: MatchedMapping =
-            match_user(&loaded.end_entity, pam_user, deps.user_mappings)?;
-    }
+    // certs without `pam_cert_user_binding` fall through to TOML; a
+    // present-but-broken extension fails closed (see `authorize_user`).
+    authorize_user(&loaded.end_entity, pam_user, deps.user_mappings)?;
 
     // Step 11 — assemble AuthContext.
     let cert_cn = loaded.end_entity.subject_cn().ok();
@@ -701,6 +703,7 @@ where
         host_id_source: deps.host_id_source,
         authenticated_at: SystemTime::now(),
         cert_not_after,
+        clock_skew_seconds: deps.cfg.trust.clock_skew_seconds,
         cert_max_integrity,
         cert_ident,
         home_dir,
@@ -983,8 +986,11 @@ where
         "pkcs11 certificate found"
     );
 
-    // Step 6 — find the matching private key (paired by CKA_ID).
-    let key: FoundPrivateKey = session.find_private_key_for_cert(&cert)?;
+    // Step 6 — find the matching private key (paired by CKA_ID).  An
+    // extractable key is rejected here unless the operator opted in via
+    // `pkcs11_allow_extractable_keys` (mode-B invariant, fail-closed).
+    let key: FoundPrivateKey =
+        session.find_private_key_for_cert(&cert, deps.cfg.pkcs11_allow_extractable_keys)?;
 
     // Step 7 — pick a signing mechanism, then challenge-response.
     let pubkey = cert.certificate.public_key().map_err(FlowError::Trust)?;
@@ -1016,12 +1022,9 @@ where
     verify_host_binding(cert.certificate.x509(), deps.host_id_hash)?;
 
     // Step 10 — user authorisation. Cert path (user_binding present)
-    // wins over `[[user_mapping]]`; legacy path used when ext absent.
-    if tessera_core::x509::user_binding_ext::parse(cert.certificate.x509()).is_ok() {
-        verify_user_binding(cert.certificate.x509(), pam_user)?;
-    } else {
-        let _matched: MatchedMapping = match_user(&cert.certificate, pam_user, deps.user_mappings)?;
-    }
+    // wins over `[[user_mapping]]`; legacy path used when ext absent; a
+    // present-but-broken extension fails closed (see `authorize_user`).
+    authorize_user(&cert.certificate, pam_user, deps.user_mappings)?;
 
     // Step 11 — assemble AuthContext.  The token serial replaces the
     // USB serial in this mode (monitord uses the same field).
@@ -1055,6 +1058,7 @@ where
         host_id_source: deps.host_id_source,
         authenticated_at: SystemTime::now(),
         cert_not_after,
+        clock_skew_seconds: deps.cfg.trust.clock_skew_seconds,
         cert_max_integrity,
         cert_ident,
         home_dir,
@@ -1211,8 +1215,9 @@ pub fn parse_chain_pem(pem: &[u8]) -> Result<Vec<Certificate>, TrustError> {
 pub struct RealFlowIo {
     /// Wait timeout.
     pub timeout: std::time::Duration,
-    /// Optional VID/PID filter (none → accept any USB block device).
-    pub vid_pid_filter: Option<(u16, u16)>,
+    /// Allow-list of `(vid, pid)` pairs from `usb_allowed_devices`
+    /// (empty → accept any USB block device).
+    pub vid_pid_filter: Vec<(u16, u16)>,
     /// Maximum number of USB partitions inspected per whole-disk.
     pub max_usb_partitions: usize,
     /// Base directory under which session-specific mountpoints are created.
@@ -1240,7 +1245,7 @@ impl RealFlowIo {
     #[must_use]
     pub fn new(
         timeout: std::time::Duration,
-        vid_pid_filter: Option<(u16, u16)>,
+        vid_pid_filter: Vec<(u16, u16)>,
         max_usb_partitions: usize,
         mountpoint_base: PathBuf,
         session_id: String,
@@ -1275,7 +1280,7 @@ impl FlowIo for RealFlowIo {
     fn wait_for_usb(&self) -> Result<Vec<UsbDevice>, UsbError> {
         tessera_core::usb::wait_for_usb_devices(
             self.timeout,
-            self.vid_pid_filter,
+            &self.vid_pid_filter,
             self.max_usb_partitions,
         )
     }
@@ -1441,6 +1446,46 @@ impl FlowIo for InMemoryFlowIo {
 /// the cert was issued for, which is the actionable information for a
 /// "wrong flash" mix-up. When the cert is also encrypted (legacy bundles)
 /// we degrade gracefully to a generic password-wrong message.
+/// Step 10 user authorisation, shared by the PKCS#12 and PKCS#11 paths.
+///
+/// The cert-driven path (`pam_cert_user_binding` extension present and
+/// well-formed) takes precedence over the legacy `[[user_mapping]]`
+/// TOML; only certs *without* the extension fall through to the legacy
+/// mapping. An extension that is present but malformed (or empty) fails
+/// closed: silently routing such a cert through the legacy mapping
+/// would let a certificate that was meant to restrict users
+/// authenticate via a stale TOML entry instead.
+// Planned (openspec/changes/role-format/): role selection lands here — parse
+// the `user+role` suffix off `pam_user`, canonicalise PAM_USER, resolve the
+// role from the on-device store, and require role ∈ the cert's allowed-roles
+// extension (no default role; a missing selection aborts the login).
+fn authorize_user(
+    cert: &Certificate,
+    pam_user: &str,
+    user_mappings: &[tessera_core::config::validated::UserMapping],
+) -> Result<(), FlowError> {
+    use tessera_core::x509::user_binding_ext::UserBindingExtError;
+    match tessera_core::x509::user_binding_ext::parse(cert.x509()) {
+        Ok(_) => verify_user_binding(cert.x509(), pam_user)?,
+        Err(UserBindingExtError::Missing) => {
+            let _matched: MatchedMapping = match_user(cert, pam_user, user_mappings)?;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "tessera.flow",
+                event = "user_binding_unparseable",
+                error = %e,
+                pam_user = %pam_user,
+                cert_serial = %cert.serial_hex().to_lowercase(),
+                "pam_cert_user_binding present but unparseable; failing closed \
+                 (legacy mapping fallback is not allowed for broken extensions)"
+            );
+            return Err(FlowError::CertScope(e.into()));
+        }
+    }
+    Ok(())
+}
+
 fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
     let Some(cert) = tessera_core::pkcs12::try_extract_cert_without_pin(p12_bytes) else {
         return "Пароль .p12 неверный. Проверьте флешку и попробуйте ещё раз.".to_string();
@@ -1449,9 +1494,7 @@ fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
         Ok(entries) => entries
             .iter()
             .map(|e| match e {
-                tessera_core::x509::host_binding_ext::HostDescriptor::Wildcard => {
-                    "*".to_string()
-                }
+                tessera_core::x509::host_binding_ext::HostDescriptor::Wildcard => "*".to_string(),
                 tessera_core::x509::host_binding_ext::HostDescriptor::Sha256Hex(h) => {
                     format!("sha256:{h}")
                 }
@@ -1465,9 +1508,7 @@ fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
         Ok(entries) => entries
             .iter()
             .map(|e| match e {
-                tessera_core::x509::user_binding_ext::UserDescriptor::Wildcard => {
-                    "*".to_string()
-                }
+                tessera_core::x509::user_binding_ext::UserDescriptor::Wildcard => "*".to_string(),
                 tessera_core::x509::user_binding_ext::UserDescriptor::Exact(u) => u.clone(),
             })
             .collect::<Vec<_>>()
@@ -1495,11 +1536,11 @@ fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
 )]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tessera_core::config::validated::{UserMapping, UserMatchCriteria};
     use tessera_core::host_identity::HostIdSourceKind;
     use tessera_core::ipc::StubClient;
     use tessera_core::trust::openssl_verifier::{OpensslVerifier, OpensslVerifierConfig};
-    use std::time::Duration;
 
     /// Loads a fixture under `crates/tessera_core/tests/fixtures/`.
     fn fixture_bytes(name: &str) -> Vec<u8> {
@@ -1528,6 +1569,7 @@ mod tests {
             intermediates: vec![int_],
             crl_pems: vec![],
             crl_strict: false,
+            crl_max_age: None,
             clock_skew: Duration::from_secs(60),
             signature_alg_whitelist: vec![
                 "sha256WithRSAEncryption".into(),
@@ -1547,6 +1589,14 @@ mod tests {
         }
     }
 
+    /// Path to a real PEM fixture usable as a `[trust].anchors` entry —
+    /// config validation rejects empty anchor lists.
+    fn anchor_path_toml() -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tessera_core/tests/fixtures/ca.pem");
+        format!("{:?}", path.to_string_lossy())
+    }
+
     fn minimal_cfg() -> ValidatedConfig {
         // Build via toml + try_from to avoid restating every default in code.
         let raw_toml = r#"
@@ -1561,7 +1611,7 @@ suspend_grace_seconds = 30
 monitor_fail_mode = "permissive"
 
 [trust]
-anchors = []
+anchors = [@ANCHOR@]
 intermediates = []
 allowed_signature_algorithms = []
 max_chain_depth = 4
@@ -1583,10 +1633,9 @@ custom_command_timeout_seconds = 5
 
 [logging]
 level = "info"
-syslog_facility = "auth"
-journald_priority = false
 "#;
-        let raw: tessera_core::config::raw::RawConfig = toml::from_str(raw_toml).unwrap();
+        let raw_toml = raw_toml.replace("@ANCHOR@", &anchor_path_toml());
+        let raw: tessera_core::config::raw::RawConfig = toml::from_str(&raw_toml).unwrap();
         ValidatedConfig::try_from(&raw).unwrap()
     }
 
@@ -1762,7 +1811,132 @@ journald_priority = false
     // Cert host/user binding scope is exhaustively tested in
     // `tessera_core::host_binding::tests`; we don't re-test the
     // matrix end-to-end here because every fixture cert has `["*"]` for
-    // both extensions (max-permissive).
+    // both extensions (max-permissive). The `authorize_user` dispatch
+    // (cert path vs legacy mapping vs fail-closed) is unit-tested below
+    // with locally built certs.
+
+    /// Builds a self-signed cert whose `pam_cert_user_binding` extension
+    /// carries `der_value` verbatim (possibly garbage DER).
+    fn cert_with_user_binding_ext(der_value: &[u8]) -> Certificate {
+        use openssl::asn1::{Asn1Integer, Asn1Object, Asn1OctetString, Asn1Time};
+        use openssl::bn::BigNum;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::rsa::Rsa;
+        use openssl::x509::{X509Builder, X509Extension, X509Name};
+
+        let pkey = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut nb = X509Name::builder().unwrap();
+        nb.append_entry_by_text("CN", "alice").unwrap();
+        let name = nb.build();
+
+        let mut b = X509Builder::new().unwrap();
+        b.set_version(2).unwrap();
+        let serial = {
+            let mut bn = BigNum::new().unwrap();
+            bn.rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
+                .unwrap();
+            Asn1Integer::from_bn(&bn).unwrap()
+        };
+        b.set_serial_number(&serial).unwrap();
+        b.set_subject_name(&name).unwrap();
+        b.set_issuer_name(&name).unwrap();
+        b.set_pubkey(&pkey).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        let oid = Asn1Object::from_str(tessera_core::x509::oids::USER_BINDING_OID).unwrap();
+        let octet = Asn1OctetString::new_from_bytes(der_value).unwrap();
+        b.append_extension(X509Extension::new_from_der(&oid, false, &octet).unwrap())
+            .unwrap();
+        b.sign(&pkey, MessageDigest::sha256()).unwrap();
+        Certificate::from_der(&b.build().to_der().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn malformed_user_binding_fails_closed() {
+        // 0x04 0x00 is an OCTET STRING, not the `SEQUENCE OF UTF8String`
+        // the extension requires → parse() yields Malformed, not Missing.
+        let cert = cert_with_user_binding_ext(&[0x04, 0x00]);
+        // A legacy mapping that WOULD authorise alice — it must NOT be
+        // consulted when the extension is present but broken.
+        let mappings = vec![cn_mapping("alice", "alice")];
+        let err = authorize_user(&cert, "alice", &mappings).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlowError::CertScope(HostBindingError::UserExtensionMalformed(_))
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(err.pam_code(), 7); // PAM_AUTH_ERR — denied, no fallback
+    }
+
+    #[test]
+    fn empty_user_binding_fails_closed() {
+        // Well-formed but empty SEQUENCE — present yet authorises nobody;
+        // must not fall back to the legacy mapping either.
+        let cert = cert_with_user_binding_ext(&[0x30, 0x00]);
+        let mappings = vec![cn_mapping("alice", "alice")];
+        let err = authorize_user(&cert, "alice", &mappings).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlowError::CertScope(HostBindingError::UserExtensionMalformed(_))
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn valid_user_binding_wins_over_legacy_mapping() {
+        // SEQUENCE { UTF8String "alice" }
+        let cert =
+            cert_with_user_binding_ext(&[0x30, 0x07, 0x0C, 0x05, b'a', b'l', b'i', b'c', b'e']);
+        // No mappings at all: the cert path must authorise alice on its own.
+        authorize_user(&cert, "alice", &[]).expect("alice allowed by cert");
+        // ...and deny bob even though a mapping would have allowed him.
+        let mappings = vec![cn_mapping("bob", "alice")];
+        let err = authorize_user(&cert, "bob", &mappings).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlowError::CertScope(HostBindingError::UserNotAllowed { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pkcs12_pin_prompt_from_config_reaches_prompter() {
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let cfg = minimal_cfg(); // sets pkcs12_pin_prompt = "PIN: "
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+        };
+
+        let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let seen = std::cell::RefCell::new(Vec::new());
+        authenticate(deps, &io, "alice", "ssh", "sess-prompt".into(), |p| {
+            seen.borrow_mut().push(p.to_string());
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .expect("happy path with custom prompt");
+        assert_eq!(seen.borrow().as_slice(), ["PIN: "]);
+    }
 
     // -----------------------------------------------------------------
     // PKCS#11 dispatch tests (T13)
@@ -1792,7 +1966,7 @@ suspend_grace_seconds = 30
 monitor_fail_mode = "permissive"
 
 [trust]
-anchors = []
+anchors = [@ANCHOR@]
 intermediates = []
 allowed_signature_algorithms = []
 max_chain_depth = 4
@@ -1814,10 +1988,9 @@ custom_command_timeout_seconds = 5
 
 [logging]
 level = "info"
-syslog_facility = "auth"
-journald_priority = false
 "#;
-        let raw: tessera_core::config::raw::RawConfig = toml::from_str(raw_toml).unwrap();
+        let raw_toml = raw_toml.replace("@ANCHOR@", &anchor_path_toml());
+        let raw: tessera_core::config::raw::RawConfig = toml::from_str(&raw_toml).unwrap();
         ValidatedConfig::try_from(&raw).unwrap()
     }
 
@@ -2074,17 +2247,16 @@ journald_priority = false
     // 4. The PKCS#11 path also calls the same hook stages.
     // -----------------------------------------------------------------
 
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use tessera_core::hooks::{
         HookConfig as Stage5HookConfig, HookOutcome, HookStage as Stage5HookStage, OnFailure, RunAs,
     };
-    use std::collections::BTreeMap;
-    use std::sync::Mutex;
 
     /// Mock executor used by the Stage 5 wiring tests.
     struct MockExec {
-        scripted: Mutex<
-            std::collections::VecDeque<Result<HookOutcome, tessera_core::hooks::HookError>>,
-        >,
+        scripted:
+            Mutex<std::collections::VecDeque<Result<HookOutcome, tessera_core::hooks::HookError>>>,
         calls: Mutex<Vec<(Stage5HookStage, Vec<String>)>>,
     }
     impl MockExec {

@@ -6,44 +6,43 @@
 
 ## 1. Мониторинг
 
-### 1.1 Health-check файл
+> Отдельного health-файла у демона **нет** — сигналы живости:
+> systemd-состояние юнита (`Type=notify` + `sd_notify`), наличие
+> IPC-сокета и записи в журнале.
 
-`monitord` периодически (раз в `5–10` секунд) обновляет
-`/run/tessera/health`. Формат:
-
-```
-OK 1735689600
-```
-
-Алгоритм мониторинга:
-
-1. Прочитать файл.
-2. Если первое слово не `OK` — критическая ошибка.
-3. Если timestamp старше `60` секунд — stale (демон висит или упал).
-
-### 1.2 systemd-сервис
+### 1.1 systemd-сервис
 
 ```bash
 systemctl is-active tessera
 ```
 
-Ожидание: `active`. Любое другое значение — алерт.
+Ожидание: `active`. Любое другое значение — алерт. Юнит работает в
+режиме `Type=notify`: systemd сам видит, что демон жив, и
+перезапускает его по `Restart=`-политике.
 
-### 1.3 Сокет
+### 1.2 Сокет
 
 ```bash
 test -S /run/tessera/monitord.sock && echo OK || echo FAIL
 ```
 
+### 1.3 Журнал
+
+Свежие ошибки демона за интервал опроса:
+
+```bash
+journalctl -u tessera --since '5 min ago' -p err --no-pager -q
+```
+
+Пустой вывод — норма; любая строка — повод посмотреть руками.
+
 ### 1.4 Snippet для Zabbix UserParameter
 
 ```ini
-UserParameter=tessera.health,
-    awk '{print $1}' /run/tessera/health
-UserParameter=tessera.timestamp,
-    awk '{print $2}' /run/tessera/health
 UserParameter=tessera.active,
     systemctl is-active tessera
+UserParameter=tessera.socket,
+    test -S /run/tessera/monitord.sock && echo 1 || echo 0
 ```
 
 ### 1.5 Snippet для Prometheus textfile collector
@@ -51,12 +50,12 @@ UserParameter=tessera.active,
 `/var/lib/node_exporter/textfile_collector/tessera.prom`:
 
 ```
-# HELP tessera_up 1 if monitord is healthy.
+# HELP tessera_up 1 if monitord is active.
 # TYPE tessera_up gauge
 tessera_up <0|1>
-# HELP tessera_health_age_seconds age of the health file.
-# TYPE tessera_health_age_seconds gauge
-tessera_health_age_seconds <int>
+# HELP tessera_socket_present 1 if the IPC socket exists.
+# TYPE tessera_socket_present gauge
+tessera_socket_present <0|1>
 ```
 
 Скрипт обновления (cron каждые 30 сек):
@@ -64,24 +63,16 @@ tessera_health_age_seconds <int>
 ```bash
 #!/usr/bin/env bash
 set -e
-NOW=$(date +%s)
-HEALTH=/run/tessera/health
-if [[ -f "$HEALTH" ]]; then
-    TS=$(awk '{print $2}' "$HEALTH")
-    AGE=$((NOW - TS))
-    UP=$([[ "$AGE" -lt 60 ]] && echo 1 || echo 0)
-else
-    AGE=999999
-    UP=0
-fi
+UP=$([[ "$(systemctl is-active tessera)" == "active" ]] && echo 1 || echo 0)
+SOCK=$([[ -S /run/tessera/monitord.sock ]] && echo 1 || echo 0)
 TMP=$(mktemp)
 {
-    echo "# HELP tessera_up 1 if monitord is healthy."
+    echo "# HELP tessera_up 1 if monitord is active."
     echo "# TYPE tessera_up gauge"
     echo "tessera_up $UP"
-    echo "# HELP tessera_health_age_seconds"
-    echo "# TYPE tessera_health_age_seconds gauge"
-    echo "tessera_health_age_seconds $AGE"
+    echo "# HELP tessera_socket_present 1 if the IPC socket exists."
+    echo "# TYPE tessera_socket_present gauge"
+    echo "tessera_socket_present $SOCK"
 } > "$TMP"
 mv "$TMP" /var/lib/node_exporter/textfile_collector/tessera.prom
 ```
@@ -214,9 +205,10 @@ Ansible-выкатка, troubleshooting.
 
 ### 4.2 Что НЕ бэкапить
 
-- `/run/tessera/` — runtime, восстанавливается systemd-tmpfiles
-  при загрузке.
-- `/var/cache/tessera/ocsp/` — кэш, восстанавливается при работе.
+- `/run/tessera/` — runtime (сокет, `sessions.json`,
+  `daemon.lock`), восстанавливается systemd-tmpfiles при загрузке.
+- `/var/cache/tessera/` — зарезервировано под кэши,
+  восстанавливается при работе.
 
 ### 4.3 Команды
 
@@ -354,9 +346,10 @@ sudo journalctl -t tessera | grep -E 'pam_user[=:]"alice"'
 **Состояние сессий.** Реестр `sessions.json` лежит на tmpfs
 (`/run/tessera/sessions.json`, `RuntimeDirectory=`). Volatile
 across reboot — это by design: sshd/login/sudo-процессы, держащие
-эти сессии, всё равно умирают на reboot. `daemon.lock` и
-OCSP/CRL-кэши остаются в `/var/lib/tessera/` и
-`/var/cache/tessera/` соответственно.
+эти сессии, всё равно умирают на reboot. Singleton-замок
+`daemon.lock` живёт рядом с `sessions.json` (fallback —
+`/var/lib/tessera/`); постоянное состояние — wallpaper-backup в
+`/var/lib/tessera/`.
 
 ## 8. Emergency contact
 

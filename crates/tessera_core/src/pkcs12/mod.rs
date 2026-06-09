@@ -181,6 +181,10 @@ pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
     Certificate::from_der(&der).ok()
 }
 
+/// PIN prompt used when the operator did not configure
+/// `pkcs12_pin_prompt`.
+pub const DEFAULT_PKCS12_PIN_PROMPT: &str = "Smart-card PIN: ";
+
 /// Bounded PIN-retry loop.
 ///
 /// Calls `prompter` up to `max_tries` times.  Each prompt's result is fed to
@@ -188,6 +192,11 @@ pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
 /// continues; on any other parse error it bails out immediately.  When all
 /// attempts are exhausted, returns [`AcquireError::MaxTries`] so the PAM layer
 /// can map it to `PAM_MAXTRIES`.
+///
+/// `prompt` is the user-facing PIN prompt (the operator-configured
+/// `pkcs12_pin_prompt`); `None` falls back to
+/// [`DEFAULT_PKCS12_PIN_PROMPT`].  The prompter receives the string
+/// verbatim on every attempt.
 ///
 /// `max_tries == 0` returns `MaxTries` without invoking the prompter.
 ///
@@ -200,12 +209,13 @@ pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
 pub fn acquire_p12_material_with_prompter<F>(
     bytes: &[u8],
     max_tries: u8,
+    prompt: Option<&str>,
     mut prompter: F,
 ) -> Result<LoadedKeyMaterial, AcquireError>
 where
     F: FnMut(&str) -> Result<SecretString, PamConvError>,
 {
-    let prompt = "Smart-card PIN: ";
+    let prompt = prompt.unwrap_or(DEFAULT_PKCS12_PIN_PROMPT);
     for _ in 0..max_tries {
         let pin = prompter(prompt)?;
         match LoadedKeyMaterial::from_p12(bytes, &pin) {

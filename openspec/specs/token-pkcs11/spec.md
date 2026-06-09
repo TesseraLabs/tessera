@@ -36,10 +36,21 @@
 
 `find_certificate`: `CKO_CERTIFICATE`+`CKC_X_509`, опц. `CKA_LABEL == pkcs11_object_label`; ПЕРВЫЙ кандидат с валидным X.509 DER в `CKA_VALUE`. Поиск НЕ ДОЛЖЕН (MUST NOT) выбирать по subject CN — привязка к pam_user делается через binding/mapping. `find_private_key_for_cert`: `CKO_PRIVATE_KEY` с `CKA_ID == cert.CKA_ID` (cert_lookup.rs, key_lookup.rs).
 
-#### Scenario: Extractable-ключ
-- **WHEN** `CKA_EXTRACTABLE == TRUE`
+#### Scenario: Несколько сертификатов на токене
+- **WHEN** на токене несколько объектов `CKO_CERTIFICATE` (с учётом фильтра `pkcs11_object_label`, если задан)
+- **THEN** берётся ПЕРВЫЙ кандидат с валидным X.509 DER в `CKA_VALUE` (не по subject CN); приватный ключ ищется по `CKA_ID == cert.CKA_ID`
+
+### Requirement: Non-extractable инвариант (режим B)
+
+Ключ с `CKA_EXTRACTABLE == TRUE` ДОЛЖЕН (MUST) отклоняться с `ExtractableKeyRejected` (fail-closed; в сообщении — тип ключа и hex-префикс `CKA_ID`, без ключевого материала) — дефолтное поведение при `pkcs11_allow_extractable_keys = false`. При явном операторском opt-in `pkcs11_allow_extractable_keys = true` модуль ДОЛЖЕН (MUST) логировать WARN `pkcs11_extractable_key` и продолжать. Ошибка маппится на PAM как прочие pkcs11-ошибки auth-пути (`PAM_AUTH_ERR`) (key_lookup.rs, error.rs).
+
+#### Scenario: Extractable-ключ при дефолтной политике
+- **WHEN** `CKA_EXTRACTABLE == TRUE` и `pkcs11_allow_extractable_keys = false` (дефолт)
+- **THEN** возвращается `ExtractableKeyRejected` → `PAM_AUTH_ERR`; аутентификация не продолжается
+
+#### Scenario: Extractable-ключ при операторском opt-in
+- **WHEN** `CKA_EXTRACTABLE == TRUE` и `pkcs11_allow_extractable_keys = true`
 - **THEN** WARN `pkcs11_extractable_key`, работа продолжается
-- ⚠ KNOWN GAP: инвариант режима B («non-extractable») не enforce'ится — только предупреждение (key_lookup.rs:158–165). Policy-решение; внешний аудит должен ловить.
 
 ### Requirement: Механизмы подписи
 

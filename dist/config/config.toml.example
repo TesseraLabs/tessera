@@ -43,6 +43,11 @@ pkcs11_locking_mode = "os"
 # Maximum time wait_for_token will block waiting for the user to insert the
 # token, in seconds. Range 0..=60. 0 disables the wait entirely.
 pkcs11_slot_wait_seconds = 10
+# Accept private keys with CKA_EXTRACTABLE = TRUE. Default false: an
+# extractable key breaks the mode-B invariant (key never leaves the token),
+# so authentication fails closed. Set to true only as a deliberate operator
+# decision; the violation is then logged as WARN pkcs11_extractable_key.
+# pkcs11_allow_extractable_keys = false
 
 # --- PKCS#12 -----------------------------------------------------------------
 # Used only when mode = "pkcs12".
@@ -65,7 +70,13 @@ pkcs11_slot_wait_seconds = 10
 
 # --- USB monitor -------------------------------------------------------------
 # Maximum time to block waiting for the user's USB token at auth time.
+# Range 0..=300; 0 means fail-fast (no wait).
 usb_wait_seconds = 10
+# Allow-list of USB devices considered as the PKCS#12 medium, as "vid:pid"
+# hex strings in lsusb format (four hex digits each). Empty or absent = any
+# USB block device. Hygiene against stray sticks, NOT a trust boundary:
+# VID/PID are spoofable; trust comes from .p12 decryption + chain validation.
+# usb_allowed_devices = ["0951:1666"]
 # Максимальное число USB-партиций, перебираемых при поиске .p12.
 # Защита от DoS: атакующий с физическим доступом не сможет заставить
 # модуль mount/unmount слишком много FS подряд. Range 1..=64.
@@ -162,16 +173,18 @@ allowed_signature_algorithms = []
 
 # --- Trust → revocation ------------------------------------------------------
 [trust.revocation]
-# "none" | "crl" | "ocsp" | "crl_then_ocsp"
+# "none" | "crl". OCSP modes ("ocsp", "crl_then_ocsp") and the ocsp_* keys
+# (ocsp_responder_url / ocsp_timeout_seconds / ocsp_cache_ttl_seconds) are
+# rejected at config validation until OCSP is implemented
+# (openspec/changes/ocsp-support).
 mode = "none"
-# CRL files (PEM/DER). Required when mode includes "crl".
+# CRL files (PEM/DER). Required when mode = "crl".
 crl_paths = []
-# OCSP responder URL (must start with http:// or https://). Required when
-# mode includes "ocsp".
-# ocsp_responder_url = "http://ocsp.example.org"
-crl_max_age_hours = 0
-ocsp_timeout_seconds = 0
-ocsp_cache_ttl_seconds = 0
+# Maximum accepted CRL age in hours, measured from thisUpdate (1..=8760).
+# A CRL older than this is stale even if its nextUpdate is in the future
+# (or missing). Omit to disable the cap; a CRL with no nextUpdate is then
+# logged as having unverifiable freshness.
+# crl_max_age_hours = 24
 
 # --- Trust → pinning ---------------------------------------------------------
 [trust.pinning]
@@ -190,8 +203,8 @@ allowed_root_spki_sha256 = []
 # --- Host identity -----------------------------------------------------------
 [host_identity]
 # Order matters: the first source that yields a non-empty value wins.
-# Allowed: "machine_id", "dmi_board_serial", "hostname", "tpm_ek_pubhash",
-#          "custom_command".
+# Allowed: "machine_id", "dmi_board_serial", "dmi_system_uuid",
+#          "dmi_system_serial", "hostname", "custom_command", "override".
 sources = ["machine_id", "hostname"]
 # What to do when every source fails: "deny" | "warn" | "allow".
 fallback = "deny"
@@ -215,12 +228,14 @@ cert_subject_cn = "Alice"
 
 # --- Logging -----------------------------------------------------------------
 [logging]
-# error | warn | info | debug | trace
+# error | warn | info | debug | trace.  Applied by the daemon's tracing
+# filter once the config is loaded; the TESSERA_LOG environment variable
+# takes precedence over this value.
 level = "info"
-# syslog facility name (e.g. "auth", "authpriv", "daemon").
-syslog_facility = "auth"
-# Encode priority as a journald-friendly numeric for the daemon path.
-journald_priority = true
+# Deprecated keys (accepted but ignored, WARN at load time):
+#   syslog_facility   — the PAM module always logs to the `auth` facility,
+#                       the daemon writes to stderr → journald.
+#   journald_priority — never applied.
 
 # --- Hooks -------------------------------------------------------------------
 # Each hook is invoked with placeholders ${pam_user}, ${cert_cn},

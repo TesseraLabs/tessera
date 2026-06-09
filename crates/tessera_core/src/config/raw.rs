@@ -34,6 +34,12 @@ pub struct RawConfig {
     /// to insert the token, in seconds.  Defaults to 10.
     #[serde(default = "default_pkcs11_slot_wait_seconds")]
     pub pkcs11_slot_wait_seconds: u32,
+    /// Accept private keys with `CKA_EXTRACTABLE = TRUE` (WARN instead of
+    /// refusing).  Defaults to `false`: an extractable key breaks the
+    /// mode-B invariant, so authentication fails closed unless the
+    /// operator explicitly opts in.
+    #[serde(default)]
+    pub pkcs11_allow_extractable_keys: bool,
     /// PKCS#12 path pattern.
     pub pkcs12_path_pattern: Option<String>,
     /// PIN prompt.
@@ -48,6 +54,13 @@ pub struct RawConfig {
     /// USB wait seconds.
     #[serde(default = "default_usb_wait_seconds")]
     pub usb_wait_seconds: u64,
+    /// Allow-list of USB devices accepted as the PKCS#12 medium, as
+    /// `"vid:pid"` hex strings in lsusb format (four hex digits each,
+    /// e.g. `["0951:1666"]`).  Empty or absent = no filter: any USB
+    /// block device is considered.  Validated in
+    /// [`crate::config::ValidatedConfig`].
+    #[serde(default)]
+    pub usb_allowed_devices: Vec<String>,
     /// Maximum number of USB partitions inspected at auth time when a
     /// whole-disk has a partition table.  Defaults to 8.  Validated
     /// against the inclusive range `1..=64`.
@@ -97,6 +110,8 @@ pub struct RawConfig {
     /// stock template values).
     #[serde(default)]
     pub fly_dm_greeter: Option<RawFlyDmGreeter>,
+    // Planned (openspec/changes/role-format/): `[roles]` section — `enforce`,
+    // `dir` (on-device role store path), `default_session_ttl`.
 }
 
 /// Raw `[fly_dm_greeter]` block: Astra fly-dm login-screen wallpaper
@@ -332,18 +347,22 @@ pub struct RawRevocation {
     /// CRL paths.
     #[serde(default)]
     pub crl_paths: Vec<PathBuf>,
-    /// OCSP URL.
+    /// OCSP URL.  Accepted by the parser for forward compatibility but
+    /// rejected during validation until OCSP is implemented
+    /// (openspec/changes/ocsp-support).
     #[serde(default)]
     pub ocsp_responder_url: Option<String>,
-    /// CRL max age.
+    /// CRL max age in hours (1..=8760).  `None` disables the age cap.
     #[serde(default)]
-    pub crl_max_age_hours: u64,
-    /// OCSP timeout.
+    pub crl_max_age_hours: Option<u64>,
+    /// OCSP timeout.  Accepted by the parser but rejected during validation
+    /// until OCSP is implemented (openspec/changes/ocsp-support).
     #[serde(default)]
-    pub ocsp_timeout_seconds: u64,
-    /// OCSP cache TTL.
+    pub ocsp_timeout_seconds: Option<u64>,
+    /// OCSP cache TTL.  Accepted by the parser but rejected during validation
+    /// until OCSP is implemented (openspec/changes/ocsp-support).
     #[serde(default)]
-    pub ocsp_cache_ttl_seconds: u64,
+    pub ocsp_cache_ttl_seconds: Option<u64>,
 }
 
 impl Default for RawRevocation {
@@ -352,9 +371,9 @@ impl Default for RawRevocation {
             mode: RawRevocationMode::None,
             crl_paths: Vec::new(),
             ocsp_responder_url: None,
-            crl_max_age_hours: 0,
-            ocsp_timeout_seconds: 0,
-            ocsp_cache_ttl_seconds: 0,
+            crl_max_age_hours: None,
+            ocsp_timeout_seconds: None,
+            ocsp_cache_ttl_seconds: None,
         }
     }
 }
@@ -460,11 +479,17 @@ pub struct RawUserMapping {
 pub struct RawLogging {
     /// Level.
     pub level: String,
-    /// Facility.
-    pub syslog_facility: String,
-    /// Journald priority.
+    /// Facility.  Deprecated: accepted (and still validated against the
+    /// supported facility names) for backwards compatibility, but ignored —
+    /// the PAM module always logs to the `auth` facility and the daemon
+    /// writes to stderr.  Presence triggers a WARN at validation time.
     #[serde(default)]
-    pub journald_priority: bool,
+    pub syslog_facility: Option<String>,
+    /// Journald priority.  Deprecated: accepted for backwards compatibility,
+    /// but ignored (the daemon's stderr→journald path needs no priority
+    /// re-encoding).  Presence triggers a WARN at validation time.
+    #[serde(default)]
+    pub journald_priority: Option<bool>,
 }
 
 /// Hook.

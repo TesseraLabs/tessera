@@ -200,7 +200,7 @@ source  status  hash_hex  hash_prefix  raw  normalized  active_under_current_con
 
 Одна строка на каждый **известный** источник (не только настроенные
 в `[host_identity].sources`): `machine_id`, `dmi_board_serial`,
-`dmi_product_serial`, `dmi_chassis_serial`, `hostname`, `override`,
+`dmi_system_uuid`, `dmi_system_serial`, `hostname`, плюс
 `custom_command` (если configured).
 
 Строка с `active_under_current_config=yes` — это тот источник,
@@ -215,7 +215,9 @@ source  status  hash_hex  hash_prefix  raw  normalized  active_under_current_con
 
 Cert получает `pam_cert_host_binding = <hash_hex>`,
 `pam_cert_user_binding = <service_user>` и стандартный
-`extendedKeyUsage = clientAuth, emailProtection`. На МКЦ-АРМ
+`extendedKeyUsage = clientAuth, emailProtection` (`emailProtection`
+требует штатный валидатор Astra — openssl `CMS_verify`; сам
+`tessera` этот EKU не проверяет). На МКЦ-АРМ
 дополнительно `pam_cert_max_integrity` (см. §«Поле MaxIntegrity»).
 
 Готовый `.p12` упаковывается на ту же флешку CA-инструментом

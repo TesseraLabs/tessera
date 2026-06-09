@@ -18,7 +18,7 @@
 //! | -------------------------------------------------- | ----- | -------------------------------------- |
 //! | Wrong PIN exhausts max attempts (no 4th prompt)    | yes   | Asserts loop never asks beyond `N`.    |
 //! | `find_certificate` after `drop(session)` is error  | yes   | No raw FFI poking; just tests RAII.    |
-//! | `CKA_EXTRACTABLE = TRUE` warning surfaces in API   | yes   | Generates a 2nd, extractable keypair.  |
+//! | `CKA_EXTRACTABLE = TRUE` round-trips from softhsm2 | yes   | Generates a 2nd, extractable keypair.  |
 //! | True `CKR_DEVICE_REMOVED` mid-operation            | TODO  | softhsm2 cannot fake hot-removal.      |
 //! | Hardware-counter `CKR_PIN_LOCKED` after N attempts | TODO  | softhsm2 has no PIN lockout counter.   |
 //!
@@ -170,12 +170,14 @@ fn live_session_drop_does_not_panic_and_token_remains_usable() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 3: extractable private-key WARN path.
+// Scenario 3: extractable private-key detection.
 //
 // We provision a *second* keypair with `--extractable` set on the
-// private key, then call `find_private_key_for_cert` against a synthesized
-// `FoundCertificate` whose `cka_id` matches the new key.  The function
-// must succeed with `extractable == true` and emit a WARN.
+// private key and verify that `CKA_EXTRACTABLE = TRUE` survives a
+// round-trip through softhsm2.  The policy on top (default refusal via
+// `ExtractableKeyRejected`, WARN-only with
+// `pkcs11_allow_extractable_keys = true`) is unit-tested in
+// `key_lookup.rs::tests`.
 //
 // The test is best-effort: if `pkcs11-tool` isn't on PATH we print a
 // `TODO` line and return.  We do not skip on missing fixtures — the
@@ -247,7 +249,7 @@ fn provision_extractable_key() -> Option<()> {
 }
 
 #[test]
-fn live_extractable_private_key_is_reported_with_warning_flag() {
+fn live_extractable_private_key_attribute_round_trips() {
     if skip_unless_pkcs11_ready() {
         return;
     }

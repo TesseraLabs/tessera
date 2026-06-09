@@ -33,6 +33,15 @@ enum Cmd {
     /// issue a per-host service cert. Output destinations: `--output PATH`,
     /// `--usb` (writes to first viable USB partition), or stdout.
     DumpHostId(DumpHostIdArgs),
+    // Planned (openspec/changes/device-enrollment/): `import-enrollment`
+    // subcommand — import the enrollment package after `finish-bootstrap`
+    // (per-host cert + device tags + first roles/tags/CRL bundle), recording
+    // the baseline `bundle_version` (anti-rollback); re-importing the same
+    // package is a no-op.
+    // Planned (openspec/changes/device-lifecycle/): `un-enroll` subcommand —
+    // reverse-flip the config back to `override="installation"` and wipe the
+    // per-host cert/keys, tags, role set, `bundle_version` persist, and the
+    // local CRL cache, leaving the device bootstrap-ready.
 }
 
 fn main() -> ExitCode {

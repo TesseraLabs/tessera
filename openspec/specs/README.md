@@ -1,6 +1,6 @@
 # Спецификации Tessera — карта capability
 
-Bootstrap-спеки текущей реализации **v0.3.19** (main @ 916c41e, 2026-06-04). Источник: код (file:line evidence) + прошлые сессии разработки (intended-поведение, rationale). Спеки описывают **intended**-поведение; известные расхождения и баги помечены маркерами **⚠ KNOWN GAP** внутри спек.
+Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09). Источник: код (file:line evidence) + прошлые сессии разработки (intended-поведение, rationale). Спеки описывают **intended**-поведение; маркеров KNOWN GAP в спеках больше нет — известные расхождения закрыты в коде/docs, а нереализованная функциональность вынесена в proposals в [`openspec/changes/`](../changes/).
 
 ## Карта
 
@@ -10,7 +10,7 @@ Bootstrap-спеки текущей реализации **v0.3.19** (main @ 916
 | [cert-authentication-flow](cert-authentication-flow/spec.md) | Оркестрация pam_sm_authenticate, PKCS#12/PKCS#11 пути, FlowError→PAM |
 | [challenge-response](challenge-response/spec.md) | Proof-of-possession (RSA-PSS/ECDSA/GOST), no replay by design |
 | [trust-chain-validation](trust-chain-validation/spec.md) | Pre-validate, chain build, подписи, constraints, pinning |
-| [revocation](revocation/spec.md) | CRL; ⚠ OCSP не реализован, подпись CRL не проверяется |
+| [revocation](revocation/spec.md) | CRL с верификацией подписи (fail-closed); OCSP — proposal [ocsp-support](../changes/ocsp-support/) |
 | [gost-crypto](gost-crypto/spec.md) | Делегация в gost-engine, ленивая загрузка |
 | [cert-scope-binding](cert-scope-binding/spec.md) | host/user_binding + max_integrity extensions, OID-контракт |
 | [host-identity](host-identity/spec.md) | first-working-wins, normalize+sha256, override, fallback |
@@ -38,21 +38,23 @@ Bootstrap-спеки текущей реализации **v0.3.19** (main @ 916
 | [pam-integration](pam-integration/spec.md) | Режимы, parsec_mac/two-include ordering, postinst |
 | [build-release](build-release/spec.md) | CI matrix, packaging, тестовые gap'ы |
 
-## Топ известных gap'ов (сводно)
+## Состояние gap'ов (сводно)
 
-Security-класс:
-1. **OCSP не реализован** при заявленном в конфиге/docs ([revocation](revocation/spec.md)) — `mode="ocsp"` = fail-open на отзыв.
-2. **Подпись и issuer CRL не проверяются** на пути check_revocation.
-3. **Malformed user_binding → тихий fallback в legacy mapping** вместо отказа ([cert-authentication-flow](cert-authentication-flow/spec.md)).
-4. **Пустой sig-alg whitelist = accept-all** (fail-open default).
-5. **Extractable PKCS#11-ключ только WARN**, не блок.
+Все известные на момент bootstrap расхождения закрыты в 0.4.0:
 
-Функциональный класс:
-6. `pkcs12_pin_prompt` — мёртвый конфиг; `monitor.idle_timeout/max_connections` не доходят до accept-loop; `[logging]` демоном игнорируется; re-mount в open_session обещан комментарием, не реализован; sticky mount при crash (нет startup-cleanup).
+Security-класс (закрыто в коде):
+- **Подпись CRL верифицируется** против issuer-сертификата, fail-closed (`TrustError::CrlSignatureInvalid`); issuer-DN сверка байт-в-байт — с f542df5.
+- **Extractable PKCS#11-ключ отклоняется** (fail-closed); ослабление только явным opt-in `pkcs11_allow_extractable_keys`.
+- **Malformed user_binding** — fail-closed (отказ вместо тихого fallback в legacy mapping).
+- **Пустой sig-alg whitelist** подменяется безопасным дефолтом `DEFAULT_SIGNATURE_ALGORITHMS` (f542df5) вместо accept-all.
 
-Docs-класс: configuration.md (17 расхождений), architecture.md (PROTOCOL_VERSION, коды ошибок, monitord fail-closed), mac-integrity.md (default cert_integrity).
+Функциональный класс (закрыто в коде): `pkcs12_pin_prompt` пробрасывается в PIN-prompt PKCS#12-пути; `monitor.idle_timeout_seconds`/`max_concurrent_connections` доходят до accept-loop (`AcceptConfig::from_monitor`); `[logging].level` применяется демоном (`apply_config_level`, приоритет `TESSERA_LOG` env > config > info); `clock_skew_seconds` — дефолт 0, диапазон 0..=600; startup sweep stale-маунтов после crash; VID/PID и anchors-валидация — по спекам. Также добавлен daemon-singleton через flock (ec4185b, [daemon-lifecycle](daemon-lifecycle/spec.md)).
 
-Testing-класс: ГОСТ E2E, реальный parsec, hook-security, release-профиль — не покрыты CI (см. [build-release](build-release/spec.md)).
+Docs-класс (закрыто в docs): configuration.md, architecture.md (PROTOCOL_VERSION=2, коды 1101/1200, честная семантика `monitor_fail_mode`), mac-integrity.md, clone-image.md, cert-issuance.md, fly-dm-greeter.md приведены в соответствие коду.
+
+Testing-класс: автоматизация оставшихся ручных проверок (ГОСТ E2E, libpdp runtime, hook-security, USB/токен) — proposal [ci-hardening](../changes/ci-hardening/); release-профиль тестов уже покрыт nightly workflow (`.github/workflows/nightly.yml`).
+
+Нереализованная функциональность — proposals: OCSP — [ocsp-support](../changes/ocsp-support/), GOST через PKCS#11 — [gost-pkcs11](../changes/gost-pkcs11/).
 
 ## Чего НЕТ в текущей реализации (чтобы не путать со спеками 0.2.x / продуктовыми планами)
 
