@@ -47,6 +47,9 @@ pub struct SessionOpenPayload {
     /// v2 field; `0` when omitted by a v1 client.
     #[serde(default)]
     pub uid: u32,
+    // Planned (openspec/changes/role-format/): optional `role` /
+    // `role_version` fields recording which role the session was opened
+    // with, for audit.
 }
 
 /// Client message.

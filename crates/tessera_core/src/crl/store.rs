@@ -42,11 +42,22 @@ pub struct CrlStore {
 }
 
 /// Configuration knobs for [`check_revocation`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct RevocationConfig {
-    /// When `true`, expired CRLs are a hard error.  When `false`, they are
+    /// When `true`, stale CRLs are a hard error.  When `false`, they are
     /// logged and skipped.
     pub crl_strict: bool,
+    /// Maximum accepted CRL age, measured from `thisUpdate`.
+    ///
+    /// A CRL is considered stale when `now > thisUpdate + crl_max_age`,
+    /// in addition to the `nextUpdate <= now` rule.  `None` disables the
+    /// age cap; CRLs that also lack `nextUpdate` then have no verifiable
+    /// freshness at all (logged as a warning).
+    pub crl_max_age: Option<Duration>,
+    /// Optional path to the gost-engine .so/.dylib, forwarded to
+    /// [`Crl::verify_signature_with_issuer`] when a CRL issuer is
+    /// GOST-signed.  `None` uses libcrypto's standard engine search path.
+    pub gost_engine_path: Option<std::path::PathBuf>,
 }
 
 impl Crl {
@@ -130,17 +141,19 @@ impl Crl {
     ///
     /// # Errors
     ///
-    /// * [`TrustError::Openssl`] on libcrypto failures.
-    /// * [`TrustError::Crl`] when the signature is syntactically invalid.
+    /// * [`TrustError::CrlSignatureInvalid`] when the signature does not
+    ///   validate under `key` or libcrypto fails to process it.
     pub fn verify_signature(&self, key: &PKey<Public>) -> Result<(), TrustError> {
         let ok = self
             .inner
             .verify(key)
-            .map_err(|e| TrustError::Crl(format!("CRL signature: {e}")))?;
+            .map_err(|e| TrustError::CrlSignatureInvalid(format!("CRL signature: {e}")))?;
         if ok {
             Ok(())
         } else {
-            Err(TrustError::Crl("CRL signature does not validate".into()))
+            Err(TrustError::CrlSignatureInvalid(
+                "CRL signature does not validate".into(),
+            ))
         }
     }
 
@@ -187,6 +200,12 @@ impl CrlStore {
         Ok(Self { crls })
     }
 
+    /// Builds a store from already-parsed CRLs.
+    #[must_use]
+    pub fn from_crls(crls: Vec<Crl>) -> Self {
+        Self { crls }
+    }
+
     /// Returns an empty store; equivalent to "no CRLs configured".
     #[must_use]
     pub fn empty() -> Self {
@@ -213,22 +232,42 @@ impl CrlStore {
 
 /// Walks a leaf-first chain and rejects revoked certificates.
 ///
-/// For each certificate in the chain (excluding the anchor), this function
-/// checks every CRL in the store; if any CRL lists the certificate's serial
-/// as lowercase hex, it returns [`TrustError::Revoked`].
+/// For each certificate in the chain (anchor included), this function checks
+/// every CRL in the store; if any applicable CRL lists the certificate's
+/// serial as lowercase hex, it returns [`TrustError::Revoked`].
 ///
-/// CRLs whose `nextUpdate` has passed are treated according to
-/// [`RevocationConfig::crl_strict`]:
+/// Before a CRL is allowed to vouch for (or revoke) a certificate, its
+/// signature is verified against the public key of the certificate's issuer
+/// found in `chain` (the chain is leaf-first and complete up to the
+/// self-signed anchor, so the issuer is always present in a verified chain).
+/// A CRL whose signature does not validate fails closed with
+/// [`TrustError::CrlSignatureInvalid`] — the same refusal class as a revoked
+/// certificate.
 ///
-/// * `true`  — return [`TrustError::Crl`].
-/// * `false` — log a warning via `tracing` and skip the CRL.
+/// Stale CRLs are treated according to [`RevocationConfig::crl_strict`].
+/// A CRL is stale when either condition holds:
+///
+/// * `nextUpdate` is present and `nextUpdate <= now`, or
+/// * [`RevocationConfig::crl_max_age`] is set and
+///   `now > thisUpdate + crl_max_age`.
+///
+/// * `crl_strict = true`  — return [`TrustError::Crl`].
+/// * `crl_strict = false` — log a warning via `tracing` and skip the CRL.
+///
+/// A CRL with no `nextUpdate` while `crl_max_age` is unset has no verifiable
+/// freshness; this is logged as a warning (target `tessera.crl`) and the CRL
+/// is still used — documented behaviour for operators that cannot set either
+/// bound.
 ///
 /// An empty store is treated as "no CRLs configured" and returns `Ok`.
 ///
 /// # Errors
 ///
 /// * [`TrustError::Revoked`] when a serial matches.
-/// * [`TrustError::Crl`] when an expired CRL is encountered in strict mode.
+/// * [`TrustError::CrlSignatureInvalid`] when an applicable CRL's signature
+///   does not validate under its issuer's key (or the issuer certificate is
+///   not present in `chain`, leaving the signature unverifiable).
+/// * [`TrustError::Crl`] when a stale CRL is encountered in strict mode.
 pub fn check_revocation(
     chain: &[Certificate],
     store: &CrlStore,
@@ -239,15 +278,31 @@ pub fn check_revocation(
         return Ok(());
     }
     for crl in store.iter() {
-        if let Some(nu) = crl.next_update {
-            if nu <= now {
-                if cfg.crl_strict {
-                    return Err(TrustError::Crl("CRL expired".into()));
-                }
-                tracing::warn!(target: "tessera.crl", "skipping expired CRL");
-                continue;
+        let stale_by_next_update = crl.next_update.is_some_and(|nu| nu <= now);
+        // `thisUpdate` near the upper bound of `SystemTime` can overflow on
+        // `+ max_age` (which panics); a deadline past that bound is
+        // infinitely far in the future, so overflow means "not stale".
+        let stale_by_max_age = cfg.crl_max_age.is_some_and(|max_age| {
+            crl.this_update
+                .checked_add(max_age)
+                .is_some_and(|deadline| now > deadline)
+        });
+        if stale_by_next_update || stale_by_max_age {
+            if cfg.crl_strict {
+                return Err(TrustError::Crl("CRL stale".into()));
             }
+            tracing::warn!(target: "tessera.crl", "skipping stale CRL");
+            continue;
         }
+        if crl.next_update.is_none() && cfg.crl_max_age.is_none() {
+            tracing::warn!(
+                target: "tessera.crl",
+                "CRL has no nextUpdate and crl_max_age_hours is not configured; \
+                 CRL freshness cannot be verified"
+            );
+        }
+        // Verify the CRL signature at most once per CRL per call.
+        let mut signature_checked = false;
         for cert in chain {
             // RFC 5280 § 6.3.3: a CRL only covers certificates issued by the
             // CRL issuer.  Compare the certificate's issuer DN against the
@@ -258,6 +313,21 @@ pub fn check_revocation(
                 Ok(issuer_der) if issuer_der == crl.issuer_dn_der => {}
                 _ => continue,
             }
+            if !signature_checked {
+                // Defensive; unreachable for chains produced by
+                // `build_chain` (every issuer up to the self-signed anchor
+                // is guaranteed present) — kept fail-closed in case callers
+                // pass partial chains.
+                let issuer = find_issuer(chain, &crl.issuer_dn_der).ok_or_else(|| {
+                    TrustError::CrlSignatureInvalid(
+                        "CRL issuer certificate not present in verified chain; \
+                         signature cannot be verified"
+                            .into(),
+                    )
+                })?;
+                crl.verify_signature_with_issuer(issuer, cfg.gost_engine_path.as_deref())?;
+                signature_checked = true;
+            }
             let serial = cert.serial_hex().to_lowercase();
             if crl.revoked.iter().any(|s| s == &serial) {
                 return Err(TrustError::Revoked(serial));
@@ -265,6 +335,20 @@ pub fn check_revocation(
         }
     }
     Ok(())
+}
+
+/// Finds the chain certificate whose subject DN (DER) equals `issuer_dn_der`.
+///
+/// In a verified leaf-first chain every certificate's issuer is a later chain
+/// element (the anchor is self-signed), so the CRL issuer is found whenever
+/// the CRL is in scope for some chain certificate.
+fn find_issuer<'a>(chain: &'a [Certificate], issuer_dn_der: &[u8]) -> Option<&'a Certificate> {
+    chain.iter().find(|cert| {
+        cert.x509()
+            .subject_name()
+            .to_der()
+            .is_ok_and(|subject| subject == issuer_dn_der)
+    })
 }
 
 fn asn1_to_system(t: &Asn1TimeRef) -> Result<SystemTime, TrustError> {

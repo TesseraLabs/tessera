@@ -17,7 +17,7 @@ use std::time::Duration;
 #[test]
 #[ignore = "requires Linux + a real plugged-in USB block device"]
 fn waits_and_returns_device() {
-    let devs = wait_for_usb_devices(Duration::from_secs(30), None, 8).expect("device");
+    let devs = wait_for_usb_devices(Duration::from_secs(30), &[], 8).expect("device");
     assert!(!devs.is_empty());
     assert!(!devs[0].devnode.as_os_str().is_empty());
 }
@@ -26,6 +26,6 @@ fn waits_and_returns_device() {
 #[ignore = "no device — short timeout exercises the timeout path"]
 fn timeouts_when_no_device() {
     let err =
-        wait_for_usb_devices(Duration::from_millis(200), Some((0xDEAD, 0xBEEF)), 8).unwrap_err();
+        wait_for_usb_devices(Duration::from_millis(200), &[(0xDEAD, 0xBEEF)], 8).unwrap_err();
     assert!(matches!(err, UsbError::Timeout));
 }

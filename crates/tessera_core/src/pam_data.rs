@@ -31,6 +31,10 @@ pub struct AuthContext {
     /// Certificate `notAfter`, captured at authenticate time so that
     /// [`pam_sm_acct_mgmt`] can re-check expiry without re-loading the cert.
     pub cert_not_after: Option<SystemTime>,
+    /// `[trust].clock_skew_seconds` captured at authenticate time, so that
+    /// `pam_sm_acct_mgmt` applies the same expiry tolerance as the trust
+    /// verifier without re-loading the config.
+    pub clock_skew_seconds: u64,
     /// `MAX_INTEGRITY` extension parsed from the leaf, or `None` if the
     /// cert carries no such extension.  Consumed by the MAC orchestrator
     /// at session-open time.
@@ -59,6 +63,7 @@ impl AuthContext {
             host_id_source: HostIdSourceKind::Override,
             authenticated_at: SystemTime::now(),
             cert_not_after: None,
+            clock_skew_seconds: 0,
             cert_max_integrity: None,
             cert_ident: None,
             home_dir: None,

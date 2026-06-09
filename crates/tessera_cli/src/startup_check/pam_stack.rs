@@ -2,7 +2,7 @@
 //!
 //! Astra SE 1.8.x ships `pam_parsec_mac.so` in the `auth` phase of every
 //! interactive service (login, fly-dm, sshd, …). Our integrate-pam.sh adds
-//! `@include certauth-only` (or `certauth-optional`) whose Felix block uses
+//! `@include tessera-only` (or `tessera-optional`) whose Felix block uses
 //! `success=done` to short-circuit on a successful certificate auth.
 //!
 //! If our include lands BEFORE `auth required pam_parsec_mac.so`, the
@@ -52,7 +52,7 @@ pub fn check(pam_d_root: &Path, report: &mut StartupCheckReport) {
 pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport) {
     let mut include_line: Option<usize> = None;
     let mut parsec_line: Option<usize> = None;
-    let mut session_certauth_line: Option<usize> = None;
+    let mut session_tessera_line: Option<usize> = None;
     let mut systemd_anchor_line: Option<usize> = None;
 
     for (idx, raw) in text.lines().enumerate() {
@@ -60,13 +60,13 @@ pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        if is_certauth_include(line) {
+        if is_tessera_include(line) {
             include_line.get_or_insert(idx);
         } else if is_auth_parsec_mac(line) {
             parsec_line.get_or_insert(idx);
         }
         if is_session_pam_tessera(line) {
-            session_certauth_line.get_or_insert(idx);
+            session_tessera_line.get_or_insert(idx);
         }
         // Anchor for the session-ordering check: either the direct module
         // line or the @include common-session aggregator (Debian/Astra
@@ -83,7 +83,7 @@ pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport
             report.push(StartupCheckRecord::error(
                 "pam_stack_misorder",
                 format!(
-                    "PAM stack misorder in {path}: @include certauth-* (line {inc}) appears \
+                    "PAM stack misorder in {path}: @include tessera-* (line {inc}) appears \
                      BEFORE 'auth required pam_parsec_mac.so' (line {par}). On Astra SE the \
                      success=done jump will skip pam_parsec_mac and account-phase will fail \
                      'Can't obtain required data'. Run: \
@@ -99,7 +99,7 @@ pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport
             report.push(StartupCheckRecord::info(
                 "pam_stack_ok",
                 format!(
-                    "PAM stack {path}: @include certauth-* correctly placed after \
+                    "PAM stack {path}: @include tessera-* correctly placed after \
                      pam_parsec_mac",
                     path = path.display()
                 ),
@@ -115,7 +115,7 @@ pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport
     // common-session, otherwise XDG_SESSION_ID is not yet in PAM env when
     // pam_sm_open_session runs → UpdateSessionTarget never sent → monitord
     // can't drive logind Logout/Lock on USB removal.
-    match (session_certauth_line, systemd_anchor_line) {
+    match (session_tessera_line, systemd_anchor_line) {
         (Some(ses), Some(sys)) if ses < sys => {
             report.push(StartupCheckRecord::error(
                 "pam_stack_session_misorder",
@@ -165,9 +165,12 @@ pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport
     }
 }
 
-fn is_certauth_include(line: &str) -> bool {
-    // Matches `@include certauth`, `@include certauth-only`,
-    // `@include certauth-optional` with arbitrary surrounding whitespace.
+fn is_tessera_include(line: &str) -> bool {
+    // Matches `@include tessera`, `@include tessera-only`,
+    // `@include tessera-optional` with arbitrary surrounding whitespace.
+    // These are the snippet names shipped in dist/pam.d/ and inserted by
+    // integrate-pam.sh; the pre-rename `certauth*` snippets never shipped,
+    // so the legacy names are intentionally not recognized.
     let mut it = line.split_whitespace();
     let Some(first) = it.next() else { return false };
     if first != "@include" {
@@ -177,7 +180,7 @@ fn is_certauth_include(line: &str) -> bool {
     if it.next().is_some() {
         return false;
     }
-    matches!(name, "certauth" | "certauth-only" | "certauth-optional")
+    matches!(name, "tessera" | "tessera-only" | "tessera-optional")
 }
 
 fn is_auth_parsec_mac(line: &str) -> bool {

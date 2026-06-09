@@ -187,3 +187,29 @@ async fn semaphore_caps_concurrent_connections() {
     // Cleanup.
     drop(s2);
 }
+
+#[test]
+fn accept_config_from_monitor_uses_validated_values_and_keeps_peercred_on() {
+    use tessera_core::config::validated::{MonitorFailMode, MonitorSection, OnUsbRemoved};
+
+    let monitor = MonitorSection {
+        socket_path: "/run/tessera/monitord.sock".into(),
+        timeout: Duration::from_secs(2),
+        fail_mode: MonitorFailMode::Strict,
+        state_file_path: "/var/lib/tessera/sessions.json".into(),
+        on_usb_removed: OnUsbRemoved::Lock,
+        usb_removed_grace: Duration::from_secs(10),
+        suspend_grace: Duration::from_secs(15),
+        on_usb_removed_hook_path: None,
+        idle_timeout: Duration::from_secs(7),
+        max_concurrent_connections: 11,
+    };
+
+    let cfg = AcceptConfig::from_monitor(&monitor);
+    assert_eq!(cfg.idle_timeout, Duration::from_secs(7));
+    assert_eq!(cfg.max_concurrent_connections, 11);
+    assert!(
+        cfg.enforce_peercred,
+        "peer-cred enforcement must stay on regardless of config"
+    );
+}

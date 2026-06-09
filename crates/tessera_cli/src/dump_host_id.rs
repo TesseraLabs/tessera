@@ -349,7 +349,7 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 fn pick_usb_partition() -> Result<UsbDevice, DumpError> {
     use tessera_core::mount::usb::ALLOWED_FS;
     let dev = UdevEnumerator
-        .enumerate(None)
+        .enumerate(&[])
         .map_err(|e| DumpError::Usb(format!("udev enumerate failed: {e}")))?;
     let candidate = dev.into_iter().find(|d| {
         d.fs_type

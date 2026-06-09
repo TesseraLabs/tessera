@@ -24,6 +24,15 @@ use thiserror::Error;
 /// allow ntfs writes.
 pub const ALLOWED_FS: &[&str] = &["vfat", "exfat", "ext4", "ntfs"];
 
+/// Base directory under which per-session USB mountpoints are created
+/// (`/run/tessera/mounts/<sid>[-seq]`).
+///
+/// Shared by the PAM module (which creates and removes the per-session
+/// subdirectories via [`crate::mount_guard::MountGuard`]) and the daemon's
+/// startup sweep of stale leftovers (crashed PAM processes never run the
+/// guard's `Drop`).
+pub const MOUNTPOINT_BASE: &str = "/run/tessera/mounts";
+
 /// Errors returned by [`mount_usb_device`].
 #[derive(Debug, Error)]
 pub enum MountError {

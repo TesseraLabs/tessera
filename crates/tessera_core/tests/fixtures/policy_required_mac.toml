@@ -9,7 +9,9 @@ suspend_grace_seconds = 30
 monitor_fail_mode = "permissive"
 
 [trust]
-anchors = []
+# Integration tests run with cwd = crate root, so this relative path
+# resolves; anchors must be non-empty to pass config validation.
+anchors = ["tests/fixtures/ca.pem"]
 intermediates = []
 allowed_signature_algorithms = []
 max_chain_depth = 4

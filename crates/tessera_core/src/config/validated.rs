@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use crate::config::raw::{
     RawCertIntegrityMode, RawConfig, RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback,
-    RawHostIdentity, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor, RawMonitorFailMode,
-    RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocationMode, RawTrust, RawTrustOverride,
-    RawUserMapping,
+    RawHostIdentity, RawLogging, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor,
+    RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocationMode, RawTrust,
+    RawTrustOverride, RawUserMapping,
 };
 use crate::error::TrustError;
 use crate::hooks::{validate_hook, HookConfig};
@@ -41,6 +41,9 @@ pub struct ValidatedConfig {
     /// Maximum time `wait_for_token` will block waiting for the user
     /// to insert the token (default 10 s).
     pub pkcs11_slot_wait: Duration,
+    /// Accept private keys with `CKA_EXTRACTABLE = TRUE` (default
+    /// `false` — fail closed; `true` downgrades the refusal to a WARN).
+    pub pkcs11_allow_extractable_keys: bool,
     /// PKCS#12 path pattern.
     pub pkcs12_path_pattern: Option<String>,
     /// PIN prompt.
@@ -53,6 +56,9 @@ pub struct ValidatedConfig {
     pub gost_engine_path: Option<PathBuf>,
     /// USB wait.
     pub usb_wait: Duration,
+    /// Allow-list of USB `(vid, pid)` pairs accepted as the PKCS#12
+    /// medium (parsed from `usb_allowed_devices`).  Empty = no filter.
+    pub usb_allowed_devices: Vec<(u16, u16)>,
     /// Maximum number of USB partitions inspected at auth time (1..=64,
     /// default 8).  Anti-DoS guard against a physical adversary plugging
     /// in a many-partition device.
@@ -331,6 +337,14 @@ pub struct RevocationSection {
     pub mode: RevocationMode,
     /// CRL paths.
     pub crl_paths: Vec<PathBuf>,
+    /// Maximum accepted CRL age measured from `thisUpdate`
+    /// (from `crl_max_age_hours`, validated to 1..=8760).  `None`
+    /// disables the age cap.
+    pub crl_max_age: Option<Duration>,
+    // The raw `ocsp_responder_url` / `ocsp_timeout_seconds` /
+    // `ocsp_cache_ttl_seconds` keys are rejected by `validate_trust` until
+    // OCSP is implemented (openspec/changes/ocsp-support); they belong here
+    // once an OCSP client exists.
 }
 
 /// Revocation mode.
@@ -340,9 +354,12 @@ pub enum RevocationMode {
     None,
     /// CRL.
     Crl,
-    /// OCSP.
+    /// OCSP.  Rejected by `validate_trust` until OCSP is implemented
+    /// (openspec/changes/ocsp-support); kept so downstream wiring code
+    /// does not churn when the mode becomes accepted.
     Ocsp,
-    /// CRL then OCSP.
+    /// CRL then OCSP.  Rejected by `validate_trust` until OCSP is
+    /// implemented (openspec/changes/ocsp-support); see [`Self::Ocsp`].
     CrlThenOcsp,
 }
 
@@ -404,14 +421,16 @@ pub enum UserMatchCriteria {
 }
 
 /// Logging section.
+///
+/// The deprecated `syslog_facility` / `journald_priority` raw keys are
+/// validated (facility) and warned about, but intentionally not carried
+/// over: nothing applies them at runtime (PAM logs to the `auth` facility
+/// fixed by design; the daemon writes to stderr → journald).
 #[derive(Debug, Clone)]
 pub struct LoggingSection {
-    /// Level.
+    /// Level applied by the daemon's tracing subscriber; the `TESSERA_LOG`
+    /// environment variable takes precedence over this value.
     pub level: LogLevel,
-    /// Facility.
-    pub syslog_facility: SyslogFacility,
-    /// Journald priority.
-    pub journald_priority: bool,
 }
 
 impl ValidatedConfig {
@@ -440,11 +459,7 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
         let trust = validate_trust(&raw.trust)?;
         let host_identity = validate_host_identity(&raw.host_identity)?;
         let user_mappings = validate_user_mappings(&raw.user_mapping)?;
-        let logging = LoggingSection {
-            level: raw.logging.level.parse()?,
-            syslog_facility: raw.logging.syslog_facility.parse()?,
-            journald_priority: raw.logging.journald_priority,
-        };
+        let logging = validate_logging(&raw.logging)?;
         let hooks = raw
             .hooks
             .iter()
@@ -460,6 +475,9 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             RawMode::Pkcs11 => Mode::Pkcs11,
         };
         validate_pkcs11_section(raw, mode)?;
+        if let Some(prompt) = raw.pkcs12_pin_prompt.as_deref() {
+            validate_pin_prompt("pkcs12_pin_prompt", prompt)?;
+        }
         Ok(Self {
             crypto_backend,
             mode,
@@ -473,10 +491,12 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             },
             pkcs11_pin_prompt: raw.pkcs11_pin_prompt.clone(),
             pkcs11_slot_wait: Duration::from_secs(u64::from(raw.pkcs11_slot_wait_seconds)),
+            pkcs11_allow_extractable_keys: raw.pkcs11_allow_extractable_keys,
             pkcs12_path_pattern: validate_pkcs12_path_pattern(raw.pkcs12_path_pattern.as_deref())?,
             pkcs12_pin_prompt: raw.pkcs12_pin_prompt.clone(),
             gost_engine_path,
-            usb_wait: Duration::from_secs(raw.usb_wait_seconds),
+            usb_wait: validate_usb_wait_seconds(raw.usb_wait_seconds)?,
+            usb_allowed_devices: validate_usb_allowed_devices(&raw.usb_allowed_devices)?,
             max_usb_partitions: validate_max_usb_partitions(raw.max_usb_partitions)?,
             on_usb_removed: match raw.on_usb_removed {
                 RawOnUsbRemoved::Lock => OnUsbRemoved::Lock,
@@ -719,6 +739,49 @@ fn validate_mac(raw: &RawMacPolicy) -> Result<MacPolicy, Error> {
 /// Range: `1..=16`; validator rejects values outside this.
 const MAX_CHAIN_DEPTH_HARD_CAP: u32 = 16;
 
+/// Upper bound on `usb_wait_seconds`.  `0` means fail-fast (no wait);
+/// anything beyond five minutes would hold the PAM stack (and thus the
+/// login screen) hostage waiting for a stick that is not coming.
+const USB_WAIT_SECONDS_MAX: u64 = 300;
+
+/// Validate `usb_wait_seconds` against the documented `0..=300` range.
+fn validate_usb_wait_seconds(raw: u64) -> Result<Duration, Error> {
+    if raw > USB_WAIT_SECONDS_MAX {
+        return Err(Error::ConfigInvalid {
+            reason: format!("usb_wait_seconds must be in 0..={USB_WAIT_SECONDS_MAX} (got {raw})"),
+        });
+    }
+    Ok(Duration::from_secs(raw))
+}
+
+/// Parse and validate the `usb_allowed_devices` allow-list.
+///
+/// Each entry must be `"vid:pid"` with exactly four hex digits on each
+/// side (lsusb format, e.g. `"0951:1666"`).  An empty list means "no
+/// filter" and is passed through as-is.
+fn validate_usb_allowed_devices(raw: &[String]) -> Result<Vec<(u16, u16)>, Error> {
+    raw.iter().map(|e| parse_vid_pid_entry(e)).collect()
+}
+
+/// Parse one `"vid:pid"` allow-list entry into a `(u16, u16)` pair.
+fn parse_vid_pid_entry(entry: &str) -> Result<(u16, u16), Error> {
+    let invalid = || Error::ConfigInvalid {
+        reason: format!(
+            "usb_allowed_devices entries must be \"vid:pid\": 4 hex digits on \
+             each side, colon-separated, no spaces (e.g. \"0951:1666\", as in \
+             lsusb output) (got {entry:?})"
+        ),
+    };
+    let (vid_s, pid_s) = entry.split_once(':').ok_or_else(invalid)?;
+    let is_hex4 = |s: &str| s.len() == 4 && s.chars().all(|c| c.is_ascii_hexdigit());
+    if !is_hex4(vid_s) || !is_hex4(pid_s) {
+        return Err(invalid());
+    }
+    let vid = u16::from_str_radix(vid_s, 16).map_err(|_| invalid())?;
+    let pid = u16::from_str_radix(pid_s, 16).map_err(|_| invalid())?;
+    Ok((vid, pid))
+}
+
 /// Default for `max_usb_partitions` when the operator did not set it.
 const DEFAULT_MAX_USB_PARTITIONS: u32 = 8;
 /// Hard cap on `max_usb_partitions`.
@@ -798,7 +861,38 @@ const DEFAULT_SIGNATURE_ALGORITHMS: &[&str] = &[
     "ecdsa-with-SHA512",
 ];
 
+fn validate_logging(raw: &RawLogging) -> Result<LoggingSection, Error> {
+    // Deprecated keys: still validated (facility names) for early typo
+    // detection, but never applied at runtime — warn so operators can
+    // drop them from config.toml.
+    if let Some(facility) = raw.syslog_facility.as_deref() {
+        let _parsed: SyslogFacility = facility.parse()?;
+        tracing::warn!(
+            target: "tessera.config",
+            "[logging].syslog_facility is deprecated and ignored: the PAM \
+             module always logs to the `auth` facility and the daemon writes \
+             to stderr; remove the key from config.toml"
+        );
+    }
+    if raw.journald_priority.is_some() {
+        tracing::warn!(
+            target: "tessera.config",
+            "[logging].journald_priority is deprecated and ignored; remove \
+             the key from config.toml"
+        );
+    }
+    Ok(LoggingSection {
+        level: raw.level.parse()?,
+    })
+}
+
 fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
+    // Reject an empty anchor list at config-validation time so the
+    // misconfiguration surfaces with a clear message; the verifier
+    // constructor re-checks this as defense-in-depth.
+    if raw.anchors.is_empty() {
+        return Err(TrustError::AnchorsEmpty.into());
+    }
     if raw.max_chain_depth == 0 {
         return Err(TrustError::MaxChainDepthZero.into());
     }
@@ -823,20 +917,43 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
             }
         }
     }
+    // OCSP has no runtime implementation yet (openspec/changes/ocsp-support).
+    // Accepting these modes/keys would silently disable revocation checking
+    // (fail-open), so the config is rejected outright instead.
     if matches!(
         raw.revocation.mode,
         RawRevocationMode::Ocsp | RawRevocationMode::CrlThenOcsp
-    ) && !raw
-        .revocation
-        .ocsp_responder_url
-        .as_deref()
-        .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
-    {
-        return Err(TrustError::OcspResponderInvalid {
-            reason: "missing or non-http URL".to_string(),
-        }
-        .into());
+    ) {
+        return Err(Error::ConfigInvalid {
+            reason: "trust.revocation.mode: OCSP is not implemented \
+                     (openspec/changes/ocsp-support); use mode = \"none\" or \"crl\""
+                .to_string(),
+        });
     }
+    if raw.revocation.ocsp_responder_url.is_some()
+        || raw.revocation.ocsp_timeout_seconds.is_some()
+        || raw.revocation.ocsp_cache_ttl_seconds.is_some()
+    {
+        return Err(Error::ConfigInvalid {
+            reason: "trust.revocation: ocsp_responder_url / ocsp_timeout_seconds / \
+                     ocsp_cache_ttl_seconds are rejected because OCSP is not \
+                     implemented (openspec/changes/ocsp-support)"
+                .to_string(),
+        });
+    }
+    let crl_max_age = match raw.revocation.crl_max_age_hours {
+        None => None,
+        Some(hours) if (1..=8760).contains(&hours) => {
+            Some(Duration::from_secs(hours.saturating_mul(3600)))
+        }
+        Some(hours) => {
+            return Err(Error::ConfigInvalid {
+                reason: format!(
+                    "trust.revocation.crl_max_age_hours must be within 1..=8760 (got {hours})"
+                ),
+            });
+        }
+    };
     if raw.pinning.enabled {
         for entry in &raw.pinning.allowed_root_spki_sha256 {
             if entry.len() != 64 || !entry.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -858,6 +975,7 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
                 RawRevocationMode::CrlThenOcsp => RevocationMode::CrlThenOcsp,
             },
             crl_paths: raw.revocation.crl_paths.clone(),
+            crl_max_age,
         },
         allowed_signature_algorithms: if raw.allowed_signature_algorithms.is_empty() {
             DEFAULT_SIGNATURE_ALGORITHMS
@@ -994,8 +1112,9 @@ fn validate_user_mappings(raw: &[RawUserMapping]) -> Result<Vec<UserMapping>, Er
 /// but we allow 64 here so operators can use Cyrillic strings (each
 /// glyph is 2 UTF-8 bytes) without hitting the limit prematurely.
 const PKCS11_LABEL_MAX_LEN: usize = 64;
-/// Maximum length of the user-facing PIN prompt string.
-const PKCS11_PROMPT_MAX_LEN: usize = 128;
+/// Maximum byte length of the user-facing PIN prompt strings
+/// (`pkcs11_pin_prompt` and `pkcs12_pin_prompt`).
+const PIN_PROMPT_MAX_LEN: usize = 128;
 /// Inclusive bounds on `pkcs11_max_pin_attempts`.
 const PKCS11_MAX_PIN_ATTEMPTS_RANGE: std::ops::RangeInclusive<u32> = 1..=5;
 /// Inclusive bounds on `pkcs11_slot_wait_seconds`.  A 0 disables the
@@ -1054,19 +1173,26 @@ fn validate_pkcs11_section(raw: &RawConfig, mode: Mode) -> Result<(), Error> {
         });
     }
     if let Some(prompt) = raw.pkcs11_pin_prompt.as_deref() {
-        if prompt.is_empty() {
-            return Err(Error::ConfigInvalid {
-                reason: "pkcs11_pin_prompt must be non-empty when set".to_owned(),
-            });
-        }
-        if prompt.len() > PKCS11_PROMPT_MAX_LEN {
-            return Err(Error::ConfigInvalid {
-                reason: format!(
-                    "pkcs11_pin_prompt must be at most {PKCS11_PROMPT_MAX_LEN} bytes (got {})",
-                    prompt.len()
-                ),
-            });
-        }
+        validate_pin_prompt("pkcs11_pin_prompt", prompt)?;
+    }
+    Ok(())
+}
+
+/// Validate a user-facing PIN prompt string (`pkcs11_pin_prompt` /
+/// `pkcs12_pin_prompt`): non-empty and at most [`PIN_PROMPT_MAX_LEN`] bytes.
+fn validate_pin_prompt(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::ConfigInvalid {
+            reason: format!("{field} must be non-empty when set"),
+        });
+    }
+    if value.len() > PIN_PROMPT_MAX_LEN {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "{field} must be at most {PIN_PROMPT_MAX_LEN} bytes (got {})",
+                value.len()
+            ),
+        });
     }
     Ok(())
 }
@@ -1334,6 +1460,97 @@ mod tests {
         let err = validate_pkcs12_path_pattern(Some("./cert.p12")).unwrap_err();
         match err {
             Error::ConfigInvalid { reason } => assert!(reason.contains("'..'")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usb_wait_seconds_accepts_range_bounds() {
+        assert_eq!(
+            validate_usb_wait_seconds(0).unwrap(),
+            Duration::from_secs(0)
+        );
+        assert_eq!(
+            validate_usb_wait_seconds(300).unwrap(),
+            Duration::from_mins(5)
+        );
+    }
+
+    #[test]
+    fn usb_wait_seconds_rejects_above_max() {
+        let err = validate_usb_wait_seconds(301).unwrap_err();
+        match err {
+            Error::ConfigInvalid { reason } => {
+                assert!(reason.contains("usb_wait_seconds"));
+                assert!(reason.contains("301"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usb_allowed_devices_parses_hex_pairs() {
+        let raw = vec!["0951:1666".to_string(), "ABCD:0001".to_string()];
+        let parsed = validate_usb_allowed_devices(&raw).unwrap();
+        assert_eq!(parsed, vec![(0x0951, 0x1666), (0xABCD, 0x0001)]);
+    }
+
+    #[test]
+    fn usb_allowed_devices_empty_means_no_filter() {
+        assert!(validate_usb_allowed_devices(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn usb_allowed_devices_rejects_malformed_entries() {
+        for bad in [
+            "0951",       // no colon
+            "951:1666",   // vid too short
+            "0951:16661", // pid too long
+            "xyz1:1666",  // non-hex vid
+            "+951:1666",  // sign accepted by from_str_radix but not lsusb format
+            "0951:",      // empty pid
+            ":1666",      // empty vid
+            "",           // empty entry
+        ] {
+            let err = validate_usb_allowed_devices(&[bad.to_string()]).unwrap_err();
+            match err {
+                Error::ConfigInvalid { reason } => {
+                    assert!(reason.contains("usb_allowed_devices"), "entry {bad:?}");
+                }
+                other => panic!("unexpected for {bad:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pin_prompt_accepts_reasonable_values() {
+        validate_pin_prompt("pkcs11_pin_prompt", "Введите PIN токена: ").unwrap();
+        validate_pin_prompt("pkcs12_pin_prompt", "Smart-card PIN: ").unwrap();
+        validate_pin_prompt("pkcs12_pin_prompt", &"x".repeat(PIN_PROMPT_MAX_LEN)).unwrap();
+    }
+
+    #[test]
+    fn pin_prompt_rejects_empty() {
+        let err = validate_pin_prompt("pkcs12_pin_prompt", "").unwrap_err();
+        match err {
+            Error::ConfigInvalid { reason } => {
+                assert!(reason.contains("pkcs12_pin_prompt"));
+                assert!(reason.contains("non-empty"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pin_prompt_rejects_too_long() {
+        let err =
+            validate_pin_prompt("pkcs12_pin_prompt", &"x".repeat(PIN_PROMPT_MAX_LEN + 1))
+                .unwrap_err();
+        match err {
+            Error::ConfigInvalid { reason } => {
+                assert!(reason.contains("pkcs12_pin_prompt"));
+                assert!(reason.contains("at most"));
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

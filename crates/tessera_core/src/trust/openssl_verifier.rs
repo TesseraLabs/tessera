@@ -67,12 +67,18 @@ pub struct OpensslVerifierConfig {
     pub intermediates: Vec<Certificate>,
     /// CRLs (PEM) configured at startup.  May be empty.
     pub crl_pems: Vec<Vec<u8>>,
-    /// When `true`, expired CRLs are a hard error.
+    /// When `true`, stale CRLs are a hard error.
     pub crl_strict: bool,
+    /// Maximum accepted CRL age measured from `thisUpdate`; `None`
+    /// disables the cap.  See [`RevocationConfig::crl_max_age`].
+    pub crl_max_age: Option<Duration>,
     /// Permissible clock skew when comparing `notBefore`/`notAfter` against `now`.
     pub clock_skew: Duration,
-    /// Permissible signature-algorithm OIDs (substring match against the
-    /// algorithm's `Display` form).
+    /// Permissible signature-algorithm names.  Each entry is compared for
+    /// exact, case-sensitive equality against the algorithm's `Display`
+    /// form (substring matching was removed on purpose — it let
+    /// `sha1WithRSAEncryption` slip past a `sha` entry).  An empty list
+    /// means "no constraint"; see [`PreValidateConfig`].
     pub signature_alg_whitelist: Vec<String>,
     /// SPKI pins.  Empty = disabled.
     pub spki_pins: Vec<SpkiPin>,
@@ -136,6 +142,8 @@ impl OpensslVerifier {
             crl_store,
             rev_cfg: RevocationConfig {
                 crl_strict: cfg.crl_strict,
+                crl_max_age: cfg.crl_max_age,
+                gost_engine_path: cfg.gost_engine_path.clone(),
             },
             pre_cfg: PreValidateConfig {
                 clock_skew: cfg.clock_skew,
@@ -198,6 +206,14 @@ impl OpensslVerifier {
         //     pre-validation by ensuring no expired intermediate or
         //     intermediate without keyCertSign slips through.
         verify_intermediate_constraints(&chain, now, self.pre_cfg.clock_skew)?;
+
+        // Planned (openspec/changes/tags-delegation/): profile-version gate
+        // and delegation-envelope checks land here — reject any cert whose
+        // `pam_cert_profile_version` exceeds the supported maximum, and for
+        // every CA cert carrying `pam_cert_delegation_constraints` verify
+        // device.tags ⊇ requireTags plus the requested role/level/TTL
+        // ceilings, AND/MIN across all chain links (a constraints extension
+        // on a CA=FALSE leaf is malformed and rejects the chain).
 
         // 5. Revocation.
         check_revocation(&chain, &self.crl_store, &self.rev_cfg, now)?;

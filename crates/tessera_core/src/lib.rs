@@ -29,8 +29,14 @@ pub mod mount_guard;
 pub mod pam_conv;
 pub mod pam_data;
 pub mod pkcs12;
+// Planned (openspec/changes/role-format/): `mod role` — on-device role store
+// (TOML role slices, strict parsing, standalone/managed trust modes, signed
+// manifest with anti-rollback).
 pub mod secret;
 pub mod self_check;
+// Planned (openspec/changes/tags-delegation/): `mod tags` — device-tags store
+// (generic key=value map, opaque to the Engine; managed signed manifest with
+// anti-rollback, or a standalone file under FS-permission trust).
 pub mod token;
 pub mod trust;
 pub mod usb;
@@ -38,6 +44,6 @@ pub mod x509;
 
 pub use config::{RawConfig, ValidatedConfig};
 pub use error::{Error, SelfCheckError};
-pub use logging::{init_syslog, LogLevel, SyslogFacility};
+pub use logging::{LogLevel, SyslogFacility};
 pub use secret::Secret;
 pub use x509::SignatureAlg;

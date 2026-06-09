@@ -127,6 +127,7 @@ pub fn wire(cfg: ValidatedConfig) -> Result<Wired, WireError> {
             tessera_core::config::validated::RevocationMode::Crl
                 | tessera_core::config::validated::RevocationMode::CrlThenOcsp
         ),
+        crl_max_age: cfg.trust.revocation.crl_max_age,
         // P1-B: take both knobs from the validated config rather than
         // hard-coding 60s/4. Validator caps both (`<= 600s`, `1..=16`)
         // so casts are safe.
