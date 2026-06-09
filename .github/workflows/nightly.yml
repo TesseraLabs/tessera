@@ -1,0 +1,124 @@
+name: nightly
+
+# Release-профиль тестов (закрывает KNOWN GAP №5 build-release спеки:
+# «nightly workflow упомянут в комментарии build.yml, не существует»).
+#
+# build.yml гоняет тесты в debug — release-компиляция тестов под
+# codegen-units=1 + LTO=thin занимает ~510s vs ~60s (baseline run #25),
+# что неприемлемо для PR-цикла. Здесь та же matrix (ubuntu stub /
+# astra builder-контейнер), но тесты в release-профиле с теми же
+# knobs, что у продового .deb — release-only ошибки (кодоген, LTO,
+# timing-чувствительные тесты) ловятся не позднее чем через сутки.
+#
+# .deb здесь не собирается — это делает build.yml; nightly валидирует
+# только тестовый прогон в продовом профиле.
+
+on:
+  schedule:
+    # 02:17 UTC = 05:17 МСК. Не :00 — GitHub советует избегать
+    # начала часа (пик нагрузки schedule-очереди, прогоны дропаются).
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-release:
+    # schedule в форках не нужен (и GITHUB_TOKEN форка не утянет
+    # GHCR-образ) — гоняем только в основном репо.
+    if: github.repository == 'RoboNET/tessera'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - id: ubuntu
+            container: ""
+            test_cmd: "cargo test --workspace --release"
+          - id: astra
+            container: "ghcr.io/robonet/tessera-astra-builder:latest"
+            test_cmd: "cargo nextest run --workspace --release"
+    name: nightly (${{ matrix.target.id }})
+    # Те же release-knobs, что в build.yml/.deb — иначе nightly
+    # валидирует не тот код, который уходит на машины.
+    env:
+      CARGO_HOME: ${{ github.workspace }}/debian/cargo_home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+      CARGO_PROFILE_RELEASE_LTO: "thin"
+    container:
+      image: ${{ matrix.target.container }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Trust workspace as git repository
+        # Container-uid mismatch + GHA workspace mount → git отказывается
+        # дискаверить repo внутри контейнера (см. build.yml). Для
+        # ubuntu-runner без контейнера — безопасный noop.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # ---- Ubuntu-only steps: build deps + rustup (в astra-образе всё есть)
+
+      - name: Install build deps (ubuntu only)
+        if: matrix.target.id == 'ubuntu'
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libssl-dev libudev-dev libdbus-1-dev libpam0g-dev libsystemd-dev \
+            clang libclang-dev pkg-config build-essential
+
+      - name: Cache rustup toolchain (ubuntu only)
+        if: matrix.target.id == 'ubuntu'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: rustup-${{ runner.os }}-1.95.0
+
+      - name: Install Rust toolchain (ubuntu only)
+        if: matrix.target.id == 'ubuntu'
+        run: |
+          set -euxo pipefail
+          if ! command -v rustup >/dev/null; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain none --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install 1.95.0 --profile minimal
+
+      # ---- Common
+
+      - name: Print toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        # Отдельный shared-key: release-target nightly не должен
+        # перетирать debug-кэш PR-пути build.yml (и наоборот).
+        # Pin тот же, что в build.yml (битый codeload для @v2-тега).
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: nightly-release-${{ matrix.target.id }}
+          cache-on-failure: true
+          cache-all-crates: true
+
+      - name: Configure sccache (compiler-level cache)
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Run tests (release profile)
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: ${{ matrix.target.test_cmd }}
