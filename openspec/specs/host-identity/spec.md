@@ -12,8 +12,6 @@
 
 Источники в `[host_identity].sources` ДОЛЖНЫ (MUST) быть из допустимого набора: `machine_id` (/etc/machine-id), `dmi_board_serial`, `dmi_system_uuid`, `dmi_system_serial` (sysfs DMI; алиасы board_serial/system_uuid/system_serial), `hostname` (/etc/hostname), `custom_command` (внешняя команда, timeout clamp 1..30s), `override` (фиксированное значение из `override`).
 
-- ⚠ KNOWN GAP (docs): configuration.md:125 упоминает несуществующий `tpm_ek_pubhash`; clone-image.md:213 — несуществующие `dmi_product_serial`/`dmi_chassis_serial`.
-
 #### Scenario: custom_command с большим таймаутом
 - **WHEN** `custom_command` задан с таймаутом вне диапазона 1..30s
 - **THEN** значение clamp'ится в 1..30s
@@ -46,7 +44,7 @@
 
 При `sources` содержащем `override` И заданном `override`-значении враппер PAM-крейта ДОЛЖЕН (MUST) вернуть hash от override-значения, минуя цепочку (lib.rs:55–101). Это основа clone-image bootstrap (`override="installation"`).
 
-- ⚠ Замечание (для контрибьюторов): в core-резолвере `Override` — no-op ветка (chain.rs:75); override работает только через враппер `tessera/src/lib.rs`. Прямое использование core `HostIdentityResolver` с `sources=["override"]` даст пустой список → всегда fallback.
+- Замечание о слоистости (нормативно): override реализован враппером PAM-крейта (`tessera/src/lib.rs`); в core-резолвере `Override` — намеренная no-op ветка (chain.rs:75). Прямое использование core `HostIdentityResolver` с `sources=["override"]` даёт пустой список → всегда fallback.
 
 #### Scenario: Override задан в clone-image bootstrap
 - **WHEN** `sources` содержит `override` и задано `override="installation"`

@@ -119,7 +119,7 @@ cargo test --workspace
 Примеры:
 
 - `feat(monitord): добавлена обработка suspend/resume через D-Bus`
-- `fix(core): исправлено поведение OCSP timeout при mode = "crl_then_ocsp"`
+- `fix(core): исправлена проверка свежести CRL при mode = "crl"`
 - `docs(install): добавлен сценарий для Mode A с FAT32-носителем`
 - `chore: обновлена зависимость serde до 1.0.x`
 - `refactor(proto): переименован Pong в HelloAck для консистентности`

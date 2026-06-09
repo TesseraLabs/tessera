@@ -23,7 +23,7 @@
 2. Atomic rewrite: `sources` → production-набор (default `["dmi_board_serial","machine_id"]`; override: `--sources` > env `POST_INSTALL_SOURCES` > default), строка `override=` комментируется; tmpfile + проверка обеих замен + сохранение perms/owner + mv; backup `config.toml.bak.<UTC>`.
 3. `tessera check`; провал → rollback из backup + exit ≠ 0, демон не рестартится (fail-closed).
 4. restart `tessera.service`, ожидание active до 30s.
-5. `dump-host-id --usb` с poll до **60s** (⚠ док clone-image.md:182 говорит ~30s); без USB — fallback-файл в `/var/lib/tessera/`.
+5. `dump-host-id --usb` с poll до **60s**; без USB — fallback-файл в `/var/lib/tessera/`.
 
 Флаги: `--non-interactive`, `--no-restart`, `--no-dump`, `--sources`.
 

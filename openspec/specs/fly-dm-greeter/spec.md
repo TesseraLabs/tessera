@@ -26,13 +26,12 @@
 
 ### Requirement: Рендер
 
-Шаблон по локали (`LC_MESSAGES`/`LANG` startswith "ru" → template_ru) ДОЛЖЕН (MUST) поддерживать подстановки `{host_id_short}` (prefix8), `{source}`, `%n` (hostname). Дефолты: DejaVuSans-Bold 64pt, чёрный, gravity=south, offset_y=120. Запись atomic (tmpfile+rename), выход всегда JPEG. Pure Rust (`image`+`ab_glyph`) — без ImageMagick/Pango. Writer НЕ ДОЛЖЕН (MUST NOT) редактировать settings.ini (blur/color_overlay/path — зона оператора/Ansible; baseline для читаемости: `color_overlay=0,0,0,30`, `blur enable=false`).
+Шаблон по локали (`LC_MESSAGES`/`LANG` startswith "ru" → template_ru) ДОЛЖЕН (MUST) поддерживать подстановки `{host_id_short}` (prefix8), `{source}`, `%n` (hostname). Дефолты: DejaVuSans-Bold 64pt, чёрный, gravity=south, offset_y=120, `wallpaper_offset_x`=0 (горизонтальный сдвиг баннера, может быть отрицательным; raw.rs:162, validated.rs:590, fly_dm_wallpaper_writer.rs:165). Запись atomic (tmpfile+rename), выход всегда JPEG. Pure Rust (`image`+`ab_glyph`) — без ImageMagick/Pango. Writer НЕ ДОЛЖЕН (MUST NOT) редактировать settings.ini (blur/color_overlay/path — зона оператора/Ansible; baseline для читаемости: `color_overlay=0,0,0,30`, `blur enable=false`).
 
 #### Scenario: Русская локаль
 - **WHEN** `LANG` начинается с "ru"
 - **THEN** используется template_ru с подстановками `{host_id_short}`, `{source}`, `%n`, запись atomic в JPEG
 
-- ⚠ KNOWN GAP (docs): fly-dm-greeter.md не документирует `wallpaper_offset_x`; заявленные события `wallpaper_rendered`/`wallpaper_backup_created`/`fly_dm_greeter_font_missing` не существуют (реально один INFO «fly-dm wallpaper update finished» с outcome + WARN при ошибке).
 - Замечание: `update_greet_string` (0.3.16–0.3.18) удалён из схемы — присутствие в конфиге теперь ОТВЕРГАЕТСЯ deny_unknown_fields, а не no-op.
 
 ### Requirement: Контекст платформы (зачем wallpaper)

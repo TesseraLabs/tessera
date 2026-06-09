@@ -50,8 +50,9 @@ Runbook end-to-end: от подготовки эталонного образа 
 - `pam_cert_user_binding = <service_user>`;
 - стандартные `extendedKeyUsage = clientAuth, emailProtection`.
 
-`emailProtection` обязателен — без него Astra-валидатор отвергает
-цепочку (см. [cert-issuance.md](cert-issuance.md)).
+`emailProtection` требует не `tessera`, а **штатный валидатор Astra**
+(openssl `CMS_verify`) — без этого EKU он отвергает цепочку
+(см. [cert-issuance.md](cert-issuance.md)).
 
 ### 2.3 `config.toml` на эталоне
 
@@ -95,6 +96,7 @@ update_wallpaper = true
 | `wallpaper_font_size` | `64`                                                    |
 | `wallpaper_text_color`| `#000000`                                               |
 | `wallpaper_gravity`   | `south`                                                 |
+| `wallpaper_offset_x`  | `0`                                                     |
 | `wallpaper_offset_y`  | `120`                                                   |
 | `template_ru`         | `Банкомат %n  host_id={host_id_short} ({source})`       |
 | `template_en`         | `ATM %n  host_id={host_id_short} ({source})`            |
@@ -129,8 +131,9 @@ enable=false
 sudo tessera check
 ```
 
-Должен вернуть exit 0. На эталоне ожидаемы INFO/WARN-записи
-`fly_dm_greeter_*` и `host_identity_override_active`.
+Должен вернуть exit 0. На эталоне в журнале демона ожидаемы INFO
+`fly-dm wallpaper update finished` (target `tessera.fly_dm_greeter`)
+и `host_identity: probe selected` с `source=Override`.
 
 ### 2.6 Снятие образа
 
@@ -171,7 +174,7 @@ Atomic, single-pass:
    rollback бекапа, exit ≠ 0.
 3. **Рестарт** `tessera.service`, ждёт `is-active=active` до 30 с.
 4. **Снимает дамп**: `tessera dump-host-id --usb` с ретраями
-   (~30 с на появление USB). Fallback: TSV в
+   (до 60 с на появление USB, опрос каждые 5 с). Fallback: TSV в
    `/var/lib/tessera/host-ids-<hostname>-<UTC>.tsv`.
 
 ### 4.2 Флаги
@@ -201,13 +204,13 @@ source  status  hash_hex  hash_prefix  raw  normalized  active_under_current_con
 ```
 
 Одна строка на каждый **известный** источник (не только настроенные):
-`machine_id`, `dmi_board_serial`, `dmi_product_serial`, `dmi_chassis_serial`,
-`hostname`, `override`, `custom_command` (если в конфиге). Строка с
-`active_under_current_config=yes` — тот источник, что демон
-**сейчас** использует. Из неё CA-админ берёт `hash_hex`.
+`machine_id`, `dmi_board_serial`, `dmi_system_uuid`,
+`dmi_system_serial`, `hostname`, плюс `custom_command` (если в
+конфиге). Строка с `active_under_current_config=yes` — тот источник,
+что демон **сейчас** использует. Из неё CA-админ берёт `hash_hex`.
 
-`status` ∈ {`ok`, `empty`, `error`}. `reason` поясняет `empty`/`error`
-(`dmi_board_serial = 0` в VM, `custom_command exited 1` и т.п.).
+`status` ∈ {`ok`, `err`}. `reason` поясняет `err` (пустое значение,
+`dmi_board_serial = 0` в VM, `custom_command exited 1` и т.п.).
 
 Exit ≠ 0 у `dump-host-id`, если **все** известные источники вернули
 пустое/ошибку — однозначный сигнал «не выписывать сертификат, пока

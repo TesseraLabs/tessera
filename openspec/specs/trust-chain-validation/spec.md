@@ -22,15 +22,14 @@ Anchors ДОЛЖНЫ (MUST) задаваться `[trust].anchors` (PEM self-sig
 
 Лист ДОЛЖЕН (MUST) проходить по порядку: X.509 v3 → validity с допуском `clock_skew_seconds` → whitelist алгоритмов подписи → KeyUsage `digitalSignature` → EKU `clientAuth` → basicConstraints отсутствует или CA=FALSE (pre_validate.rs:51–102). Отсутствие KeyUsage/EKU → reject (fail-closed).
 
-#### Scenario: Пустой whitelist алгоритмов
-- **WHEN** `allowed_signature_algorithms = []`
-- **THEN** принимаются ЛЮБЫЕ алгоритмы (pre_validate.rs:28–31)
-- ⚠ KNOWN GAP: fail-open default, не акцентирован в docs. Рекомендация деплоя — всегда задавать whitelist явно.
+#### Scenario: Пустой whitelist алгоритмов → безопасный дефолт
+- **WHEN** `allowed_signature_algorithms` опущен или равен `[]`
+- **THEN** валидатор конфигурации ДОЛЖЕН (MUST) подставить дефолтный whitelist `DEFAULT_SIGNATURE_ALGORITHMS` (config/validated.rs:792–868): `sha256/384/512WithRSAEncryption` + `ecdsa-with-SHA256/384/512`. SHA-1 и прочие deprecated-алгоритмы в дефолт НЕ входят; GOST в дефолт НЕ входит (gost-engine не подтягивается, `needs_gost=false`) — GOST включается только явным перечислением в конфиге
 
 #### Scenario: EKU emailProtection
 - **WHEN** leaf без emailProtection EKU
 - **THEN** tessera НЕ отвергает (проверяется только clientAuth)
-- ⚠ Замечание: требование emailProtection исходит от штатного валидатора Astra / openssl CMS_verify (исторический контекст 0.2.x), НЕ от tessera. Docs (cert-issuance.md:224, clone-image.md:58–60) приписывают требование модулю — неверно.
+- Историческая справка: требование emailProtection исходит от штатного валидатора Astra / openssl CMS_verify (контекст 0.2.x), НЕ от tessera — docs (cert-issuance.md, clone-image.md) атрибутируют его именно штатному валидатору Astra.
 
 ### Requirement: Построение цепочки
 
@@ -57,8 +56,6 @@ Anchors ДОЛЖНЫ (MUST) задаваться `[trust].anchors` (PEM self-sig
 #### Scenario: Алгоритм совпадает только по подстроке
 - **WHEN** алгоритм подписи совпадает с элементом whitelist лишь как подстрока (например, `sha1WithRSAEncryption` против `sha`)
 - **THEN** совпадение НЕ засчитывается — требуется строгое равенство, иначе reject
-
-- ⚠ Устаревший doc-комментарий: openssl_verifier.rs:75 всё ещё описывает «substring match».
 
 ### Requirement: SPKI-pinning
 
