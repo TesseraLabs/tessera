@@ -38,6 +38,9 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 | [pam-integration](pam-integration/spec.md) | Режимы, parsec_mac/two-include ordering, postinst |
 | [build-release](build-release/spec.md) | CI matrix, packaging, тестовые gap'ы |
 
+### Лицензирование
+| [licensing-distribution](licensing-distribution/spec.md) | Dual-license AGPL/commercial, граница open/commercial, SPI MacBackend, CLA |
+
 ## Состояние gap'ов (сводно)
 
 Все известные на момент bootstrap расхождения закрыты в 0.4.0:

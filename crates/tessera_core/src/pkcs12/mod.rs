@@ -162,7 +162,7 @@ pub fn validate_p12_envelope(bytes: &[u8]) -> Result<(), P12EnvelopeError> {
 /// Attempt to extract the end-entity certificate from a PKCS#12 buffer
 /// **without** a password.
 ///
-/// Newer issuance tooling (`issue-bfs-service-cert.sh` v2 and later)
+/// Newer issuance tooling (`issue-service-cert.sh` v2 and later)
 /// places the leaf certificate in an unencrypted `SafeBag` so an admin
 /// can inspect host/user bindings without the PIN. When that layout is
 /// present this returns `Some(Certificate)`; when the cert is encrypted
