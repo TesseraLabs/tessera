@@ -40,6 +40,14 @@ Engine ДОЛЖЕН (MUST) загружаться once-per-process (OnceLock) и
 - **WHEN** пакет устанавливается на систему без `libpdp`/`libparsec`
 - **THEN** установка проходит — эти зависимости в Recommends, а не Depends, а GOST-engine берётся из альтернатив `libgost-engine | gost-engine | libgost-astra`
 
+### Requirement: ГОСТ-делегация в открытой части
+
+ГОСТ-функциональность edge-агента (делегация в gost-engine: ленивая загрузка, challenge-response GOST 2012-256/512, верификация GOST-цепочек) входит в открытую часть проекта и ДОЛЖНА (MUST) оставаться полностью функциональной в открытой сборке (`crates/tessera_core/src/gost/` — этот репозиторий, см. [licensing-distribution](../licensing-distribution/spec.md)).
+
+#### Scenario: Открытая сборка с ГОСТ
+- **WHEN** репозиторий собирается без доступа к коммерческим компонентам
+- **THEN** ГОСТ-путь (gost-engine делегация) полностью функционален
+
 ### Requirement: Feature-флаги
 
 `gost-tests` ДОЛЖЕН (MUST) гейтить только интеграционные тесты `gost_*_real.rs`; runtime-код engine компилируется всегда.
