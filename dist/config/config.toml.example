@@ -58,7 +58,7 @@ pkcs11_slot_wait_seconds = 10
 # Default: "certs/user.p12".
 # pkcs12_path_pattern = "certs/user.p12"
 # альтернативные варианты:
-# pkcs12_path_pattern = "bfs_service.p12"
+# pkcs12_path_pattern = "service.p12"
 # pkcs12_path_pattern = "${user}.p12"
 # pkcs12_pin_prompt   = "Пароль PKCS#12: "
 
