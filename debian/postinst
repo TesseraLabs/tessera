@@ -36,9 +36,13 @@ case "$1" in
             chmod 0640 "$CONFIG_DIR/ca/bundle.pem"
         fi
 
+        # OCSP response cache: written by the PAM auth path (runs as root),
+        # DER entries 0640 root:root per the revocation spec. The daemon
+        # never touches it, so no tessera group access on the leaf dir; the
+        # parent /var/cache/tessera stays daemon-owned for future caches.
         mkdir -p "$CACHE_DIR"
         chmod 0750 "$CACHE_DIR"
-        chown tessera:tessera "$CACHE_DIR"
+        chown root:root "$CACHE_DIR"
         chown tessera:tessera "$(dirname "$CACHE_DIR")"
 
         mkdir -p "$STATE_DIR"

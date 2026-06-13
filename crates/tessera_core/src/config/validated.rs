@@ -7,8 +7,8 @@ use std::time::Duration;
 use crate::config::raw::{
     RawCertIntegrityMode, RawConfig, RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback,
     RawHostIdentity, RawLogging, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor,
-    RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocationMode, RawTrust,
-    RawTrustOverride, RawUserMapping,
+    RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocation, RawRevocationMode,
+    RawTrust, RawTrustOverride, RawUserMapping,
 };
 use crate::error::TrustError;
 use crate::hooks::{validate_hook, HookConfig};
@@ -341,10 +341,20 @@ pub struct RevocationSection {
     /// (from `crl_max_age_hours`, validated to 1..=8760).  `None`
     /// disables the age cap.
     pub crl_max_age: Option<Duration>,
-    // The raw `ocsp_responder_url` / `ocsp_timeout_seconds` /
-    // `ocsp_cache_ttl_seconds` keys are rejected by `validate_trust` until
-    // OCSP is implemented (openspec/changes/ocsp-support); they belong here
-    // once an OCSP client exists.
+    /// OCSP responder URL (from `ocsp_responder_url`, validated to start
+    /// with `http://` or `https://`).  `Some` exactly when [`Self::mode`]
+    /// is [`RevocationMode::Ocsp`] or [`RevocationMode::CrlThenOcsp`]:
+    /// the key is required in those modes and rejected in all others.
+    /// AIA URL extraction from the certificate is deliberately not
+    /// performed — the responder comes from config only.
+    pub ocsp_responder_url: Option<String>,
+    /// Overall deadline for one OCSP exchange (connect + write + read),
+    /// from `ocsp_timeout_seconds` (validated to 1..=30, default 5).
+    pub ocsp_timeout: Duration,
+    /// Upper bound on the lifetime of an OCSP cache entry, from
+    /// `ocsp_cache_ttl_seconds` (validated to 0..=86400, default 3600).
+    /// [`Duration::ZERO`] disables the cache.
+    pub ocsp_cache_ttl: Duration,
 }
 
 /// Revocation mode.
@@ -354,12 +364,9 @@ pub enum RevocationMode {
     None,
     /// CRL.
     Crl,
-    /// OCSP.  Rejected by `validate_trust` until OCSP is implemented
-    /// (openspec/changes/ocsp-support); kept so downstream wiring code
-    /// does not churn when the mode becomes accepted.
+    /// OCSP.
     Ocsp,
-    /// CRL then OCSP.  Rejected by `validate_trust` until OCSP is
-    /// implemented (openspec/changes/ocsp-support); see [`Self::Ocsp`].
+    /// CRL then OCSP.
     CrlThenOcsp,
 }
 
@@ -917,30 +924,7 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
             }
         }
     }
-    // OCSP has no runtime implementation yet (openspec/changes/ocsp-support).
-    // Accepting these modes/keys would silently disable revocation checking
-    // (fail-open), so the config is rejected outright instead.
-    if matches!(
-        raw.revocation.mode,
-        RawRevocationMode::Ocsp | RawRevocationMode::CrlThenOcsp
-    ) {
-        return Err(Error::ConfigInvalid {
-            reason: "trust.revocation.mode: OCSP is not implemented \
-                     (openspec/changes/ocsp-support); use mode = \"none\" or \"crl\""
-                .to_string(),
-        });
-    }
-    if raw.revocation.ocsp_responder_url.is_some()
-        || raw.revocation.ocsp_timeout_seconds.is_some()
-        || raw.revocation.ocsp_cache_ttl_seconds.is_some()
-    {
-        return Err(Error::ConfigInvalid {
-            reason: "trust.revocation: ocsp_responder_url / ocsp_timeout_seconds / \
-                     ocsp_cache_ttl_seconds are rejected because OCSP is not \
-                     implemented (openspec/changes/ocsp-support)"
-                .to_string(),
-        });
-    }
+    let ocsp = validate_ocsp(&raw.revocation)?;
     let crl_max_age = match raw.revocation.crl_max_age_hours {
         None => None,
         Some(hours) if (1..=8760).contains(&hours) => {
@@ -976,6 +960,9 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
             },
             crl_paths: raw.revocation.crl_paths.clone(),
             crl_max_age,
+            ocsp_responder_url: ocsp.responder_url,
+            ocsp_timeout: ocsp.timeout,
+            ocsp_cache_ttl: ocsp.cache_ttl,
         },
         allowed_signature_algorithms: if raw.allowed_signature_algorithms.is_empty() {
             DEFAULT_SIGNATURE_ALGORITHMS
@@ -995,6 +982,115 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
         },
         max_chain_depth: raw.max_chain_depth,
         clock_skew_seconds: raw.clock_skew_seconds,
+    })
+}
+
+/// Default `ocsp_timeout_seconds` (overall deadline of one OCSP exchange).
+const OCSP_TIMEOUT_SECONDS_DEFAULT: u64 = 5;
+/// Inclusive bounds on `ocsp_timeout_seconds`.
+const OCSP_TIMEOUT_SECONDS_RANGE: std::ops::RangeInclusive<u64> = 1..=30;
+/// Default `ocsp_cache_ttl_seconds` (one hour).
+const OCSP_CACHE_TTL_SECONDS_DEFAULT: u64 = 3600;
+/// Upper bound on `ocsp_cache_ttl_seconds` (24 hours).  `0` is valid and
+/// disables the cache.
+const OCSP_CACHE_TTL_SECONDS_MAX: u64 = 86_400;
+
+/// Validated OCSP knobs extracted from `[trust.revocation]` by
+/// [`validate_ocsp`].
+struct OcspSettings {
+    /// Responder URL; `Some` exactly in the OCSP-capable modes.
+    responder_url: Option<String>,
+    /// Overall deadline of one OCSP exchange.
+    timeout: Duration,
+    /// Cache-entry TTL; [`Duration::ZERO`] disables the cache.
+    cache_ttl: Duration,
+}
+
+/// Validate the `ocsp_*` keys of `[trust.revocation]`.
+///
+/// In OCSP-capable modes (`ocsp`, `crl_then_ocsp`) the responder URL is
+/// required and must be `http://` or `https://`; the numeric knobs fall
+/// back to their defaults and are range-checked.  In every other mode any
+/// `ocsp_*` key is rejected outright: a key that would be silently ignored
+/// at runtime is a footgun (same guard as `monitor.on_usb_removed_hook_path`).
+fn validate_ocsp(raw: &RawRevocation) -> Result<OcspSettings, Error> {
+    let ocsp_capable = matches!(
+        raw.mode,
+        RawRevocationMode::Ocsp | RawRevocationMode::CrlThenOcsp
+    );
+    if !ocsp_capable {
+        let set_keys: Vec<&str> = [
+            ("ocsp_responder_url", raw.ocsp_responder_url.is_some()),
+            ("ocsp_timeout_seconds", raw.ocsp_timeout_seconds.is_some()),
+            (
+                "ocsp_cache_ttl_seconds",
+                raw.ocsp_cache_ttl_seconds.is_some(),
+            ),
+        ]
+        .iter()
+        .filter(|(_, is_set)| *is_set)
+        .map(|(key, _)| *key)
+        .collect();
+        if !set_keys.is_empty() {
+            return Err(Error::ConfigInvalid {
+                reason: format!(
+                    "trust.revocation: {} only valid when mode = \"ocsp\" or \"crl_then_ocsp\"",
+                    set_keys.join(", ")
+                ),
+            });
+        }
+        return Ok(OcspSettings {
+            responder_url: None,
+            timeout: Duration::from_secs(OCSP_TIMEOUT_SECONDS_DEFAULT),
+            cache_ttl: Duration::from_secs(OCSP_CACHE_TTL_SECONDS_DEFAULT),
+        });
+    }
+    let responder_url = match raw.ocsp_responder_url.as_deref() {
+        None => {
+            return Err(TrustError::OcspResponderInvalid {
+                reason: "trust.revocation.ocsp_responder_url is required when \
+                         mode = \"ocsp\" or \"crl_then_ocsp\""
+                    .to_string(),
+            }
+            .into());
+        }
+        Some(url) if url.starts_with("http://") || url.starts_with("https://") => url.to_owned(),
+        Some(url) => {
+            return Err(TrustError::OcspResponderInvalid {
+                reason: format!(
+                    "trust.revocation.ocsp_responder_url must start with \
+                     http:// or https:// (got {url:?})"
+                ),
+            }
+            .into());
+        }
+    };
+    let timeout_seconds = raw
+        .ocsp_timeout_seconds
+        .unwrap_or(OCSP_TIMEOUT_SECONDS_DEFAULT);
+    if !OCSP_TIMEOUT_SECONDS_RANGE.contains(&timeout_seconds) {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "trust.revocation.ocsp_timeout_seconds must be in \
+                 {OCSP_TIMEOUT_SECONDS_RANGE:?} (got {timeout_seconds})"
+            ),
+        });
+    }
+    let cache_ttl_seconds = raw
+        .ocsp_cache_ttl_seconds
+        .unwrap_or(OCSP_CACHE_TTL_SECONDS_DEFAULT);
+    if cache_ttl_seconds > OCSP_CACHE_TTL_SECONDS_MAX {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "trust.revocation.ocsp_cache_ttl_seconds must be in \
+                 0..={OCSP_CACHE_TTL_SECONDS_MAX} (got {cache_ttl_seconds})"
+            ),
+        });
+    }
+    Ok(OcspSettings {
+        responder_url: Some(responder_url),
+        timeout: Duration::from_secs(timeout_seconds),
+        cache_ttl: Duration::from_secs(cache_ttl_seconds),
     })
 }
 

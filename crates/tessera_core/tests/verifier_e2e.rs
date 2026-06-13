@@ -33,6 +33,11 @@ fn config_builder() -> OpensslVerifierConfig {
         spki_pins: vec![],
         max_depth: 4,
         gost_engine_path: None,
+        revocation_mode: tessera_core::config::validated::RevocationMode::Crl,
+        ocsp_responder_url: None,
+        ocsp_timeout: Duration::from_secs(5),
+        ocsp_cache_dir: std::path::PathBuf::from("/var/cache/tessera/ocsp"),
+        ocsp_cache_ttl: Duration::ZERO,
     }
 }
 

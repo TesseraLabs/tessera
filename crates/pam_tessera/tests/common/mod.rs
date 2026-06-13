@@ -66,6 +66,13 @@ pub fn build_verifier(crl_pems: Vec<Vec<u8>>) -> OpensslVerifier {
         spki_pins: vec![],
         max_depth: 4,
         gost_engine_path: None,
+        // CRL mode so a supplied CRL store is consulted; an empty store is a
+        // no-op early return, matching the suites' "no CRL = success" cases.
+        revocation_mode: tessera_core::config::validated::RevocationMode::Crl,
+        ocsp_responder_url: None,
+        ocsp_timeout: Duration::from_secs(5),
+        ocsp_cache_dir: std::path::PathBuf::from("/var/cache/tessera/ocsp"),
+        ocsp_cache_ttl: Duration::ZERO,
     })
     .unwrap()
 }

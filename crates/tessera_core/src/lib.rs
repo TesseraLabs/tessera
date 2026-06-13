@@ -26,6 +26,7 @@ pub mod mac;
 pub mod mapping;
 pub mod mount;
 pub mod mount_guard;
+pub mod ocsp;
 pub mod pam_conv;
 pub mod pam_data;
 pub mod pkcs12;

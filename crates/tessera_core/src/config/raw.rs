@@ -347,20 +347,22 @@ pub struct RawRevocation {
     /// CRL paths.
     #[serde(default)]
     pub crl_paths: Vec<PathBuf>,
-    /// OCSP URL.  Accepted by the parser for forward compatibility but
-    /// rejected during validation until OCSP is implemented
-    /// (openspec/changes/ocsp-support).
+    /// OCSP responder URL (`http://` or `https://`).  Required when
+    /// `mode` is `ocsp` or `crl_then_ocsp`; rejected during validation in
+    /// every other mode (a key that would be silently ignored at runtime
+    /// is a footgun).  Validated in [`crate::config::ValidatedConfig`].
     #[serde(default)]
     pub ocsp_responder_url: Option<String>,
     /// CRL max age in hours (1..=8760).  `None` disables the age cap.
     #[serde(default)]
     pub crl_max_age_hours: Option<u64>,
-    /// OCSP timeout.  Accepted by the parser but rejected during validation
-    /// until OCSP is implemented (openspec/changes/ocsp-support).
+    /// Overall deadline of one OCSP exchange in seconds (1..=30, default
+    /// 5).  Only valid when `mode` is `ocsp` or `crl_then_ocsp`.
     #[serde(default)]
     pub ocsp_timeout_seconds: Option<u64>,
-    /// OCSP cache TTL.  Accepted by the parser but rejected during validation
-    /// until OCSP is implemented (openspec/changes/ocsp-support).
+    /// OCSP cache-entry TTL in seconds (0..=86400, default 3600; 0
+    /// disables the cache).  Only valid when `mode` is `ocsp` or
+    /// `crl_then_ocsp`.
     #[serde(default)]
     pub ocsp_cache_ttl_seconds: Option<u64>,
 }
