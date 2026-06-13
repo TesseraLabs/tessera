@@ -278,16 +278,7 @@ pub fn check_revocation(
         return Ok(());
     }
     for crl in store.iter() {
-        let stale_by_next_update = crl.next_update.is_some_and(|nu| nu <= now);
-        // `thisUpdate` near the upper bound of `SystemTime` can overflow on
-        // `+ max_age` (which panics); a deadline past that bound is
-        // infinitely far in the future, so overflow means "not stale".
-        let stale_by_max_age = cfg.crl_max_age.is_some_and(|max_age| {
-            crl.this_update
-                .checked_add(max_age)
-                .is_some_and(|deadline| now > deadline)
-        });
-        if stale_by_next_update || stale_by_max_age {
+        if crl_is_stale(crl, cfg, now) {
             if cfg.crl_strict {
                 return Err(TrustError::Crl("CRL stale".into()));
             }
@@ -335,6 +326,89 @@ pub fn check_revocation(
         }
     }
     Ok(())
+}
+
+/// Whether a fresh CRL in the store covers a given certificate, and the
+/// resulting status when it does.  Used by the `crl_then_ocsp` revocation
+/// mode to decide between an offline CRL verdict and a network OCSP call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrlCoverage {
+    /// A fresh CRL issued by the certificate's issuer covers it; the bool is
+    /// `true` when the certificate's serial is listed (revoked).
+    Covered(bool),
+    /// No fresh CRL whose issuer DN matches the certificate's issuer DN is
+    /// present (none configured, all stale, or none in scope) — the caller
+    /// must fall back to OCSP.
+    NotCovered,
+}
+
+/// Returns whether a fresh, in-scope CRL covers `cert` and its revocation
+/// verdict, for the `crl_then_ocsp` mode's "CRL first, OCSP only on miss"
+/// rule (delta-spec `revocation`).
+///
+/// `cert`'s issuer DN is matched byte-for-byte against each CRL's issuer DN
+/// (RFC 5280 § 6.3.3).  A matching CRL is consulted only when it is fresh
+/// (same staleness rule as [`check_revocation`]: `nextUpdate <= now`, or
+/// `thisUpdate + crl_max_age < now` when the cap is set); a stale CRL yields
+/// [`CrlCoverage::NotCovered`] so the caller falls back to OCSP rather than
+/// failing — staleness is not fatal in this mode.
+///
+/// Before a CRL's verdict is trusted its signature is verified against the
+/// issuer certificate found in `chain` (by subject DN); a signature that
+/// does not validate fails closed.
+///
+/// # Errors
+///
+/// * [`TrustError::CrlSignatureInvalid`] when an in-scope fresh CRL's
+///   signature does not validate under its issuer's key, or the issuer
+///   certificate is absent from `chain`.
+pub fn crl_status_for(
+    cert: &Certificate,
+    chain: &[Certificate],
+    store: &CrlStore,
+    cfg: &RevocationConfig,
+    now: SystemTime,
+) -> Result<CrlCoverage, TrustError> {
+    let Ok(cert_issuer_der) = cert.x509().issuer_name().to_der() else {
+        // Issuer DN cannot be encoded: no CRL can be proven in scope.
+        return Ok(CrlCoverage::NotCovered);
+    };
+    let serial = cert.serial_hex().to_lowercase();
+    for crl in store.iter() {
+        if crl.issuer_dn_der() != cert_issuer_der.as_slice() {
+            continue;
+        }
+        if crl_is_stale(crl, cfg, now) {
+            // Stale CRL: not a usable offline source -> fall back to OCSP.
+            continue;
+        }
+        // In scope and fresh: verify its signature before trusting it.
+        let issuer = find_issuer(chain, crl.issuer_dn_der()).ok_or_else(|| {
+            TrustError::CrlSignatureInvalid(
+                "CRL issuer certificate not present in verified chain; \
+                 signature cannot be verified"
+                    .into(),
+            )
+        })?;
+        crl.verify_signature_with_issuer(issuer, cfg.gost_engine_path.as_deref())?;
+        let revoked = crl.revoked_serials().iter().any(|s| s == &serial);
+        return Ok(CrlCoverage::Covered(revoked));
+    }
+    Ok(CrlCoverage::NotCovered)
+}
+
+/// Whether `crl` is stale at `now` under `cfg` (RFC 5280 freshness).
+fn crl_is_stale(crl: &Crl, cfg: &RevocationConfig, now: SystemTime) -> bool {
+    let stale_by_next_update = crl.next_update.is_some_and(|nu| nu <= now);
+    // `thisUpdate` near the upper bound of `SystemTime` can overflow on
+    // `+ max_age` (which panics); a deadline past that bound is infinitely
+    // far in the future, so overflow means "not stale".
+    let stale_by_max_age = cfg.crl_max_age.is_some_and(|max_age| {
+        crl.this_update
+            .checked_add(max_age)
+            .is_some_and(|deadline| now > deadline)
+    });
+    stale_by_next_update || stale_by_max_age
 }
 
 /// Finds the chain certificate whose subject DN (DER) equals `issuer_dn_der`.

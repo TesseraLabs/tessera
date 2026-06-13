@@ -10,7 +10,7 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 | [cert-authentication-flow](cert-authentication-flow/spec.md) | Оркестрация pam_sm_authenticate, PKCS#12/PKCS#11 пути, FlowError→PAM |
 | [challenge-response](challenge-response/spec.md) | Proof-of-possession (RSA-PSS/ECDSA/GOST), no replay by design |
 | [trust-chain-validation](trust-chain-validation/spec.md) | Pre-validate, chain build, подписи, constraints, pinning |
-| [revocation](revocation/spec.md) | CRL с верификацией подписи (fail-closed); OCSP — proposal [ocsp-support](../changes/ocsp-support/) |
+| [revocation](revocation/spec.md) | CRL с верификацией подписи (fail-closed); OCSP (4 режима, кэш, fail-closed) |
 | [gost-crypto](gost-crypto/spec.md) | Делегация в gost-engine, ленивая загрузка |
 | [cert-scope-binding](cert-scope-binding/spec.md) | host/user_binding + max_integrity extensions, OID-контракт |
 | [host-identity](host-identity/spec.md) | first-working-wins, normalize+sha256, override, fallback |
@@ -57,7 +57,7 @@ Docs-класс (закрыто в docs): configuration.md, architecture.md (PRO
 
 Testing-класс: автоматизация оставшихся ручных проверок (ГОСТ E2E, libpdp runtime, hook-security, USB/токен) — proposal [ci-hardening](../changes/ci-hardening/); release-профиль тестов уже покрыт nightly workflow (`.github/workflows/nightly.yml`).
 
-Нереализованная функциональность — proposals: OCSP — [ocsp-support](../changes/ocsp-support/), GOST через PKCS#11 — [gost-pkcs11](../changes/gost-pkcs11/).
+Нереализованная функциональность — proposals: GOST через PKCS#11 — [gost-pkcs11](../changes/gost-pkcs11/). OCSP реализован (change [ocsp-support](../changes/ocsp-support/), осталась ручная проверка на Astra VM — task 5.3).
 
 ## Чего НЕТ в текущей реализации (чтобы не путать со спеками 0.2.x / продуктовыми планами)
 

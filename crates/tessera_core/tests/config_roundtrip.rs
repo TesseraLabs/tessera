@@ -370,16 +370,88 @@ fn fixture_with_revocation(anchor: &Path, revocation_body: &str) -> String {
 }
 
 #[test]
-fn validated_config_rejects_ocsp_mode() -> Result<(), Box<dyn std::error::Error>> {
+fn validated_config_accepts_ocsp_mode_with_url_and_defaults(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_revocation(
+        &anchor,
+        "mode = \"ocsp\"\ncrl_paths = []\nocsp_responder_url = \"https://ocsp.example.org/\"",
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(
+        v.trust.revocation.ocsp_responder_url.as_deref(),
+        Some("https://ocsp.example.org/")
+    );
+    assert_eq!(
+        v.trust.revocation.ocsp_timeout,
+        std::time::Duration::from_secs(5)
+    );
+    assert_eq!(
+        v.trust.revocation.ocsp_cache_ttl,
+        std::time::Duration::from_hours(1)
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_accepts_crl_then_ocsp_mode_with_url() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_revocation(
+        &anchor,
+        "mode = \"crl_then_ocsp\"\ncrl_paths = []\n\
+         ocsp_responder_url = \"http://ocsp.example.org/\"\n\
+         ocsp_timeout_seconds = 30\nocsp_cache_ttl_seconds = 86400",
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(
+        v.trust.revocation.ocsp_responder_url.as_deref(),
+        Some("http://ocsp.example.org/")
+    );
+    assert_eq!(
+        v.trust.revocation.ocsp_timeout,
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(
+        v.trust.revocation.ocsp_cache_ttl,
+        std::time::Duration::from_hours(24)
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_accepts_ocsp_cache_ttl_zero() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_revocation(
+        &anchor,
+        "mode = \"ocsp\"\ncrl_paths = []\n\
+         ocsp_responder_url = \"https://ocsp.example.org/\"\nocsp_cache_ttl_seconds = 0",
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(v.trust.revocation.ocsp_cache_ttl, std::time::Duration::ZERO);
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_ocsp_mode_without_url() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
     for mode in ["ocsp", "crl_then_ocsp"] {
         let body = fixture_with_revocation(&anchor, &format!("mode = {mode:?}\ncrl_paths = []"));
         let raw: RawConfig = toml::from_str(&body)?;
-        let err = ValidatedConfig::try_from(&raw).expect_err("OCSP modes must be rejected");
+        let err =
+            ValidatedConfig::try_from(&raw).expect_err("OCSP mode without url must be rejected");
         assert!(
-            matches!(err, Error::ConfigInvalid { ref reason }
-                if reason.contains("OCSP is not implemented")),
+            matches!(
+                err,
+                Error::Trust(tessera_core::error::TrustError::OcspResponderInvalid { .. })
+            ),
             "unexpected error for mode {mode}: {err:?}"
         );
     }
@@ -387,24 +459,96 @@ fn validated_config_rejects_ocsp_mode() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
-fn validated_config_rejects_ocsp_keys_in_any_mode() -> Result<(), Box<dyn std::error::Error>> {
+fn validated_config_rejects_ocsp_url_with_bad_scheme() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
-    for key_line in [
-        "ocsp_responder_url = \"https://ocsp.example.org\"",
-        "ocsp_timeout_seconds = 5",
-        "ocsp_cache_ttl_seconds = 600",
+    for url in ["ftp://ocsp.example.org/", "ocsp.example.org"] {
+        let body = fixture_with_revocation(
+            &anchor,
+            &format!("mode = \"ocsp\"\ncrl_paths = []\nocsp_responder_url = {url:?}"),
+        );
+        let raw: RawConfig = toml::from_str(&body)?;
+        let err = ValidatedConfig::try_from(&raw).expect_err("non-http(s) url must be rejected");
+        assert!(
+            matches!(
+                err,
+                Error::Trust(tessera_core::error::TrustError::OcspResponderInvalid { .. })
+            ),
+            "unexpected error for url {url}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_ocsp_timeout_out_of_range() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    for seconds in [0u64, 31] {
+        let body = fixture_with_revocation(
+            &anchor,
+            &format!(
+                "mode = \"ocsp\"\ncrl_paths = []\n\
+                 ocsp_responder_url = \"https://ocsp.example.org/\"\n\
+                 ocsp_timeout_seconds = {seconds}"
+            ),
+        );
+        let raw: RawConfig = toml::from_str(&body)?;
+        let err = ValidatedConfig::try_from(&raw).expect_err("out-of-range timeout must fail");
+        assert!(
+            matches!(err, Error::ConfigInvalid { ref reason }
+                if reason.contains("ocsp_timeout_seconds")),
+            "unexpected error for {seconds}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_ocsp_cache_ttl_out_of_range() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_revocation(
+        &anchor,
+        "mode = \"ocsp\"\ncrl_paths = []\n\
+         ocsp_responder_url = \"https://ocsp.example.org/\"\nocsp_cache_ttl_seconds = 86401",
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("out-of-range ttl must fail");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("ocsp_cache_ttl_seconds")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_ocsp_keys_outside_ocsp_modes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // Each ocsp_* key would be silently ignored at runtime in non-OCSP
+    // modes, so validation must reject it (same footgun-guard pattern as
+    // monitor.on_usb_removed_hook_path).
+    for (mode, key_line) in [
+        ("crl", "ocsp_responder_url = \"https://ocsp.example.org/\""),
+        ("none", "ocsp_responder_url = \"https://ocsp.example.org/\""),
+        ("none", "ocsp_timeout_seconds = 5"),
+        ("none", "ocsp_cache_ttl_seconds = 600"),
     ] {
         let body = fixture_with_revocation(
             &anchor,
-            &format!("mode = \"none\"\ncrl_paths = []\n{key_line}"),
+            &format!("mode = {mode:?}\ncrl_paths = []\n{key_line}"),
         );
         let raw: RawConfig = toml::from_str(&body)?;
-        let err = ValidatedConfig::try_from(&raw).expect_err("ocsp_* keys must be rejected");
+        let err = ValidatedConfig::try_from(&raw)
+            .expect_err("ocsp_* keys outside OCSP modes must be rejected");
         assert!(
             matches!(err, Error::ConfigInvalid { ref reason }
-                if reason.contains("OCSP is not implemented")),
-            "unexpected error for {key_line}: {err:?}"
+                if reason.contains("only valid when")),
+            "unexpected error for mode {mode} + {key_line}: {err:?}"
         );
     }
     Ok(())

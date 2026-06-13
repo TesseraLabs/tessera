@@ -299,6 +299,73 @@ pub enum TrustError {
         /// Reason.
         reason: String,
     },
+    /// OCSP request could not be built.
+    #[error("OCSP request build failed: {reason}")]
+    OcspRequestBuild {
+        /// Reason.
+        reason: String,
+    },
+    /// OCSP transport failure (connect, write, read, premature close).
+    #[error("OCSP transport error: {reason}")]
+    OcspTransport {
+        /// Reason.
+        reason: String,
+    },
+    /// The overall OCSP exchange deadline (`ocsp_timeout_seconds`) elapsed.
+    #[error("OCSP request timed out")]
+    OcspTimeout,
+    /// HTTP-level refusal: status != 200, chunked transfer encoding,
+    /// missing/oversized `Content-Length`, or malformed response framing.
+    #[error("OCSP HTTP error: {reason}")]
+    OcspHttp {
+        /// Reason.
+        reason: String,
+    },
+    /// `OCSPResponse` failed to parse or is structurally unusable.
+    #[error("OCSP response malformed: {reason}")]
+    OcspMalformed {
+        /// Reason.
+        reason: String,
+    },
+    /// `OCSPResponseStatus` is not `successful`.
+    #[error("OCSP responder refused the request: {status}")]
+    OcspResponderRefused {
+        /// Responder status as reported.
+        status: String,
+    },
+    /// Responder signature does not verify against the trust anchors.
+    #[error("OCSP response signature invalid: {reason}")]
+    OcspSignatureInvalid {
+        /// Reason.
+        reason: String,
+    },
+    /// Response carries a nonce that does not match the request nonce.
+    #[error("OCSP nonce mismatch")]
+    OcspNonceMismatch,
+    /// `thisUpdate`/`nextUpdate` window is invalid at verification time
+    /// (with `clock_skew_seconds` tolerance already applied).
+    #[error("OCSP response validity window check failed: {reason}")]
+    OcspValidityWindow {
+        /// Reason.
+        reason: String,
+    },
+    /// Responder reported certificate status `unknown`.  Fail-closed:
+    /// an undeterminable revocation status refuses authentication.
+    #[error("OCSP status unknown for serial {serial}")]
+    OcspStatusUnknown {
+        /// Certificate serial (lowercase hex).
+        serial: String,
+    },
+    /// gost-engine could not be loaded for OCSP response verification.
+    /// Fail-closed: a GOST responder chain cannot be verified without the
+    /// engine, so the revocation status stays undeterminable and
+    /// authentication is refused.
+    #[error("gost-engine unavailable for OCSP response verification: {source}")]
+    OcspEngineUnavailable {
+        /// Underlying engine load failure.
+        #[source]
+        source: crate::gost::GostEngineError,
+    },
     /// Pinning hash invalid.
     #[error("pinning hash invalid: {entry}")]
     PinningHashInvalid {
