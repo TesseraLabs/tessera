@@ -50,6 +50,12 @@ pub enum WireError {
         /// The offending hex string.
         entry: String,
     },
+    /// The configured `ocsp_responder_url` could not be parsed.
+    #[error("invalid OCSP responder URL: {reason}")]
+    OcspUrl {
+        /// Why parsing failed.
+        reason: String,
+    },
 }
 
 /// Decode the validated SPKI pin hex strings into raw 32-byte arrays.
@@ -118,6 +124,17 @@ pub fn wire(cfg: ValidatedConfig) -> Result<Wired, WireError> {
         Vec::new()
     };
 
+    // Parse the OCSP responder URL once at wiring time; an invalid URL is a
+    // hard error (the auth path must not silently skip revocation).  `None`
+    // in the non-OCSP modes, where the config key is absent by validation.
+    let ocsp_url = match &cfg.trust.revocation.ocsp_responder_url {
+        Some(raw) => Some(
+            tessera_core::ocsp::OcspUrl::parse(raw)
+                .map_err(|e| WireError::OcspUrl { reason: e.to_string() })?,
+        ),
+        None => None,
+    };
+
     let verifier = OpensslVerifier::new(OpensslVerifierConfig {
         anchors: anchors.clone(),
         intermediates,
@@ -137,6 +154,13 @@ pub fn wire(cfg: ValidatedConfig) -> Result<Wired, WireError> {
         spki_pins,
         max_depth: usize::try_from(cfg.trust.max_chain_depth).unwrap_or(usize::MAX),
         gost_engine_path: cfg.gost_engine_path.clone(),
+        revocation_mode: cfg.trust.revocation.mode,
+        ocsp_responder_url: ocsp_url,
+        ocsp_timeout: cfg.trust.revocation.ocsp_timeout,
+        ocsp_cache_dir: std::path::PathBuf::from(
+            tessera_core::trust::openssl_verifier::OCSP_CACHE_DIR,
+        ),
+        ocsp_cache_ttl: cfg.trust.revocation.ocsp_cache_ttl,
     })?;
 
     let _ = anchors; // kept for future use; no ACL verifier wires it any more

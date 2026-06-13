@@ -31,9 +31,11 @@
 - Не управляет PIN-кодами токенов (это задача администратора и
   пользователя).
 - Не защищает от компрометации root-аккаунта или ядра ОС (вне TOE).
-- Не выполняет сетевых запросов вообще: revocation — только локальный
-  CRL; OCSP не реализован (`mode = "ocsp"` отвергается валидацией
-  конфига).
+- Сетевые запросы выполняет только на revocation-пути в OCSP-режимах
+  (`mode ∈ {ocsp, crl_then_ocsp}`): синхронный HTTP POST на заданный
+  конфигом `ocsp_responder_url`, с жёстким таймаутом и дисковым кэшем.
+  В режимах `none`/`crl` сети нет вовсе (offline CRL). Zero-egress
+  контуры (банкоматы) остаются на `none`/`crl`.
 
 Полное описание границ TOE — в [docs/threat-model.md](threat-model.md).
 
@@ -247,11 +249,14 @@ flowchart LR
 | `/run/tessera/sessions/<sid>/`          | cdylib                   | удаляет MountGuard на drop     | `0700 root:root`       |
 | `/run/tessera/sessions.json`            | monitord                 | monitord (между перезапусками демона в пределах boot; tmpfs, volatile) | `0600 tessera:tessera` |
 | `/run/tessera/daemon.lock`              | monitord (flock-singleton; рядом с `sessions.json`, fallback `/var/lib/tessera/`) | monitord | —             |
+| `/var/cache/tessera/ocsp/*.der`         | cdylib (auth-путь, OCSP-кэш) | cdylib (с ре-верификацией перед использованием) | `0640 root:root` (каталог `0750 root:root`) |
 
 `/run/tessera/` и `/var/lib/tessera/` создаются systemd
 через директивы `RuntimeDirectory` и `StateDirectory` юнита
 (см. [`tessera.service`](../dist/systemd/tessera.service)
 и [`dist/tmpfiles/tessera.conf`](../dist/tmpfiles/tessera.conf)).
+`/var/cache/tessera/ocsp/` создаёт postinst пакета
+([`debian/postinst`](../debian/postinst)).
 
 ## 6. Sequence diagram — `pam_sm_authenticate` happy path с PKCS#11
 
@@ -555,7 +560,7 @@ Newline-delimited JSON (NDJSON):
 | 3  | `self_check` упал (engine, paths, hooks)                       | `PAM_AUTHINFO_UNAVAIL` (9) |
 | 4  | USB/mount/discovery не дали носителя, PKCS#11-модуль не загрузился | `PAM_AUTHINFO_UNAVAIL` (9) |
 | 5  | сертификат не проходит chain verification                      | `PAM_PERM_DENIED` (6)  |
-| 6  | revocation check провалился (`mode = "crl"`: серийник в CRL, CRL отсутствует или несвеж) | `PAM_PERM_DENIED` (6) |
+| 6  | revocation check провалился (`crl`: серийник в CRL, CRL отсутствует/несвежа; `ocsp`/`crl_then_ocsp`: responder недоступен, таймаут, статус `unknown`/`revoked`, подпись ответа невалидна) | `PAM_PERM_DENIED` (6) |
 | 7  | challenge-response не сошёлся                                  | `PAM_PERM_DENIED` (6)  |
 | 8  | legacy `[[user_mapping]]` не дал совпадения                    | `PAM_PERM_DENIED` (6)  |
 | 9  | исчерпан лимит попыток PIN (`MaxTries`, `PinLocked`)           | `PAM_MAXTRIES` (8)     |

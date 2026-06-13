@@ -9,4 +9,4 @@
 
 mod store;
 
-pub use store::{check_revocation, Crl, CrlStore, RevocationConfig};
+pub use store::{check_revocation, crl_status_for, Crl, CrlCoverage, CrlStore, RevocationConfig};

@@ -94,4 +94,12 @@ pub enum TrustError {
         #[source]
         source: crate::gost::GostEngineError,
     },
+
+    /// An OCSP revocation check could not determine the certificate status
+    /// (responder unreachable, malformed/`unknown` answer, signature or
+    /// nonce failure, etc.).  Carries the stringified
+    /// [`crate::error::TrustError`] from the OCSP subsystem.  Fail-closed:
+    /// any inability to determine OCSP status refuses authentication.
+    #[error("OCSP error: {0}")]
+    Ocsp(String),
 }
