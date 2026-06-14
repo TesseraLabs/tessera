@@ -25,6 +25,8 @@ fn sample_open() -> ClientMessage {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        role: Some("serv".into()),
+        role_version: Some(7),
     }
 }
 
@@ -45,6 +47,64 @@ fn session_open_roundtrip() {
     let s = serde_json::to_string(&msg).expect("encode");
     let back: ClientMessage = serde_json::from_str(&s).expect("decode");
     assert_eq!(back, msg);
+}
+
+#[test]
+fn session_open_with_role_serializes_and_roundtrips() {
+    // 5.2: role="serv", role_version=7 are carried on the wire and survive a
+    // serialize/deserialize roundtrip.
+    let msg = sample_open();
+    let s = serde_json::to_string(&msg).expect("encode");
+    assert!(s.contains("\"role\":\"serv\""), "json = {s}");
+    assert!(s.contains("\"role_version\":7"), "json = {s}");
+    let back: ClientMessage = serde_json::from_str(&s).expect("decode");
+    assert_eq!(back, msg);
+}
+
+#[test]
+fn session_open_without_role_omits_fields_and_defaults_to_none() {
+    // 5.2: a session opened with no role (enforce=false) omits role /
+    // role_version entirely; the frame stays valid and decodes back to None.
+    let mut msg = sample_open();
+    if let ClientMessage::SessionOpen {
+        role,
+        role_version,
+        ..
+    } = &mut msg
+    {
+        *role = None;
+        *role_version = None;
+    }
+    let s = serde_json::to_string(&msg).expect("encode");
+    assert!(!s.contains("\"role\""), "role must be absent: {s}");
+    assert!(!s.contains("\"role_version\""), "role_version must be absent: {s}");
+    let back: ClientMessage = serde_json::from_str(&s).expect("decode");
+    assert_eq!(back, msg);
+
+    // A frame that never mentions the fields still parses (backward compat).
+    let legacy = r#"{
+      "type":"session_open",
+      "session_id":"00000000-0000-0000-0000-000000000000",
+      "pam_user":"alice",
+      "pam_service":"sshd",
+      "target":{"kind":"tty","path":"/dev/pts/0"},
+      "host_id_hash":"deadbeef",
+      "opened_at":1700000000,
+      "cert_cn":"Alice",
+      "cert_serial":"01"
+    }"#;
+    let parsed: ClientMessage = serde_json::from_str(legacy).expect("legacy frame parses");
+    match parsed {
+        ClientMessage::SessionOpen {
+            role,
+            role_version,
+            ..
+        } => {
+            assert_eq!(role, None);
+            assert_eq!(role_version, None);
+        }
+        other => panic!("expected SessionOpen, got {other:?}"),
+    }
 }
 
 #[test]

@@ -495,6 +495,10 @@ async fn dispatch(msg: ClientMessage, event_tx: &mpsc::UnboundedSender<Event>) -
             engineer_ski,
             engineer_cert_sha256,
             uid,
+            // role / role_version are accepted on the wire for audit but the
+            // daemon does not yet persist them; ignore gracefully (role-format).
+            role: _,
+            role_version: _,
         } => {
             let session = ActiveSession {
                 session_id,

@@ -1,6 +1,15 @@
-# role-selection Delta Specification
+# role-selection Specification
 
-## ADDED Requirements
+## Purpose
+
+Выбор роли на логине в `pam_tessera`: явное указание роли (без дефолта) через суффикс
+имени учётки `<user>+<role>` или текстовый PAM-prompt, канонизация PAM_USER, атомарный
+резолв и проверка покрытия удостоверением, фиксация payload роли в сессии с ограниченным TTL.
+
+Код: `crates/pam_tessera/` (`pam_sm_authenticate`, суффикс-парсер, prompt, резолв из role-store),
+`crates/tessera_core/src/role/`.
+
+## Requirements
 
 ### Requirement: Явный выбор роли, без дефолта
 

@@ -47,9 +47,17 @@ pub struct SessionOpenPayload {
     /// v2 field; `0` when omitted by a v1 client.
     #[serde(default)]
     pub uid: u32,
-    // Planned (openspec/changes/role-format/): optional `role` /
-    // `role_version` fields recording which role the session was opened
-    // with, for audit.
+    /// Role id the session was opened with (role-format). `None` when
+    /// `[roles].enforce = false` or no role was selected.
+    ///
+    /// Optional NDJSON field added within `PROTOCOL_VERSION` 2: clients that omit
+    /// it deserialise into `None`, keeping backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Resolved role slice version recorded for audit (role-format). `None`
+    /// when no role was selected. Optional NDJSON field; see [`Self::role`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_version: Option<u32>,
 }
 
 /// Client message.
@@ -100,6 +108,14 @@ pub enum ClientMessage {
         /// Unix uid the PAM module authenticated. v2.
         #[serde(default)]
         uid: u32,
+        /// Role id the session was opened with (role-format). Optional NDJSON
+        /// field within `PROTOCOL_VERSION` 2; absent for `enforce=false` logins.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        /// Resolved role slice version for audit (role-format). Optional NDJSON
+        /// field; see `role`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_version: Option<u32>,
     },
     /// Look up the active session for a given Unix uid.
     ///

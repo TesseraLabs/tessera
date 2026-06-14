@@ -57,6 +57,12 @@ pub struct OpenSessionInfo<'a> {
     /// Unix uid the PAM module authenticated (used by monitord to index
     /// the active-session registry).
     pub uid: u32,
+    /// Role id the session was opened with (role-format). `None` when
+    /// `[roles].enforce = false` or no role was selected.
+    pub role: Option<&'a str>,
+    /// Resolved role slice version for audit (role-format). `None` when no
+    /// role was selected.
+    pub role_version: Option<u32>,
 }
 
 /// Sync IPC client trait used by the PAM flow.

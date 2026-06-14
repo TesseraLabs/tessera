@@ -12,8 +12,10 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 | [trust-chain-validation](trust-chain-validation/spec.md) | Pre-validate, chain build, подписи, constraints, pinning |
 | [revocation](revocation/spec.md) | CRL с верификацией подписи (fail-closed); OCSP (4 режима, кэш, fail-closed) |
 | [gost-crypto](gost-crypto/spec.md) | Делегация в gost-engine, ленивая загрузка |
-| [cert-scope-binding](cert-scope-binding/spec.md) | host/user_binding + max_integrity extensions, OID-контракт |
+| [cert-scope-binding](cert-scope-binding/spec.md) | host/user_binding + max_integrity + allowed_roles extensions, OID-контракт |
 | [host-identity](host-identity/spec.md) | first-working-wins, normalize+sha256, override, fallback |
+| [role-selection](role-selection/spec.md) | Выбор роли на логине (`user+role`/prompt, без дефолта), канонизация PAM_USER, покрытие удостоверением, TTL сессии |
+| [role-store](role-store/spec.md) | База ролей `/var/lib/tessera/roles/`, формат среза TOML, standalone (права ФС) + managed (подписанный manifest, anti-rollback), атомарное обновление |
 
 ### Носители
 | [usb-media-pkcs12](usb-media-pkcs12/spec.md) | USB discovery, hardened mount, anti-oracle перебор партиций, PIN |
@@ -57,7 +59,7 @@ Docs-класс (закрыто в docs): configuration.md, architecture.md (PRO
 
 Testing-класс: автоматизация оставшихся ручных проверок (ГОСТ E2E, libpdp runtime, hook-security, USB/токен) — proposal [ci-hardening](../changes/ci-hardening/); release-профиль тестов уже покрыт nightly workflow (`.github/workflows/nightly.yml`).
 
-Нереализованная функциональность — proposals: GOST через PKCS#11 — [gost-pkcs11](../changes/gost-pkcs11/). OCSP реализован (change [ocsp-support](../changes/ocsp-support/), осталась ручная проверка на Astra VM — task 5.3).
+Нереализованная функциональность — proposals: GOST через PKCS#11 — [gost-pkcs11](../changes/gost-pkcs11/). OCSP реализован (change [ocsp-support](../changes/ocsp-support/), осталась ручная проверка на Astra VM — task 5.3). Формат роли и выбор роли на логине реализованы (change [role-format](../changes/role-format/) — capabilities [role-selection](role-selection/spec.md), [role-store](role-store/spec.md); осталась ручная E2E-проверка на Astra VM — task 6.3, поэтому change ещё не заархивирован).
 
 ## Чего НЕТ в текущей реализации (чтобы не путать со спеками 0.2.x / продуктовыми планами)
 

@@ -34,6 +34,9 @@ pub const EVENT_INTEGRITY_CAPPED: &str = "integrity_capped_below_user_mnkc";
 /// `homedir_label_above_session_cap` — `$HOME` label exceeds the
 /// effective process label (advisory; warn-only).
 pub const EVENT_HOMEDIR_LABEL_ABOVE: &str = "homedir_label_above_session_cap";
+/// `role_mask_exceeds_ceiling` — a role's requested `mac_mask` is not covered
+/// by the cert integrity ceiling; the session is denied (no silent narrowing).
+pub const EVENT_MASK_EXCEEDS_CEILING: &str = "role_mask_exceeds_ceiling";
 /// `mac_apply_failed` — `apply_session` returned an error.
 pub const EVENT_MAC_APPLY_FAILED: &str = "mac_apply_failed";
 /// `mac_caps_missing` — process is missing `PARSEC_CAP_CHMAC`.
@@ -138,6 +141,32 @@ pub fn emit_integrity_capped(
         F_effective_categories = format!("{:016x}", effective.categories).as_str(),
         F_user_level = i64::from(user_mnkc.level),
         F_user_categories = format!("{:016x}", user_mnkc.categories).as_str(),
+    );
+}
+
+/// Emit `role_mask_exceeds_ceiling` — role `mac_mask` not covered by the cert
+/// ceiling. The caller additionally emits a `role.audit` `role_deny` with
+/// `reason=mask_exceeds_ceiling`; this event records the MAC-side detail.
+pub fn emit_mask_exceeds_ceiling(
+    ident: &CertIdent,
+    pam_user: &str,
+    pam_service: &str,
+    requested: IntegrityLabel,
+    ceiling: IntegrityLabel,
+) {
+    tracing::warn!(
+        target: "mac.audit",
+        F_event = EVENT_MASK_EXCEEDS_CEILING,
+        F_pam_user = pam_user,
+        F_pam_service = pam_service,
+        F_cert_serial = ident.serial.as_str(),
+        F_cert_issuer = ident.issuer.as_str(),
+        F_cert_cn = ident.cn.as_str(),
+        F_cert_fingerprint = ident.fingerprint.as_str(),
+        F_requested_level = i64::from(requested.level),
+        F_requested_categories = format!("{:016x}", requested.categories).as_str(),
+        F_ceiling_level = i64::from(ceiling.level),
+        F_ceiling_categories = format!("{:016x}", ceiling.categories).as_str(),
     );
 }
 

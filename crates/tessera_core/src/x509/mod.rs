@@ -20,8 +20,7 @@ pub mod error;
 pub(crate) mod ext;
 pub mod host_binding_ext;
 pub mod max_integrity_ext;
-// Planned (openspec/changes/role-format/): `mod allowed_roles_ext` — parser
-// for the allowed-roles leaf extension (consumed from `VerifiedX509` only).
+pub mod allowed_roles_ext;
 pub mod oids;
 pub mod pinning;
 pub mod pre_validate;

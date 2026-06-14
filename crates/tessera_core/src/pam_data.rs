@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use crate::host_identity::HostIdSourceKind;
 use crate::mac::IntegrityLabel;
+use crate::role::SessionRolePayload;
 use crate::x509::CertIdent;
 
 /// Authentication context stored in PAM data.
@@ -47,6 +48,11 @@ pub struct AuthContext {
     /// the MAC orchestrator's home-label advisory.  Optional because
     /// some PAM services run without a recognised passwd entry.
     pub home_dir: Option<PathBuf>,
+    /// Role payload snapshot fixed at authenticate time (role-format).
+    /// `None` when `[roles].enforce = false` or no role was selected; the
+    /// session-open phase reads the bounded TTL and role metadata from this
+    /// copy so a later store edit cannot affect the live session.
+    pub role: Option<SessionRolePayload>,
 }
 
 impl AuthContext {
@@ -67,6 +73,7 @@ impl AuthContext {
             cert_max_integrity: None,
             cert_ident: None,
             home_dir: None,
+            role: None,
         }
     }
 }
