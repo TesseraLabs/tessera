@@ -26,6 +26,7 @@ mandatory-extension policy).
 |---|---|---|
 | `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | `extnValue ::= SEQUENCE OF UTF8String` |
 | `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | `extnValue ::= SEQUENCE OF UTF8String` |
+| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | `extnValue ::= SEQUENCE OF UTF8String` |
 
 OID размещены в нерегистрируемой ветке `2.25.<UUID>` (RFC 4530), что
 гарантирует уникальность без обращения к внешнему реестру. Эти значения
@@ -181,6 +182,54 @@ IntegrityLabel ::= SEQUENCE {
 ```
 
 DER здесь — три TLV: `SEQUENCE`, `INTEGER 2`, `BIT STRING '01'B`.
+
+## Расширение `allowed_roles` (выбор роли на логине, role-format)
+
+`pam_cert_allowed_roles` — non-critical X.509 v3-расширение, перечисляющее
+`role_id`, которые leaf-сертификат имеет право активировать на логине
+(`user+role`). Семантика авторизационная: запрошенная роль покрыта, если
+её `role_id` присутствует в списке.
+
+OID: `2.25.185305973969816596290730578528098241367`
+
+Структура (DER) — та же, что у host/user binding:
+
+```asn1
+extnValue ::= SEQUENCE OF UTF8String
+```
+
+Каждая `UTF8String` — это `role_id`, обязан матчить `^[a-z][a-z0-9-]{0,15}$`.
+Список разбирается строго fail-closed: при некорректном DER **или** любой
+строке, не проходящей regex `role_id`, всё расширение считается malformed
+(не пропуск одной строки), список ролей пуст → запрошенная роль не покрыта
+→ отказ (audit `cert_allowed_roles_parse_failed`). Отсутствие расширения =
+сертификат не даёт ролей (при `roles.enforce = require` — отказ входа; при
+`warn` — лог и пропуск, миграционный режим).
+
+Семантика на сервере: см. `docs/configuration.md` §«roles» и дельта-спеку
+`role-selection`. Извлечение — только из верифицированного серта
+(`VerifiedX509`), как у `max_integrity`.
+
+Фрагмент `openssl.cnf` через `ASN1:SEQUENCE` (две роли — `oper`, `serv`):
+
+```ini
+# Роли, которые серт может активировать на логине
+2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:allowed_roles
+
+[ allowed_roles ]
+e0 = UTF8String:oper
+e1 = UTF8String:serv
+```
+
+Эквивалент одной DER-строкой (`SEQUENCE { UTF8String "oper", UTF8String "serv" }`):
+
+```ini
+2.25.185305973969816596290730578528098241367 = DER:30:0c:0c:04:6f:70:65:72:0c:04:73:65:72:76
+```
+
+DER здесь: `SEQUENCE` (30 0c) → `UTF8String "oper"` (0c 04 6f 70 65 72) →
+`UTF8String "serv"` (0c 04 73 65 72 76). Расширение non-critical (без
+префикса `critical,`).
 
 ## Workflow для клонированных образов
 

@@ -27,6 +27,7 @@ pub enum PamHelperError {
 const PAM_SUCCESS: c_int = pam_sys::PAM_SUCCESS as c_int;
 const PAM_SERVICE: c_int = pam_sys::PAM_SERVICE as c_int;
 const PAM_TTY: c_int = pam_sys::PAM_TTY as c_int;
+const PAM_USER: c_int = pam_sys::PAM_USER as c_int;
 
 extern "C" {
     /// Re-declared with a stable signature; bindgen generates this with
@@ -42,6 +43,14 @@ extern "C" {
         pamh: *mut pam_sys::pam_handle_t,
         item_type: c_int,
         item: *mut *const c_void,
+    ) -> c_int;
+
+    /// Set a PAM item (used here for `PAM_USER`). PAM copies the string, so
+    /// the buffer we pass need only be valid for the duration of the call.
+    fn pam_set_item(
+        pamh: *mut pam_sys::pam_handle_t,
+        item_type: c_int,
+        item: *const c_void,
     ) -> c_int;
 
     /// Read a PAM environment variable (`pam_getenv`). Returns a
@@ -80,6 +89,36 @@ pub unsafe fn pam_get_user_string(
     cstr.to_str()
         .map(str::to_owned)
         .map_err(|_| PamHelperError::NonUtf8)
+}
+
+/// Rewrite `PAM_USER` to the canonical account name via
+/// `pam_set_item(PAM_USER)`.
+///
+/// Called immediately after the `<user>+<role>` suffix is parsed so the
+/// canonical name is the one every subsequent step and every other module in
+/// the stack sees (design Decision 6). PAM copies the buffer, so `canonical`
+/// need only live for the duration of this call.
+///
+/// # Safety
+///
+/// `pamh` must be the live PAM handle handed to a `pam_sm_*` callback.
+///
+/// # Errors
+///
+/// * [`PamHelperError::PamRc`] when the underlying PAM call fails (including
+///   `canonical` containing an interior NUL byte, rc=-1).
+pub unsafe fn pam_set_user(
+    pamh: *mut pam_sys::pam_handle_t,
+    canonical: &str,
+) -> Result<(), PamHelperError> {
+    let c_user = CString::new(canonical).map_err(|_| PamHelperError::PamRc(-1))?;
+    // SAFETY: `pamh` is owned by PAM; `c_user` is a valid NUL-terminated C
+    // string whose lifetime covers this call. PAM copies the value.
+    let rc = unsafe { pam_set_item(pamh, PAM_USER, c_user.as_ptr().cast::<c_void>()) };
+    if rc != PAM_SUCCESS {
+        return Err(PamHelperError::PamRc(rc));
+    }
+    Ok(())
 }
 
 /// Read the PAM service name off the live handle (`pam_get_item(PAM_SERVICE)`).

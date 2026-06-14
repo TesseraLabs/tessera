@@ -70,6 +70,7 @@ fn missing_p12_returns_authinfo_unavail() {
         host_id_source: HostIdSourceKind::Override,
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
+        role_stage: pam_tessera::flow::RoleStage::disabled(),
     };
     let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
     let err = authenticate(deps, &io, "alice", "ssh", "sess-x".into(), |_| {

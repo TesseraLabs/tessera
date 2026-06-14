@@ -117,6 +117,8 @@ impl MonitordClient {
             engineer_ski: payload.engineer_ski.clone(),
             engineer_cert_sha256: payload.engineer_cert_sha256.clone(),
             uid: payload.uid,
+            role: payload.role.clone(),
+            role_version: payload.role_version,
         };
         self.send(&msg)?;
         match self.recv()? {
@@ -276,6 +278,8 @@ impl MonitorClient for ConnectPerCall {
             engineer_ski: info.engineer_ski.to_string(),
             engineer_cert_sha256: info.engineer_cert_sha256.to_string(),
             uid: info.uid,
+            role: info.role.map(str::to_string),
+            role_version: info.role_version,
         };
         c.send_session_open(&payload)
     }

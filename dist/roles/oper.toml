@@ -1,0 +1,22 @@
+# Example role slice — Operator (Linux).
+#
+# This is a SAMPLE for an os = "linux" device. A live role base is a single
+# directory of slices for ONE OS; do not mix OSes in a production base. These
+# dist/roles/*.toml files are documentation samples, not a live base.
+#
+# Standalone trust model (sudoers.d): place validated slices under
+# /var/lib/tessera/roles/ owned root:root, dir 0755, files 0644. Validate
+# with: tessera role lint --dir /var/lib/tessera/roles --os linux
+
+role = "oper"          # role id == file stem; ^[a-z][a-z0-9-]{0,15}$
+version = 1            # bump on every change (monotonic)
+os = "linux"
+name = "Operator"
+level = 1             # display-ordering hint only; roles are not comparable
+description = "Day-to-day operator with minimal privileges."
+
+[payload]
+groups = ["operators"]
+
+[session]
+max_ttl_seconds = 28800   # 8h
