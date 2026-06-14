@@ -103,6 +103,9 @@ fn build_role_stage(
     }
 
     // Resolve the requested role: prefer the suffix; otherwise prompt.
+    // The nested match mirrors the two-axis decision (prompt outcome x role
+    // validity); if-let chains would obscure the fail-closed branches.
+    #[allow(clippy::single_match_else)]
     let requested: Option<RoleId> = match suffix_role {
         Some(r) => Some(r),
         None => {
