@@ -9,15 +9,15 @@
 
 ## 2. Расширение profile_version (tessera_core, открытое)
 
-- [ ] 2.1 Выделить OID `pam_cert_profile_version` в арке `2.25.<UUID>`, зафиксировать в `x509/oids.rs` + таблице OID main-спеки `cert-scope-binding`; пометить **critical**
-- [ ] 2.2 `x509/profile_version_ext.rs`: DER INTEGER, извлечение только из `VerifiedX509`; malformed → reject (fail-closed); тесты
-- [ ] 2.3 Обработка critical-флага: непонятый critical OID на любом серте цепи → reject (проверить/закрепить в pre_validate/chain)
+- [x] 2.1 Выделить OID `pam_cert_profile_version` в арке `2.25.<UUID>`, зафиксировать в `x509/oids.rs` + таблице OID main-спеки `cert-scope-binding`; пометить **critical**
+- [x] 2.2 `x509/profile_version_ext.rs`: DER INTEGER, извлечение только из `VerifiedX509`; malformed → reject (fail-closed); тесты
+- [ ] 2.3 Обработка critical-флага: непонятый critical OID на любом серте цепи → reject (проверить/закрепить в pre_validate/chain) — ОТЛОЖЕНО к секции 4: текущая верификация цепи (`x509::signatures::verify_chain_signatures`) делает per-link `X509::verify(&pk)` (только подпись), НЕ вызывает `X509_verify_cert`/`X509StoreContext`, поэтому `X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION` не возникает и fail-closed на непонятый critical НЕ обеспечивается автоматически — нужна явная проверка в path validation
 
 ## 3. Расширение delegation_constraints (tessera_core, открытое)
 
-- [ ] 3.1 Выделить OID `pam_cert_delegation_constraints` в арке `2.25.<UUID>`, зафиксировать в `oids.rs` + таблице; **critical**
-- [ ] 3.2 `x509/delegation_constraints_ext.rs`: DER `SEQUENCE { requireTags SEQ OF {key,value}, allowRoles SEQ OF UTF8, maxLevel INTEGER, maxTtl INTEGER }`; извлечение только из `VerifiedX509`; malformed → reject
-- [ ] 3.3 Размещение: расширение на серте с `CA=FALSE` (лист) → malformed → reject; тест «delegation_constraints на листе»
+- [x] 3.1 Выделить OID `pam_cert_delegation_constraints` в арке `2.25.<UUID>`, зафиксировать в `oids.rs` + таблице; **critical**
+- [x] 3.2 `x509/delegation_constraints_ext.rs`: DER `SEQUENCE { requireTags SEQ OF {key,value}, allowRoles SEQ OF UTF8, maxLevel INTEGER, maxTtl INTEGER }`; извлечение только из `VerifiedX509`; malformed → reject
+- [x] 3.3 Размещение: расширение на серте с `CA=FALSE` (лист) → malformed → reject; тест «delegation_constraints на листе»
 
 ## 4. Path validation (trust-chain-validation, tessera_core, открытое)
 
