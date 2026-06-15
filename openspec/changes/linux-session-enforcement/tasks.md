@@ -8,7 +8,9 @@
 ## 2. Backend применения (открытое ядро)
 
 - [ ] 2.1 Ввести `LinuxEnforcementBackend` по образцу `mac/` (trait + open-реализация): операции apply-groups / apply-rlimit / apply-session-limits; probe доступности (logind для systemd-лимитов)
-- [ ] 2.2 Supplementary-группы — replace набором роли (`setgroups` = ровно группы роли), своя реализация (не `pam_group`); подтвердить наследование сессией на Astra SE и Debian
+- [ ] 2.1a **БЛОКИРУЮЩИЙ прототип** (до 2.2): проверить порядок `initgroups` vs `pam_setcred` и итоговый набор групп в дочерней сессии на Astra SE (fly-dm, `login`, `sshd`, `sudo`) и Debian; критерий — группы роли реально в процессе сессии. Не перетирает → 2.2 (setgroups); перетирает → 2.2b (NSS)
+- [ ] 2.2 Supplementary-группы — replace набором роли (`setgroups` = ровно группы роли) в `setcred`, своя реализация (не `pam_group`) — если прототип 2.1a подтвердил
+- [ ] 2.2b (если 2.1a показал перетирание) NSS-модуль `nss_tessera`: `getgrouplist`/`initgroups` отдаёт группы активной роли; доступ к состоянию «активная роль» из NSS
 - [ ] 2.3 `RLIMIT_NOFILE`/`NPROC` к пользовательской сессии в `setcred` (не путать с hook-путём `hooks/rlimit.rs`)
 - [ ] 2.4 systemd cgroup-лимиты в `open_session` через logind DBus `SetUnitProperties` на session-scope; `MemoryMax`/`TasksMax`/`CPUWeight`/`IOWeight`; logind недоступен → fail-closed
 - [ ] 2.5 `sudo_role` — депрекейт: sudo через `groups`; снять поле из переноса в сессию, обновить `role/schema.rs` (депрекейт-маркер) и пример `dist/roles/serv.toml`
