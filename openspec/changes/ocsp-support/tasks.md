@@ -27,4 +27,4 @@
 
 - [x] 5.1 Матрица good/revoked/unknown/просроченное окно/чужой подписант — фикстуры из реального `openssl ocsp` responder'а (`tests/fixtures/gen_ocsp.sh`), unit-тесты `ocsp/response.rs`; happy-path без сети — mock-listener (`ocsp/http.rs` + `tests/ocsp_dispatch.rs`)
 - [x] 5.2 Обновлены docs/configuration.md (секция `[trust.revocation]`: 4 режима, ocsp_*-ключи, fail-closed), docs/architecture.md (границы TOE, таблица PAM-кодов п.6); README уже отражал CRL/OCSP. Дельта в main-спеки — ниже
-- [ ] 5.3 Ручная проверка на Astra VM: `mode="crl_then_ocsp"` с выключенным responder'ом (отказ), с включённым (вход), с CRL-покрытием (вход без сети) — при следующем доступе к VM (manual-хвост, как 1.4 mac-integrity)
+- [x] 5.3 Ручная проверка на Astra VM: `mode="crl_then_ocsp"` с выключенным responder'ом (отказ), с включённым (вход), с CRL-покрытием (вход без сети) — validated 2026-06-15 на Astra SE 1.8.4 через production `pam_tessera.so` 0.4.0, 3/3 (A responder off → DENY `OCSP transport error: Connection refused` fail-closed; B responder on → SUCCESS; C свежий CRL покрывает issuer DN → SUCCESS без сети). Responder = `openssl ocsp` issuer-signer.
