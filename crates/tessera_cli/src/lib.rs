@@ -33,6 +33,7 @@ pub mod server;
 pub mod shutdown;
 pub mod startup_check;
 pub mod state;
+pub mod tags;
 pub mod testing;
 pub mod udev_monitor;
 pub mod udev_query;

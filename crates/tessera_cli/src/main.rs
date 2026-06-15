@@ -11,6 +11,7 @@ use tessera_cli::check::{self, CheckArgs};
 use tessera_cli::daemon::{self, DaemonArgs};
 use tessera_cli::dump_host_id::{self, DumpHostIdArgs};
 use tessera_cli::role::{self, RoleArgs};
+use tessera_cli::tags::{self, TagsArgs};
 
 #[derive(Debug, Parser)]
 #[command(name = "tessera", version, about = "Tessera control plane")]
@@ -38,6 +39,10 @@ enum Cmd {
     /// every slice and exits non-zero on any error; `role list` prints the
     /// roles that would load (skipping invalid slices).
     Role(RoleArgs),
+    /// Show the device's applied tags, or strictly validate a local tags file.
+    /// `tags show` prints the applied `key=value` set (empty if none);
+    /// `tags lint <file>` exits non-zero on any malformed tags file.
+    Tags(TagsArgs),
     // Planned (openspec/changes/device-enrollment/): `import-enrollment`
     // subcommand — import the enrollment package after `finish-bootstrap`
     // (per-host cert + device tags + first roles/tags/CRL bundle), recording
@@ -56,5 +61,6 @@ fn main() -> ExitCode {
         Cmd::Check(args) => check::run(args),
         Cmd::DumpHostId(args) => dump_host_id::run_cli(args),
         Cmd::Role(args) => role::run(args),
+        Cmd::Tags(args) => tags::run(args),
     }
 }

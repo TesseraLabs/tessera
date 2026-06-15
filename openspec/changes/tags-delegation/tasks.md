@@ -2,10 +2,10 @@
 
 ## 1. Теги устройства (tessera_core, открытое)
 
-- [ ] 1.1 Модуль `tags/schema.rs`: тип `DeviceTags` (map `key→value`, UTF8), serde-парсер; запрет дубля ключа; unit-тесты (дубль ключа, пустой ключ, не-UTF8 байты не паникуют)
-- [ ] 1.2 `tags/source.rs`: managed-источник из манифеста `role-store` (переиспользовать верификацию подписи + `bundle_version`/anti-rollback); standalone-источник (файл под правами ФС, паритет с role-store standalone); fail-closed на битую подпись/откат
-- [ ] 1.3 Generic-match `device.tags ⊇ requireTags` (без хардкода имён ключей); property-тест: новый произвольный ключ обрабатывается как данные
-- [ ] 1.4 `tessera-cli tags show` (теги устройства) и `tags lint` (валидация локального файла)
+- [x] 1.1 Модуль `tags/schema.rs`: тип `DeviceTags` (map `key→value`, UTF8), serde-парсер; запрет дубля ключа; unit-тесты (дубль ключа, пустой ключ, не-UTF8 байты не паникуют)
+- [x] 1.2 `tags/source.rs`: managed-источник из манифеста `role-store` (переиспользовать верификацию подписи + `bundle_version`/anti-rollback); standalone-источник (файл под правами ФС, паритет с role-store standalone); fail-closed на битую подпись/откат
+- [x] 1.3 Generic-match `device.tags ⊇ requireTags` (без хардкода имён ключей); property-тест: новый произвольный ключ обрабатывается как данные
+- [x] 1.4 `tessera-cli tags show` (теги устройства) и `tags lint` (валидация локального файла)
 
 ## 2. Расширение profile_version (tessera_core, открытое)
 
