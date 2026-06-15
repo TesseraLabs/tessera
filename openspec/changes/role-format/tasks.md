@@ -35,4 +35,4 @@
 
 - [x] 6.1 Обновить docs/configuration.md (`roles.*`), README (роль/выбор на логине), дельта в main-спеки через `/opsx:sync` или archive
 - [x] 6.2 Платформенная спека tessera-ws: глоссарная строка «Сертификат» обогащена (allowed_roles + max_integrity); §7 «формат роли» уже в «Решено» со ссылкой на change role-format
-- [ ] 6.3 E2E-сценарий на Astra VM: `ivanov+serv` по серту с allowed_roles → сессия с группами; отказы (нет роли, нет покрытия, malformed расширение) — при следующем доступе к VM (hardware-gated manual-хвост, как ocsp 5.3 / open-core-split 1.4; Linux-FFI компилируется в CI ubuntu+astra)
+- [x] 6.3 E2E-сценарий на Astra VM: `ivanov+serv` по серту с allowed_roles → сессия с группами; отказы (нет роли, нет покрытия, malformed расширение) — validated 2026-06-15 на Astra SE 1.8.4 через production `pam_tessera.so` 0.4.0, 5/5 (R1 success+`role_session_open` role=serv v1 method=cert ttl=14400; R2 `role_deny not_covered`; R3 `role_deny not_found`; R4 `cert_allowed_roles_parse_failed`+not_covered; R5 enforce=false → skip). Harness: `vagrant/scripts/test-roles.sh` (USB-эмуляция loop+udev), фикстуры `tests/fixtures/roles/`.
