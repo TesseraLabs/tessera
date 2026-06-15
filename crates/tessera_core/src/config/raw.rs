@@ -110,8 +110,49 @@ pub struct RawConfig {
     /// stock template values).
     #[serde(default)]
     pub fly_dm_greeter: Option<RawFlyDmGreeter>,
-    // Planned (openspec/changes/role-format/): `[roles]` section — `enforce`,
-    // `dir` (on-device role store path), `default_session_ttl`.
+    /// Role-format section (`[roles]`). Optional; when absent the validated
+    /// layer applies defaults (`enforce = false` — pre-role behaviour,
+    /// `dir = /var/lib/tessera/roles`, `default_session_ttl_seconds = 43200`).
+    #[serde(default)]
+    pub roles: RawRoles,
+}
+
+/// Migration / enforcement mode for the `[roles]` section.
+///
+/// Three-stage rollout (design Migration Plan): `false` — roles are not
+/// checked (v0.3.19 behaviour); `warn` — resolve + coverage are checked and
+/// logged but never deny; `require` — full enforcement (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RawRolesEnforce {
+    /// Roles not checked — pre-role behaviour (default for this stage).
+    #[default]
+    False,
+    /// Checked + logged, never denies.
+    Warn,
+    /// Full enforcement; fail-closed.
+    Require,
+}
+
+/// Raw `[roles]` block.
+///
+/// All fields are optional with defaults; `deny_unknown_fields` so unknown
+/// keys are rejected at parse time (design Decision 9). The duration field
+/// follows the codebase `*_seconds: u64` convention rather than a humantime
+/// literal.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRoles {
+    /// Enforcement mode. Default `false`.
+    #[serde(default)]
+    pub enforce: RawRolesEnforce,
+    /// On-device role-store directory. Default `/var/lib/tessera/roles`.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Global default session TTL (seconds), used when neither the
+    /// certificate nor the role sets one. Default 43200 (12h).
+    #[serde(default)]
+    pub default_session_ttl_seconds: Option<u64>,
 }
 
 /// Raw `[fly_dm_greeter]` block: Astra fly-dm login-screen wallpaper

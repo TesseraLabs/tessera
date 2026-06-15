@@ -1,0 +1,22 @@
+# Example role slice — Administrator (Astra Linux, МКЦ).
+#
+# SAMPLE for an os = "astra" device. This belongs to a SEPARATE base from the
+# linux samples — a base is one OS only. Validate with:
+#   tessera role lint --dir <astra-base> --os astra
+#
+# On the open build the mac_mask payload PARSES but is NOT enforced (the МКЦ
+# enforcement adapter is a commercial extension); a slice carrying mac_mask
+# is rejected at session time on the open build.
+
+role = "admin"
+version = 1
+os = "astra"
+name = "Administrator"
+level = 63                 # mirrors the МКЦ level on Astra
+description = "Astra administrator with a high МКЦ integrity mask."
+
+[payload]
+mac_mask = "0x3f"          # МКЦ bitmask (hex 0x.. or decimal); parse-only on open build
+
+[session]
+max_ttl_seconds = 7200     # 2h

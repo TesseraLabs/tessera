@@ -170,6 +170,7 @@ pub fn run_flow_with(
         host_id_source: HostIdSourceKind::Override,
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
+        role_stage: pam_tessera::flow::RoleStage::disabled(),
     };
 
     let io = InMemoryFlowIo::new(tmp.path().to_path_buf());

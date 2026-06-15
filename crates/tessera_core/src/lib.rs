@@ -30,9 +30,7 @@ pub mod ocsp;
 pub mod pam_conv;
 pub mod pam_data;
 pub mod pkcs12;
-// Planned (openspec/changes/role-format/): `mod role` — on-device role store
-// (TOML role slices, strict parsing, standalone/managed trust modes, signed
-// manifest with anti-rollback).
+pub mod role;
 pub mod secret;
 pub mod self_check;
 // Planned (openspec/changes/tags-delegation/): `mod tags` — device-tags store

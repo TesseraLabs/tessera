@@ -48,6 +48,38 @@ fn ordering_strict_less_when_level_or_cats_drop() {
 }
 
 #[test]
+fn from_mac_mask_places_bits_in_categories_at_level_zero() {
+    let label = IntegrityLabel::from_mac_mask(0b110);
+    assert_eq!(label.level, 0);
+    assert_eq!(label.categories, 0b110);
+}
+
+#[test]
+fn covers_accepts_subset_mask_and_rejects_extra_bits() {
+    let ceiling = IntegrityLabel {
+        level: 3,
+        categories: 0b100,
+    };
+    // mask 0b100 is a subset of the ceiling categories at level <= ceiling.
+    assert!(ceiling.covers(&IntegrityLabel::from_mac_mask(0b100)));
+    // mask 0b110 asks for a category bit (0b010) the ceiling lacks.
+    assert!(!ceiling.covers(&IntegrityLabel::from_mac_mask(0b110)));
+}
+
+#[test]
+fn covers_rejects_requested_level_above_ceiling() {
+    let ceiling = IntegrityLabel {
+        level: 1,
+        categories: u64::MAX,
+    };
+    let requested = IntegrityLabel {
+        level: 2,
+        categories: 0,
+    };
+    assert!(!ceiling.covers(&requested));
+}
+
+#[test]
 fn full_u64_mask_roundtrips_through_intersect() {
     let cert = IntegrityLabel {
         level: 127,

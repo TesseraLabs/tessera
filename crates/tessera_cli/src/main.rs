@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use tessera_cli::check::{self, CheckArgs};
 use tessera_cli::daemon::{self, DaemonArgs};
 use tessera_cli::dump_host_id::{self, DumpHostIdArgs};
+use tessera_cli::role::{self, RoleArgs};
 
 #[derive(Debug, Parser)]
 #[command(name = "tessera", version, about = "Tessera control plane")]
@@ -33,6 +34,10 @@ enum Cmd {
     /// issue a per-host service cert. Output destinations: `--output PATH`,
     /// `--usb` (writes to first viable USB partition), or stdout.
     DumpHostId(DumpHostIdArgs),
+    /// Validate or list the on-device role base. `role lint` strictly checks
+    /// every slice and exits non-zero on any error; `role list` prints the
+    /// roles that would load (skipping invalid slices).
+    Role(RoleArgs),
     // Planned (openspec/changes/device-enrollment/): `import-enrollment`
     // subcommand — import the enrollment package after `finish-bootstrap`
     // (per-host cert + device tags + first roles/tags/CRL bundle), recording
@@ -50,5 +55,6 @@ fn main() -> ExitCode {
         Cmd::Daemon(args) => daemon::run(args),
         Cmd::Check(args) => check::run(args),
         Cmd::DumpHostId(args) => dump_host_id::run_cli(args),
+        Cmd::Role(args) => role::run(args),
     }
 }

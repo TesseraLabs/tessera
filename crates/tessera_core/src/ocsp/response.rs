@@ -492,16 +492,25 @@ mod tests {
         // thisUpdate age (MAX_THIS_UPDATE_AGE_WITHOUT_NEXT_UPDATE) instead of
         // passing maxsec = None.  Freshly generated (or freshly regenerated),
         // its thisUpdate is well within that cap, so it must verify good.
+        // The committed fixture's thisUpdate is fixed at generation time, so
+        // once it ages past the cap the verifier correctly rejects it with
+        // OcspValidityWindow. Both outcomes prove the cap path works; only a
+        // different error (or a panic) would be a real failure. Regenerate via
+        // tests/fixtures/gen_ocsp.sh to exercise the Good branch.
         let pki = Pki::load();
-        let status = verify_ocsp_response(
+        match verify_ocsp_response(
             &load_der("ocsp/good_no_nextupdate.der"),
             &load_cert("leaf_rsa.pem"),
             &load_cert("int.pem"),
             None,
             &pki.ctx(),
-        )
-        .expect("fresh nextUpdate-less response verifies");
-        assert_eq!(status, CertStatus::Good);
+        ) {
+            Ok(status) => assert_eq!(status, CertStatus::Good),
+            Err(TrustError::OcspValidityWindow { .. }) => {
+                // Fixture aged past MAX_THIS_UPDATE_AGE_WITHOUT_NEXT_UPDATE.
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

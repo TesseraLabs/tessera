@@ -25,9 +25,10 @@ pub const USER_BINDING_OID: &str = "2.25.215438916728501023845629178354627";
 /// Non-critical. See `docs/superpowers/specs/2026-05-14-mac-integrity-design.md`.
 pub const MAX_INTEGRITY_OID: &str = "2.25.273824307386008814506455310913083078403";
 
-// Planned (openspec/changes/role-format/): OID for the `pam_cert_allowed_roles`
-// extension (`extnValue ::= SEQUENCE OF UTF8String` of role_id values the leaf
-// certificate is allowed to activate).
+/// OID of the `pam_cert_allowed_roles` X.509 extension.
+/// `extnValue ::= SEQUENCE OF UTF8String`, each entry a `role_id` the leaf may activate.
+/// Non-critical. Allocated 2026-06 (RFC 4530 2.25.<UUID> arc).
+pub const ALLOWED_ROLES_OID: &str = "2.25.185305973969816596290730578528098241367";
 
 // Planned (openspec/changes/tags-delegation/): OIDs for the critical extensions
 // `pam_cert_delegation_constraints` (requireTags / allowRoles / maxLevel /

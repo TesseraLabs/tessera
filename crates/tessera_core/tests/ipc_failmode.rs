@@ -52,6 +52,8 @@ fn open_info() -> OpenSessionInfo<'static> {
         engineer_ski: "",
         engineer_cert_sha256: "",
         uid: 0,
+        role: None,
+        role_version: None,
     }
 }
 

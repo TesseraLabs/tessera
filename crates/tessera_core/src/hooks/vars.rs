@@ -326,6 +326,7 @@ mod tests {
             cert_max_integrity: None,
             cert_ident: None,
             home_dir: None,
+            role: None,
         };
         let v = HookVars::for_session_open("alice", &ctx);
         assert_eq!(v.stage, HookStage::SessionOpen);

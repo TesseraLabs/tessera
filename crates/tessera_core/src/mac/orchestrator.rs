@@ -62,6 +62,12 @@ pub enum OrchestratorError {
     /// Backend call (`get_user_mnkc` / `apply_session`) failed.
     #[error("MAC backend failure: {0}")]
     ApplyFailed(#[from] MacError),
+    /// The role's requested `mac_mask` is not covered by the cert ceiling
+    /// (`(ceiling & mask) != mask`). The role demands a label the cert does
+    /// not authorise; per the mac-integrity spec this is an explicit deny,
+    /// never a silent narrowing of the requested label.
+    #[error("role mac_mask exceeds cert integrity ceiling")]
+    MaskExceedsCeiling,
 }
 
 /// PAM services that warrant the home-dir label-mismatch warning.
@@ -72,9 +78,77 @@ fn is_interactive_service(svc: &str) -> bool {
     )
 }
 
+/// Compute the effective integrity label for a session (orchestrator step 5).
+///
+/// The ceiling is the cert `MAX_INTEGRITY` extension, else the admin
+/// `fallback_max_integrity`, else none. When `role_mac_mask` is `Some`, the
+/// ceiling MUST cover it or the session is denied; the effective label is then
+/// `mask ∩ ceiling ∩ user МНКЦ`. When `None`, the prior `min(ceiling, МНКЦ)`
+/// semantics apply.
+///
+/// # Errors
+///
+/// [`OrchestratorError::MaskExceedsCeiling`] when `role_mac_mask` is set and
+/// the cert ceiling does not cover it (no silent narrowing — mac-integrity
+/// spec).
+fn compute_effective_label(
+    policy: &MacPolicy,
+    cert_max: Option<IntegrityLabel>,
+    role_mac_mask: Option<IntegrityLabel>,
+    user_mnkc: &IntegrityLabel,
+    ctx: &SessionContext,
+) -> Result<IntegrityLabel, OrchestratorError> {
+    // Determine the cert ceiling: cert ext, else admin fallback, else none.
+    let ceiling = if let Some(cert_bound) = cert_max {
+        Some(cert_bound)
+    } else if let Some(fallback) = policy.fallback_max_integrity {
+        audit::emit_fallback_used(&ctx.pam_user, &ctx.pam_service, fallback);
+        Some(fallback)
+    } else {
+        None
+    };
+
+    let Some(mask) = role_mac_mask else {
+        // No role mask → prior semantics.
+        return Ok(match ceiling {
+            Some(ceiling) => ceiling.intersect_cert_with_user(user_mnkc),
+            // Cert imposes no bound, no admin fallback → user МНКЦ unbounded.
+            None => *user_mnkc,
+        });
+    };
+
+    // Role requests an explicit label. It MUST be covered by the cert ceiling —
+    // the role gets exactly what it asks for or the login is denied; never a
+    // silent narrowing (mac-integrity spec).
+    let Some(ceiling) = ceiling else {
+        // No cert ceiling and no admin fallback: nothing constrains the mask
+        // from above, so it is bounded only by the user МНКЦ.
+        return Ok(user_mnkc.intersect(&mask));
+    };
+    if !ceiling.covers(&mask) {
+        audit::emit_mask_exceeds_ceiling(
+            &ctx.cert_ident,
+            &ctx.pam_user,
+            &ctx.pam_service,
+            mask,
+            ceiling,
+        );
+        return Err(OrchestratorError::MaskExceedsCeiling);
+    }
+    // effective = mask ∩ ceiling ∩ user МНКЦ.
+    Ok(ceiling.intersect_cert_with_user(user_mnkc).intersect(&mask))
+}
+
 /// Resolve and apply the effective integrity label for a PAM session.
 ///
 /// See the module-level docs for the decision tree.
+///
+/// `role_mac_mask` is the requested label derived from the selected role's
+/// `mac_mask` (role-format). When `Some`, the cert ceiling MUST cover it
+/// (`ceiling.covers(mask)`) or the session is denied with
+/// [`OrchestratorError::MaskExceedsCeiling`]; when covered, the effective
+/// label is the intersection of the mask, the cert ceiling and the user МНКЦ.
+/// When `None`, the prior `min(ceiling, МНКЦ)` semantics apply unchanged.
 ///
 /// # Errors
 ///
@@ -84,10 +158,13 @@ fn is_interactive_service(svc: &str) -> bool {
 ///   the backend probe reports non-Active.
 /// * [`OrchestratorError::ApplyFailed`] — backend MNKC lookup or
 ///   `apply_session` failed.
+/// * [`OrchestratorError::MaskExceedsCeiling`] — `role_mac_mask` is set
+///   and the cert ceiling does not cover it.
 pub fn apply_session_policy(
     backend: &dyn MacBackend,
     policy: &MacPolicy,
     cert_max: Option<IntegrityLabel>,
+    role_mac_mask: Option<IntegrityLabel>,
     ctx: &SessionContext,
 ) -> Result<Outcome, OrchestratorError> {
     // (1) explicit ignore wins.
@@ -137,16 +214,9 @@ pub fn apply_session_policy(
         Err(e) => return Err(OrchestratorError::ApplyFailed(e)),
     };
 
-    // (5) compute effective.
-    let effective = if let Some(cert_bound) = cert_max {
-        cert_bound.intersect_cert_with_user(&user_mnkc)
-    } else if let Some(fallback) = policy.fallback_max_integrity {
-        audit::emit_fallback_used(&ctx.pam_user, &ctx.pam_service, fallback);
-        fallback.intersect_cert_with_user(&user_mnkc)
-    } else {
-        // Cert imposes no bound, no admin fallback → user MNKC unbounded.
-        user_mnkc
-    };
+    // (5) compute the effective label from the ceiling, user МНКЦ and the
+    // optional role mask (may deny — see `compute_effective_label`).
+    let effective = compute_effective_label(policy, cert_max, role_mac_mask, &user_mnkc, ctx)?;
 
     // (6) capping audit.
     if effective.strictly_below(&user_mnkc) {

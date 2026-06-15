@@ -39,6 +39,8 @@ async fn full_session_lifecycle_via_real_socket() {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        role: None,
+        role_version: None,
     };
     // Drive a sync client from a worker thread.
     let payload_for_thread = payload.clone();

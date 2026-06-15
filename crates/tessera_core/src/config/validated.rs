@@ -8,7 +8,7 @@ use crate::config::raw::{
     RawCertIntegrityMode, RawConfig, RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback,
     RawHostIdentity, RawLogging, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor,
     RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocation, RawRevocationMode,
-    RawTrust, RawTrustOverride, RawUserMapping,
+    RawRoles, RawRolesEnforce, RawTrust, RawTrustOverride, RawUserMapping,
 };
 use crate::error::TrustError;
 use crate::hooks::{validate_hook, HookConfig};
@@ -89,6 +89,8 @@ pub struct ValidatedConfig {
     pub mac: MacPolicy,
     /// Astra fly-dm greeter banner section.
     pub fly_dm_greeter: FlyDmGreeterSection,
+    /// Role-format section (`[roles]`).
+    pub roles: RolesSection,
 }
 
 /// Validated `[fly_dm_greeter]` section. See [`RawFlyDmGreeter`] for the
@@ -207,6 +209,56 @@ pub enum MacRuntimeMode {
     /// Always use the stub backend regardless of kernel state.
     Disabled,
 }
+
+/// Validated `[roles]` section (role-format).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolesSection {
+    /// Enforcement mode. Default [`RolesEnforce::False`].
+    pub enforce: RolesEnforce,
+    /// On-device role-store directory. Default `/var/lib/tessera/roles`.
+    pub dir: PathBuf,
+    /// Global default session TTL, used when neither the certificate nor the
+    /// role sets one. Default 12h; never unbounded (design Decision 8).
+    pub default_session_ttl: Duration,
+}
+
+impl Default for RolesSection {
+    fn default() -> Self {
+        Self {
+            enforce: RolesEnforce::False,
+            dir: PathBuf::from(crate::role::DEFAULT_ROLES_DIR),
+            default_session_ttl: Duration::from_secs(DEFAULT_ROLE_SESSION_TTL_SECONDS),
+        }
+    }
+}
+
+impl RolesSection {
+    /// Map to the `tessera_core::role` enforcement enum used by the
+    /// resolve/coverage core. Keeps the config and role layers decoupled.
+    #[must_use]
+    pub fn enforce_mode(&self) -> crate::role::RoleEnforce {
+        match self.enforce {
+            RolesEnforce::False => crate::role::RoleEnforce::Disabled,
+            RolesEnforce::Warn => crate::role::RoleEnforce::Warn,
+            RolesEnforce::Require => crate::role::RoleEnforce::Require,
+        }
+    }
+}
+
+/// Migration / enforcement mode for `[roles]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RolesEnforce {
+    /// Roles not checked — pre-role (v0.3.19) behaviour.
+    #[default]
+    False,
+    /// Checked + logged, never denies.
+    Warn,
+    /// Full enforcement (fail-closed).
+    Require,
+}
+
+/// Default global session TTL in seconds (12h) for the `[roles]` section.
+pub const DEFAULT_ROLE_SESSION_TTL_SECONDS: u64 = 43200;
 
 /// Trinary policy for the X.509 `MAX_INTEGRITY` extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,8 +582,44 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             hooks,
             mac: validate_mac(&raw.mac)?,
             fly_dm_greeter: validate_fly_dm_greeter(raw.fly_dm_greeter.as_ref())?,
+            roles: validate_roles(&raw.roles)?,
         })
     }
+}
+
+fn validate_roles(raw: &RawRoles) -> Result<RolesSection, Error> {
+    let enforce = match raw.enforce {
+        RawRolesEnforce::False => RolesEnforce::False,
+        RawRolesEnforce::Warn => RolesEnforce::Warn,
+        RawRolesEnforce::Require => RolesEnforce::Require,
+    };
+    let dir = match raw.dir.as_ref() {
+        Some(p) => {
+            if !p.is_absolute() {
+                return Err(Error::ConfigInvalid {
+                    reason: format!("[roles].dir must be absolute (got {})", p.display()),
+                });
+            }
+            p.clone()
+        }
+        None => PathBuf::from(crate::role::DEFAULT_ROLES_DIR),
+    };
+    // A zero default TTL would make every role session expire immediately.
+    // Reject it so the misconfiguration surfaces at load, not at first login.
+    let default_session_ttl = match raw.default_session_ttl_seconds {
+        Some(0) => {
+            return Err(Error::ConfigInvalid {
+                reason: "[roles].default_session_ttl_seconds must be > 0".into(),
+            });
+        }
+        Some(secs) => Duration::from_secs(secs),
+        None => Duration::from_secs(DEFAULT_ROLE_SESSION_TTL_SECONDS),
+    };
+    Ok(RolesSection {
+        enforce,
+        dir,
+        default_session_ttl,
+    })
 }
 
 fn fly_dm_absolute_path(
@@ -1748,5 +1836,126 @@ mod tests {
             Error::ConfigInvalid { reason } => assert!(reason.contains("wallpaper_gravity")),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ---- [roles] section (task 4.3) ---------------------------------------
+
+    #[test]
+    fn roles_defaults_when_section_absent() {
+        let s = validate_roles(&RawRoles::default()).expect("ok");
+        assert_eq!(s.enforce, RolesEnforce::False);
+        assert_eq!(s.dir, PathBuf::from(crate::role::DEFAULT_ROLES_DIR));
+        assert_eq!(
+            s.default_session_ttl,
+            Duration::from_secs(DEFAULT_ROLE_SESSION_TTL_SECONDS)
+        );
+        // Default maps to the disabled enforcement mode in the role core.
+        assert_eq!(s.enforce_mode(), crate::role::RoleEnforce::Disabled);
+    }
+
+    #[test]
+    fn roles_enforce_modes_map_through() {
+        for (raw, want_cfg, want_core) in [
+            (
+                RawRolesEnforce::False,
+                RolesEnforce::False,
+                crate::role::RoleEnforce::Disabled,
+            ),
+            (
+                RawRolesEnforce::Warn,
+                RolesEnforce::Warn,
+                crate::role::RoleEnforce::Warn,
+            ),
+            (
+                RawRolesEnforce::Require,
+                RolesEnforce::Require,
+                crate::role::RoleEnforce::Require,
+            ),
+        ] {
+            let s = validate_roles(&RawRoles {
+                enforce: raw,
+                ..Default::default()
+            })
+            .expect("ok");
+            assert_eq!(s.enforce, want_cfg);
+            assert_eq!(s.enforce_mode(), want_core);
+        }
+    }
+
+    #[test]
+    fn roles_custom_dir_and_ttl() {
+        let s = validate_roles(&RawRoles {
+            enforce: RawRolesEnforce::Require,
+            dir: Some(PathBuf::from("/srv/roles")),
+            default_session_ttl_seconds: Some(3600),
+        })
+        .expect("ok");
+        assert_eq!(s.dir, PathBuf::from("/srv/roles"));
+        assert_eq!(s.default_session_ttl, Duration::from_hours(1));
+    }
+
+    #[test]
+    fn roles_rejects_relative_dir() {
+        let err = validate_roles(&RawRoles {
+            dir: Some(PathBuf::from("roles")),
+            ..Default::default()
+        })
+        .unwrap_err();
+        match err {
+            Error::ConfigInvalid { reason } => assert!(reason.contains("[roles].dir")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roles_rejects_zero_ttl() {
+        let err = validate_roles(&RawRoles {
+            default_session_ttl_seconds: Some(0),
+            ..Default::default()
+        })
+        .unwrap_err();
+        match err {
+            Error::ConfigInvalid { reason } => {
+                assert!(reason.contains("default_session_ttl_seconds"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roles_rejects_unknown_field() {
+        let err = toml::from_str::<RawRoles>("enforce = \"warn\"\nbogus = 1\n").unwrap_err();
+        assert!(err.to_string().contains("bogus") || err.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn roles_parses_from_full_raw_config_toml() {
+        // Smoke-test that the [roles] section threads through RawConfig
+        // (deny_unknown_fields) and validate_roles. Full ValidatedConfig
+        // construction is not exercised here because it stats anchor files.
+        let toml_src = r#"
+crypto_backend = "openssl"
+mode = "pkcs12"
+pkcs12_path_pattern = "user.p12"
+
+[trust]
+anchors = ["/etc/tessera/anchors/ca.pem"]
+
+[host_identity]
+sources = ["dmi_board_serial"]
+
+[logging]
+level = "info"
+
+[roles]
+enforce = "require"
+dir = "/var/lib/tessera/roles"
+default_session_ttl_seconds = 7200
+"#;
+        let raw: RawConfig = toml::from_str(toml_src).expect("raw parse");
+        let roles = validate_roles(&raw.roles).expect("validate roles");
+        assert_eq!(roles.enforce, RolesEnforce::Require);
+        assert_eq!(roles.dir, PathBuf::from("/var/lib/tessera/roles"));
+        assert_eq!(roles.default_session_ttl, Duration::from_hours(2));
     }
 }
