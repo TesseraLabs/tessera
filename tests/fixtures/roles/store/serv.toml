@@ -1,0 +1,31 @@
+# Role-store fixture — Service Engineer (serv), Linux.
+#
+# Standalone-trust slice for the role E2E (vagrant/scripts/test-roles.sh).
+# Content mirrors dist/roles/serv.toml. Deployed to the device role dir
+# (default /var/lib/tessera/roles) as serv.toml, owned root:root, file 0644,
+# dir 0755 — the sudoers.d filesystem-permission trust model (TrustMode
+# ::Standalone, no manifest).
+#
+# Grants supplementary groups [service, wheel]; the open-build PAM auth path
+# resolves + covers the role and snapshots this payload, emitting
+# role_session_open. Actual setgroups application is a later session/daemon
+# phase — see the harness comment on scenario R1.
+
+role = "serv"
+version = 1
+os = "linux"
+name = "Service Engineer"
+level = 5
+description = "Service engineer with sudo and higher resource limits."
+
+[payload]
+groups = ["service", "wheel"]
+sudo_role = "service"      # sudoers Role/alias granted in-session
+
+[payload.limits]
+nofile = 4096              # RLIMIT_NOFILE
+
+[session]
+max_ttl_seconds = 14400    # 4h
+memory_max = "2G"          # systemd MemoryMax
+tasks_max = 512            # systemd TasksMax

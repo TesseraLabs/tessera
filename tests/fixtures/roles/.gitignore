@@ -1,0 +1,13 @@
+# Generated/secret material for the role E2E — regenerate locally:
+#   cp ../../../crates/tessera_core/tests/fixtures/ca.key ca.key.pem
+#   cp ../../../crates/tessera_core/tests/fixtures/ca.pem ca.crt.pem
+#   ./gen-role-certs.sh                          # produces *.key.pem + *.crt.pem
+#   openssl pkcs12 -export -out role-<x>.p12 ... # bundle the p12 the harness reads
+# Committed: *.cnf, *.crt.pem, gen-role-certs.sh, store/. Private keys / p12 / CA
+# copies are NOT (mirrors the MAC fixtures convention).
+ca.key.pem
+ca.crt.pem
+ca.crt.srl
+*.key.pem
+*.p12
+ocsp-work/
