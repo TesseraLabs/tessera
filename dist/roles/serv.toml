@@ -1,0 +1,23 @@
+# Example role slice — Service Engineer (Linux).
+#
+# SAMPLE for an os = "linux" device (see dist/roles/oper.toml header). Not a
+# live base on its own.
+
+role = "serv"
+version = 1
+os = "linux"
+name = "Service Engineer"
+level = 5
+description = "Service engineer with sudo and higher resource limits."
+
+[payload]
+groups = ["service", "wheel"]
+sudo_role = "service"      # sudoers Role/alias granted in-session
+
+[payload.limits]
+nofile = 4096              # RLIMIT_NOFILE
+
+[session]
+max_ttl_seconds = 14400    # 4h
+memory_max = "2G"          # systemd MemoryMax
+tasks_max = 512            # systemd TasksMax

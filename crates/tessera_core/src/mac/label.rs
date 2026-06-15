@@ -61,6 +61,36 @@ impl IntegrityLabel {
         }
     }
 
+    /// Build a requested label from a role's `mac_mask` (role-format).
+    ///
+    /// A role's `mac_mask` is a raw 64-bit category bitmask (see
+    /// `role::schema::parse_mac_mask`). It carries no linear level of its own,
+    /// so the requested label is `level = 0` (the Astra default level) with the
+    /// mask placed verbatim into `categories`. The level ceiling is enforced
+    /// separately by the cert's `MAX_INTEGRITY` during intersection; the role
+    /// only constrains the category set it explicitly requests.
+    #[must_use]
+    pub fn from_mac_mask(mask: u64) -> Self {
+        Self {
+            level: 0,
+            categories: mask,
+        }
+    }
+
+    /// Whether `self` (a ceiling) fully covers `requested`.
+    ///
+    /// Coverage is `requested.level <= self.level` AND every requested category
+    /// bit present in the ceiling (`(self.categories & requested.categories) ==
+    /// requested.categories`). A requested label that asks for a level or
+    /// category bit the ceiling does not grant is **not** covered — the caller
+    /// MUST deny rather than silently narrow (mac-integrity spec: «не
+    /// молчаливое сужение метки»).
+    #[must_use]
+    pub fn covers(&self, requested: &Self) -> bool {
+        requested.level <= self.level
+            && (self.categories & requested.categories) == requested.categories
+    }
+
     /// Strict componentwise less-than (level lower OR fewer categories).
     #[must_use]
     pub fn strictly_below(&self, other: &Self) -> bool {

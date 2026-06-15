@@ -63,6 +63,7 @@ PAM-cdylib ДОЛЖЕН (MUST) перечитывать конфиг с диск
 - `[logging]`: level (trace..error; применяется демоном к tracing-фильтру после загрузки конфига, env `TESSERA_LOG` приоритетнее — см. [logging-audit](../logging-audit/spec.md)); syslog_facility (deprecated, ignored + WARN при валидации; значение всё ещё валидируется: auth|authpriv|user|daemon, прочие — включая local0..7 — отклоняются) и journald_priority (deprecated, ignored + WARN) в ValidatedConfig не пробрасываются.
 - `[[hooks]]` — см. [hooks](../hooks/spec.md).
 - `[mac]` — см. [mac-integrity](../mac-integrity/spec.md). Дефолты: cert_integrity=**optional**, runtime=auto.
+- `[roles]`: enforce (`false`|`warn`|`require`, дефолт `false`), dir (`/var/lib/tessera/roles`), default_session_ttl (duration, `12h`) — детали см. требование «Секция [roles]» ниже и [role-selection](../role-selection/spec.md) / [role-store](../role-store/spec.md).
 - `[fly_dm_greeter]` — см. [fly-dm-greeter](../fly-dm-greeter/spec.md).
 
 #### Scenario: Пустой [trust].anchors
@@ -108,3 +109,24 @@ PAM-cdylib ДОЛЖЕН (MUST) перечитывать конфиг с диск
 #### Scenario: Расхождение docs ↔ код
 - **WHEN** docs/configuration.md описывает поведение, отсутствующее в коде (одно из 17 зафиксированных расхождений)
 - **THEN** это считается дефектом документации, требующим синхронизации с кодом
+
+### Requirement: Секция [roles]
+
+Конфиг ДОЛЖЕН (MUST) поддерживать секцию `[roles]` (как и весь конфиг — `deny_unknown_fields`):
+
+| Поле | Тип | Дефолт | Семантика |
+|---|---|---|---|
+| `enforce` | `"false" \| "warn" \| "require"` | `"false"` | этап миграции: `false` — роли не проверяются (поведение v0.3.19); `warn` — проверка с логом, без отказов; `require` — полный enforcement |
+| `dir` | путь | `/var/lib/tessera/roles` | каталог базы ролей |
+| `default_session_ttl` | duration | `12h` | TTL сессии, когда ни удостоверение, ни роль его не задают |
+
+`enforce = "require"` при пустой/невалидной базе ролей ДОЛЖЕН (MUST) приводить к отказу
+входов, требующих роль (fail-closed), с диагностикой «роли не настроены».
+
+#### Scenario: enforce=false — поведение прежней версии
+- **WHEN** `roles.enforce = "false"` (или секция отсутствует)
+- **THEN** суффикс/prompt не запрашиваются, покрытие не проверяется, вход работает как в v0.3.19
+
+#### Scenario: enforce=require при пустой базе
+- **WHEN** `roles.enforce = "require"` и каталог ролей пуст
+- **THEN** вход отклоняется с диагностикой «роли не настроены», audit `role_deny reason=not_found`

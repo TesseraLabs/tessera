@@ -177,13 +177,49 @@ pub fn run_open_session_pipeline_with_backend_and_monitor(
         home_dir: ctx.home_dir.clone(),
     };
 
-    let result = match apply_session_policy(backend, &cfg.mac, ctx.cert_max_integrity, &sctx) {
+    // Requested label from the selected role's mac_mask (role-format). `None`
+    // when no role is attached or the role declares no mac_mask, in which case
+    // the orchestrator keeps the prior min(ceiling, МНКЦ) semantics.
+    let role_mac_mask = ctx
+        .role
+        .as_ref()
+        .and_then(|r| r.mac_mask)
+        .map(tessera_core::mac::IntegrityLabel::from_mac_mask);
+
+    let result = match apply_session_policy(
+        backend,
+        &cfg.mac,
+        ctx.cert_max_integrity,
+        role_mac_mask,
+        &sctx,
+    ) {
         Ok(_) => Ok(()),
         Err(OrchestratorError::CertLacksExt | OrchestratorError::RuntimeRequired(_)) => {
             tracing::error!(
                 target: "tessera.session",
                 pam_user = %pam_user,
                 "MAC orchestrator refused session (policy violation)",
+            );
+            Err(PAM_AUTH_ERR)
+        }
+        Err(OrchestratorError::MaskExceedsCeiling) => {
+            // Role demanded a label the cert ceiling does not cover. Emit the
+            // role.audit role_deny (reason=mask_exceeds_ceiling) in addition to
+            // the mac.audit detail the orchestrator already logged, then refuse
+            // the session (no silent narrowing — mac-integrity spec).
+            let requested_role = ctx
+                .role
+                .as_ref()
+                .map_or("", |r| r.role.as_str());
+            tessera_core::role::audit::emit_role_deny(
+                pam_user,
+                requested_role,
+                tessera_core::role::RoleDenyReason::MaskExceedsCeiling.as_str(),
+            );
+            tracing::error!(
+                target: "tessera.session",
+                pam_user = %pam_user,
+                "MAC orchestrator refused session (role mac_mask exceeds cert ceiling)",
             );
             Err(PAM_AUTH_ERR)
         }

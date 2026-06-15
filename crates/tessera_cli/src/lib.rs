@@ -28,6 +28,7 @@ pub mod logind;
 pub mod notify;
 pub mod peercred;
 pub mod registry;
+pub mod role;
 pub mod server;
 pub mod shutdown;
 pub mod startup_check;

@@ -9,6 +9,7 @@ pub mod flow;
 pub mod logging;
 pub mod pam_args;
 pub mod panic_guard;
+pub mod role_selection;
 pub mod session;
 pub mod xdg_capture;
 
@@ -178,6 +179,7 @@ mod tests {
             cert_max_integrity: None,
             cert_ident: None,
             home_dir: None,
+            role: None,
         }
     }
 

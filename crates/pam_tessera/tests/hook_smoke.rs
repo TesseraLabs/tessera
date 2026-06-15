@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use common::*;
 
-use pam_tessera::flow::{authenticate, Deps, InMemoryFlowIo};
+use pam_tessera::flow::{authenticate, Deps, InMemoryFlowIo, RoleStage};
 use tessera_core::config::ValidatedConfig;
 use tessera_core::hooks::{ForkExecExecutor, HookConfig, HookStage, OnFailure, RunAs};
 use tessera_core::host_identity::HostIdSourceKind;
@@ -95,6 +95,7 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
         host_id_source: HostIdSourceKind::Override,
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
+        role_stage: RoleStage::disabled(),
     };
 
     // 4. Drive the flow.

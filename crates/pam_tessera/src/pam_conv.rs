@@ -165,6 +165,76 @@ pub unsafe fn prompt_pin(
     Ok(SecretString::from(pin_str))
 }
 
+/// Prompt the user for a non-secret value via the live PAM conversation.
+///
+/// Unlike [`prompt_pin`] this returns a plain `String` (the value is not a
+/// secret, e.g. a role name) and lets the caller choose the message style
+/// (`PAM_PROMPT_ECHO_ON` for a visible prompt). The PAM-allocated response
+/// buffer is freed before returning. Empty responses are returned as an
+/// empty string so the caller can distinguish "no input" from "no conv".
+///
+/// # Safety
+///
+/// `pamh` must be the live PAM handle handed to a `pam_sm_*` callback.
+///
+/// # Errors
+///
+/// * [`PamConvError::NoConv`] — PAM did not return a `pam_conv` item.
+/// * [`PamConvError::ConvFailed`] — the conv callback returned non-success
+///   or produced a NULL response.
+/// * [`PamConvError::NonUtf8`] — the response is not valid UTF-8.
+pub unsafe fn prompt_value(
+    pamh: *mut pam_sys::pam_handle_t,
+    prompt: &str,
+    msg_style: c_int,
+) -> Result<String, PamConvError> {
+    let mut conv_ptr: *const c_void = std::ptr::null();
+    // SAFETY: PAM guarantees `pamh` is non-null; `conv_ptr` is checked.
+    let rc = unsafe { pam_get_item(pamh, PAM_CONV, &raw mut conv_ptr) };
+    if rc != PAM_SUCCESS || conv_ptr.is_null() {
+        return Err(PamConvError::NoConv);
+    }
+    // SAFETY: `conv_ptr` is a non-null `struct pam_conv` owned by the app.
+    let conv: &PamConv = unsafe { &*(conv_ptr.cast::<PamConv>()) };
+    let Some(conv_fn) = conv.conv else {
+        return Err(PamConvError::NoConv);
+    };
+
+    let c_prompt = CString::new(prompt).map_err(|_| PamConvError::ConvFailed)?;
+    let msg = PamMessage {
+        msg_style,
+        msg: c_prompt.as_ptr(),
+    };
+    let msg_ptr: *const PamMessage = &raw const msg;
+    let mut msg_arr: [*const PamMessage; 1] = [msg_ptr];
+    let mut resp_ptr: *mut PamResponse = std::ptr::null_mut();
+
+    // SAFETY: `msg_arr`/`resp_ptr` valid for the call; PAM allocates the
+    // response on success and we own freeing it.
+    let rc = unsafe { conv_fn(1, msg_arr.as_mut_ptr(), &raw mut resp_ptr, conv.appdata_ptr) };
+    if rc != PAM_SUCCESS || resp_ptr.is_null() {
+        return Err(PamConvError::ConvFailed);
+    }
+
+    // SAFETY: `resp_ptr` is a non-null PAM-allocated `pam_response` we own.
+    let resp = unsafe { &*resp_ptr };
+    if resp.resp.is_null() {
+        // No reply text: treat as empty input. Free the response struct.
+        // SAFETY: `resp_ptr` is the PAM-allocated `pam_response` we own.
+        unsafe { free(resp_ptr.cast::<c_void>()) };
+        return Ok(String::new());
+    }
+
+    // SAFETY: `resp.resp` is a non-null NUL-terminated PAM buffer.
+    let value_cstr = unsafe { CStr::from_ptr(resp.resp) };
+    let value_result = value_cstr.to_str().map(str::to_string);
+    // SAFETY: `resp.resp` and `resp_ptr` are PAM-allocated buffers we own.
+    unsafe { free(resp.resp.cast::<c_void>()) };
+    // SAFETY: as above.
+    unsafe { free(resp_ptr.cast::<c_void>()) };
+    value_result.map_err(|_| PamConvError::NonUtf8)
+}
+
 /// Emit a `PAM_TEXT_INFO` message to the live PAM conversation handle.
 ///
 /// Used by the flow to surface admin-actionable diagnostics on auth

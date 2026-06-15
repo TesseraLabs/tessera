@@ -1,0 +1,38 @@
+# OpenSSL config — leaf with a MALFORMED pam_cert_allowed_roles extension.
+#
+# Tests parser robustness: a malformed extension is fail-closed (treated as
+# "no roles" → requested role not covered → DENY under require), and emits the
+# cert_allowed_roles_parse_failed audit event.
+#
+# DER payload: SEQUENCE claiming 5 content octets, then a truncated
+# UTF8String (tag 0x0c, length 0x01, but no content byte). This is exactly
+# the malformed shape asserted in
+# crates/tessera_core/tests/allowed_roles_ext_parse.rs::malformed_der_returns_err
+# (`[0x30, 0x05, 0x0c, 0x01]`), so the VM exercises the same parser path the
+# unit test does.
+#
+#   30 05 0c 01
+#   ^^ ^^         SEQUENCE, content length = 5 octets (but only 2 follow)
+#      ^^ 0c 01   UTF8String, length 1, content truncated → Parse error
+[ req ]
+default_bits        = 2048
+default_md          = sha256
+prompt              = no
+distinguished_name  = dn
+req_extensions      = leaf_ext
+
+[ dn ]
+CN = role-malformed
+O  = tessera-test
+C  = RU
+
+[ leaf_ext ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = clientAuth, emailProtection
+subjectKeyIdentifier   = hash
+# pam_cert_host_binding = ["*"]  (wildcard — authorises any host, test leaf)
+2.25.183976554325829274683049824615098 = DER:30:03:0c:01:2a
+2.25.215438916728501023845629178354627 = DER:30:08:0c:06:69:76:61:6e:6f:76
+# pam_cert_allowed_roles — malformed DER (non-critical)
+2.25.185305973969816596290730578528098241367 = DER:30:05:0c:01

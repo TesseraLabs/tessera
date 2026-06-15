@@ -5,14 +5,16 @@
 //! wired up correctly.
 
 #![cfg(feature = "mac-tests")]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::sync::Mutex;
 
 use pam_tessera::session::{
     run_open_session_pipeline_with_backend, run_open_session_pipeline_with_backend_and_monitor,
 };
-use tessera_core::config::validated::{CertIntegrityMode, MacPolicy, ValidatedConfig};
+use tessera_core::config::validated::{
+    CertIntegrityMode, MacPolicy, MacRuntimeMode, ValidatedConfig,
+};
 use tessera_core::error::IpcError;
 use tessera_core::ipc::{MonitorClient, OpenSessionInfo};
 use tessera_core::mac::backend::{MacRuntime, MockMacBackend};
@@ -71,6 +73,7 @@ fn cfg_with_mac(mode: CertIntegrityMode) -> ValidatedConfig {
         cert_integrity: mode,
         fallback_max_integrity: None,
         warn_on_homedir_label_mismatch: false,
+        runtime: MacRuntimeMode::Auto,
     };
     cfg
 }

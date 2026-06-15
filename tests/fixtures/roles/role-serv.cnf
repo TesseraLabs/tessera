@@ -1,0 +1,35 @@
+# OpenSSL config — leaf with pam_cert_allowed_roles = [serv].
+#
+# Used by gen-role-certs.sh to generate a role-coverage test leaf signed by
+# the CA in tests/fixtures/ca.{key,crt}.pem.
+#
+# OID 2.25.185305973969816596290730578528098241367 (ALLOWED_ROLES_OID, see
+# crates/tessera_core/src/x509/oids.rs — do NOT change).
+#
+# DER payload for SEQUENCE { UTF8String "serv" }:
+#   30 06 0c 04 73 65 72 76
+#   ^^ ^^                      SEQUENCE, content length = 6 octets
+#      ^^ 0c 04 73 65 72 76    UTF8String "serv"            (6 octets)
+[ req ]
+default_bits        = 2048
+default_md          = sha256
+prompt              = no
+distinguished_name  = dn
+req_extensions      = leaf_ext
+
+[ dn ]
+CN = role-serv
+O  = tessera-test
+C  = RU
+
+[ leaf_ext ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = clientAuth, emailProtection
+subjectKeyIdentifier   = hash
+# pam_cert_user_binding = [ivanov]  (real USER_BINDING_OID, see oids.rs)
+# pam_cert_host_binding = ["*"]  (wildcard — authorises any host, test leaf)
+2.25.183976554325829274683049824615098 = DER:30:03:0c:01:2a
+2.25.215438916728501023845629178354627 = DER:30:08:0c:06:69:76:61:6e:6f:76
+# pam_cert_allowed_roles = [serv]  (non-critical)
+2.25.185305973969816596290730578528098241367 = DER:30:06:0c:04:73:65:72:76

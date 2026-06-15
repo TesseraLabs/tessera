@@ -138,6 +138,12 @@ pub enum FlowError {
     /// A `post_auth_success` hook returned a fatal error.
     #[error("post_auth_success hook failed: {0}")]
     PostAuthHook(#[source] HookError),
+
+    /// Role selection denied the login (role-format): the requested role was
+    /// not found / not covered by the cert / needs an absent backend, and
+    /// `[roles].enforce = require`. Carries the audit deny reason.
+    #[error("role denied: {0}")]
+    RoleDenied(tessera_core::role::RoleDenyReason),
 }
 
 impl From<AcquireError> for FlowError {
@@ -208,8 +214,14 @@ impl FlowError {
             // PAM_MAXTRIES — exhausted PIN-retry budget on either path.
             Self::MaxTries
             | Self::Pkcs11Acquire(P11Acquire::PinLocked | P11Acquire::MaxAttemptsExceeded) => 8,
-            // PAM_PERM_DENIED — cert chain rejected the auth.
-            Self::Pkcs12(_) | Self::Crypto(_) | Self::Trust(_) | Self::Mapping(_) => 6,
+            // PAM_PERM_DENIED — cert chain rejected the auth, or the
+            // requested role was denied (not found / not covered / needs an
+            // absent backend) under `[roles].enforce = require`.
+            Self::Pkcs12(_)
+            | Self::Crypto(_)
+            | Self::Trust(_)
+            | Self::Mapping(_)
+            | Self::RoleDenied(_) => 6,
             // PAM_SYSTEM_ERR — internal invariants.
             Self::Internal(_) => 4,
             // PAM_AUTH_ERR — every other authentication-side failure
@@ -328,6 +340,45 @@ pub struct Deps<'a> {
     /// display to act on. The cdylib derives this from `PAM_TTY`; tests
     /// that don't care can use [`tessera_proto::SessionTarget::Unknown`].
     pub pam_target: tessera_proto::SessionTarget,
+    /// Role-selection stage (role-format). Carries the requested role, the
+    /// loaded role store, the enforcement mode, and the global default TTL.
+    /// `enforce = Disabled` (the default migration stage) makes the whole
+    /// stage a no-op, preserving pre-role behaviour.
+    pub role_stage: RoleStage<'a>,
+}
+
+/// Inputs to the atomic resolve + coverage stage (role-format, task 4.3/4.4).
+///
+/// Built once per `pam_sm_authenticate` and threaded through [`Deps`] so the
+/// requested role travels with the cert verification — there is no later
+/// re-read of `PAM_USER` and no swap window (polkit CVE-2021-3560).
+pub struct RoleStage<'a> {
+    /// The role parsed from the `<user>+<role>` login suffix / prompt, or
+    /// `None` when none was supplied.
+    pub requested: Option<tessera_core::role::RoleId>,
+    /// The on-device role store (already loaded by the cdylib). `None` when
+    /// enforcement is disabled (the store is not loaded in that case).
+    pub store: Option<&'a tessera_core::role::RoleStore>,
+    /// Enforcement mode mapped from `[roles].enforce`.
+    pub enforce: tessera_core::role::RoleEnforce,
+    /// Global default session TTL from `[roles].default_session_ttl`.
+    pub default_session_ttl: std::time::Duration,
+}
+
+impl RoleStage<'_> {
+    /// A disabled stage (pre-role behaviour) — convenient default for tests
+    /// and the `enforce = false` migration phase.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            requested: None,
+            store: None,
+            enforce: tessera_core::role::RoleEnforce::Disabled,
+            default_session_ttl: std::time::Duration::from_secs(
+                tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
+            ),
+        }
+    }
 }
 
 /// Outcome of a successful authentication.
@@ -692,6 +743,16 @@ where
     let cert_ident = Some(cert_ident_value);
     let home_dir = resolve_home_dir(pam_user);
 
+    // Step 10b — atomic role resolve + coverage (role-format). Runs right
+    // after cert verification and before the session payload is fixed, with
+    // no swap window (CVE-2021-3560). A `require`-mode denial aborts here.
+    let role = resolve_role_stage(
+        &verified_leaf,
+        &deps.role_stage,
+        pam_user,
+        cert_remaining_ttl(cert_not_after),
+    )?;
+
     let auth_ctx = AuthContext {
         session_id,
         cert_cn,
@@ -707,6 +768,7 @@ where
         cert_max_integrity,
         cert_ident,
         home_dir,
+        role,
     };
 
     // Step 11b — post_auth_success hooks (Stage 5). Run after every
@@ -741,6 +803,8 @@ where
         engineer_ski: &extras.engineer_ski,
         engineer_cert_sha256: &extras.engineer_cert_sha256,
         uid: extras.uid,
+        role: auth_ctx.role.as_ref().map(|r| r.role.as_str()),
+        role_version: auth_ctx.role.as_ref().map(|r| r.role_version),
     };
     if let Err(e) = deps.monitor.open_session(&info) {
         tracing::warn!(
@@ -1047,6 +1111,16 @@ where
         };
     let cert_ident = Some(cert_ident_value);
     let home_dir = resolve_home_dir(pam_user);
+
+    // Step 10b — atomic role resolve + coverage (role-format). Same gate as
+    // the PKCS#12 path; runs before the session payload is fixed.
+    let role = resolve_role_stage(
+        &verified_leaf,
+        &deps.role_stage,
+        pam_user,
+        cert_remaining_ttl(cert_not_after),
+    )?;
+
     let auth_ctx = AuthContext {
         session_id,
         cert_cn,
@@ -1062,6 +1136,7 @@ where
         cert_max_integrity,
         cert_ident,
         home_dir,
+        role,
     };
 
     // Drop the session here so `C_Logout` runs before we return.
@@ -1095,6 +1170,8 @@ where
         engineer_ski: &extras.engineer_ski,
         engineer_cert_sha256: &extras.engineer_cert_sha256,
         uid: extras.uid,
+        role: auth_ctx.role.as_ref().map(|r| r.role.as_str()),
+        role_version: auth_ctx.role.as_ref().map(|r| r.role_version),
     };
     if let Err(e) = deps.monitor.open_session(&info) {
         tracing::warn!(
@@ -1455,10 +1532,10 @@ impl FlowIo for InMemoryFlowIo {
 /// closed: silently routing such a cert through the legacy mapping
 /// would let a certificate that was meant to restrict users
 /// authenticate via a stale TOML entry instead.
-// Planned (openspec/changes/role-format/): role selection lands here — parse
-// the `user+role` suffix off `pam_user`, canonicalise PAM_USER, resolve the
-// role from the on-device store, and require role ∈ the cert's allowed-roles
-// extension (no default role; a missing selection aborts the login).
+// Role selection (the `user+role` suffix, PAM_USER canonicalisation, store
+// resolve + allowed-roles coverage) runs separately in `resolve_role_stage`,
+// invoked after cert verification; this function only handles the legacy
+// user↔cert authorisation (user_binding extension or `[[user_mapping]]`).
 fn authorize_user(
     cert: &Certificate,
     pam_user: &str,
@@ -1484,6 +1561,140 @@ fn authorize_user(
         }
     }
     Ok(())
+}
+
+/// Atomic resolve + coverage stage (role-format, tasks 4.3/4.4).
+///
+/// Runs **after** the cert chain is verified and **before** the session
+/// payload is fixed, in one uninterrupted step (polkit CVE-2021-3560
+/// lesson): the requested role is resolved from the store, checked for
+/// membership in the cert's `allowed_roles` extension, and — when allowed —
+/// snapshotted into a [`SessionRolePayload`] with a bounded TTL and a
+/// backend-availability gate.
+///
+/// Returns:
+/// - `Ok(None)` — enforcement disabled, or warn-mode with no usable role:
+///   behave as before (no role attached to the session).
+/// - `Ok(Some(payload))` — role resolved, covered, and enforceable.
+/// - `Err(FlowError::RoleDenied)` — `require` mode and the role was denied.
+///
+/// `cert_ttl` is `notAfter - now` (saturating); `None` means the cert has no
+/// usable expiry, in which case the global default bounds the session.
+fn resolve_role_stage(
+    verified_leaf: &tessera_core::x509::VerifiedX509,
+    stage: &RoleStage<'_>,
+    user: &str,
+    cert_ttl: Option<std::time::Duration>,
+) -> Result<Option<tessera_core::role::SessionRolePayload>, FlowError> {
+    use tessera_core::role::{
+        self, resolve_and_cover, CoverageMethod, Resolution, RoleDenyReason, RoleEnforce,
+        SessionRolePayload,
+    };
+
+    if stage.enforce == RoleEnforce::Disabled {
+        return Ok(None);
+    }
+    // Enforcement on but no store loaded → fail-closed under `require`
+    // ("roles not configured"), benign skip under `warn`.
+    let Some(store) = stage.store else {
+        return match stage.enforce {
+            RoleEnforce::Require => {
+                role::audit::emit_role_deny(
+                    user,
+                    stage.requested.as_ref().map_or("", role::RoleId::as_str),
+                    RoleDenyReason::NotFound.as_str(),
+                );
+                Err(FlowError::RoleDenied(RoleDenyReason::NotFound))
+            }
+            _ => Ok(None),
+        };
+    };
+
+    // Extract the cert's allowed_roles extension (fail-closed on malformed).
+    let allowed: Option<Vec<role::RoleId>> =
+        match tessera_core::x509::allowed_roles_ext::extract_allowed_roles(verified_leaf) {
+            Ok(roles) => roles,
+            Err(e) => {
+                // A malformed extension is fail-closed: treat as "no roles"
+                // so coverage fails. Emit the stable role.audit event (keyed by
+                // cert subject) and a tessera.flow warn for the operator.
+                let subject = cert_subject(verified_leaf);
+                role::audit::emit_cert_allowed_roles_parse_failed(&subject);
+                tracing::warn!(
+                    target: "tessera.flow",
+                    error = %e,
+                    pam_user = %user,
+                    subject = %subject,
+                    "pam_cert_allowed_roles malformed; treating as no roles (fail-closed)"
+                );
+                Some(Vec::new())
+            }
+        };
+
+    let resolution = resolve_and_cover(
+        store,
+        stage.requested.as_ref(),
+        allowed.as_deref(),
+        stage.enforce,
+        user,
+    );
+
+    let (slice, method) = match resolution {
+        Resolution::Skipped => return Ok(None),
+        Resolution::Denied { reason } => return Err(FlowError::RoleDenied(reason)),
+        Resolution::Allowed { slice, method } => (slice, method),
+    };
+
+    // Fix the session payload: snapshot + bounded TTL + backend gate.
+    let payload: SessionRolePayload =
+        match SessionRolePayload::fix(&slice, cert_ttl, stage.default_session_ttl) {
+            Ok(p) => p,
+            Err(fix_err) => {
+                let reason = fix_err.deny_reason();
+                // Backend unavailable is an explicit deny in both warn and
+                // require: silently narrowing privileges is forbidden by the
+                // spec. Under warn we still proceed without the role.
+                role::audit::emit_role_deny(user, slice.role.as_str(), reason.as_str());
+                return match stage.enforce {
+                    RoleEnforce::Require => Err(FlowError::RoleDenied(reason)),
+                    _ => Ok(None),
+                };
+            }
+        };
+
+    // Success: emit role_session_open with the bounded TTL.
+    let method_str = match method {
+        CoverageMethod::Cert => "cert",
+        CoverageMethod::Code => "code",
+    };
+    role::audit::emit_role_session_open(
+        user,
+        payload.role.as_str(),
+        payload.role_version,
+        method_str,
+        payload.ttl.as_secs(),
+    );
+    Ok(Some(payload))
+}
+
+/// Build a stable subject identifier for a verified leaf, used as the
+/// `subject` field of the `cert_allowed_roles_parse_failed` audit event.
+/// Combines the subject CN and serial so the offending cert is identifiable
+/// without logging the raw extension bytes.
+fn cert_subject(verified_leaf: &tessera_core::x509::VerifiedX509) -> String {
+    let ident = tessera_core::x509::CertIdent::from(verified_leaf);
+    format!("CN={} serial={}", ident.cn, ident.serial.to_lowercase())
+}
+
+/// Compute the certificate's remaining lifetime as a TTL (`notAfter - now`),
+/// saturating to zero. Returns `None` when `notAfter` is absent.
+fn cert_remaining_ttl(cert_not_after: Option<SystemTime>) -> Option<std::time::Duration> {
+    let not_after = cert_not_after?;
+    Some(
+        not_after
+            .duration_since(SystemTime::now())
+            .unwrap_or(std::time::Duration::ZERO),
+    )
 }
 
 fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
@@ -1665,6 +1876,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -1701,6 +1913,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -1735,6 +1948,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -1768,6 +1982,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
         let err = authenticate(deps, &io, "alice", "ssh", "sess-4".into(), |_| {
@@ -1803,6 +2018,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
         let err = authenticate(deps, &io, "alice", "ssh", "sess-5".into(), |_| {
@@ -1931,6 +2147,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2075,6 +2292,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
         let io = dummy_flow_io();
         let err = authenticate(deps, &io, "alice", "ssh", "sess-p11-1".into(), |_| {
@@ -2104,6 +2322,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
         let io = dummy_flow_io();
         let err = authenticate(deps, &io, "alice", "ssh", "sess-p11-2".into(), |_| {
@@ -2134,6 +2353,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         // We exercise `authenticate_pkcs11` directly with the stub, since
@@ -2176,6 +2396,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let stub = StubPkcs11Io::new();
@@ -2214,6 +2435,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let stub = StubPkcs11Io::new();
@@ -2351,6 +2573,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2387,6 +2610,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2430,6 +2654,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2468,6 +2693,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let stub = StubPkcs11Io::new();
@@ -2624,6 +2850,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let outcome = authenticate(deps, &io, "alice", "ssh", "sess-fb1".into(), |_| {
@@ -2678,6 +2905,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let err = authenticate(deps, &io, "alice", "ssh", "sess-fb2".into(), |_| {
@@ -2740,6 +2968,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let err = authenticate(deps, &io, "alice", "ssh", "sess-empty".into(), |_| {
@@ -2793,6 +3022,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
         };
 
         let err = authenticate(deps, &io, "alice", "ssh", "sess-wpin".into(), |_| {
@@ -2810,5 +3040,40 @@ level = "info"
             1,
             "PIN failure must NOT iterate to partition 1 (would be a PIN oracle)"
         );
+    }
+
+    // ---- role-format glue (tasks 4.3/4.4) --------------------------------
+
+    #[test]
+    fn role_stage_disabled_is_pre_role_default() {
+        let stage = RoleStage::disabled();
+        assert_eq!(stage.enforce, tessera_core::role::RoleEnforce::Disabled);
+        assert!(stage.requested.is_none());
+        assert!(stage.store.is_none());
+        assert_eq!(
+            stage.default_session_ttl,
+            Duration::from_secs(
+                tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS
+            )
+        );
+    }
+
+    #[test]
+    fn cert_remaining_ttl_future_and_past() {
+        // notAfter in the future → positive remaining TTL.
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let ttl = cert_remaining_ttl(Some(future)).expect("some");
+        assert!(ttl > Duration::from_secs(3000) && ttl <= Duration::from_secs(3600));
+        // notAfter in the past → saturates to zero.
+        let past = SystemTime::UNIX_EPOCH;
+        assert_eq!(cert_remaining_ttl(Some(past)), Some(Duration::ZERO));
+        // No notAfter → None (global default bounds the session).
+        assert_eq!(cert_remaining_ttl(None), None);
+    }
+
+    #[test]
+    fn role_denied_maps_to_perm_denied() {
+        let err = FlowError::RoleDenied(tessera_core::role::RoleDenyReason::NotCovered);
+        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
     }
 }

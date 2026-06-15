@@ -61,6 +61,8 @@ fn payload() -> SessionOpenPayload {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        role: None,
+        role_version: None,
     }
 }
 
