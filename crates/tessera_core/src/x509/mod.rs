@@ -25,6 +25,7 @@ pub mod max_integrity_ext;
 pub mod oids;
 pub mod pinning;
 pub mod pre_validate;
+pub mod profile_validation;
 pub mod profile_version_ext;
 pub mod sig_alg;
 pub mod signatures;
@@ -362,6 +363,19 @@ impl Certificate {
     /// Returns [`TrustError::Openssl`] if the public key cannot be extracted.
     pub fn public_key(&self) -> Result<PKey<Public>, TrustError> {
         Ok(self.inner.public_key()?)
+    }
+
+    /// Returns the dotted OIDs of every extension marked `critical`.
+    ///
+    /// Used by the chain verifier to fail closed on any critical extension it
+    /// does not understand (RFC 5280 §4.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError::CertParse`] when the certificate structure is
+    /// malformed.
+    pub fn critical_extension_oids(&self) -> Result<Vec<String>, TrustError> {
+        ext::critical_extension_oids(&self.inner)
     }
 }
 

@@ -81,6 +81,12 @@ pub trait Stage2TrustVerifier: Send + Sync {
     ) -> Result<Stage2VerifiedChain, TrustError>;
 }
 
+/// Default `max_supported_profile_version` used until the `[trust]` config key
+/// (section 5.2) is wired through. Baseline format = 0; an absent
+/// `pam_cert_profile_version` extension is also treated as 0, so this default
+/// accepts only baseline certs and is fail-closed against any newer format.
+pub const DEFAULT_MAX_SUPPORTED_PROFILE_VERSION: u32 = 0;
+
 /// Builder/constructor configuration for [`OpensslVerifier`].
 pub struct OpensslVerifierConfig {
     /// Trusted self-signed roots.
@@ -106,6 +112,12 @@ pub struct OpensslVerifierConfig {
     pub spki_pins: Vec<SpkiPin>,
     /// Maximum allowed chain length (including leaf and anchor).
     pub max_depth: usize,
+    /// Highest `pam_cert_profile_version` this Engine understands. Any chain
+    /// cert declaring a higher version rejects the whole chain (fail-closed
+    /// version gate, task 4.1). Section 5.2 wires this from
+    /// `[trust].max_supported_profile_version`; until then construct with
+    /// [`DEFAULT_MAX_SUPPORTED_PROFILE_VERSION`].
+    pub max_supported_profile_version: u32,
     /// Optional path to the gost-engine .so/.dylib.  When `None` the engine
     /// is located via libcrypto's standard `OPENSSL_ENGINES` search path.
     ///
@@ -139,6 +151,7 @@ pub struct OpensslVerifier {
     pre_cfg: PreValidateConfig,
     pins: Vec<SpkiPin>,
     max_depth: usize,
+    max_supported_profile_version: u32,
     gost_engine_path: Option<PathBuf>,
     revocation_mode: RevocationMode,
     ocsp_responder_url: Option<OcspUrl>,
@@ -205,6 +218,7 @@ impl OpensslVerifier {
             },
             pins: cfg.spki_pins,
             max_depth: cfg.max_depth,
+            max_supported_profile_version: cfg.max_supported_profile_version,
             gost_engine_path: cfg.gost_engine_path,
             revocation_mode: cfg.revocation_mode,
             ocsp_responder_url: cfg.ocsp_responder_url,
@@ -266,13 +280,16 @@ impl OpensslVerifier {
         //     intermediate without keyCertSign slips through.
         verify_intermediate_constraints(&chain, now, self.pre_cfg.clock_skew)?;
 
-        // Planned (openspec/changes/tags-delegation/): profile-version gate
-        // and delegation-envelope checks land here — reject any cert whose
-        // `pam_cert_profile_version` exceeds the supported maximum, and for
-        // every CA cert carrying `pam_cert_delegation_constraints` verify
-        // device.tags ⊇ requireTags plus the requested role/level/TTL
-        // ceilings, AND/MIN across all chain links (a constraints extension
-        // on a CA=FALSE leaf is malformed and rejects the chain).
+        // 4c. Profile version-gate (4.1) + unknown-critical-extension scan
+        //     (2.3) over every cert in the chain (fail-closed). The
+        //     delegation-envelope checks (4.2-4.4, device.tags ⊇ requireTags +
+        //     role/level/TTL ceilings) run in the PAM flow via
+        //     `trust::enforce_delegation`, where the requested role/level and
+        //     device tags are known — see openspec change tags-delegation §4.
+        crate::x509::profile_validation::verify_profile_and_criticals(
+            &chain,
+            self.max_supported_profile_version,
+        )?;
 
         // 5. Revocation — dispatched by configured mode (fail-closed in the
         //    OCSP modes: an undeterminable status refuses authentication).

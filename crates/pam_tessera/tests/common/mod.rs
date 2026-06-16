@@ -56,6 +56,7 @@ pub fn build_verifier(crl_pems: Vec<Vec<u8>>) -> OpensslVerifier {
     let ca = Certificate::from_pem(&fixture_bytes("ca.pem")).unwrap();
     let int_ = Certificate::from_pem(&fixture_bytes("int.pem")).unwrap();
     OpensslVerifier::new(OpensslVerifierConfig {
+        max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         anchors: vec![ca],
         intermediates: vec![int_],
         crl_pems,

@@ -1,9 +1,11 @@
 //! Trust verification traits and stubs.
 
+pub mod delegation;
 pub mod openssl_verifier;
 pub mod stub;
 pub mod types;
 
+pub use delegation::{enforce_delegation, DelegationError};
 pub use openssl_verifier::{
     OpensslVerifier, OpensslVerifierConfig, Stage2TrustVerifier, Stage2VerifiedChain,
 };

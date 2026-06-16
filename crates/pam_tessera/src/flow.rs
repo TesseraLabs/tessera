@@ -1781,6 +1781,7 @@ mod tests {
             crl_pems: vec![],
             crl_strict: false,
             crl_max_age: None,
+            max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
             clock_skew: Duration::from_secs(60),
             signature_alg_whitelist: vec![
                 "sha256WithRSAEncryption".into(),

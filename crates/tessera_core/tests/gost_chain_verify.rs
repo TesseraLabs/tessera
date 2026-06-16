@@ -39,6 +39,7 @@ const CA: &[u8] = include_bytes!("fixtures/ca.pem");
 
 fn rsa_only_verifier() -> OpensslVerifier {
     OpensslVerifier::new(OpensslVerifierConfig {
+        max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         anchors: vec![Certificate::from_pem(CA).unwrap()],
         intermediates: vec![Certificate::from_pem(INT).unwrap()],
         crl_pems: vec![],

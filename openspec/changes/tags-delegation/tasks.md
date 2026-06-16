@@ -11,7 +11,7 @@
 
 - [x] 2.1 Выделить OID `pam_cert_profile_version` в арке `2.25.<UUID>`, зафиксировать в `x509/oids.rs` + таблице OID main-спеки `cert-scope-binding`; пометить **critical**
 - [x] 2.2 `x509/profile_version_ext.rs`: DER INTEGER, извлечение только из `VerifiedX509`; malformed → reject (fail-closed); тесты
-- [ ] 2.3 Обработка critical-флага: непонятый critical OID на любом серте цепи → reject (проверить/закрепить в pre_validate/chain) — ОТЛОЖЕНО к секции 4: текущая верификация цепи (`x509::signatures::verify_chain_signatures`) делает per-link `X509::verify(&pk)` (только подпись), НЕ вызывает `X509_verify_cert`/`X509StoreContext`, поэтому `X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION` не возникает и fail-closed на непонятый critical НЕ обеспечивается автоматически — нужна явная проверка в path validation
+- [x] 2.3 Обработка critical-флага: непонятый critical OID на любом серте цепи → reject — реализовано явным сканом в `x509::profile_validation::verify_profile_and_criticals` (allowlist KNOWN_CRITICAL_OIDS = basicConstraints/keyUsage/EKU + два наших OID), вшито в `verify_at` (live). Тест unknown_critical_extension_rejected.
 
 ## 3. Расширение delegation_constraints (tessera_core, открытое)
 
@@ -21,10 +21,10 @@
 
 ## 4. Path validation (trust-chain-validation, tessera_core, открытое)
 
-- [ ] 4.1 Version-gate: `tessera_profile_version ≤ max_supported` на каждом серте цепи, иначе reject; тест «версия выше supported»
-- [ ] 4.2 Конверт по тегам: для каждого CA-серта с `delegation_constraints` — `device.tags ⊇ requireTags`; нет тегов / не удовлетворяет → reject; AND по всем CA-звеньям; тест «misissued широкий дочерний CA не вырывается»
-- [ ] 4.3 Потолки: запрошенная роль ∈ `allowRoles` каждого CA; запрошенный уровень ≤ `maxLevel` каждого CA (и ≤ max_integrity листа); срок звена ≤ `maxTtl` родителя; тесты по каждому
-- [ ] 4.4 Wildcard `host_binding=*` + конверт: лист работает на устройствах группы и только на них; тест «wildcard под северным CA не пускает на южное устройство»
+- [x] 4.1 Version-gate: `pam_cert_profile_version ≤ max_supported` на каждом серте цепи — вшито в `verify_at` (live); дефолт max_supported=0 (fail-closed). Тесты профиля.
+- [x] 4.2 Конверт по тегам: `enforce_delegation` (trust/delegation.rs) — `device.tags ⊇ requireTags` AND по всем CA-звеньям, no-tags→reject, misissued child не вырывается. Логика+тесты done. ЖИВОЕ вшивание enforce_delegation в PAM-flow (с device-tags + запрошенной role/level) — в секции 5 (config-источник тегов + проброс).
+- [x] 4.3 Потолки: роль ∈ allowRoles каждого CA, уровень ≤ maxLevel каждого CA (+ max_integrity листа), срок звена ≤ maxTtl родителя — в `enforce_delegation`, тесты по каждому. Live-wiring — секция 5 (см. 4.2).
+- [x] 4.4 Wildcard `host_binding=*` + конверт: следует из 4.2 (enforce_delegation отвергает несоответствующее устройство независимо от wildcard); тесты wildcard north-pass/south-reject + canonical_north_ca_wildcard_leaf_end_to_end. Live-wiring — секция 5.
 
 ## 5. Аудит и конфиг
 

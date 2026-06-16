@@ -145,6 +145,9 @@ pub fn wire(cfg: ValidatedConfig) -> Result<Wired, WireError> {
                 | tessera_core::config::validated::RevocationMode::CrlThenOcsp
         ),
         crl_max_age: cfg.trust.revocation.crl_max_age,
+        // Profile version-gate ceiling. Reads the baseline default until the
+        // [trust] config key is plumbed through validated config.
+        max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         // P1-B: take both knobs from the validated config rather than
         // hard-coding 60s/4. Validator caps both (`<= 600s`, `1..=16`)
         // so casts are safe.
