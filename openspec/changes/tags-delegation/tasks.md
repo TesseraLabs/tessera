@@ -34,10 +34,10 @@
 
 ## 6. Issuance-тулинг и доки
 
-- [ ] 6.1 openssl CA-конфиги (`docs/cert-issuance.md`): секции выпуска `delegation_constraints` (CA-серты) и `profile_version`; примеры монотонного сужения
-- [ ] 6.2 Обновить main-спеку `cert-scope-binding` (таблица OID + примечание про critical) при архивации change
+- [x] 6.1 openssl CA-конфиги (`docs/cert-issuance.md`): секции выпуска `delegation_constraints` (CA-серты) и `profile_version`; примеры монотонного сужения
+- [x] 6.2 Обновить main-спеку `cert-scope-binding` (таблица OID + примечание про critical) при архивации change
 
 ## 7. Проверка
 
-- [ ] 7.1 `openspec validate tags-delegation --strict` зелёный
-- [ ] 7.2 Интеграционный тест полной цепи: корень → CA(region:north) → wildcard-лист, устройство с тегом region:north пускает, region:south отвергает
+- [x] 7.1 `openspec validate tags-delegation --strict` зелёный
+- [x] 7.2 Интеграционный тест полной цепи: корень → CA(region:north) → wildcard-лист, устройство с тегом region:north пускает, region:south отвергает
