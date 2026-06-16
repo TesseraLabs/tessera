@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use secrecy::SecretString;
 use tessera_core::challenge::{challenge_response, CryptoError};
 use tessera_core::config::ValidatedConfig;
 use tessera_core::discovery::{discover_credentials, DiscoveredCreds, DiscoveryError};
@@ -39,10 +40,10 @@ use tessera_core::pkcs12::{
     acquire_p12_material_with_prompter, validate_p12_envelope, AcquireError, LoadedKeyMaterial,
     P12EnvelopeError, Pkcs12Error,
 };
+use tessera_core::tags::DeviceTags;
 use tessera_core::trust::openssl_verifier::Stage2TrustVerifier;
 use tessera_core::usb::{UsbDevice, UsbError};
 use tessera_core::x509::{Certificate, TrustError};
-use secrecy::SecretString;
 
 /// Errors raised by [`authenticate`].
 ///
@@ -144,6 +145,13 @@ pub enum FlowError {
     /// `[roles].enforce = require`. Carries the audit deny reason.
     #[error("role denied: {0}")]
     RoleDenied(tessera_core::role::RoleDenyReason),
+
+    /// The delegation envelope on the verified chain rejected this device,
+    /// role, level, or TTL (tags-delegation §4). The full reason vector is in
+    /// the `delegation_denied` audit event; the engineer sees only a generic
+    /// message (envelope structure is not leaked pre-auth).
+    #[error("delegation denied")]
+    DelegationDenied(#[source] tessera_core::trust::DelegationError),
 }
 
 impl From<AcquireError> for FlowError {
@@ -221,7 +229,8 @@ impl FlowError {
             | Self::Crypto(_)
             | Self::Trust(_)
             | Self::Mapping(_)
-            | Self::RoleDenied(_) => 6,
+            | Self::RoleDenied(_)
+            | Self::DelegationDenied(_) => 6,
             // PAM_SYSTEM_ERR — internal invariants.
             Self::Internal(_) => 4,
             // PAM_AUTH_ERR — every other authentication-side failure
@@ -315,6 +324,17 @@ pub trait FlowIo {
     fn show_info(&self, _msg: &str) {}
 }
 
+/// A process-wide empty [`DeviceTags`] (no applied tags).
+///
+/// Returned as the fail-closed default when no `[tags]` source is configured,
+/// and used by tests that do not exercise delegation. A `&'static` shared
+/// instance avoids threading an owned empty set through every call site.
+#[must_use]
+pub fn empty_device_tags() -> &'static DeviceTags {
+    static EMPTY: std::sync::OnceLock<DeviceTags> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(DeviceTags::empty)
+}
+
 /// All runtime collaborators required by [`authenticate`].
 pub struct Deps<'a> {
     /// Validated configuration (used for logging defaults; the heavy lifting
@@ -345,6 +365,13 @@ pub struct Deps<'a> {
     /// `enforce = Disabled` (the default migration stage) makes the whole
     /// stage a no-op, preserving pre-role behaviour.
     pub role_stage: RoleStage<'a>,
+    /// This device's trusted, applied tag set (tags-delegation §5). Loaded
+    /// once per attempt from the configured `[tags]` source. When no source is
+    /// configured (or `[tags].enforce = false`) this is an empty set, so any
+    /// group-delegation `requireTags` envelope in the chain is unsatisfiable
+    /// and rejects (fail-closed). Per-host chains without an envelope are
+    /// unaffected.
+    pub device_tags: &'a DeviceTags,
 }
 
 /// Inputs to the atomic resolve + coverage stage (role-format, task 4.3/4.4).
@@ -753,6 +780,23 @@ where
         cert_remaining_ttl(cert_not_after),
     )?;
 
+    // Step 10c — LIVE delegation-envelope enforcement (tags-delegation §4).
+    // For every CA in the verified chain carrying delegation_constraints,
+    // device.tags ⊇ requireTags AND role/level/TTL ceilings must hold. A
+    // chain with no constraints is a no-op. Fail-closed: a generic message to
+    // the engineer, the full reason vector only to the `delegation_denied`
+    // audit event.
+    if let Err(e) = enforce_delegation_stage(
+        &verified,
+        deps.device_tags,
+        role.as_ref(),
+        cert_max_integrity,
+        &verified_leaf,
+    ) {
+        io.show_info(tessera_core::trust::delegation_audit::GENERIC_DELEGATION_DENIED_MESSAGE);
+        return Err(e);
+    }
+
     let auth_ctx = AuthContext {
         session_id,
         cert_cn,
@@ -875,10 +919,7 @@ pub trait Pkcs11Io {
         &self,
         slot: tessera_core::token::pkcs11::Slot,
         pin_prompter: &mut PinPrompterFn<'_>,
-    ) -> Result<
-        tessera_core::token::pkcs11::Pkcs11Session,
-        tessera_core::token::pkcs11::AcquireError,
-    >;
+    ) -> Result<tessera_core::token::pkcs11::Pkcs11Session, tessera_core::token::pkcs11::AcquireError>;
 }
 
 /// Production [`Pkcs11Io`] backed by a real [`tessera_core::token::pkcs11::Pkcs11Backend`].
@@ -902,8 +943,7 @@ pub struct RealPkcs11Io<'a> {
 impl Pkcs11Io for RealPkcs11Io<'_> {
     fn wait_for_token(
         &self,
-    ) -> Result<tessera_core::token::pkcs11::Slot, tessera_core::token::pkcs11::Pkcs11Error>
-    {
+    ) -> Result<tessera_core::token::pkcs11::Slot, tessera_core::token::pkcs11::Pkcs11Error> {
         self.backend
             .wait_for_token(self.timeout, self.token_label.as_deref())
     }
@@ -919,10 +959,8 @@ impl Pkcs11Io for RealPkcs11Io<'_> {
         &self,
         slot: tessera_core::token::pkcs11::Slot,
         pin_prompter: &mut PinPrompterFn<'_>,
-    ) -> Result<
-        tessera_core::token::pkcs11::Pkcs11Session,
-        tessera_core::token::pkcs11::AcquireError,
-    > {
+    ) -> Result<tessera_core::token::pkcs11::Pkcs11Session, tessera_core::token::pkcs11::AcquireError>
+    {
         tessera_core::token::pkcs11::acquire_pkcs11_session(
             &self.backend,
             slot,
@@ -946,10 +984,8 @@ pub fn real_pkcs11_io(cfg: &ValidatedConfig) -> Result<RealPkcs11Io<'_>, FlowErr
         .pkcs11_module
         .as_deref()
         .ok_or(FlowError::Pkcs11ModulePathMissingInConfig)?;
-    let backend = tessera_core::token::pkcs11::Pkcs11Backend::load(
-        module_path,
-        cfg.pkcs11_locking_mode,
-    )?;
+    let backend =
+        tessera_core::token::pkcs11::Pkcs11Backend::load(module_path, cfg.pkcs11_locking_mode)?;
     Ok(RealPkcs11Io {
         backend,
         timeout: cfg.pkcs11_slot_wait,
@@ -1119,6 +1155,17 @@ where
         &deps.role_stage,
         pam_user,
         cert_remaining_ttl(cert_not_after),
+    )?;
+
+    // Step 10c — LIVE delegation-envelope enforcement (tags-delegation §4),
+    // identical gate to the PKCS#12 path. Fail-closed; the full reason vector
+    // goes only to the `delegation_denied` audit event.
+    enforce_delegation_stage(
+        &verified,
+        deps.device_tags,
+        role.as_ref(),
+        cert_max_integrity,
+        &verified_leaf,
     )?;
 
     let auth_ctx = AuthContext {
@@ -1427,10 +1474,7 @@ impl MountOps for NoopMountOps {
     fn umount(&self, _target: &Path) -> Result<(), tessera_core::error::MountGuardError> {
         Ok(())
     }
-    fn mkdir_mode_0700(
-        &self,
-        _path: &Path,
-    ) -> Result<(), tessera_core::error::MountGuardError> {
+    fn mkdir_mode_0700(&self, _path: &Path) -> Result<(), tessera_core::error::MountGuardError> {
         Ok(())
     }
     fn rmdir(&self, _path: &Path) -> Result<(), tessera_core::error::MountGuardError> {
@@ -1677,6 +1721,132 @@ fn resolve_role_stage(
     Ok(Some(payload))
 }
 
+/// Live delegation-envelope enforcement (tags-delegation §4, wired in §5).
+///
+/// Runs AFTER trust verification and role resolution on BOTH auth paths. For
+/// every CA in the verified chain carrying `pam_cert_delegation_constraints`,
+/// [`tessera_core::trust::enforce_delegation_opt`] checks
+/// `device.tags ⊇ requireTags`, role ∈ `allowRoles`, level ≤ `maxLevel`, and
+/// link TTL ≤ parent `maxTtl` (AND/MIN across all links). A chain carrying NO
+/// constraints is a no-op (prior per-host semantics preserved).
+///
+/// Inputs:
+/// * `verified` — the stage-2 verified chain (full `[leaf]++mids++[anchor]`).
+/// * `device_tags` — this device's trusted, applied tag set.
+/// * `role` — the resolved session role (`None` when role enforcement is off);
+///   an envelope-scoped chain with no role rejects fail-closed.
+/// * `cert_max_integrity` — the leaf `max_integrity` label, if present. Its
+///   `level` is BOTH the requested integrity level (the level the session
+///   assumes) and the leaf ceiling.
+/// * `verified_leaf` — used to extract the leaf `allowed_roles` list.
+///
+/// On `Err`, emits the `delegation_denied` audit event with the culprit serial,
+/// the violated check, and a device-tags snapshot, then returns
+/// [`FlowError::DelegationDenied`]. The caller surfaces only a GENERIC message
+/// to the engineer (envelope structure is not leaked pre-auth).
+///
+/// # Errors
+///
+/// [`FlowError::DelegationDenied`] on any envelope/ceiling violation.
+fn enforce_delegation_stage(
+    verified: &tessera_core::trust::Stage2VerifiedChain,
+    device_tags: &DeviceTags,
+    role: Option<&tessera_core::role::SessionRolePayload>,
+    cert_max_integrity: Option<tessera_core::mac::IntegrityLabel>,
+    verified_leaf: &tessera_core::x509::VerifiedX509,
+) -> Result<(), FlowError> {
+    let chain = verified.full_chain();
+
+    // Whether this chain is envelope-scoped (any CA carries
+    // delegation_constraints). A malformed/mis-placed extension is itself
+    // fail-closed here. For a non-envelope (per-host) chain the delegation
+    // ceilings do not apply, so a malformed *non-critical* leaf max_integrity
+    // is tolerated exactly as before; for an envelope-scoped chain it must
+    // fail closed (the leaf level is a security ceiling input — see below).
+    let scoped = match tessera_core::trust::chain_carries_constraints(&chain) {
+        Ok(s) => s,
+        Err(err) => {
+            let culprit_serial = chain.get(err.culprit_index()).map_or_else(
+                || verified.end_entity.serial_hex().to_lowercase(),
+                |c| c.serial_hex().to_lowercase(),
+            );
+            tessera_core::trust::delegation_audit::emit_delegation_denied(
+                &culprit_serial,
+                &err,
+                device_tags,
+            );
+            return Err(FlowError::DelegationDenied(err));
+        }
+    };
+
+    // Requested role = the resolved session role (if any).
+    let requested_role = role.map(|r| &r.role);
+
+    // Requested integrity level = the leaf's max_integrity level (the level the
+    // session assumes); leaf ceiling = the same value. Absent extension =
+    // baseline 0 with no leaf level ceiling.
+    //
+    // A leaf max_integrity that was present-but-malformed reaches here as
+    // `None` (the caller's MAC parse failed). Because the leaf level is a
+    // security ceiling input to the CA `maxLevel` checks, treating a malformed
+    // ceiling as "baseline 0, no leaf cap" would be fail-OPEN under an
+    // envelope. So when the chain is envelope-scoped and the leaf carries a
+    // malformed max_integrity, reject fail-closed.
+    if scoped
+        && cert_max_integrity.is_none()
+        && tessera_core::x509::max_integrity_ext::extract_max_integrity(verified_leaf).is_err()
+    {
+        // Present-but-malformed leaf max_integrity under an envelope: the leaf
+        // level is a ceiling input, so a malformed value must reject rather
+        // than degrade to baseline 0 (which would be fail-open). A genuinely
+        // absent extension (`Ok(None)`) is fine — no leaf ceiling.
+        let err = tessera_core::trust::DelegationError::LevelCeiling {
+            requested: i8::MAX,
+            ceiling: 0,
+            scope: "leaf max_integrity malformed (fail-closed)".to_owned(),
+        };
+        tessera_core::trust::delegation_audit::emit_delegation_denied(
+            &verified.end_entity.serial_hex().to_lowercase(),
+            &err,
+            device_tags,
+        );
+        return Err(FlowError::DelegationDenied(err));
+    }
+
+    let requested_level = cert_max_integrity.map_or(0, |l| l.level);
+    let leaf_max_integrity_level = cert_max_integrity.map(|l| l.level);
+
+    // Leaf allowed-roles (fail-closed on malformed → empty list grants none).
+    let leaf_allowed: Option<Vec<tessera_core::role::RoleId>> =
+        match tessera_core::x509::allowed_roles_ext::extract_allowed_roles(verified_leaf) {
+            Ok(roles) => roles,
+            Err(_) => Some(Vec::new()),
+        };
+
+    if let Err(err) = tessera_core::trust::enforce_delegation_opt(
+        &chain,
+        device_tags,
+        requested_role,
+        requested_level,
+        leaf_max_integrity_level,
+        leaf_allowed.as_deref(),
+    ) {
+        // Resolve the culprit serial from the offending chain index. Fall back
+        // to the leaf serial if the index is somehow out of range.
+        let culprit_serial = chain.get(err.culprit_index()).map_or_else(
+            || verified.end_entity.serial_hex().to_lowercase(),
+            |c| c.serial_hex().to_lowercase(),
+        );
+        tessera_core::trust::delegation_audit::emit_delegation_denied(
+            &culprit_serial,
+            &err,
+            device_tags,
+        );
+        return Err(FlowError::DelegationDenied(err));
+    }
+    Ok(())
+}
+
 /// Build a stable subject identifier for a verified leaf, used as the
 /// `subject` field of the `cert_allowed_roles_parse_failed` audit event.
 /// Combines the subject CN and serial so the offending cert is identifiable
@@ -1781,7 +1951,8 @@ mod tests {
             crl_pems: vec![],
             crl_strict: false,
             crl_max_age: None,
-            max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
+            max_supported_profile_version:
+                tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
             clock_skew: Duration::from_secs(60),
             signature_alg_whitelist: vec![
                 "sha256WithRSAEncryption".into(),
@@ -1878,6 +2049,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -1915,6 +2087,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -1950,6 +2123,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -1984,6 +2158,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
         let err = authenticate(deps, &io, "alice", "ssh", "sess-4".into(), |_| {
@@ -2020,6 +2195,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
         let err = authenticate(deps, &io, "alice", "ssh", "sess-5".into(), |_| {
@@ -2149,6 +2325,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2294,6 +2471,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
         let io = dummy_flow_io();
         let err = authenticate(deps, &io, "alice", "ssh", "sess-p11-1".into(), |_| {
@@ -2324,6 +2502,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
         let io = dummy_flow_io();
         let err = authenticate(deps, &io, "alice", "ssh", "sess-p11-2".into(), |_| {
@@ -2355,6 +2534,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         // We exercise `authenticate_pkcs11` directly with the stub, since
@@ -2398,6 +2578,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let stub = StubPkcs11Io::new();
@@ -2437,6 +2618,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let stub = StubPkcs11Io::new();
@@ -2575,6 +2757,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2612,6 +2795,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2656,6 +2840,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2695,6 +2880,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let stub = StubPkcs11Io::new();
@@ -2852,6 +3038,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let outcome = authenticate(deps, &io, "alice", "ssh", "sess-fb1".into(), |_| {
@@ -2907,6 +3094,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let err = authenticate(deps, &io, "alice", "ssh", "sess-fb2".into(), |_| {
@@ -2970,6 +3158,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let err = authenticate(deps, &io, "alice", "ssh", "sess-empty".into(), |_| {
@@ -3024,6 +3213,7 @@ level = "info"
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
         };
 
         let err = authenticate(deps, &io, "alice", "ssh", "sess-wpin".into(), |_| {
@@ -3053,9 +3243,7 @@ level = "info"
         assert!(stage.store.is_none());
         assert_eq!(
             stage.default_session_ttl,
-            Duration::from_secs(
-                tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS
-            )
+            Duration::from_secs(tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS)
         );
     }
 

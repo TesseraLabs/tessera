@@ -101,6 +101,14 @@ pub fn verify_profile_and_criticals(
             Err(e) => return Err(TrustError::ProfileVersionMalformed(e.to_string())),
         };
         if version > max_supported_profile_version {
+            // Audit the version-gate rejection (tags-delegation §5.1). The
+            // serial identifies the offending chain cert; the engineer-facing
+            // reason stays generic (a trust rejection), the detail is here.
+            crate::trust::delegation_audit::emit_profile_version_rejected(
+                &cert.serial_hex().to_lowercase(),
+                version,
+                max_supported_profile_version,
+            );
             return Err(TrustError::ProfileVersionUnsupported {
                 found: version,
                 max: max_supported_profile_version,

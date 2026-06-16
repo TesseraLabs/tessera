@@ -116,6 +116,28 @@ pub enum DelegationError {
     },
 }
 
+impl DelegationError {
+    /// Chain index (0 = leaf) of the certificate that triggered this
+    /// rejection: the CA whose envelope/ceiling was violated, the over-long
+    /// link's parent CA, or the malformed cert. Leaf-list role/level
+    /// rejections (which carry no chain index) map to the leaf (0). Used to
+    /// resolve the culprit serial for the `delegation_denied` audit event.
+    #[must_use]
+    pub fn culprit_index(&self) -> usize {
+        match self {
+            DelegationError::Malformed { index, .. } | DelegationError::TagEnvelope { index } => {
+                *index
+            }
+            DelegationError::TtlCeiling { parent_index, .. } => *parent_index,
+            // Role/level rejections carry a textual scope (a CA index or the
+            // leaf list) rather than a numeric index; attribute them to the
+            // leaf, which is always present. The full scope is in the error's
+            // Display, captured in the audit `detail` field.
+            DelegationError::RoleNotAllowed { .. } | DelegationError::LevelCeiling { .. } => 0,
+        }
+    }
+}
+
 /// Enforces the delegation envelope, role/level/TTL ceilings, and wildcard
 /// group-scoping over a verified `chain` (leaf → anchor ordering, as produced
 /// by [`crate::x509::chain::build_chain`]).
@@ -223,6 +245,76 @@ pub fn enforce_delegation(
         }
     }
 
+    Ok(())
+}
+
+/// `true` if any certificate in `chain` carries a well-formed
+/// `pam_cert_delegation_constraints` extension (i.e. the chain is
+/// envelope-scoped). A malformed/mis-placed extension is reported as
+/// `Err(Malformed)` — fail-closed, same as [`enforce_delegation`].
+///
+/// # Errors
+///
+/// [`DelegationError::Malformed`] for a malformed or mis-placed extension.
+pub fn chain_carries_constraints(chain: &[Certificate]) -> Result<bool, DelegationError> {
+    for (index, cert) in chain.iter().enumerate() {
+        let verified = VerifiedX509::new(cert.x509().clone());
+        match extract_delegation_constraints(&verified) {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(source) => return Err(DelegationError::Malformed { index, source }),
+        }
+    }
+    Ok(false)
+}
+
+/// Like [`enforce_delegation`] but for a possibly-absent requested role.
+///
+/// When `requested_role` is `Some`, this delegates verbatim to
+/// [`enforce_delegation`]. When it is `None` (no role was selected — e.g.
+/// `[roles].enforce = false`), an envelope-scoped chain cannot be satisfied:
+/// a group-delegation login that names no role cannot be proven to fall within
+/// any CA's `allowRoles`, so the chain is rejected fail-closed. A chain that
+/// carries NO delegation constraints is unaffected (prior per-host semantics).
+///
+/// # Errors
+///
+/// Any [`DelegationError`] — every one is a fail-closed rejection.
+pub fn enforce_delegation_opt(
+    chain: &[Certificate],
+    device_tags: &DeviceTags,
+    requested_role: Option<&RoleId>,
+    requested_level: i8,
+    leaf_max_integrity_level: Option<i8>,
+    leaf_allowed_roles: Option<&[RoleId]>,
+) -> Result<(), DelegationError> {
+    if let Some(role) = requested_role {
+        return enforce_delegation(
+            chain,
+            device_tags,
+            role,
+            requested_level,
+            leaf_max_integrity_level,
+            leaf_allowed_roles,
+        );
+    }
+    // No role selected: only envelope-free (per-host) chains are allowed
+    // through. An envelope-scoped chain rejects fail-closed — we attribute it
+    // to the first constraint-bearing CA so the audit culprit serial is
+    // meaningful.
+    for (index, cert) in chain.iter().enumerate() {
+        let verified = VerifiedX509::new(cert.x509().clone());
+        match extract_delegation_constraints(&verified) {
+            Ok(Some(_)) => {
+                return Err(DelegationError::RoleNotAllowed {
+                    role: String::new(),
+                    scope: format!("allowRoles of CA at chain index {index} (no role selected)"),
+                });
+            }
+            Ok(None) => {}
+            Err(source) => return Err(DelegationError::Malformed { index, source }),
+        }
+    }
     Ok(())
 }
 

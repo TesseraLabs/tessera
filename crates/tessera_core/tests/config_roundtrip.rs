@@ -4,9 +4,9 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::panic_in_result_fn)]
 
+use std::path::{Path, PathBuf};
 use tessera_core::config::{RawConfig, ValidatedConfig};
 use tessera_core::Error;
-use std::path::{Path, PathBuf};
 
 #[test]
 fn full_fixture_parses_raw() -> Result<(), Box<dyn std::error::Error>> {
@@ -117,10 +117,8 @@ fn validated_config_rejects_unsupported_syslog_facility() -> Result<(), Box<dyn 
     let anchor = write_anchor(dir.path());
     // local0..7 are intentionally unsupported even though the key itself
     // is deprecated-and-ignored: a typo should still surface at load time.
-    let body = fixture_with_anchor(&anchor).replace(
-        "syslog_facility = \"auth\"",
-        "syslog_facility = \"local0\"",
-    );
+    let body = fixture_with_anchor(&anchor)
+        .replace("syslog_facility = \"auth\"", "syslog_facility = \"local0\"");
     let raw: RawConfig = toml::from_str(&body)?;
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject local0");
     assert!(
@@ -137,7 +135,10 @@ fn validated_config_rejects_empty_trust_anchors() -> Result<(), Box<dyn std::err
     let raw: RawConfig = toml::from_str(&body)?;
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject empty anchors");
     assert!(
-        matches!(err, Error::Trust(tessera_core::error::TrustError::AnchorsEmpty)),
+        matches!(
+            err,
+            Error::Trust(tessera_core::error::TrustError::AnchorsEmpty)
+        ),
         "unexpected error: {err:?}"
     );
     Ok(())
@@ -213,7 +214,9 @@ fn empty_sig_alg_list_falls_back_to_safe_defaults() -> Result<(), Box<dyn std::e
     );
     assert!(algs.contains("sha256WithRSAEncryption"));
     assert!(
-        !algs.iter().any(|a| a.contains("sha1") || a.contains("SHA1")),
+        !algs
+            .iter()
+            .any(|a| a.contains("sha1") || a.contains("SHA1")),
         "default whitelist must not admit SHA-1: {algs:?}"
     );
     Ok(())
@@ -525,8 +528,8 @@ fn validated_config_rejects_ocsp_cache_ttl_out_of_range() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn validated_config_rejects_ocsp_keys_outside_ocsp_modes(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn validated_config_rejects_ocsp_keys_outside_ocsp_modes() -> Result<(), Box<dyn std::error::Error>>
+{
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
     // Each ocsp_* key would be silently ignored at runtime in non-OCSP
@@ -610,7 +613,10 @@ fn usb_allowed_devices_roundtrip_to_pairs() -> Result<(), Box<dyn std::error::Er
     let raw: RawConfig = toml::from_str(&injected)?;
     assert_eq!(raw.usb_allowed_devices.len(), 2);
     let v = ValidatedConfig::try_from(&raw)?;
-    assert_eq!(v.usb_allowed_devices, vec![(0x0951, 0x1666), (0xABCD, 0x0001)]);
+    assert_eq!(
+        v.usb_allowed_devices,
+        vec![(0x0951, 0x1666), (0xABCD, 0x0001)]
+    );
     Ok(())
 }
 
@@ -644,7 +650,8 @@ fn usb_allowed_devices_rejects_malformed_entry() -> Result<(), Box<dyn std::erro
 fn usb_wait_seconds_accepts_upper_bound() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
-    let body = fixture_with_anchor(&anchor).replace("usb_wait_seconds = 10", "usb_wait_seconds = 300");
+    let body =
+        fixture_with_anchor(&anchor).replace("usb_wait_seconds = 10", "usb_wait_seconds = 300");
     let raw: RawConfig = toml::from_str(&body)?;
     let v = ValidatedConfig::try_from(&raw)?;
     assert_eq!(v.usb_wait, std::time::Duration::from_mins(5));
@@ -655,7 +662,8 @@ fn usb_wait_seconds_accepts_upper_bound() -> Result<(), Box<dyn std::error::Erro
 fn usb_wait_seconds_rejects_301() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
-    let body = fixture_with_anchor(&anchor).replace("usb_wait_seconds = 10", "usb_wait_seconds = 301");
+    let body =
+        fixture_with_anchor(&anchor).replace("usb_wait_seconds = 10", "usb_wait_seconds = 301");
     let raw: RawConfig = toml::from_str(&body)?;
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject above-range wait");
     assert!(
@@ -679,5 +687,127 @@ fn validated_config_needs_gost_false_for_pkcs11_backend_even_with_gost_oid(
     let raw: RawConfig = toml::from_str(&switched)?;
     let v = ValidatedConfig::try_from(&raw)?;
     assert!(!v.needs_gost());
+    Ok(())
+}
+
+// ---- tags-delegation §5.2: [tags] + max_supported_profile_version ----------
+
+#[test]
+fn tags_section_absent_yields_no_applied_tags_default() -> Result<(), Box<dyn std::error::Error>> {
+    use tessera_core::config::validated::TagsMode;
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // The full_valid.toml fixture carries no [tags] section.
+    let raw: RawConfig = toml::from_str(&fixture_with_anchor(&anchor))?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    // Fail-closed default: enforce = false (device has no applied tags),
+    // standalone mode, default tags path.
+    assert!(!v.tags.enforce);
+    assert_eq!(v.tags.mode, TagsMode::Standalone);
+    assert_eq!(
+        v.tags.source,
+        std::path::PathBuf::from(tessera_core::tags::DEFAULT_TAGS_FILE)
+    );
+    Ok(())
+}
+
+#[test]
+fn max_supported_profile_version_absent_uses_compiled_default(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let raw: RawConfig = toml::from_str(&fixture_with_anchor(&anchor))?;
+    assert!(raw.trust.max_supported_profile_version.is_none());
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(
+        v.trust.max_supported_profile_version,
+        tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION
+    );
+    Ok(())
+}
+
+#[test]
+fn max_supported_profile_version_explicit_is_carried() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_anchor(&anchor)
+        .replace("[trust]\n", "[trust]\nmax_supported_profile_version = 3\n");
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(v.trust.max_supported_profile_version, 3);
+    Ok(())
+}
+
+#[test]
+fn tags_section_standalone_parses_and_validates() -> Result<(), Box<dyn std::error::Error>> {
+    use tessera_core::config::validated::TagsMode;
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = format!(
+        "{}\n[tags]\nenforce = true\nmode = \"standalone\"\nsource = \"/var/lib/tessera/tags.toml\"\n",
+        fixture_with_anchor(&anchor)
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert!(v.tags.enforce);
+    assert_eq!(v.tags.mode, TagsMode::Standalone);
+    assert_eq!(
+        v.tags.source,
+        std::path::PathBuf::from("/var/lib/tessera/tags.toml")
+    );
+    Ok(())
+}
+
+#[test]
+fn tags_section_relative_source_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = format!(
+        "{}\n[tags]\nenforce = true\nsource = \"relative/tags.toml\"\n",
+        fixture_with_anchor(&anchor)
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("relative [tags].source must reject");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason } if reason.contains("[tags].source must be absolute")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tags_section_managed_default_source_is_roles_dir() -> Result<(), Box<dyn std::error::Error>> {
+    use tessera_core::config::validated::TagsMode;
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // Managed mode with no explicit source → role-store directory (shared
+    // anti-rollback floor). No [roles] section means the role-store default.
+    let body = format!(
+        "{}\n[tags]\nenforce = true\nmode = \"managed\"\n",
+        fixture_with_anchor(&anchor)
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(v.tags.mode, TagsMode::Managed);
+    assert_eq!(
+        v.tags.source,
+        std::path::PathBuf::from(tessera_core::role::DEFAULT_ROLES_DIR)
+    );
+    Ok(())
+}
+
+#[test]
+fn tags_section_rejects_unknown_field() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = format!(
+        "{}\n[tags]\nenforce = true\nbogus = 1\n",
+        fixture_with_anchor(&anchor)
+    );
+    let parsed: Result<RawConfig, _> = toml::from_str(&body);
+    assert!(
+        parsed.is_err(),
+        "unknown [tags] field must be rejected at parse"
+    );
     Ok(())
 }

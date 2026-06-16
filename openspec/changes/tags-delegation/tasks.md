@@ -28,8 +28,9 @@
 
 ## 5. Аудит и конфиг
 
-- [ ] 5.1 `logging-audit`: события `delegation_denied` (звено-виновник, нарушенная проверка, снимок device.tags), `tag_manifest_applied` (device_id, bundle_version), `profile_version_rejected` (serial, версия, max_supported)
-- [ ] 5.2 `configuration`: `[trust].max_supported_profile_version`, `[tags]` (путь/режим источника, enforce); дефолты fail-closed-совместимы
+- [x] 5.1 `logging-audit`: события `delegation_denied` (звено-виновник, нарушенная проверка, снимок device.tags), `tag_manifest_applied` (device_id, bundle_version), `profile_version_rejected` (serial, версия, max_supported)
+- [x] 5.2 `configuration`: `[trust].max_supported_profile_version`, `[tags]` (путь/режим источника, enforce); дефолты fail-closed-совместимы
+  - Примечание: managed-режим загрузки тегов застаблен fail-closed (возвращает пустые теги) — ключ верификации enrollment-манифеста не экспонируется в open-build (серверная фича, design Non-Goal); standalone — поддерживаемый путь. `tag_manifest_applied` определён, но не зовётся live до wiring managed-enrollment.
 
 ## 6. Issuance-тулинг и доки
 

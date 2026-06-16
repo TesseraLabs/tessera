@@ -23,13 +23,13 @@ use std::time::Duration;
 
 use common::*;
 
-use pam_tessera::flow::{authenticate, Deps, InMemoryFlowIo, RoleStage};
+use pam_tessera::flow::{authenticate, empty_device_tags, Deps, InMemoryFlowIo, RoleStage};
+use secrecy::SecretString;
 use tessera_core::config::ValidatedConfig;
 use tessera_core::hooks::{ForkExecExecutor, HookConfig, HookStage, OnFailure, RunAs};
 use tessera_core::host_identity::HostIdSourceKind;
 use tessera_core::ipc::StubClient;
 use tessera_core::x509::Certificate;
-use secrecy::SecretString;
 
 #[test]
 fn pre_auth_hook_runs_and_writes_marker_file() {
@@ -72,8 +72,7 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
             // rely on a custom MARKER var to find the temp path.
             m.insert(
                 "MARKER".to_string(),
-                tessera_core::hooks::Template::parse(marker.to_string_lossy().as_ref())
-                    .unwrap(),
+                tessera_core::hooks::Template::parse(marker.to_string_lossy().as_ref()).unwrap(),
             );
             m
         },
@@ -96,6 +95,7 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
         role_stage: RoleStage::disabled(),
+        device_tags: empty_device_tags(),
     };
 
     // 4. Drive the flow.

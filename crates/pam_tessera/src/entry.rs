@@ -90,7 +90,7 @@ fn build_role_stage(
     roles_cfg: &tessera_core::config::validated::RolesSection,
     suffix_role: Option<tessera_core::role::RoleId>,
 ) -> Result<RoleStageOwned, i32> {
-    use tessera_core::role::{RoleDenyReason, RoleEnforce, RoleId, RoleStore, RoleOs, TrustMode};
+    use tessera_core::role::{RoleDenyReason, RoleEnforce, RoleId, RoleOs, RoleStore, TrustMode};
 
     let enforce = roles_cfg.enforce_mode();
     if enforce == RoleEnforce::Disabled {
@@ -183,6 +183,61 @@ fn build_role_stage(
     })
 }
 
+/// Load this device's trusted tag set from the configured `[tags]` source
+/// (tags-delegation §5.2).
+///
+/// Fail-closed: when `[tags].enforce = false` the device has no applied tags
+/// (an empty set), so any group-delegation `requireTags` envelope in a chain is
+/// unsatisfiable and rejects. A configured-but-broken source (bad signature,
+/// rollback, malformed file) is also treated as "no tags" — never as "all tags
+/// allowed" — and the per-source audit event has already been emitted by the
+/// loader. A missing standalone file is benign (empty set).
+#[cfg(target_os = "linux")]
+fn build_device_tags(
+    tags_cfg: &tessera_core::config::validated::TagsSection,
+    roles_cfg: &tessera_core::config::validated::RolesSection,
+) -> tessera_core::tags::DeviceTags {
+    use tessera_core::config::validated::TagsMode;
+    use tessera_core::tags::{load_standalone_optional, DeviceTags};
+
+    let _ = roles_cfg; // reserved for managed-mode wiring (see below)
+    if !tags_cfg.enforce {
+        return DeviceTags::empty();
+    }
+    match tags_cfg.mode {
+        TagsMode::Standalone => match load_standalone_optional(&tags_cfg.source) {
+            Ok(tags) => tags,
+            Err(err) => {
+                tracing::error!(
+                    target: "tags.audit",
+                    error = %err,
+                    source = %tags_cfg.source.display(),
+                    "device-tags standalone load failed; treating as no tags (fail-closed)"
+                );
+                DeviceTags::empty()
+            }
+        },
+        TagsMode::Managed => {
+            // Managed tags ride in the SAME signed role-store manifest. The
+            // enrollment verification key the manifest is signed under is not
+            // exposed as its own config key in the open build (the standalone
+            // role-store / tags model is the supported path here), so managed
+            // device-tags loading has no trusted pubkey to verify against yet.
+            // Fail-closed: no tags applied. Wiring the enrollment-key source is
+            // a serverside/enrollment concern (design Non-Goals) tracked
+            // separately; until then `mode = "managed"` yields no tags rather
+            // than an unverified read.
+            tracing::error!(
+                target: "tags.audit",
+                source = %tags_cfg.source.display(),
+                "device-tags mode = managed is not wired to an enrollment key in this build; \
+                 treating as no tags (fail-closed)"
+            );
+            DeviceTags::empty()
+        }
+    }
+}
+
 /// Prompt the engineer for a role via the PAM conversation
 /// (`PAM_PROMPT_ECHO_ON`). Returns `Ok(Some(role))` on input, `Ok(None)` on
 /// empty input, `Err(())` when no usable conversation is available. The
@@ -196,9 +251,7 @@ fn build_role_stage(
 unsafe fn prompt_for_role(pamh: *mut pam_sys::pam_handle_t) -> Result<Option<String>, ()> {
     // SAFETY: forwarded to the conv helper, which upholds the live-handle
     // contract documented on `prompt_value`.
-    match unsafe {
-        crate::pam_conv::prompt_value(pamh, "Роль (role): ", PAM_PROMPT_ECHO_ON)
-    } {
+    match unsafe { crate::pam_conv::prompt_value(pamh, "Роль (role): ", PAM_PROMPT_ECHO_ON) } {
         Ok(value) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -245,10 +298,8 @@ pub unsafe fn collect_args(
 
 #[cfg(target_os = "linux")]
 fn config_path_from_args(args: &BTreeMap<String, String>) -> PathBuf {
-    args.get("config").map_or_else(
-        || PathBuf::from("/etc/tessera/config.toml"),
-        PathBuf::from,
-    )
+    args.get("config")
+        .map_or_else(|| PathBuf::from("/etc/tessera/config.toml"), PathBuf::from)
 }
 
 /// Map a PAM_TTY string into a [`tessera_proto::SessionTarget`].
@@ -337,21 +388,21 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // `role_deny reason=syntax` carrying the raw login string. A stray
         // `+` is illegal in canonical account names regardless of the
         // enforcement stage, so malformed login strings are always fatal.
-        let (pam_user, requested_role) =
-            match crate::role_selection::parse_user_role(&raw_pam_user) {
-                Ok((canonical, role)) => (canonical, role),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "role.audit",
-                        event = "role_deny",
-                        reason = "syntax",
-                        raw_user = %raw_pam_user,
-                        error = %err,
-                        "login string rejected before authentication",
-                    );
-                    return PAM_AUTH_ERR;
-                }
-            };
+        let (pam_user, requested_role) = match crate::role_selection::parse_user_role(&raw_pam_user)
+        {
+            Ok((canonical, role)) => (canonical, role),
+            Err(err) => {
+                tracing::warn!(
+                    target: "role.audit",
+                    event = "role_deny",
+                    reason = "syntax",
+                    raw_user = %raw_pam_user,
+                    error = %err,
+                    "login string rejected before authentication",
+                );
+                return PAM_AUTH_ERR;
+            }
+        };
         // Rewrite PAM_USER to the canonical name when a suffix was stripped.
         if pam_user != raw_pam_user {
             // SAFETY: `pamh` is the live PAM handle for this callback.
@@ -438,14 +489,15 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // Open Question). Then load the on-device role store. The requested
         // role + store + enforce mode travel atomically through Deps so the
         // role is resolved together with cert verification (no swap window).
-        let role_stage = match build_role_stage(
-            pamh,
-            &wired.cfg.roles,
-            requested_role,
-        ) {
+        let role_stage = match build_role_stage(pamh, &wired.cfg.roles, requested_role) {
             Ok(s) => s,
             Err(rc) => return rc,
         };
+
+        // 7c. Device-tags stage (tags-delegation §5). Loaded once per attempt
+        // from the configured `[tags]` source; an absent/disabled source yields
+        // an empty set (fail-closed: group-delegation envelopes then reject).
+        let device_tags = build_device_tags(&wired.cfg.tags, &wired.cfg.roles);
 
         // 8. Drive the flow.
         // Stage 5: real fork+execve hook executor. The struct is stateless;
@@ -461,6 +513,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             user_mappings: &wired.cfg.user_mappings,
             pam_target,
             role_stage: role_stage.as_deps(),
+            device_tags: &device_tags,
         };
         let outcome = crate::flow::authenticate(
             deps,
@@ -613,33 +666,26 @@ pub unsafe extern "C" fn pam_sm_open_session(
         // failure logs WARN but never breaks PAM auth.
         {
             // SAFETY: `pamh` is the live PAM handle for this callback.
-            let xdg = match unsafe {
-                crate::pam_helpers::pam_get_env_string(pamh, "XDG_SESSION_ID")
-            } {
-                Ok(v) => v,
-                Err(err) => {
-                    tracing::warn!(
-                        target: "tessera.session",
-                        session_id = %ctx.session_id,
-                        error = %err,
-                        "pam_getenv(XDG_SESSION_ID) failed",
-                    );
-                    None
-                }
-            };
-            let session_uuid =
-                crate::xdg_capture::session_uuid_from_string(&ctx.session_id);
+            let xdg =
+                match unsafe { crate::pam_helpers::pam_get_env_string(pamh, "XDG_SESSION_ID") } {
+                    Ok(v) => v,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "tessera.session",
+                            session_id = %ctx.session_id,
+                            error = %err,
+                            "pam_getenv(XDG_SESSION_ID) failed",
+                        );
+                        None
+                    }
+                };
+            let session_uuid = crate::xdg_capture::session_uuid_from_string(&ctx.session_id);
             let socket_path = cfg.monitor.socket_path.clone();
             let timeout = cfg.monitor.timeout;
-            let _ = crate::xdg_capture::capture_xdg(
-                session_uuid,
-                xdg.as_deref(),
-                |target| {
-                    let mut client =
-                        tessera_core::ipc::MonitordClient::connect(&socket_path, timeout)?;
-                    client.send_update_session_target(session_uuid, target)
-                },
-            );
+            let _ = crate::xdg_capture::capture_xdg(session_uuid, xdg.as_deref(), |target| {
+                let mut client = tessera_core::ipc::MonitordClient::connect(&socket_path, timeout)?;
+                client.send_update_session_target(session_uuid, target)
+            });
         }
 
         let vars = tessera_core::hooks::HookVars::for_session_open(&pam_user, ctx);

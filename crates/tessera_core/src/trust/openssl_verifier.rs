@@ -59,6 +59,22 @@ impl Stage2VerifiedChain {
     pub fn verified_leaf(&self) -> crate::x509::VerifiedX509 {
         crate::x509::VerifiedX509::new(self.end_entity.x509().clone())
     }
+
+    /// The full ordered chain `[end_entity] ++ intermediates ++ [anchor]`
+    /// (leaf → anchor), matching the ordering [`crate::x509::chain::build_chain`]
+    /// produces and the ordering [`crate::trust::enforce_delegation`] expects.
+    ///
+    /// Reconstructed by cloning the three stored parts; the verifier does not
+    /// retain the original `Vec`, and re-verifying to obtain it would be both
+    /// wasteful and a TOCTOU risk, so this minimal accessor rebuilds it.
+    #[must_use]
+    pub fn full_chain(&self) -> Vec<Certificate> {
+        let mut out = Vec::with_capacity(self.chain.len() + 2);
+        out.push(self.end_entity.clone());
+        out.extend(self.chain.iter().cloned());
+        out.push(self.anchor.clone());
+        out
+    }
 }
 
 /// Stage-2 trust verifier interface.
@@ -341,9 +357,7 @@ impl OpensslVerifier {
     ) -> Result<(), TrustError> {
         match self.revocation_mode {
             RevocationMode::None => Ok(()),
-            RevocationMode::Crl => {
-                check_revocation(chain, &self.crl_store, &self.rev_cfg, now)
-            }
+            RevocationMode::Crl => check_revocation(chain, &self.crl_store, &self.rev_cfg, now),
             RevocationMode::Ocsp => self.check_revocation_ocsp(chain, now, false),
             RevocationMode::CrlThenOcsp => self.check_revocation_ocsp(chain, now, true),
         }
@@ -364,7 +378,9 @@ impl OpensslVerifier {
         let last = chain.len().saturating_sub(1);
         for idx in 0..last {
             let Some(subject) = chain.get(idx) else { break };
-            let Some(issuer) = chain.get(idx + 1) else { break };
+            let Some(issuer) = chain.get(idx + 1) else {
+                break;
+            };
 
             if crl_first {
                 match crl_status_for(subject, chain, &self.crl_store, &self.rev_cfg, now)? {
@@ -408,8 +424,7 @@ impl OpensslVerifier {
 
         // Untrusted helpers for responder-chain building: configured
         // intermediates plus the certificate's own issuer.
-        let mut untrusted: Vec<Certificate> =
-            Vec::with_capacity(self.intermediates.len() + 1);
+        let mut untrusted: Vec<Certificate> = Vec::with_capacity(self.intermediates.len() + 1);
         untrusted.extend(self.intermediates.iter().cloned());
         untrusted.push(issuer.clone());
         let ctx = OcspVerifyContext {
@@ -450,8 +465,9 @@ impl OpensslVerifier {
         );
         let response_der =
             post_ocsp_request(url, request.der(), self.ocsp_timeout).map_err(ocsp_err)?;
-        let status = verify_ocsp_response(&response_der, subject, issuer, Some(request.der()), &ctx)
-            .map_err(ocsp_err)?;
+        let status =
+            verify_ocsp_response(&response_der, subject, issuer, Some(request.der()), &ctx)
+                .map_err(ocsp_err)?;
         tracing::debug!(
             target: "tessera.ocsp",
             serial = %serial,
