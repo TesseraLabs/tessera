@@ -5,9 +5,7 @@
 Структурное логирование (tracing) и стабильные audit-события. Что логируется, куда, что НИКОГДА не попадает в логи.
 
 Код: `crates/tessera_core/src/logging.rs` (типы `LogLevel`/`SyslogFacility`), `tessera_cli/src/logging.rs`, `tessera_core/src/mac/audit.rs`.
-
 ## Requirements
-
 ### Requirement: Назначение вывода
 
 Демон/CLI ДОЛЖНЫ (MUST) писать tracing в stderr → journald (под systemd). Уровень фильтра ДОЛЖЕН (MUST) определяться приоритетом: env `TESSERA_LOG` > `[logging].level` из конфига > `info`. Демон инициализирует tracing до загрузки конфига (чтобы ошибки загрузки были видны) с фильтром за reload-layer, и после успешной загрузки применяет `[logging].level` через `logging::apply_config_level` (no-op при заданном `TESSERA_LOG`) (tessera_cli/src/logging.rs, daemon/mod.rs). PAM-сторона инициализируется через `logging::init_once` в entry.rs и пишет в syslog facility `auth` фиксированно (by design).
@@ -86,3 +84,21 @@
 #### Scenario: Отказ базы в managed
 - **WHEN** манифест отвергнут (rollback)
 - **THEN** эмитится `bundle_rejected` severity critical с `reason=rollback` и обеими версиями в полях
+
+### Requirement: Audit-события делегирования и тегов
+
+Engine ДОЛЖЕН (MUST) эмитить audit-события для решений делегирования и применения тегов:
+`delegation_denied` (звено-виновник serial, нарушенная проверка: tags/role/level/ttl/version,
+снимок `device.tags`), `tag_manifest_applied` (`device_id`, `bundle_version`),
+`profile_version_rejected` (serial, версия серта, `max_supported`). Причина отказа, показываемая
+инженеру, ДОЛЖНА (MUST) быть обобщённой; полный вектор причин ДОЛЖЕН (MUST) попадать только в
+audit (не раскрываем структуру рамок до аутентификации).
+
+#### Scenario: Отказ по конверту делегирования
+- **WHEN** цепь отвергнута из-за несоответствия `device.tags` конверту
+- **THEN** эмитится `delegation_denied` с serial звена-виновника и снимком `device.tags`, инженеру — обобщённая причина
+
+#### Scenario: Применение манифеста тегов
+- **WHEN** применён новый подписанный манифест с тегами устройства
+- **THEN** эмитится `tag_manifest_applied` с `device_id` и `bundle_version`
+
