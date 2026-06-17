@@ -50,9 +50,9 @@ fn wrong_pin_three_times_returns_max_tries() {
 #[test]
 fn missing_p12_returns_authinfo_unavail() {
     use pam_tessera::flow::{authenticate, Deps, InMemoryFlowIo};
+    use secrecy::SecretString;
     use tessera_core::host_identity::HostIdSourceKind;
     use tessera_core::ipc::StubClient;
-    use secrecy::SecretString;
 
     let tmp = tempfile::tempdir().unwrap();
     // No `certs/` directory at all.
@@ -71,6 +71,7 @@ fn missing_p12_returns_authinfo_unavail() {
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
         role_stage: pam_tessera::flow::RoleStage::disabled(),
+        device_tags: pam_tessera::flow::empty_device_tags(),
     };
     let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
     let err = authenticate(deps, &io, "alice", "ssh", "sess-x".into(), |_| {

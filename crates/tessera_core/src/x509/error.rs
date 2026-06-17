@@ -102,4 +102,28 @@ pub enum TrustError {
     /// any inability to determine OCSP status refuses authentication.
     #[error("OCSP error: {0}")]
     Ocsp(String),
+
+    /// A certificate in the chain declares a `pam_cert_profile_version`
+    /// greater than the Engine's `max_supported_profile_version`.  Fail-closed
+    /// version gate: a newer-format certificate is refused rather than
+    /// interpreted with stale rules (design decision 5, layer 2).
+    #[error("profile_version {found} exceeds supported maximum {max}")]
+    ProfileVersionUnsupported {
+        /// The version declared by the certificate.
+        found: u32,
+        /// The maximum version this Engine understands.
+        max: u32,
+    },
+
+    /// A certificate in the chain carries a `pam_cert_profile_version`
+    /// extension whose body is malformed.  Fail-closed.
+    #[error("malformed profile_version extension: {0}")]
+    ProfileVersionMalformed(String),
+
+    /// A certificate in the chain carries a `critical` extension whose OID is
+    /// not in the Engine's known-critical allowlist.  Per RFC 5280 §4.2 an
+    /// unrecognised critical extension MUST cause rejection (`PwnKit`
+    /// fail-closed; design decision 5, layer 1).
+    #[error("unhandled critical extension: {0}")]
+    UnhandledCriticalExtension(String),
 }

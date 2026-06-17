@@ -33,9 +33,7 @@ pub mod pkcs12;
 pub mod role;
 pub mod secret;
 pub mod self_check;
-// Planned (openspec/changes/tags-delegation/): `mod tags` — device-tags store
-// (generic key=value map, opaque to the Engine; managed signed manifest with
-// anti-rollback, or a standalone file under FS-permission trust).
+pub mod tags;
 pub mod token;
 pub mod trust;
 pub mod usb;
@@ -45,4 +43,5 @@ pub use config::{RawConfig, ValidatedConfig};
 pub use error::{Error, SelfCheckError};
 pub use logging::{LogLevel, SyslogFacility};
 pub use secret::Secret;
+pub use tags::{parse_tags, DeviceTags, TagsSchemaError, TagsSourceError};
 pub use x509::SignatureAlg;

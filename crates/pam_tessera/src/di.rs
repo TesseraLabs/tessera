@@ -15,9 +15,7 @@
 use std::time::Duration;
 
 use tessera_core::config::ValidatedConfig;
-use tessera_core::ipc::{
-    ConnectPerCall, FailModeWrapper, MonitorClient, MonitorClientFactory,
-};
+use tessera_core::ipc::{ConnectPerCall, FailModeWrapper, MonitorClient, MonitorClientFactory};
 use tessera_core::trust::openssl_verifier::{OpensslVerifier, OpensslVerifierConfig};
 use tessera_core::x509::pinning::SpkiPin;
 use tessera_core::x509::Certificate;
@@ -128,10 +126,13 @@ pub fn wire(cfg: ValidatedConfig) -> Result<Wired, WireError> {
     // hard error (the auth path must not silently skip revocation).  `None`
     // in the non-OCSP modes, where the config key is absent by validation.
     let ocsp_url = match &cfg.trust.revocation.ocsp_responder_url {
-        Some(raw) => Some(
-            tessera_core::ocsp::OcspUrl::parse(raw)
-                .map_err(|e| WireError::OcspUrl { reason: e.to_string() })?,
-        ),
+        Some(raw) => {
+            Some(
+                tessera_core::ocsp::OcspUrl::parse(raw).map_err(|e| WireError::OcspUrl {
+                    reason: e.to_string(),
+                })?,
+            )
+        }
         None => None,
     };
 
@@ -145,6 +146,9 @@ pub fn wire(cfg: ValidatedConfig) -> Result<Wired, WireError> {
                 | tessera_core::config::validated::RevocationMode::CrlThenOcsp
         ),
         crl_max_age: cfg.trust.revocation.crl_max_age,
+        // Profile version-gate ceiling, from `[trust].max_supported_profile_version`
+        // (absent → compiled baseline default, fail-closed).
+        max_supported_profile_version: cfg.trust.max_supported_profile_version,
         // P1-B: take both knobs from the validated config rather than
         // hard-coding 60s/4. Validator caps both (`<= 600s`, `1..=16`)
         // so casts are safe.
@@ -186,13 +190,12 @@ pub fn wire(cfg: ValidatedConfig) -> Result<Wired, WireError> {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use tessera_core::config::load_validated_config;
     use std::io::Write;
+    use tessera_core::config::load_validated_config;
     // Write is used below in write_min_config.
 
     fn fixtures_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tessera_core/tests/fixtures")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tessera_core/tests/fixtures")
     }
 
     /// Minimal-but-valid config wired against real fixture anchors so

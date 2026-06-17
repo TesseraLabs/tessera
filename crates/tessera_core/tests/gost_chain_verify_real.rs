@@ -33,6 +33,7 @@ fn build_verifier(anchor_pem: &str, intermediate_pem: Option<&str>, alg: &str) -
         None => vec![],
     };
     OpensslVerifier::new(OpensslVerifierConfig {
+        max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         anchors,
         intermediates,
         crl_pems: vec![],
