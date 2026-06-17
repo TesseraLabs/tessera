@@ -12,18 +12,21 @@
 //! `crate::error::TrustError` used by stage-1 stubs; they will be unified
 //! in a later stage.
 
+pub mod allowed_roles_ext;
 pub mod basic_constraints;
 pub mod chain;
+pub mod delegation_constraints_ext;
 pub(crate) mod der;
 pub(crate) mod der_helpers;
 pub mod error;
 pub(crate) mod ext;
 pub mod host_binding_ext;
 pub mod max_integrity_ext;
-pub mod allowed_roles_ext;
 pub mod oids;
 pub mod pinning;
 pub mod pre_validate;
+pub mod profile_validation;
+pub mod profile_version_ext;
 pub mod sig_alg;
 pub mod signatures;
 #[cfg(test)]
@@ -131,6 +134,27 @@ impl VerifiedX509 {
     #[must_use]
     pub fn as_x509(&self) -> &X509 {
         &self.0
+    }
+
+    /// Returns the `basicConstraints` view if the extension is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError::CertParse`] if the extension is malformed.
+    pub fn basic_constraints(&self) -> Result<Option<BasicConstraintsView>, TrustError> {
+        ext::basic_constraints(&self.0)
+    }
+
+    /// Whether this certificate asserts `basicConstraints` `cA = TRUE`.
+    ///
+    /// A missing `basicConstraints` extension is treated as `cA = FALSE`
+    /// (the RFC 5280 default).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError::CertParse`] if the extension is malformed.
+    pub fn is_ca(&self) -> Result<bool, TrustError> {
+        Ok(self.basic_constraints()?.is_some_and(|bc| bc.is_ca))
     }
 
     /// Test-only escape hatch.  Use ONLY in unit tests with self-signed
@@ -339,6 +363,19 @@ impl Certificate {
     /// Returns [`TrustError::Openssl`] if the public key cannot be extracted.
     pub fn public_key(&self) -> Result<PKey<Public>, TrustError> {
         Ok(self.inner.public_key()?)
+    }
+
+    /// Returns the dotted OIDs of every extension marked `critical`.
+    ///
+    /// Used by the chain verifier to fail closed on any critical extension it
+    /// does not understand (RFC 5280 §4.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError::CertParse`] when the certificate structure is
+    /// malformed.
+    pub fn critical_extension_oids(&self) -> Result<Vec<String>, TrustError> {
+        ext::critical_extension_oids(&self.inner)
     }
 }
 

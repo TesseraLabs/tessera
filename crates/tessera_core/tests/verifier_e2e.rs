@@ -23,6 +23,7 @@ fn whitelist() -> Vec<String> {
 
 fn config_builder() -> OpensslVerifierConfig {
     OpensslVerifierConfig {
+        max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         anchors: vec![Certificate::from_pem(CA).unwrap()],
         intermediates: vec![Certificate::from_pem(INT).unwrap()],
         crl_pems: vec![CRL_VALID.to_vec()],

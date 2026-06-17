@@ -12,14 +12,16 @@
 
 OID-арка ДОЛЖНА (MUST) оставаться неизменной — это проводной контракт между выпуском сертификатов и модулем верификации.
 
-| Расширение | OID |
-|---|---|
-| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` |
-| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` |
-| `pam_cert_max_integrity` | `2.25.273824307386008814506455310913083078403` |
-| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` |
+| Расширение | OID | Critical |
+|---|---|---|
+| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | non-critical |
+| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | non-critical |
+| `pam_cert_max_integrity` | `2.25.273824307386008814506455310913083078403` | non-critical |
+| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | non-critical |
+| `pam_cert_delegation_constraints` | `2.25.242193075883906031821745064285793775511` | **critical** |
+| `pam_cert_profile_version` | `2.25.107983357797077476746994938370032043240` | **critical** |
 
-Арка `2.25.<UUID>` (RFC 4530, без PEN/IANA). Все расширения non-critical. host/user binding: `SEQUENCE OF UTF8String`; max_integrity: `SEQUENCE { level INTEGER(-128..127), categories BIT STRING DEFAULT ''B }`; allowed_roles: `SEQUENCE OF UTF8String` (каждая строка — `role_id`, `^[a-z][a-z0-9-]{0,15}$`).
+Арка `2.25.<UUID>` (RFC 4530, без PEN/IANA). Листовые scope-расширения non-critical. host/user binding: `SEQUENCE OF UTF8String`; max_integrity: `SEQUENCE { level INTEGER(-128..127), categories BIT STRING DEFAULT ''B }`; allowed_roles: `SEQUENCE OF UTF8String` (каждая строка — `role_id`, `^[a-z][a-z0-9-]{0,15}$`). Расширения делегирования `pam_cert_delegation_constraints` (`SEQUENCE { requireTags SEQUENCE OF SEQUENCE{key UTF8String, value UTF8String}, allowRoles SEQUENCE OF UTF8String, maxLevel INTEGER, maxTtl INTEGER }`, только на `CA=TRUE`) и `pam_cert_profile_version` (`INTEGER`) ДОЛЖНЫ (MUST) помечаться **critical**: их игнорирование = обход рамок. UUID-источники: delegation_constraints `b634b091-47d7-4e54-a0fc-3f7dc4a56f97`, profile_version `513cd696-16f7-4de7-8b14-f675c71284e8`.
 
 Известное ограничение экосистемы: Go `encoding/asn1` (Vault PKI) не парсит OID-дуги >int64 → Vault не может выпускать такие серты через `pki/issue`/`sign-verbatim`; выпуск — локальным openssl CA (решение May 2026).
 

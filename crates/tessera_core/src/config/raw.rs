@@ -115,6 +115,58 @@ pub struct RawConfig {
     /// `dir = /var/lib/tessera/roles`, `default_session_ttl_seconds = 43200`).
     #[serde(default)]
     pub roles: RawRoles,
+    /// Device-tags source section (`[tags]`, tags-delegation §5.2). Optional;
+    /// when absent the validated layer applies fail-closed defaults — the
+    /// device has NO tags (an empty set), so any group-delegation `requireTags`
+    /// envelope in the chain is unsatisfiable and rejects. Per-host logins
+    /// without a delegation envelope are unaffected.
+    #[serde(default)]
+    pub tags: RawTags,
+}
+
+/// Trust mode for the device-tags source (`[tags].mode`).
+///
+/// Mirrors the role-store trust split (`[roles]` standalone/managed): in
+/// `managed` mode the tags ride in the SAME signed `manifest.toml` under the
+/// SAME `bundle_version` anti-rollback floor as the role base; in `standalone`
+/// mode a local file is trusted by filesystem permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RawTagsMode {
+    /// Local file trusted by filesystem permissions (default — parity with
+    /// the standalone role-store).
+    #[default]
+    Standalone,
+    /// Tags ride in the signed `role-store` manifest (shared anti-rollback).
+    Managed,
+}
+
+/// Raw `[tags]` block (tags-delegation §5.2).
+///
+/// All fields are optional with fail-closed defaults; `deny_unknown_fields`
+/// rejects typos at parse time. When the whole section is absent the validated
+/// layer treats the device as having NO tags (empty set), which is the
+/// fail-closed default the configuration spec mandates ("отсутствие источника
+/// тегов = «тегов нет»").
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawTags {
+    /// Whether to load and apply device tags from [`Self::source`]. Default
+    /// `false` (pre-delegation behaviour): the device has no applied tags.
+    /// Group-delegation envelopes in a chain still reject a no-tags device
+    /// (fail-closed) regardless of this flag — it only governs whether a
+    /// configured source is read.
+    #[serde(default)]
+    pub enforce: bool,
+    /// Trust mode of the source. Default `standalone`.
+    #[serde(default)]
+    pub mode: RawTagsMode,
+    /// Source path: in `standalone` mode the tags file; in `managed` mode the
+    /// directory holding the signed `manifest.toml`. When absent the validated
+    /// layer applies the standalone default (`/var/lib/tessera/tags.toml`); in
+    /// `managed` mode the role-store directory is used.
+    #[serde(default)]
+    pub source: Option<PathBuf>,
 }
 
 /// Migration / enforcement mode for the `[roles]` section.
@@ -372,6 +424,13 @@ pub struct RawTrust {
     /// Pinning.
     #[serde(default)]
     pub pinning: RawPinning,
+    /// Highest `pam_cert_profile_version` this Engine understands
+    /// (tags-delegation §5.2 / trust-chain-validation version-gate). Any chain
+    /// cert declaring a higher version rejects the whole chain (fail-closed).
+    /// When absent the validated layer applies the compiled
+    /// [`crate::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION`].
+    #[serde(default)]
+    pub max_supported_profile_version: Option<u32>,
 }
 
 const fn default_max_chain_depth() -> u32 {

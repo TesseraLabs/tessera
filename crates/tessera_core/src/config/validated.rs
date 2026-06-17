@@ -8,7 +8,7 @@ use crate::config::raw::{
     RawCertIntegrityMode, RawConfig, RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback,
     RawHostIdentity, RawLogging, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor,
     RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocation, RawRevocationMode,
-    RawRoles, RawRolesEnforce, RawTrust, RawTrustOverride, RawUserMapping,
+    RawRoles, RawRolesEnforce, RawTags, RawTagsMode, RawTrust, RawTrustOverride, RawUserMapping,
 };
 use crate::error::TrustError;
 use crate::hooks::{validate_hook, HookConfig};
@@ -91,6 +91,8 @@ pub struct ValidatedConfig {
     pub fly_dm_greeter: FlyDmGreeterSection,
     /// Role-format section (`[roles]`).
     pub roles: RolesSection,
+    /// Device-tags source section (`[tags]`, tags-delegation §5.2).
+    pub tags: TagsSection,
 }
 
 /// Validated `[fly_dm_greeter]` section. See [`RawFlyDmGreeter`] for the
@@ -148,9 +150,7 @@ impl Default for FlyDmGreeterSection {
             update_wallpaper: false,
             wallpaper_target: PathBuf::from("/usr/share/wallpapers/fly-default-light.jpg"),
             wallpaper_backup: PathBuf::from("/var/lib/tessera/wallpaper.orig.jpg"),
-            wallpaper_font: PathBuf::from(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            ),
+            wallpaper_font: PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
             wallpaper_font_size: 64,
             wallpaper_text_color: [0, 0, 0, 255],
             wallpaper_gravity: Gravity::South,
@@ -365,6 +365,46 @@ pub struct TrustSection {
     /// PKI clock-skew tolerance in seconds.  Validator enforces
     /// `<= 600` (ten minutes).
     pub clock_skew_seconds: u64,
+    /// Highest `pam_cert_profile_version` this Engine understands
+    /// (version-gate ceiling). From `[trust].max_supported_profile_version`;
+    /// absent → [`crate::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION`].
+    pub max_supported_profile_version: u32,
+}
+
+/// Trust mode of the device-tags source (`[tags].mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagsMode {
+    /// Local file trusted by filesystem permissions.
+    Standalone,
+    /// Tags ride in the signed `role-store` manifest (shared anti-rollback).
+    Managed,
+}
+
+/// Validated `[tags]` section (tags-delegation §5.2).
+///
+/// Fail-closed semantics: when the raw `[tags]` section is absent, or present
+/// with `enforce = false`, the device has NO applied tags. A group-delegation
+/// `requireTags` envelope in a chain is then unsatisfiable and rejects
+/// (fail-closed); per-host logins without an envelope are unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagsSection {
+    /// Whether to load and apply device tags from [`Self::source`]. When
+    /// `false` the device has no applied tags (default).
+    pub enforce: bool,
+    /// Trust mode of the source.
+    pub mode: TagsMode,
+    /// Source path: standalone tags file, or the managed manifest directory.
+    pub source: PathBuf,
+}
+
+impl Default for TagsSection {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            mode: TagsMode::Standalone,
+            source: PathBuf::from(crate::tags::DEFAULT_TAGS_FILE),
+        }
+    }
 }
 
 /// Validated `[trust.pinning]` section.
@@ -583,8 +623,48 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             mac: validate_mac(&raw.mac)?,
             fly_dm_greeter: validate_fly_dm_greeter(raw.fly_dm_greeter.as_ref())?,
             roles: validate_roles(&raw.roles)?,
+            tags: validate_tags(&raw.tags, &raw.roles)?,
         })
     }
+}
+
+/// Validate the `[tags]` section (tags-delegation §5.2).
+///
+/// Fail-closed defaults: an absent section (all fields default) yields
+/// `enforce = false` + the standalone default path, i.e. the device has no
+/// applied tags. The source path, when set, must be absolute (the trust of the
+/// source is its filesystem location, so a relative path is rejected rather
+/// than silently resolved against an attacker-influenced cwd). In `managed`
+/// mode with no explicit `source`, the role-store directory (`[roles].dir`) is
+/// used so tags ride alongside the role base under one anti-rollback floor.
+fn validate_tags(raw: &RawTags, roles: &RawRoles) -> Result<TagsSection, Error> {
+    let mode = match raw.mode {
+        RawTagsMode::Standalone => TagsMode::Standalone,
+        RawTagsMode::Managed => TagsMode::Managed,
+    };
+    let source = match raw.source.as_ref() {
+        Some(p) => {
+            if !p.is_absolute() {
+                return Err(Error::ConfigInvalid {
+                    reason: format!("[tags].source must be absolute (got {})", p.display()),
+                });
+            }
+            p.clone()
+        }
+        None => match mode {
+            TagsMode::Standalone => PathBuf::from(crate::tags::DEFAULT_TAGS_FILE),
+            // Managed tags live in the role-store manifest directory.
+            TagsMode::Managed => match roles.dir.as_ref() {
+                Some(dir) => dir.clone(),
+                None => PathBuf::from(crate::role::DEFAULT_ROLES_DIR),
+            },
+        },
+    };
+    Ok(TagsSection {
+        enforce: raw.enforce,
+        mode,
+        source,
+    })
 }
 
 fn validate_roles(raw: &RawRoles) -> Result<RolesSection, Error> {
@@ -702,8 +782,12 @@ fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeter
         wallpaper_font_size,
         wallpaper_text_color,
         wallpaper_gravity,
-        wallpaper_offset_x: raw.wallpaper_offset_x.unwrap_or(defaults.wallpaper_offset_x),
-        wallpaper_offset_y: raw.wallpaper_offset_y.unwrap_or(defaults.wallpaper_offset_y),
+        wallpaper_offset_x: raw
+            .wallpaper_offset_x
+            .unwrap_or(defaults.wallpaper_offset_x),
+        wallpaper_offset_y: raw
+            .wallpaper_offset_y
+            .unwrap_or(defaults.wallpaper_offset_y),
         template_ru: raw.template_ru.clone().unwrap_or(defaults.template_ru),
         template_en: raw.template_en.clone().unwrap_or(defaults.template_en),
     })
@@ -1070,6 +1154,10 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
         },
         max_chain_depth: raw.max_chain_depth,
         clock_skew_seconds: raw.clock_skew_seconds,
+        // Absent → compiled baseline default (fail-closed version gate).
+        max_supported_profile_version: raw
+            .max_supported_profile_version
+            .unwrap_or(crate::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION),
     })
 }
 
@@ -1727,9 +1815,8 @@ mod tests {
 
     #[test]
     fn pin_prompt_rejects_too_long() {
-        let err =
-            validate_pin_prompt("pkcs12_pin_prompt", &"x".repeat(PIN_PROMPT_MAX_LEN + 1))
-                .unwrap_err();
+        let err = validate_pin_prompt("pkcs12_pin_prompt", &"x".repeat(PIN_PROMPT_MAX_LEN + 1))
+            .unwrap_err();
         match err {
             Error::ConfigInvalid { reason } => {
                 assert!(reason.contains("pkcs12_pin_prompt"));

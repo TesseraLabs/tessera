@@ -164,6 +164,62 @@ fn extension_value(cert: &X509, target_oid: &str) -> Result<Option<Vec<u8>>, Tru
     Ok(None)
 }
 
+/// Returns the dotted OIDs of every extension marked `critical` in `cert`.
+///
+/// Walks the DER directly because `openssl` 0.10 exposes no API to enumerate
+/// an arbitrary extension's `critical` bit.  An extension whose
+/// `critical BOOLEAN` is present and TRUE is collected; absent (DEFAULT FALSE)
+/// or explicitly FALSE is skipped.  The chain verifier compares the result
+/// against a known-critical allowlist and rejects any unrecognised critical
+/// OID (RFC 5280 §4.2 / `PwnKit` fail-closed).
+///
+/// # Errors
+///
+/// Returns [`TrustError::CertParse`] when the certificate structure is
+/// malformed (the same fail-closed behaviour as [`extension_value`]).
+pub(crate) fn critical_extension_oids(cert: &X509) -> Result<Vec<String>, TrustError> {
+    let der = cert.to_der().map_err(TrustError::Openssl)?;
+    let outer = read_tlv_expect(&der, TAG_SEQUENCE)?;
+    let tbs = read_tlv_expect(outer.value, TAG_SEQUENCE)?;
+    let mut rest = tbs.value;
+    let extensions_octets: Option<&[u8]> = loop {
+        if rest.is_empty() {
+            break None;
+        }
+        let tlv = read_tlv(rest)?;
+        if tlv.tag == 0xA3 {
+            break Some(tlv.value);
+        }
+        rest = tlv.rest;
+    };
+    let Some(ext_outer) = extensions_octets else {
+        return Ok(Vec::new());
+    };
+    let ext_seq = read_tlv_expect(ext_outer, TAG_SEQUENCE)?;
+    let mut walker = ext_seq.value;
+    let mut out: Vec<String> = Vec::new();
+    while !walker.is_empty() {
+        let ext_tlv = read_tlv_expect(walker, TAG_SEQUENCE)?;
+        walker = ext_tlv.rest;
+        let mut inner = ext_tlv.value;
+        let oid = read_tlv_expect(inner, TAG_OID)?;
+        inner = oid.rest;
+        // Optional `critical BOOLEAN DEFAULT FALSE`.  Present-and-nonzero is
+        // critical; absent or zero is not.
+        let mut critical = false;
+        if !inner.is_empty() {
+            let peek = read_tlv(inner)?;
+            if peek.tag == TAG_BOOLEAN {
+                critical = peek.value.first().copied().unwrap_or(0) != 0;
+            }
+        }
+        if critical {
+            out.push(oid_to_dotted(oid.value)?);
+        }
+    }
+    Ok(out)
+}
+
 /// Returns the subject key identifier (the raw octet content of SKI), if present.
 pub(crate) fn ski(cert: &X509) -> Option<Vec<u8>> {
     cert.subject_key_id().map(|id| id.as_slice().to_vec())

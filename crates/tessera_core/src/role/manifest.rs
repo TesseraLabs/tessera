@@ -76,6 +76,15 @@ pub struct Manifest {
     pub signature: String,
     /// Role → pin map. `BTreeMap` for deterministic iteration order.
     pub roles: BTreeMap<RoleId, ManifestRole>,
+    /// Optional device-tags table (`key → value`). The tags ride in the SAME
+    /// signed manifest under the SAME `bundle_version` as the role base (one
+    /// anti-rollback counter, design decision 2). Additive and optional so
+    /// role-only manifests still parse. The map is *raw* here (the signature
+    /// already covers these bytes); strict device-tags validation (non-empty
+    /// key/value, opaque-key semantics) happens in the `tags` module when the
+    /// section is consumed. A duplicate key is rejected by TOML itself.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 /// A manifest that has passed full verification (signature + anti-rollback +
@@ -286,10 +295,9 @@ pub fn verify_signature(
             reason: e.to_string(),
         })?;
     // Ed25519 is pure EdDSA: no message digest, one-shot verify.
-    let mut verifier =
-        Verifier::new_without_digest(&pkey).map_err(|e| ManifestError::Openssl {
-            reason: e.to_string(),
-        })?;
+    let mut verifier = Verifier::new_without_digest(&pkey).map_err(|e| ManifestError::Openssl {
+        reason: e.to_string(),
+    })?;
     let ok = verifier
         .verify_oneshot(&sig, signed_payload)
         .map_err(|e| ManifestError::Openssl {
@@ -341,7 +349,10 @@ pub fn last_accepted_bundle_version(persist_dir: &Path) -> Result<Option<u64>, M
 /// Propagates the underlying I/O error.
 pub fn persist_bundle_version(persist_dir: &Path, v: u64) -> Result<(), ManifestError> {
     let path = persist_dir.join(BUNDLE_VERSION_FILENAME);
-    let tmp = persist_dir.join(format!(".{BUNDLE_VERSION_FILENAME}.{}.tmp", std::process::id()));
+    let tmp = persist_dir.join(format!(
+        ".{BUNDLE_VERSION_FILENAME}.{}.tmp",
+        std::process::id()
+    ));
     let result = (|| -> io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -545,7 +556,10 @@ mod tests {
             "bundle_version = {bundle_version}\nos = \"linux\"\nsignature = \"{sig}\"\n{roles_toml}"
         );
         // Sanity: signed_payload(full) must equal `unsigned`.
-        assert_eq!(signed_payload(full.as_bytes()).unwrap(), unsigned.as_bytes());
+        assert_eq!(
+            signed_payload(full.as_bytes()).unwrap(),
+            unsigned.as_bytes()
+        );
         fs::write(dir.path().join(MANIFEST_FILENAME), full.as_bytes()).unwrap();
 
         (dir, persist)
@@ -555,7 +569,8 @@ mod tests {
     fn signed_payload_strips_signature_line() {
         let file = "bundle_version = 1\nos = \"linux\"\nsignature = \"deadbeef\"\n[roles.a]\nversion = 1\nsha256 = \"x\"\n";
         let payload = signed_payload(file.as_bytes()).unwrap();
-        let expected = "bundle_version = 1\nos = \"linux\"\n[roles.a]\nversion = 1\nsha256 = \"x\"\n";
+        let expected =
+            "bundle_version = 1\nos = \"linux\"\n[roles.a]\nversion = 1\nsha256 = \"x\"\n";
         assert_eq!(payload, expected.as_bytes());
         assert!(!String::from_utf8(payload).unwrap().contains("signature"));
     }
@@ -604,9 +619,15 @@ mod tests {
         verify_manifest(dir10.path(), RoleOs::Linux, &key.pub_pem, persist.path()).unwrap();
         // Now present a version-5 bundle against the same persist dir.
         let (dir5, _p) = build_bundle(&key, 5, &[("oper", 1)]);
-        let err = verify_manifest(dir5.path(), RoleOs::Linux, &key.pub_pem, persist.path())
-            .unwrap_err();
-        assert!(matches!(err, ManifestError::Rollback { found: 5, persisted: 10 }));
+        let err =
+            verify_manifest(dir5.path(), RoleOs::Linux, &key.pub_pem, persist.path()).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::Rollback {
+                found: 5,
+                persisted: 10
+            }
+        ));
         // Floor unchanged.
         assert_eq!(
             last_accepted_bundle_version(persist.path()).unwrap(),
@@ -637,8 +658,13 @@ mod tests {
         let attacker_view = gen_key();
         let (dir, persist) = build_bundle(&signer, 1, &[("oper", 1)]);
         // Verify with a DIFFERENT trusted key than the one that signed.
-        let err = verify_manifest(dir.path(), RoleOs::Linux, &attacker_view.pub_pem, persist.path())
-            .unwrap_err();
+        let err = verify_manifest(
+            dir.path(),
+            RoleOs::Linux,
+            &attacker_view.pub_pem,
+            persist.path(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ManifestError::BadSignature));
     }
 

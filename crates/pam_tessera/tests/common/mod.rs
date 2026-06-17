@@ -23,9 +23,7 @@ use tessera_core::ipc::StubClient;
 use tessera_core::trust::openssl_verifier::{OpensslVerifier, OpensslVerifierConfig};
 use tessera_core::x509::Certificate;
 
-use pam_tessera::flow::{
-    authenticate, Deps, FlowError, FlowOutcome, InMemoryFlowIo, NoopMountOps,
-};
+use pam_tessera::flow::{authenticate, Deps, FlowError, FlowOutcome, InMemoryFlowIo, NoopMountOps};
 
 use secrecy::SecretString;
 
@@ -56,6 +54,8 @@ pub fn build_verifier(crl_pems: Vec<Vec<u8>>) -> OpensslVerifier {
     let ca = Certificate::from_pem(&fixture_bytes("ca.pem")).unwrap();
     let int_ = Certificate::from_pem(&fixture_bytes("int.pem")).unwrap();
     OpensslVerifier::new(OpensslVerifierConfig {
+        max_supported_profile_version:
+            tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         anchors: vec![ca],
         intermediates: vec![int_],
         crl_pems,
@@ -171,6 +171,7 @@ pub fn run_flow_with(
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
         role_stage: pam_tessera::flow::RoleStage::disabled(),
+        device_tags: pam_tessera::flow::empty_device_tags(),
     };
 
     let io = InMemoryFlowIo::new(tmp.path().to_path_buf());

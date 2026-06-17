@@ -27,6 +27,8 @@ mandatory-extension policy).
 | `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | `extnValue ::= SEQUENCE OF UTF8String` |
 | `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | `extnValue ::= SEQUENCE OF UTF8String` |
 | `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | `extnValue ::= SEQUENCE OF UTF8String` |
+| `pam_cert_profile_version` | `2.25.107983357797077476746994938370032043240` | `extnValue ::= INTEGER` (**critical**) |
+| `pam_cert_delegation_constraints` | `2.25.242193075883906031821745064285793775511` | `SEQUENCE { requireTags, allowRoles, maxLevel, maxTtl }` (**critical**, только `CA=TRUE`) |
 
 OID размещены в нерегистрируемой ветке `2.25.<UUID>` (RFC 4530), что
 гарантирует уникальность без обращения к внешнему реестру. Эти значения
@@ -230,6 +232,108 @@ e1 = UTF8String:serv
 DER здесь: `SEQUENCE` (30 0c) → `UTF8String "oper"` (0c 04 6f 70 65 72) →
 `UTF8String "serv"` (0c 04 73 65 72 76). Расширение non-critical (без
 префикса `critical,`).
+
+## Расширение `profile_version` (version-gate, tags-delegation)
+
+`pam_cert_profile_version` — **critical** X.509 v3-расширение, несущее
+целочисленную версию формата серта. Engine знает `max_supported_profile_version`
+(конфиг `[trust].max_supported_profile_version`, дефолт `0`); серт **любого**
+звена цепи с версией выше → reject всей цепи (fail-closed version-gate). Это
+второй слой защиты от эволюции формата: непонятый critical-OID отвергается по
+RFC, а понятый, но более новый профиль — version-gate'ом.
+
+OID: `2.25.107983357797077476746994938370032043240`
+
+Структура (DER):
+
+```asn1
+extnValue ::= INTEGER
+```
+
+Извлечение — только из верифицированного серта (`VerifiedX509`). Malformed (не
+INTEGER) или отрицательное значение → reject (audit `profile_version_rejected`).
+Отсутствие расширения = baseline (версия `0`), допускается.
+
+Фрагмент `openssl.cnf` для версии `1`:
+
+```ini
+2.25.107983357797077476746994938370032043240 = critical,ASN1:INTEGER:1
+```
+
+Эквивалент DER-строкой (`INTEGER 1`): `critical,DER:02:01:01`.
+
+## Расширение `delegation_constraints` (рамки делегирования, tags-delegation)
+
+`pam_cert_delegation_constraints` — **critical** X.509 v3-расширение, валидное
+**только на серте с `basicConstraints CA=TRUE`** (на листе → malformed → reject).
+Объявляет конверт делегирования выпускающего CA: на какую группу устройств (по
+тегам), какие роли, потолок уровня и TTL он вправе выпускать. Гарантия
+проверяется на устройстве офлайн против собственных подписанных тегов, по
+логическому И/MIN ко **всем** CA-звеньям цепи (misissued дочерний CA не
+вырывается из родительского конверта).
+
+OID: `2.25.242193075883906031821745064285793775511`
+
+Структура (DER):
+
+```asn1
+DelegationConstraints ::= SEQUENCE {
+    requireTags  SEQUENCE OF SEQUENCE { key UTF8String, value UTF8String },
+    allowRoles   SEQUENCE OF UTF8String,   -- каждый — валидный role_id
+    maxLevel     INTEGER,                  -- потолок МКЦ-уровня (-128..127)
+    maxTtl       INTEGER                   -- потолок срока звена, секунды
+}
+```
+
+Семантика на устройстве: `device.tags ⊇ requireTags` (generic-сравнение пар,
+без хардкода имён ключей); запрошенная роль ∈ `allowRoles`; запрошенный уровень
+`≤ maxLevel`; срок дочернего звена `≤ maxTtl`. Любое нарушение → reject (audit
+`delegation_denied`; инженеру — обобщённая причина). Извлечение — только из
+`VerifiedX509`; malformed или невалидный `role_id` → reject.
+
+Фрагмент `openssl.cnf` через `ASN1:SEQUENCE` (CA для `region=north`, роли
+`oper`/`serv`, уровень ≤ 5, TTL ≤ 14400 с):
+
+```ini
+# Только на CA-серте (basicConstraints CA:TRUE)
+2.25.242193075883906031821745064285793775511 = critical,ASN1:SEQUENCE:deleg
+
+[ deleg ]
+field1 = SEQUENCE:require_tags
+field2 = SEQUENCE:allow_roles
+field3 = INTEGER:5            # maxLevel
+field4 = INTEGER:14400        # maxTtl
+
+[ require_tags ]
+t0 = SEQUENCE:tag_region
+
+[ tag_region ]
+key = UTF8String:region
+val = UTF8String:north
+
+[ allow_roles ]
+r0 = UTF8String:oper
+r1 = UTF8String:serv
+```
+
+Эквивалент DER-строкой:
+
+```ini
+2.25.242193075883906031821745064285793775511 = critical,DER:30:28:30:11:30:0f:0c:06:72:65:67:69:6f:6e:0c:05:6e:6f:72:74:68:30:0c:0c:04:6f:70:65:72:0c:04:73:65:72:76:02:01:05:02:02:38:40
+```
+
+DER: `SEQUENCE`(30 28){ `SEQUENCE`(30 11) requireTags { `SEQUENCE`(30 0f){
+`UTF8String "region"`, `UTF8String "north"` } }, `SEQUENCE`(30 0c) allowRoles {
+`UTF8String "oper"`, `UTF8String "serv"` }, `INTEGER 5`(02 01 05),
+`INTEGER 14400`(02 02 38 40) }.
+
+**Монотонное сужение.** Дочерний CA ДОЛЖЕН выпускать конверт ⊆ родительского
+(больше `requireTags`, подмножество `allowRoles`, не больший `maxLevel`/`maxTtl`)
+— ранний отказ и ясность; но безопасность не зависит от честности звеньев:
+Engine применяет рамки каждого CA по И, так что более широкий дочерний конверт
+не расширяет права. Пример сужения: родитель `requireTags{region:north}`,
+`allowRoles{oper,serv,admin}`, `maxLevel:7`; дочерний регион-CA
+`requireTags{region:north,site:hq}`, `allowRoles{oper,serv}`, `maxLevel:5`.
 
 ## Workflow для клонированных образов
 

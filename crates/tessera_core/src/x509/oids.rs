@@ -30,8 +30,32 @@ pub const MAX_INTEGRITY_OID: &str = "2.25.27382430738600881450645531091308307840
 /// Non-critical. Allocated 2026-06 (RFC 4530 2.25.<UUID> arc).
 pub const ALLOWED_ROLES_OID: &str = "2.25.185305973969816596290730578528098241367";
 
-// Planned (openspec/changes/tags-delegation/): OIDs for the critical extensions
-// `pam_cert_delegation_constraints` (requireTags / allowRoles / maxLevel /
-// maxTtl delegation envelope, valid only on CA=TRUE certs) and
-// `pam_cert_profile_version` (integer version gate; certs above
-// `max_supported_profile_version` reject the whole chain, fail-closed).
+/// OID of the `pam_cert_delegation_constraints` X.509 extension.
+///
+/// `extnValue ::= SEQUENCE { requireTags SEQUENCE OF SEQUENCE { key UTF8String, value UTF8String },
+/// allowRoles SEQUENCE OF UTF8String, maxLevel INTEGER, maxTtl INTEGER }`.
+/// Carries the delegation envelope on an intermediate CA: every chain link's
+/// envelope is applied with AND/MIN semantics so a misissued child CA cannot
+/// widen the scope it inherited.  Valid **only** on a cert with
+/// basicConstraints `cA = TRUE`; presence on a leaf (`cA = FALSE`) is malformed
+/// and rejects the chain.
+///
+/// **Critical.** Unlike the leaf scope extensions (all non-critical), ignoring
+/// this extension would bypass the delegation envelope, so a verifier that does
+/// not understand it MUST reject the certificate.  Allocated 2026-06 from the
+/// RFC 4530 `2.25.<UUID>` arc (UUID `b634b091-47d7-4e54-a0fc-3f7dc4a56f97`).
+pub const DELEGATION_CONSTRAINTS_OID: &str = "2.25.242193075883906031821745064285793775511";
+
+/// OID of the `pam_cert_profile_version` X.509 extension.
+///
+/// `extnValue ::= INTEGER`.  Declares the certificate-format version; the chain
+/// verifier rejects any cert whose value exceeds
+/// `max_supported_profile_version` (fail-closed version gate — the comparison
+/// itself lives in `trust-chain-validation`; this OID names the format and
+/// extraction).
+///
+/// **Critical.** A verifier that does not understand this extension MUST reject
+/// the certificate rather than silently skip the version gate.  Allocated
+/// 2026-06 from the RFC 4530 `2.25.<UUID>` arc (UUID
+/// `513cd696-16f7-4de7-8b14-f675c71284e8`).
+pub const PROFILE_VERSION_OID: &str = "2.25.107983357797077476746994938370032043240";
