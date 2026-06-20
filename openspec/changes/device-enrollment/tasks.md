@@ -15,8 +15,8 @@
 
 ## 3. clone-image-bootstrap CA-контракт (docs)
 
-- [ ] 3.1 `docs/clone-image.md`: шаг — на возврате USB CA отдаёт подписанный manifest (теги+роли+CRL) рядом с per-host сертом; формат enrollment-пакета как контракт CA-стороны
-- [ ] 3.2 Зафиксировать: назначение тегов = серверная сторона (Control inventory `hash_hex`→теги / оператор при установке)
+- [x] 3.1 `docs/clone-image.md`: шаг — на возврате USB CA отдаёт подписанный manifest (теги+роли+CRL) рядом с per-host сертом; формат enrollment-пакета как контракт CA-стороны
+- [x] 3.2 Зафиксировать: назначение тегов = серверная сторона (Control inventory `hash_hex`→теги / оператор при установке)
 
 ## 4. Аудит
 
@@ -24,6 +24,6 @@
 
 ## 5. Проверка
 
-- [ ] 5.1 `openspec validate device-enrollment --strict` зелёный
-- [ ] 5.2 Интеграционный тест: клон → flip → импорт managed-пакета (теги region:north) → вход по per-host серту с групповым листом проходит; импорт с меньшим bundle_version отвергается
-- [ ] 5.3 Интеграционный тест standalone: раскатка без сервера — файл тегов + роли под FS-perms, вход работает
+- [x] 5.1 `openspec validate device-enrollment --strict` зелёный
+- [x] 5.2 Интеграционный тест: клон → flip → импорт managed-пакета (теги region:north) → вход по per-host серту с групповым листом проходит; импорт с меньшим bundle_version отвергается
+- [x] 5.3 Интеграционный тест standalone: раскатка без сервера — файл тегов + роли под FS-perms, вход работает
