@@ -22,6 +22,7 @@ pub mod actions;
 pub mod check;
 pub mod daemon;
 pub mod dump_host_id;
+pub mod enroll;
 pub mod fly_dm_wallpaper_writer;
 pub mod logging;
 pub mod logind;

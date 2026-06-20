@@ -9,9 +9,9 @@
 
 ## 2. CLI enrollment (tessera_cli)
 
-- [ ] 2.1 Подкоманда `tessera enroll --import <путь|USB>` после `finish-bootstrap`: импорт пакета, отчёт (host_id prefix8, serial, bundle_version, режим)
-- [ ] 2.2 Standalone-режим: `tessera enroll --standalone` — раскладка файла тегов + ролей под FS-perms (без подписи), для раскатки без сервера
-- [ ] 2.3 `tessera check` после импорта; провал → откат, exit ≠ 0 (fail-closed)
+- [x] 2.1 Подкоманда `tessera enroll --import <путь|USB>` после `finish-bootstrap`: импорт пакета, отчёт (host_id prefix8, serial, bundle_version, режим)
+- [x] 2.2 Standalone-режим: `tessera enroll --standalone` — раскладка файла тегов + ролей под FS-perms (без подписи), для раскатки без сервера
+- [x] 2.3 `tessera check` после импорта; провал → откат, exit ≠ 0 (fail-closed)
 
 ## 3. clone-image-bootstrap CA-контракт (docs)
 
@@ -20,7 +20,7 @@
 
 ## 4. Аудит
 
-- [ ] 4.1 `logging-audit`: событие `device_enrolled` (host_id prefix8, serial per-host серта, bundle_version, режим standalone/managed)
+- [x] 4.1 `logging-audit`: событие `device_enrolled` (host_id prefix8, serial per-host серта, bundle_version, режим standalone/managed)
 
 ## 5. Проверка
 
