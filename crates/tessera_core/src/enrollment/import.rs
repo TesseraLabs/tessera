@@ -340,13 +340,52 @@ impl EnrollmentPackage {
         device_os: RoleOs,
         trusted_pubkey: Option<&[u8]>,
     ) -> Result<ImportOutcome, ImportError> {
-        match self.mode {
-            ImportMode::Managed => {
-                let key = trusted_pubkey.ok_or(ImportError::MissingKey)?;
-                self.install_managed(paths, device_os, key)
-            }
+        self.install_with_ids(
+            paths,
+            device_os,
+            trusted_pubkey,
+            audit::EnrollAuditIds::default(),
+        )
+    }
+
+    /// Like [`Self::install`], but emits the enrollment audit event enriched
+    /// with the CLI-supplied `host_id` prefix8 and per-host certificate serial
+    /// ([`audit::EnrollAuditIds`]). This is the single emission point for the
+    /// `device_enrolled` / `enrollment_rejected` events, so the CLI gets exactly
+    /// one enriched event per import (no double-emit). A managed re-import of the
+    /// already-applied `bundle_version` is a no-op and emits nothing.
+    ///
+    /// # Errors
+    ///
+    /// Any [`ImportError`]; on `Err` the device is unchanged and an
+    /// `enrollment_rejected` event was emitted. A managed install without a
+    /// `trusted_pubkey` is [`ImportError::MissingKey`].
+    pub fn install_with_ids(
+        &self,
+        paths: &InstallPaths,
+        device_os: RoleOs,
+        trusted_pubkey: Option<&[u8]>,
+        ids: audit::EnrollAuditIds<'_>,
+    ) -> Result<ImportOutcome, ImportError> {
+        let result = match self.mode {
+            ImportMode::Managed => match trusted_pubkey {
+                Some(key) => self.install_managed(paths, device_os, key),
+                None => Err(ImportError::MissingKey),
+            },
             ImportMode::Standalone => self.install_standalone(paths, device_os),
+        };
+        match &result {
+            // A no-op (same bundle already applied) changed nothing, so it
+            // emits no `device_enrolled`.
+            Ok(o) if !o.no_op => {
+                audit::emit_device_enrolled_full(self.mode.label(), o.bundle_version, ids);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                audit::emit_enrollment_rejected_full(reason_for(e), ids);
+            }
         }
+        result
     }
 
     /// Standalone install: validate role slices + tags file under FS-perms,
@@ -400,7 +439,6 @@ impl EnrollmentPackage {
         match install_result {
             Ok(()) => {
                 stage_guard.disarm();
-                audit::emit_device_enrolled(self.mode.label(), 0);
                 Ok(ImportOutcome {
                     mode: self.mode,
                     bundle_version: 0,
@@ -408,10 +446,7 @@ impl EnrollmentPackage {
                     no_op: false,
                 })
             }
-            Err(e) => {
-                audit::emit_enrollment_rejected(reason_for(&e));
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1082,13 +1117,9 @@ impl EnrollmentPackage {
         match outcome {
             Ok(o) => {
                 stage_guard.disarm();
-                audit::emit_device_enrolled(self.mode.label(), o.bundle_version);
                 Ok(o)
             }
-            Err(e) => {
-                audit::emit_enrollment_rejected(reason_for(&e));
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 }
