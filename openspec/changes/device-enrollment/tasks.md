@@ -2,10 +2,10 @@
 
 ## 1. Импорт enrollment-пакета (tessera_core, открытое)
 
-- [ ] 1.1 Модуль `enrollment/import.rs`: разбор enrollment-пакета (per-host `.p12` + manifest тегов/ролей/CRL); managed — верификация подписи + `bundle_version` (переиспользовать `role-store`); standalone — раскладка файлов под FS-perms
-- [ ] 1.2 Baseline anti-rollback: персист первого принятого `bundle_version`; реплей меньшего → reject; тесты (baseline, rollback, повтор=no-op, больший=применён)
-- [ ] 1.3 Идемпотентность: повторный импорт того же manifest — no-op; частичный сбой импорта → атомарный откат (tmp → rename), устройство в прежнем состоянии (fail-closed)
-- [ ] 1.4 Источник тегов: импортированные теги попадают в доверенный источник `device-tags`; произвольный локальный конфиг тегов НЕ принимается
+- [x] 1.1 Модуль `enrollment/import.rs`: разбор enrollment-пакета (per-host `.p12` + manifest тегов/ролей/CRL); managed — верификация подписи + `bundle_version` (переиспользовать `role-store`); standalone — раскладка файлов под FS-perms
+- [x] 1.2 Baseline anti-rollback: персист первого принятого `bundle_version`; реплей меньшего → reject; тесты (baseline, rollback, повтор=no-op, больший=применён)
+- [x] 1.3 Идемпотентность: повторный импорт того же manifest — no-op; частичный сбой импорта → атомарный откат (tmp → rename), устройство в прежнем состоянии (fail-closed)
+- [x] 1.4 Источник тегов: импортированные теги попадают в доверенный источник `device-tags`; произвольный локальный конфиг тегов НЕ принимается
 
 ## 2. CLI enrollment (tessera_cli)
 

@@ -20,7 +20,8 @@ pub mod update;
 
 pub use manifest::{
     last_accepted_bundle_version, parse_manifest, persist_bundle_version, signed_payload,
-    verify_manifest, verify_signature, Manifest, ManifestError, ManifestRole, VerifiedManifest,
+    verify_manifest, verify_signature, Manifest, ManifestCrl, ManifestError, ManifestRole,
+    VerifiedManifest,
 };
 pub use schema::{
     parse_slice, Payload, RoleId, RoleOs, RoleSchemaError, RoleSlice, SessionLimits,
