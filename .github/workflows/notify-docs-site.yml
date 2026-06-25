@@ -12,10 +12,22 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     steps:
+      - name: Mint dispatch token for tessera-website (GitHub App)
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: token
+        with:
+          # App tessera-docs-ci. Client ID не секретен; приватный ключ — в secrets.
+          client-id: Iv23liI25MSVnW6XhXaF
+          private-key: ${{ secrets.TESSERA_APP_PRIVATE_KEY }}
+          owner: TesseraLabs
+          repositories: tessera-website
+
       - name: Trigger docs site rebuild
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           curl -sf -X POST \
-            -H "Authorization: Bearer ${{ secrets.DOCS_SITE_DISPATCH_TOKEN }}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/RoboNET/tessera-website/dispatches \
+            https://api.github.com/repos/TesseraLabs/tessera-website/dispatches \
             -d '{"event_type":"docs-updated"}'
