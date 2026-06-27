@@ -64,6 +64,26 @@ pub struct ManifestRole {
     pub sha256: String,
 }
 
+/// Pin for a co-located CRL file shipped with the bundle (enrollment first
+/// bundle delivers роли+CRL — see `device-enrollment`). The CRL bytes live in
+/// a file next to the manifest; this pin (filename + SHA-256) rides the SAME
+/// signature and `bundle_version` as the role base, so the CRL inherits the
+/// managed trust without a second signature or anti-rollback counter.
+///
+/// `verify_manifest` itself does not consult this field (it gates only the
+/// role slices); the enrollment importer verifies the CRL file against this
+/// signed pin after the manifest verifies, then installs the CRL. The field is
+/// additive and optional so role/tag-only manifests still parse.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestCrl {
+    /// CRL file name, relative to the manifest directory (e.g. `device.crl`).
+    /// A bare file name (no path separators) — validated by the consumer.
+    pub file: String,
+    /// SHA-256 over the raw CRL file bytes, lowercase hex.
+    pub sha256: String,
+}
+
 /// Parsed `manifest.toml` (strict: `deny_unknown_fields`).
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +105,23 @@ pub struct Manifest {
     /// section is consumed. A duplicate key is rejected by TOML itself.
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    /// Optional co-located CRL pin. When present, the enrollment importer
+    /// verifies and installs the CRL named here under the SAME signature and
+    /// `bundle_version` as the rest of the bundle (one anti-rollback floor).
+    /// Additive and optional so role/tag-only manifests still parse. The
+    /// signature already covers these bytes; `verify_manifest` does not act on
+    /// this field — installation is an enrollment-layer step.
+    #[serde(default)]
+    pub crl: Option<ManifestCrl>,
+    /// Optional SHA-256 pin (lowercase hex) over the raw per-host `.p12` bytes,
+    /// in the same CRL-pin style. When present, the enrollment importer verifies
+    /// the shipped `.p12` against it before installing — closing the last
+    /// otherwise-unauthenticated managed byte stream. The `.p12` is still placed
+    /// as-is and never decrypted; this pin only authenticates its bytes under
+    /// the SAME signature and `bundle_version`. Additive and optional so older
+    /// manifests still parse. `verify_manifest` does not act on this field.
+    #[serde(default)]
+    pub p12_sha256: Option<String>,
 }
 
 /// A manifest that has passed full verification (signature + anti-rollback +

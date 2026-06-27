@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use tessera_cli::check::{self, CheckArgs};
 use tessera_cli::daemon::{self, DaemonArgs};
 use tessera_cli::dump_host_id::{self, DumpHostIdArgs};
+use tessera_cli::enroll::{self, EnrollArgs};
 use tessera_cli::role::{self, RoleArgs};
 use tessera_cli::tags::{self, TagsArgs};
 
@@ -43,11 +44,14 @@ enum Cmd {
     /// `tags show` prints the applied `key=value` set (empty if none);
     /// `tags lint <file>` exits non-zero on any malformed tags file.
     Tags(TagsArgs),
-    // Planned (openspec/changes/device-enrollment/): `import-enrollment`
-    // subcommand — import the enrollment package after `finish-bootstrap`
-    // (per-host cert + device tags + first roles/tags/CRL bundle), recording
-    // the baseline `bundle_version` (anti-rollback); re-importing the same
-    // package is a no-op.
+    /// Import an enrollment package after `finish-bootstrap` (per-host cert +
+    /// device tags + first roles/tags/CRL bundle). Managed
+    /// (`--manifest-pubkey`) verifies the signed manifest + anti-rollback
+    /// `bundle_version`; `--standalone` trusts the package by filesystem
+    /// permissions (server-less rollout). Re-importing the same managed bundle
+    /// is a no-op. Runs `tessera check` after import and exits non-zero if it
+    /// fails (fail-closed); the import core guarantees atomic rollback.
+    Enroll(EnrollArgs),
     // Planned (openspec/changes/device-lifecycle/): `un-enroll` subcommand —
     // reverse-flip the config back to `override="installation"` and wipe the
     // per-host cert/keys, tags, role set, `bundle_version` persist, and the
@@ -62,5 +66,6 @@ fn main() -> ExitCode {
         Cmd::DumpHostId(args) => dump_host_id::run_cli(args),
         Cmd::Role(args) => role::run(args),
         Cmd::Tags(args) => tags::run(args),
+        Cmd::Enroll(args) => enroll::run_cli(args),
     }
 }

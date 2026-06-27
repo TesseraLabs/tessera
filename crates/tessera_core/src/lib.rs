@@ -15,6 +15,7 @@ pub mod challenge;
 pub mod config;
 pub mod crl;
 pub mod discovery;
+pub mod enrollment;
 pub mod error;
 pub mod gost;
 pub mod hooks;
@@ -40,6 +41,7 @@ pub mod usb;
 pub mod x509;
 
 pub use config::{RawConfig, ValidatedConfig};
+pub use enrollment::{EnrollmentPackage, ImportError, ImportMode, ImportOutcome, InstallPaths};
 pub use error::{Error, SelfCheckError};
 pub use logging::{LogLevel, SyslogFacility};
 pub use secret::Secret;
