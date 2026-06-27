@@ -30,15 +30,15 @@ jobs:
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_PAT }}
         with:
           path-to-signatures: 'signatures/version-1/cla.json'
-          path-to-document: 'https://github.com/RoboNET/tessera/blob/main/docs/cla/CLA-individual.md'
+          path-to-document: 'https://github.com/TesseraLabs/tessera/blob/main/docs/cla/CLA-individual.md'
           branch: 'main'
-          remote-organization-name: 'RoboNET'
+          remote-organization-name: 'TesseraLabs'
           remote-repository-name: 'cla-signatures'
-          allowlist: 'RoboNET,dependabot[bot],*[bot]'
+          allowlist: 'TesseraLabs,dependabot[bot],*[bot]'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-notsigned-prcomment: >
             Thank you for your contribution! Before we can merge it, you need
-            to sign our [Contributor License Agreement](https://github.com/RoboNET/tessera/blob/main/docs/cla/CLA-individual.md).
+            to sign our [Contributor License Agreement](https://github.com/TesseraLabs/tessera/blob/main/docs/cla/CLA-individual.md).
             Please post the following comment, adding your **full name** on the
             second line:<br/><br/>`I have read the CLA Document and I hereby sign the CLA`<br/>`Full name: <your full legal name>`
           custom-allsigned-prcomment: 'All contributors have signed the CLA ✍️'
