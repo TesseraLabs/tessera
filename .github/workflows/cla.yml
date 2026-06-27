@@ -37,7 +37,7 @@ jobs:
           branch: 'main'
           remote-organization-name: 'TesseraLabs'
           remote-repository-name: 'cla-signatures'
-          allowlist: 'TesseraLabs,dependabot[bot],*[bot]'
+          allowlist: 'RoboNET,TesseraLabs,dependabot[bot],*[bot]'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-notsigned-prcomment: >
             Thank you for your contribution! Before we can merge it, you need
