@@ -35,7 +35,7 @@ jobs:
           file: docker/astra-builder.Dockerfile
           push: true
           tags: |
-            ghcr.io/robonet/tessera-astra-builder:latest
-            ghcr.io/robonet/tessera-astra-builder:${{ github.sha }}
+            ghcr.io/tesseralabs/tessera-astra-builder:latest
+            ghcr.io/tesseralabs/tessera-astra-builder:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

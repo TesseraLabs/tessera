@@ -637,10 +637,10 @@ fn partial_import_failure_rolls_back_to_prior_state() {
 
 #[test]
 fn phase2_io_failure_does_not_advance_floor_or_roles() {
-    // C1 regression: a phase-2 (CRL/.p12) I/O failure AFTER the staged role
-    // base is otherwise valid must NOT leave the device half-enrolled. The
-    // invariant is: there is no observable state where roles/floor advanced
-    // while the CRL or .p12 are stale. Prior state must be fully retained.
+    // A phase-2 (CRL/.p12) I/O failure AFTER the staged role base is otherwise
+    // valid must NOT leave the device half-enrolled. The invariant is: there is
+    // no observable state where roles/floor advanced while the CRL or .p12 are
+    // stale. Prior state must be fully retained.
     let key = gen_key();
     let root = tempfile::tempdir().unwrap();
 
@@ -693,19 +693,32 @@ fn phase2_io_failure_does_not_advance_floor_or_roles() {
         },
     );
 
-    // Make the artefacts dir unwritable: 0500 (read+exec, no write) so the new
-    // temp files for the CRL/.p12 cannot be created.
-    fs::set_permissions(&artefacts, PermissionsExt::from_mode(0o500)).unwrap();
+    // Inject the phase-2 failure structurally, not via permission bits: when the
+    // CRL is published, its prior file is first moved aside to a deterministic
+    // `<crl>.bak` sibling. Pre-create that sibling as a directory so the
+    // `rename(device.crl -> device.crl.bak)` fails with EISDIR. Renaming a
+    // regular file onto an existing directory is a filesystem structural error
+    // that root cannot bypass (unlike a chmod'd dir, which root ignores), so the
+    // failure fires uniformly whether or not the test runs as root. The prior
+    // device.crl is left untouched (its rename never completes), and the .p12 /
+    // roles / floor are never reached, so every prior-state assertion still holds.
+    let crl_bak = artefacts.join("device.crl.bak");
+    fs::create_dir(&crl_bak).unwrap();
 
     let result = EnrollmentPackage::parse(pkg6.path(), ImportMode::Managed)
         .unwrap()
         .install(&paths, RoleOs::Linux, Some(&key.pub_pem));
 
-    // Restore write perms so the assertions below (and tempdir cleanup) work.
-    fs::set_permissions(&artefacts, PermissionsExt::from_mode(0o755)).unwrap();
-
-    // The install must fail (the CRL/.p12 could not be written).
-    assert!(result.is_err(), "expected phase-2 I/O failure, got Ok");
+    // The failure must be exactly the CRL-publish I/O error, not some unrelated
+    // earlier failure that would leave prior state intact for the wrong reason.
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, ImportError::Io { path, .. } if path.ends_with("device.crl")),
+        "expected CRL-publish I/O failure, got {err:?}"
+    );
+    // The obstructing directory must still be present: confirm the rename
+    // collision actually happened rather than the decoy being consumed.
+    assert!(crl_bak.is_dir());
 
     // INVARIANT: device fully in its prior state. With the pre-fix ordering
     // (role swap + floor persist BEFORE the CRL/.p12 commit) these assertions
