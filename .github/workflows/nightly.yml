@@ -43,7 +43,7 @@ jobs:
             container: ""
             test_cmd: "cargo test --workspace --release"
           - id: astra
-            container: "ghcr.io/robonet/tessera-astra-builder:latest"
+            container: "ghcr.io/tesseralabs/tessera-astra-builder:latest"
             test_cmd: "cargo nextest run --workspace --release"
     name: nightly (${{ matrix.target.id }})
     # Те же release-knobs, что в build.yml/.deb — иначе nightly

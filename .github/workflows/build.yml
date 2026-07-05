@@ -49,7 +49,7 @@ jobs:
             artifact_name: tessera-deb-ubuntu
             skip_lintian: false
           - id: astra
-            container: "ghcr.io/robonet/tessera-astra-builder:latest"
+            container: "ghcr.io/tesseralabs/tessera-astra-builder:latest"
             # Открытая сборка: без МКЦ-FFI (закрытый crate tessera_mac_parsec
             # живёт в tessera-enterprise; коммерческий CI — там же).
             features: ""
