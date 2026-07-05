@@ -25,6 +25,7 @@ use tessera_core::config::ValidatedConfig;
 
 pub mod host_identity;
 pub mod mac_runtime;
+pub mod mrd;
 pub mod pam_stack;
 pub mod parsec_caps;
 pub mod trust;
@@ -173,6 +174,10 @@ pub struct StartupCheckOptions {
     /// real probe is used (via `astra-mac` FFI when compiled in, otherwise
     /// always-absent on dev/host builds).
     pub kernel_parsec_probe: Option<KernelParsecProbe>,
+    /// Optional injected probe for the mandatory confidentiality control (МРД)
+    /// axis. When `None`, the real probe is used (via `astra-mac` FFI when
+    /// compiled in, otherwise `Unknown` on dev/host builds).
+    pub mrd_probe: Option<MrdProbe>,
 }
 
 impl Default for StartupCheckOptions {
@@ -181,6 +186,7 @@ impl Default for StartupCheckOptions {
             pam_d_root: PathBuf::from("/etc/pam.d"),
             fs_root: None,
             kernel_parsec_probe: None,
+            mrd_probe: None,
         }
     }
 }
@@ -221,6 +227,26 @@ pub fn real_kernel_parsec_probe() -> KernelParsecState {
     }
 }
 
+/// Function pointer for injecting a mandatory-confidentiality-control (МРД)
+/// probe.
+pub type MrdProbe = fn() -> tessera_core::mac::MrdState;
+
+/// Production probe: calls into the real FFI when `astra-mac` is on,
+/// otherwise reports `Unknown` (the confidentiality axis is invisible to
+/// open builds).
+#[must_use]
+pub fn real_mrd_probe() -> tessera_core::mac::MrdState {
+    #[cfg(feature = "astra-mac")]
+    {
+        // Cheap, side-effect free; documented to be safe in any state.
+        tessera_mac_parsec::probe_mrd()
+    }
+    #[cfg(not(feature = "astra-mac"))]
+    {
+        tessera_core::mac::MrdState::Unknown
+    }
+}
+
 /// Run the full startup-check pipeline.
 ///
 /// Always runs every check (so the operator sees the complete picture in a
@@ -236,6 +262,9 @@ pub fn run_startup_checks(cfg: &ValidatedConfig, opts: &StartupCheckOptions) -> 
     let kernel = probe();
     mac_runtime::check(cfg, kernel, &mut report);
 
+    let mrd = opts.mrd_probe.unwrap_or(real_mrd_probe)();
+    mrd::check(cfg, mrd, &mut report);
+
     trust::check_anchors(cfg, &mut report);
     trust::check_ca_dir_permissions(opts.fs_root.as_deref(), &mut report);
 
@@ -250,6 +279,7 @@ pub fn run_startup_checks(cfg: &ValidatedConfig, opts: &StartupCheckOptions) -> 
 /// tests) have a single import surface.
 pub use crate::startup_check::{
     mac_runtime::check as check_mac_runtime,
+    mrd::check as check_mrd,
     pam_stack::check as check_pam_stack,
     parsec_caps::check as check_parsec_caps,
     trust::{check_anchors as check_trust_anchors, check_ca_dir_permissions},
