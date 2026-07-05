@@ -1,4 +1,4 @@
-//! Mandatory Access Control (МКЦ) integration: types, traits, SPI.
+//! Mandatory integrity control (МКЦ) integration: types, traits, SPI.
 //!
 //! See `docs/superpowers/specs/2026-05-14-mac-integrity-design.md`.
 //!
@@ -15,5 +15,5 @@ pub mod orchestrator;
 
 #[cfg(feature = "mac-tests")]
 pub use backend::MockMacBackend;
-pub use backend::{MacBackend, MacError, MacRuntime, StubBackend};
+pub use backend::{MacBackend, MacError, MacRuntime, MrdState, StubBackend};
 pub use label::IntegrityLabel;

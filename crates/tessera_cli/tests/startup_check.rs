@@ -22,6 +22,7 @@ use tessera_cli::startup_check::{
 };
 use tessera_core::config::validated::MacRuntimeMode;
 use tessera_core::config::{load_validated_config, ValidatedConfig};
+use tessera_core::mac::MrdState;
 
 /// Helper: minimal config TOML mirroring `fixtures/full_valid.toml` but
 /// parameterised on anchor path, mac runtime, and `host_identity` sources
@@ -489,6 +490,7 @@ fn run_startup_checks_full_smoke_no_errors_for_healthy_config() {
         pam_d_root: pam_d,
         fs_root: Some(tmp.path().to_path_buf()),
         kernel_parsec_probe: Some(probe_unavailable),
+        mrd_probe: Some(probe_mrd_unknown),
     };
 
     let report = run_startup_checks(&cfg, &opts);
@@ -497,4 +499,87 @@ fn run_startup_checks_full_smoke_no_errors_for_healthy_config() {
 
 fn probe_unavailable() -> KernelParsecState {
     KernelParsecState::Unavailable
+}
+
+fn probe_mrd_unknown() -> MrdState {
+    MrdState::Unknown
+}
+
+// ---------------------------------------------------------------------------
+// МРД (mandatory confidentiality control) cross-check
+// ---------------------------------------------------------------------------
+
+/// Load a config with the given `[mac].runtime` mode, then drive the МРД
+/// check with the given probed state and return the single emitted record's
+/// severity and code. The check always emits exactly one `mac_mrd_active`
+/// record, so the whole 3×3 matrix collapses to this helper.
+fn mrd_outcome(runtime: MacRuntimeMode, mrd: MrdState) -> (StartupCheckSeverity, &'static str) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let anchor = write_anchor(tmp.path(), "anchor.pem", FAKE_PEM);
+    let cfg_path = write_min_config(tmp.path(), anchor.to_str().unwrap(), "auto", "optional");
+    let mut cfg = load_cfg(&cfg_path);
+    cfg.mac.runtime = runtime;
+
+    let mut report = StartupCheckReport::default();
+    startup_check::mrd::check(&cfg, mrd, &mut report);
+
+    assert_eq!(report.records.len(), 1, "expected one record: {report:#?}");
+    let record = &report.records[0];
+    assert_eq!(record.check, "mac_mrd_active");
+    (record.severity, record.check)
+}
+
+#[test]
+fn startup_check_mrd_required_active_errors() {
+    let (severity, code) = mrd_outcome(MacRuntimeMode::Required, MrdState::Active);
+    assert_eq!(severity, StartupCheckSeverity::Error);
+    assert_eq!(code, "mac_mrd_active");
+}
+
+#[test]
+fn startup_check_mrd_required_unknown_warns() {
+    let (severity, _) = mrd_outcome(MacRuntimeMode::Required, MrdState::Unknown);
+    assert_eq!(severity, StartupCheckSeverity::Warn);
+}
+
+#[test]
+fn startup_check_mrd_required_inactive_is_info() {
+    let (severity, _) = mrd_outcome(MacRuntimeMode::Required, MrdState::Inactive);
+    assert_eq!(severity, StartupCheckSeverity::Info);
+}
+
+#[test]
+fn startup_check_mrd_auto_active_warns() {
+    let (severity, _) = mrd_outcome(MacRuntimeMode::Auto, MrdState::Active);
+    assert_eq!(severity, StartupCheckSeverity::Warn);
+}
+
+#[test]
+fn startup_check_mrd_auto_unknown_is_info() {
+    let (severity, _) = mrd_outcome(MacRuntimeMode::Auto, MrdState::Unknown);
+    assert_eq!(severity, StartupCheckSeverity::Info);
+}
+
+#[test]
+fn startup_check_mrd_auto_inactive_is_info() {
+    let (severity, _) = mrd_outcome(MacRuntimeMode::Auto, MrdState::Inactive);
+    assert_eq!(severity, StartupCheckSeverity::Info);
+}
+
+#[test]
+fn startup_check_mrd_disabled_active_is_info() {
+    let (severity, _) = mrd_outcome(MacRuntimeMode::Disabled, MrdState::Active);
+    assert_eq!(severity, StartupCheckSeverity::Info);
+}
+
+#[test]
+fn startup_check_mrd_disabled_unknown_is_info() {
+    let (severity, _) = mrd_outcome(MacRuntimeMode::Disabled, MrdState::Unknown);
+    assert_eq!(severity, StartupCheckSeverity::Info);
+}
+
+#[test]
+fn startup_check_mrd_disabled_inactive_is_info() {
+    let (severity, _) = mrd_outcome(MacRuntimeMode::Disabled, MrdState::Inactive);
+    assert_eq!(severity, StartupCheckSeverity::Info);
 }
