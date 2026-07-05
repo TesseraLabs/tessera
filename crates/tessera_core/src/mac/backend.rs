@@ -52,6 +52,29 @@ pub enum MacRuntime {
     Unavailable,
 }
 
+/// State of the host's mandatory *confidentiality* control (МРД) axis.
+///
+/// МРД is Astra's Bell–LaPadula confidentiality mechanism (active on the
+/// «Смоленск» protection level). It is a separate parsec axis from МКЦ
+/// (mandatory *integrity* control, Biba), which is the only axis Tessera
+/// assigns. Tessera never selects or writes the confidentiality coordinate;
+/// this state is probed only so the daemon can refuse or warn on hosts where
+/// an active МРД would make integrity-only labelling unsafe.
+///
+/// The real probe lives in the closed `tessera_mac_parsec` backend (selected
+/// behind the `astra-mac` feature); open builds always report
+/// [`MrdState::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MrdState {
+    /// Mandatory confidentiality control is active on this host.
+    Active,
+    /// Mandatory confidentiality control is present but not enforcing.
+    Inactive,
+    /// Confidentiality state could not be determined (no FFI compiled in, or
+    /// the probe returned an unexpected value).
+    Unknown,
+}
+
 /// Abstraction over an Astra МКЦ backend.
 ///
 /// Implementations may either talk to the real kernel/userspace via FFI
@@ -68,6 +91,12 @@ pub trait MacBackend: Send + Sync {
     fn get_user_mnkc(&self, user: &str) -> Result<IntegrityLabel, MacError>;
 
     /// Apply `label` to the current process / PAM session.
+    ///
+    /// Implementations MUST NOT alter the confidentiality coordinate (field 0
+    /// of the parsec label) of the target: they operate on the integrity axis
+    /// only. Where the underlying API writes a full label triple, the current
+    /// confidentiality field of the target MUST be read and carried over
+    /// unchanged rather than overwritten (including with a constant zero).
     fn apply_session(&self, label: IntegrityLabel) -> Result<(), MacError>;
 
     /// Read the МКЦ label currently attached to `path`.
@@ -75,6 +104,12 @@ pub trait MacBackend: Send + Sync {
 
     /// Set the МКЦ label on `path`.  If `irelax` is true, the implementation
     /// may attempt the operation in IRELAX (write-down) mode where supported.
+    ///
+    /// Implementations MUST NOT alter the confidentiality coordinate (field 0
+    /// of the parsec label) of the target: they operate on the integrity axis
+    /// only. Where the underlying API writes a full label triple, the current
+    /// confidentiality field of the target MUST be read and carried over
+    /// unchanged rather than overwritten (including with a constant zero).
     fn set_file_label(
         &self,
         path: &std::path::Path,
@@ -85,6 +120,12 @@ pub trait MacBackend: Send + Sync {
     /// Set the МКЦ label on an open file descriptor.  Used by callers that
     /// hold an exclusive `fd` (e.g. the sessions.json writer) to close the
     /// path-based TOCTOU window between `open()` and `set_file_label()`.
+    ///
+    /// Implementations MUST NOT alter the confidentiality coordinate (field 0
+    /// of the parsec label) of the target: they operate on the integrity axis
+    /// only. Where the underlying API writes a full label triple, the current
+    /// confidentiality field of the target MUST be read and carried over
+    /// unchanged rather than overwritten (including with a constant zero).
     fn set_fd_label(
         &self,
         fd: std::os::unix::io::RawFd,
