@@ -1,4 +1,4 @@
-# Contributing to pam-certauth
+# Contributing to Tessera
 
 Thank you for considering a contribution!
 

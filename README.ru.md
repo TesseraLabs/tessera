@@ -262,5 +262,5 @@ PAM-cdylib `pam_tessera.so` пишет события `tracing` в syslog
 
 ## Контакты сопровождения
 
-- Репозиторий: <https://github.com/RoboNET/tessera>.
+- Репозиторий: <https://github.com/TesseraLabs/tessera>.
 - Баг-трекер: GitHub Issues.

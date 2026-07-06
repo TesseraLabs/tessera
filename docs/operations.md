@@ -355,33 +355,3 @@ across reboot — это by design: sshd/login/sudo-процессы, держа
 
 Для конфиденциальных сообщений о безопасности — см. контакты в
 [README.md](../README.md#безопасность-и-сообщения-об-уязвимостях).
-
-## CLA automation
-
-External-contributor CLA flow is enforced by `.github/workflows/cla.yml`
-(CLA Assistant Lite). Reference: design spec
-`docs/superpowers/specs/2026-06-04-cla-automation-design.md`.
-
-- **Signatures:** stored in the private repo `RoboNET/cla-signatures`,
-  file `signatures/version-1/cla.json`. Never edit manually.
-- **Token:** secret `CLA_SIGNATURES_PAT` (fine-grained PAT, contents:write
-  on `cla-signatures` only) expires yearly — renew in GitHub Developer
-  settings and update via `gh secret set CLA_SIGNATURES_PAT --repo
-  RoboNET/tessera`. Symptom of expiry: CLA workflow run fails with a
-  401/403 on the signatures repo.
-- **Updating the CLA text:** bump **Document version** in
-  `docs/cla/CLA-individual.md`, change `path-to-signatures` in the workflow
-  to `signatures/version-2/cla.json` — the bot will re-request signatures
-  from everyone on their next PR.
-- **Corporate CLA:** executed manually via e-mail (see
-  `docs/cla/CLA-corporate.md`); after execution add the designated GitHub
-  accounts to the `allowlist` input in `.github/workflows/cla.yml`.
-- **Legal status:** the CLA text is a draft pending lawyer review; schedule
-  review before any certification round or external partner due
-  diligence. Re-signing mechanism above covers text upgrades.
-- **Pending first external PR:** the flow has not yet been exercised
-  end-to-end, and the CLA check is not yet a required status check on
-  `main`. When the first external PR arrives: verify the bot blocks and
-  unblocks correctly (including the `Full name:` line in the signing
-  comment), confirm the signature lands in `cla-signatures`, then add the
-  exact check name to branch protection as a required status check.

@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: tessera
 Upstream-Contact: Mikhail Korolev <mikhail@robonet.me>
-Source: https://github.com/RoboNET/tessera
+Source: https://github.com/TesseraLabs/tessera
 
 Files: *
 Copyright: 2024-2026 Mikhail Korolev

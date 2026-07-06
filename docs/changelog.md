@@ -587,8 +587,7 @@
   approver-EKU / external policy TOML / `pam-certauth execute|policy|gc`.
   Бинарь оставляет только `pam-certauth daemon`. IPC v2 retains
   `engineer_ski` + `engineer_cert_sha256` (МКЦ-audit), `scopes`
-  убран. Подробности см. в плане
-  `docs/superpowers/plans/2026-05-14-strip-scopes-mofn.md`.
+  убран.
 
 ## [0.1.1] — 2026-05-06
 
