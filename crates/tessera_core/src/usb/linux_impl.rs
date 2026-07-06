@@ -26,9 +26,7 @@ const DEFAULT_MAX_USB_PARTITIONS: usize = 64;
 /// whole-devices with a partition table produce one entry per viable
 /// child partition (FS in the allow-list), capped at
 /// [`DEFAULT_MAX_USB_PARTITIONS`].
-pub(super) fn enumerate_once(
-    vid_pid_filter: &[(u16, u16)],
-) -> Result<Vec<UsbDevice>, UsbError> {
+pub(super) fn enumerate_once(vid_pid_filter: &[(u16, u16)]) -> Result<Vec<UsbDevice>, UsbError> {
     enumerate_once_with_limit(vid_pid_filter, DEFAULT_MAX_USB_PARTITIONS)
 }
 

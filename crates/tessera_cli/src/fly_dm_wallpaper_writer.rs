@@ -28,10 +28,11 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
-use image::{DynamicImage, ImageBuffer, Rgba};
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+use tempfile::NamedTempFile;
 
 use tessera_core::config::validated::{FlyDmGreeterSection, Gravity};
 use tessera_core::host_identity::ResolvedHostId;
@@ -74,6 +75,16 @@ pub enum WriterError {
         path: PathBuf,
         /// Human-readable cause.
         reason: String,
+    },
+    /// A directory the root daemon writes into is writable by a non-owner
+    /// (group- or world-writable), which would let a local user pre-plant a
+    /// symlink and redirect the write.
+    #[error("refusing to write into {path}: directory mode {mode:04o} is group/world-writable")]
+    InsecureDir {
+        /// Offending directory.
+        path: PathBuf,
+        /// Permission bits (`& 0o7777`).
+        mode: u32,
     },
 }
 
@@ -126,13 +137,13 @@ pub fn update(
         if !target_exists {
             return Ok(UpdateOutcome::NoBackupSourceNoTarget);
         }
-        if let Some(parent) = cfg.wallpaper_backup.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent).map_err(|e| WriterError::io(parent.to_path_buf(), e))?;
-            }
+        let backup_parent = parent_dir(&cfg.wallpaper_backup);
+        if !backup_parent.exists() {
+            fs::create_dir_all(backup_parent)
+                .map_err(|e| WriterError::io(backup_parent.to_path_buf(), e))?;
         }
-        fs::copy(&cfg.wallpaper_target, &cfg.wallpaper_backup)
-            .map_err(|e| WriterError::io(cfg.wallpaper_backup.clone(), e))?;
+        ensure_dir_not_foreign_writable(backup_parent)?;
+        copy_via_exclusive_temp(&cfg.wallpaper_target, &cfg.wallpaper_backup, backup_parent)?;
         backed_up_now = true;
     }
 
@@ -141,8 +152,8 @@ pub fn update(
         source: e,
     })?;
 
-    let font_bytes =
-        fs::read(&cfg.wallpaper_font).map_err(|e| WriterError::io(cfg.wallpaper_font.clone(), e))?;
+    let font_bytes = fs::read(&cfg.wallpaper_font)
+        .map_err(|e| WriterError::io(cfg.wallpaper_font.clone(), e))?;
     let font = FontArc::try_from_vec(font_bytes).map_err(|e| WriterError::FontLoad {
         path: cfg.wallpaper_font.clone(),
         reason: e.to_string(),
@@ -168,34 +179,83 @@ pub fn update(
     );
 
     let dyn_img = DynamicImage::ImageRgba8(rgba);
-    let target_parent = cfg.wallpaper_target.parent().ok_or_else(|| {
-        WriterError::io(
-            cfg.wallpaper_target.clone(),
-            io::Error::new(io::ErrorKind::InvalidInput, "no parent dir"),
-        )
-    })?;
-    if !target_parent.as_os_str().is_empty() && !target_parent.exists() {
+    let target_parent = parent_dir(&cfg.wallpaper_target);
+    if !target_parent.exists() {
         fs::create_dir_all(target_parent)
             .map_err(|e| WriterError::io(target_parent.to_path_buf(), e))?;
     }
-    let tmp = target_parent.join(format!(
-        ".tessera_wallpaper.{}.tmp.jpg",
-        std::process::id()
-    ));
-    // Force JPEG output regardless of target extension by writing to a .jpg
-    // tmp file; the rename below moves it onto the configured target path.
+    ensure_dir_not_foreign_writable(target_parent)?;
+
+    // Encode into an exclusively-created temp file (O_EXCL + random name) in
+    // the target's directory, then atomically rename it onto the target. The
+    // root daemon must never open a predictable, symlink-followable path for
+    // writing in a directory a local user might influence: that is how a
+    // planted symlink turns a wallpaper write into an arbitrary-file
+    // overwrite. Encoding to a temp handle also forces JPEG output
+    // regardless of the target's extension.
+    let mut tmp = NamedTempFile::new_in(target_parent)
+        .map_err(|e| WriterError::io(target_parent.to_path_buf(), e))?;
     dyn_img
-        .save(&tmp)
+        .write_to(tmp.as_file_mut(), ImageFormat::Jpeg)
         .map_err(|e| WriterError::ImageEncode {
-            path: tmp.clone(),
+            path: cfg.wallpaper_target.clone(),
             source: e,
         })?;
-    fs::rename(&tmp, &cfg.wallpaper_target)
-        .map_err(|e| WriterError::io(cfg.wallpaper_target.clone(), e))?;
+    tmp.persist(&cfg.wallpaper_target)
+        .map_err(|e| WriterError::io(cfg.wallpaper_target.clone(), e.error))?;
 
     Ok(UpdateOutcome::Wrote {
         backed_up: backed_up_now,
     })
+}
+
+/// Directory a path lives in, mapping a missing or empty parent to `.` so
+/// relative filenames are still written into the current directory.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Copies `src` to `dst` through an exclusively-created temp file in
+/// `dst_parent`, then renames it into place.
+///
+/// The rename replaces whatever name sits at `dst` without following it, and
+/// the temp is created with `O_EXCL` under a random name, so a pre-planted
+/// symlink at either path cannot redirect the write.
+fn copy_via_exclusive_temp(src: &Path, dst: &Path, dst_parent: &Path) -> Result<(), WriterError> {
+    let mut reader = fs::File::open(src).map_err(|e| WriterError::io(src.to_path_buf(), e))?;
+    let mut tmp = NamedTempFile::new_in(dst_parent)
+        .map_err(|e| WriterError::io(dst_parent.to_path_buf(), e))?;
+    io::copy(&mut reader, tmp.as_file_mut()).map_err(|e| WriterError::io(dst.to_path_buf(), e))?;
+    tmp.persist(dst)
+        .map_err(|e| WriterError::io(dst.to_path_buf(), e.error))?;
+    Ok(())
+}
+
+/// Refuses a directory the root daemon writes into when it is writable by a
+/// non-owner (group- or world-writable): such a directory lets a local user
+/// pre-plant a symlink and redirect a root write. No-op on non-Unix hosts,
+/// which are dev-only for this crate.
+#[cfg(unix)]
+fn ensure_dir_not_foreign_writable(dir: &Path) -> Result<(), WriterError> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::metadata(dir).map_err(|e| WriterError::io(dir.to_path_buf(), e))?;
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(WriterError::InsecureDir {
+            path: dir.to_path_buf(),
+            mode: mode & 0o7777,
+        });
+    }
+    Ok(())
+}
+
+/// Non-Unix stub: permission bits are not meaningful on these dev-only hosts.
+#[cfg(not(unix))]
+fn ensure_dir_not_foreign_writable(_dir: &Path) -> Result<(), WriterError> {
+    Ok(())
 }
 
 fn is_russian_locale() -> bool {
@@ -261,8 +321,14 @@ fn draw_text(
     let (img_w, img_h) = (img.width(), img.height());
     let (anchor_x, anchor_y) = match gravity {
         Gravity::North => ((img_w as f32 - text_width) / 2.0, ascent),
-        Gravity::South => ((img_w as f32 - text_width) / 2.0, img_h as f32 - descent.abs()),
-        Gravity::East => (img_w as f32 - text_width, (img_h as f32 + text_height) / 2.0),
+        Gravity::South => (
+            (img_w as f32 - text_width) / 2.0,
+            img_h as f32 - descent.abs(),
+        ),
+        Gravity::East => (
+            img_w as f32 - text_width,
+            (img_h as f32 + text_height) / 2.0,
+        ),
         Gravity::West => (0.0, (img_h as f32 + text_height) / 2.0),
         Gravity::Center => (
             (img_w as f32 - text_width) / 2.0,
@@ -321,9 +387,9 @@ fn draw_text(
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgba};
-    use tessera_core::host_identity::HostIdSourceKind;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+    use tessera_core::host_identity::HostIdSourceKind;
 
     // DejaVu Sans Bold ships with Astra and most dev workstations; tests
     // try a list of candidate paths and fall back to skipping the test
@@ -336,10 +402,7 @@ mod tests {
             "/System/Library/Fonts/Helvetica.ttc",
             "/System/Library/Fonts/Geneva.ttf",
         ];
-        candidates
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.exists())
+        candidates.iter().map(PathBuf::from).find(|p| p.exists())
     }
 
     fn fixture_resolved(kind: HostIdSourceKind, hash_hex: &str) -> ResolvedHostId {
@@ -351,7 +414,12 @@ mod tests {
         }
     }
 
-    fn make_cfg(target: PathBuf, backup: PathBuf, font: PathBuf, enabled: bool) -> FlyDmGreeterSection {
+    fn make_cfg(
+        target: PathBuf,
+        backup: PathBuf,
+        font: PathBuf,
+        enabled: bool,
+    ) -> FlyDmGreeterSection {
         FlyDmGreeterSection {
             update_wallpaper: enabled,
             wallpaper_target: target,
@@ -376,11 +444,7 @@ mod tests {
     #[test]
     fn substitute_replaces_host_id_short_source_n() {
         let r = fixture_resolved(HostIdSourceKind::DmiBoardSerial, "abc12345deadbeef");
-        let out = substitute(
-            "ATM %n host_id={host_id_short} ({source})",
-            &r,
-            "astra184",
-        );
+        let out = substitute("ATM %n host_id={host_id_short} ({source})", &r, "astra184");
         assert_eq!(out, "ATM astra184 host_id=abc12345 (dmi_board_serial)");
     }
 
@@ -459,6 +523,34 @@ mod tests {
         assert_eq!(
             backup_after_first, backup_after_second,
             "backup must be byte-identical across runs"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_refuses_group_or_world_writable_target_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(font) = find_test_font() else {
+            eprintln!("skipping: no test font on this host");
+            return;
+        };
+        let tmp = tempdir().expect("tempdir");
+        // A shared, world-writable directory is exactly where a local user
+        // could pre-plant a symlink for the root daemon to write through.
+        let shared = tmp.path().join("shared");
+        fs::create_dir(&shared).expect("mkdir");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
+        let target = shared.join("wp.jpg");
+        let backup = tmp.path().join("wp.orig.jpg");
+        write_white_jpeg(&target, 64, 32);
+        // Backup already exists so the run reaches the target-write stage.
+        write_white_jpeg(&backup, 64, 32);
+        let cfg = make_cfg(target.clone(), backup, font, true);
+        let r = fixture_resolved(HostIdSourceKind::Hostname, "abcdefgh");
+        let err = update(&cfg, &r).expect_err("must refuse insecure dir");
+        assert!(
+            matches!(err, WriterError::InsecureDir { .. }),
+            "got {err:?}"
         );
     }
 

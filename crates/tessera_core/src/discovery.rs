@@ -149,9 +149,7 @@ pub fn discover_credentials(
 
     let chain_path = mountpoint.join("certs").join("chain.pem");
     let chain_rel = Path::new("certs").join("chain.pem");
-    let chain_pem = if let Some(chain_path) =
-        safe_resolve(mountpoint, &chain_path, &chain_rel)?
-    {
+    let chain_pem = if let Some(chain_path) = safe_resolve(mountpoint, &chain_path, &chain_rel)? {
         let meta = fs::metadata(&chain_path)?;
         if meta.len() > MAX_CHAIN_BYTES {
             return Err(DiscoveryError::ChainTooLarge { actual: meta.len() });

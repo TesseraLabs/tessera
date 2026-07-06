@@ -1089,12 +1089,24 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
     for path in raw.anchors.iter().chain(raw.intermediates.iter()) {
         validate_pem(path)?;
     }
+    check_crl_mode_has_paths(raw.revocation.mode, &raw.revocation.crl_paths)?;
     if matches!(raw.revocation.mode, RawRevocationMode::Crl) {
         for path in &raw.revocation.crl_paths {
             if !path.is_file() {
                 return Err(TrustError::CrlPathMissing { path: path.clone() }.into());
             }
         }
+    }
+    if revocation_is_disabled(raw.revocation.mode) {
+        // Absent or explicit `mode = "none"` means no CRL/OCSP consultation:
+        // a revoked certificate still authenticates. Surface this loudly so
+        // an operator cannot run without revocation unknowingly.
+        tracing::warn!(
+            target: "tessera.config",
+            "trust.revocation.mode is \"none\": certificate revocation is NOT checked; \
+             a revoked certificate will authenticate. Set mode to \"crl\", \"ocsp\", or \
+             \"crl_then_ocsp\" to enable revocation."
+        );
     }
     let ocsp = validate_ocsp(&raw.revocation)?;
     let crl_max_age = match raw.revocation.crl_max_age_hours {
@@ -1170,6 +1182,30 @@ const OCSP_CACHE_TTL_SECONDS_DEFAULT: u64 = 3600;
 /// Upper bound on `ocsp_cache_ttl_seconds` (24 hours).  `0` is valid and
 /// disables the cache.
 const OCSP_CACHE_TTL_SECONDS_MAX: u64 = 86_400;
+
+/// Rejects a `crl`-mode revocation config that lists no CRLs.
+///
+/// [`crate::crl::check_revocation`] treats an empty CRL store as "no CRLs
+/// configured" and returns `Ok` for every certificate. In `crl` mode that
+/// is a silent no-op: a revoked certificate would authenticate. Failing
+/// validation here mirrors the responder-URL guard the OCSP modes already
+/// enforce, keeping the misconfiguration fail-closed.
+///
+/// `crl_then_ocsp` is intentionally not covered: with no covering CRL it
+/// falls back to the (still-mandatory) OCSP responder, so revocation is
+/// never silently skipped.
+fn check_crl_mode_has_paths(mode: RawRevocationMode, crl_paths: &[PathBuf]) -> Result<(), Error> {
+    if matches!(mode, RawRevocationMode::Crl) && crl_paths.is_empty() {
+        return Err(TrustError::CrlPathsEmpty.into());
+    }
+    Ok(())
+}
+
+/// Whether the resolved revocation mode consults no revocation source at
+/// all, leaving a revoked certificate able to authenticate.
+const fn revocation_is_disabled(mode: RawRevocationMode) -> bool {
+    matches!(mode, RawRevocationMode::None)
+}
 
 /// Validated OCSP knobs extracted from `[trust.revocation]` by
 /// [`validate_ocsp`].
@@ -1678,6 +1714,44 @@ fn validate_gost_engine_path(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crl_mode_with_empty_paths_is_rejected() {
+        // `crl` mode with no CRLs would make check_revocation short-circuit
+        // to Ok for every certificate — a silently disabled revocation check.
+        let err = check_crl_mode_has_paths(RawRevocationMode::Crl, &[]).unwrap_err();
+        assert!(
+            matches!(err, Error::Trust(TrustError::CrlPathsEmpty)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn crl_mode_with_paths_is_accepted() {
+        let paths = vec![PathBuf::from("/etc/tessera/ca.crl")];
+        assert!(check_crl_mode_has_paths(RawRevocationMode::Crl, &paths).is_ok());
+    }
+
+    #[test]
+    fn non_crl_modes_do_not_require_crl_paths() {
+        // Only pure `crl` mode fails closed on empty crl_paths; the other
+        // modes either do not use CRLs or fall back to a mandatory responder.
+        for mode in [
+            RawRevocationMode::None,
+            RawRevocationMode::Ocsp,
+            RawRevocationMode::CrlThenOcsp,
+        ] {
+            assert!(check_crl_mode_has_paths(mode, &[]).is_ok(), "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn only_none_mode_is_reported_as_disabled() {
+        assert!(revocation_is_disabled(RawRevocationMode::None));
+        assert!(!revocation_is_disabled(RawRevocationMode::Crl));
+        assert!(!revocation_is_disabled(RawRevocationMode::Ocsp));
+        assert!(!revocation_is_disabled(RawRevocationMode::CrlThenOcsp));
+    }
 
     #[test]
     fn pkcs12_pattern_accepts_relative_paths() {

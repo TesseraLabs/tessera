@@ -38,11 +38,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use secrecy::SecretString;
 use tessera_core::token::pkcs11::{
     acquire_pkcs11_session, test_helpers, AcquireError, LockingMode, Pkcs11Backend, Pkcs11Error,
     Pkcs11Session,
 };
-use secrecy::SecretString;
 
 // ---------------------------------------------------------------------------
 // Skip helpers (mirror the layout in `pkcs11_integration.rs`).

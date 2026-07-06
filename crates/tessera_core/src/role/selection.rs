@@ -334,7 +334,10 @@ impl SessionRolePayload {
         if !payload_backend_available(slice) {
             return Err(SessionFixError::BackendUnavailable);
         }
-        let role_max_ttl = slice.session.as_ref().and_then(super::schema::SessionLimits::max_ttl);
+        let role_max_ttl = slice
+            .session
+            .as_ref()
+            .and_then(super::schema::SessionLimits::max_ttl);
         let ttl = bounded_ttl(cert_ttl, role_max_ttl, global_default);
         // Snapshot the role's mac_mask as a raw bitmask. The slice has already
         // passed `validate_payload_for_os` (mac_mask only valid on astra and
@@ -398,7 +401,13 @@ mod tests {
     #[test]
     fn disabled_always_skips_without_touching_store() {
         let store = RoleStore::default();
-        let r = resolve_and_cover(&store, Some(&rid("serv")), None, RoleEnforce::Disabled, "ivanov");
+        let r = resolve_and_cover(
+            &store,
+            Some(&rid("serv")),
+            None,
+            RoleEnforce::Disabled,
+            "ivanov",
+        );
         assert!(matches!(r, Resolution::Skipped));
     }
 
@@ -526,12 +535,20 @@ mod tests {
         let g = Duration::from_secs(43200);
         // cert shortest
         assert_eq!(
-            bounded_ttl(Some(Duration::from_secs(100)), Some(Duration::from_secs(200)), g),
+            bounded_ttl(
+                Some(Duration::from_secs(100)),
+                Some(Duration::from_secs(200)),
+                g
+            ),
             Duration::from_secs(100)
         );
         // role shortest
         assert_eq!(
-            bounded_ttl(Some(Duration::from_secs(500)), Some(Duration::from_secs(200)), g),
+            bounded_ttl(
+                Some(Duration::from_secs(500)),
+                Some(Duration::from_secs(200)),
+                g
+            ),
             Duration::from_secs(200)
         );
         // global shortest
@@ -556,12 +573,8 @@ mod tests {
 
     #[test]
     fn fix_groups_only_role_ok_in_open_build() {
-        let slice = parse_slice(
-            linux_groups_slice("oper").as_bytes(),
-            "oper",
-            RoleOs::Linux,
-        )
-        .unwrap();
+        let slice =
+            parse_slice(linux_groups_slice("oper").as_bytes(), "oper", RoleOs::Linux).unwrap();
         let fixed = SessionRolePayload::fix(&slice, None, Duration::from_secs(43200)).unwrap();
         assert_eq!(fixed.role.as_str(), "oper");
         assert_eq!(fixed.role_version, 4);
@@ -616,8 +629,14 @@ mod tests {
     fn deny_reason_wire_strings() {
         assert_eq!(RoleDenyReason::NotFound.as_str(), "not_found");
         assert_eq!(RoleDenyReason::NotCovered.as_str(), "not_covered");
-        assert_eq!(RoleDenyReason::BackendUnavailable.as_str(), "backend_unavailable");
-        assert_eq!(RoleDenyReason::MaskExceedsCeiling.as_str(), "mask_exceeds_ceiling");
+        assert_eq!(
+            RoleDenyReason::BackendUnavailable.as_str(),
+            "backend_unavailable"
+        );
+        assert_eq!(
+            RoleDenyReason::MaskExceedsCeiling.as_str(),
+            "mask_exceeds_ceiling"
+        );
         assert_eq!(RoleDenyReason::Syntax.as_str(), "syntax");
         assert_eq!(CoverageMethod::Cert.as_str(), "cert");
         assert_eq!(CoverageMethod::Code.as_str(), "code");

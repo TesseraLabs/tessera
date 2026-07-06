@@ -107,7 +107,8 @@ fn build_cert(is_ca: bool, constraints_der: Option<&[u8]>, validity_days: u32) -
     b.set_subject_name(&name).unwrap();
     b.set_issuer_name(&name).unwrap();
     b.set_pubkey(&pkey).unwrap();
-    b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+    b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
     b.set_not_after(&Asn1Time::days_from_now(validity_days).unwrap())
         .unwrap();
     if is_ca {
@@ -203,7 +204,10 @@ fn device_tags_violate_envelope_rejected() {
         None,
     )
     .unwrap_err();
-    assert!(matches!(err, DelegationError::TagEnvelope { .. }), "{err:?}");
+    assert!(
+        matches!(err, DelegationError::TagEnvelope { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -213,7 +217,10 @@ fn no_device_tags_with_nonempty_require_rejected() {
     let ca = build_cert(true, Some(&cons), DAYS);
     let chain = vec![leaf, ca];
     let err = enforce_delegation(&chain, &tags(&[]), &role("oper"), 0, None, None).unwrap_err();
-    assert!(matches!(err, DelegationError::TagEnvelope { .. }), "{err:?}");
+    assert!(
+        matches!(err, DelegationError::TagEnvelope { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -236,7 +243,10 @@ fn misissued_wider_child_ca_does_not_escape_parent() {
         None,
     )
     .unwrap_err();
-    assert!(matches!(err, DelegationError::TagEnvelope { .. }), "{err:?}");
+    assert!(
+        matches!(err, DelegationError::TagEnvelope { .. }),
+        "{err:?}"
+    );
 }
 
 // ---- 4.3 ceilings -----------------------------------------------------------
@@ -248,9 +258,11 @@ fn requested_role_not_in_allow_roles_rejected() {
     let leaf = build_cert(false, None, DAYS);
     let ca = build_cert(true, Some(&cons), DAYS);
     let chain = vec![leaf, ca];
-    let err =
-        enforce_delegation(&chain, &tags(&[]), &role("serv"), 0, None, None).unwrap_err();
-    assert!(matches!(err, DelegationError::RoleNotAllowed { .. }), "{err:?}");
+    let err = enforce_delegation(&chain, &tags(&[]), &role("serv"), 0, None, None).unwrap_err();
+    assert!(
+        matches!(err, DelegationError::RoleNotAllowed { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -262,9 +274,11 @@ fn requested_role_must_be_in_every_ca() {
     let child_ca = build_cert(true, Some(&child_cons), DAYS);
     let parent_ca = build_cert(true, Some(&parent_cons), DAYS);
     let chain = vec![leaf, child_ca, parent_ca];
-    let err =
-        enforce_delegation(&chain, &tags(&[]), &role("serv"), 0, None, None).unwrap_err();
-    assert!(matches!(err, DelegationError::RoleNotAllowed { .. }), "{err:?}");
+    let err = enforce_delegation(&chain, &tags(&[]), &role("serv"), 0, None, None).unwrap_err();
+    assert!(
+        matches!(err, DelegationError::RoleNotAllowed { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -284,7 +298,10 @@ fn requested_role_not_in_leaf_allowed_roles_rejected() {
         Some(&leaf_allowed),
     )
     .unwrap_err();
-    assert!(matches!(err, DelegationError::RoleNotAllowed { .. }), "{err:?}");
+    assert!(
+        matches!(err, DelegationError::RoleNotAllowed { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -294,9 +311,11 @@ fn requested_level_above_ca_max_rejected() {
     let leaf = build_cert(false, None, DAYS);
     let ca = build_cert(true, Some(&cons), DAYS);
     let chain = vec![leaf, ca];
-    let err =
-        enforce_delegation(&chain, &tags(&[]), &role("oper"), 6, None, None).unwrap_err();
-    assert!(matches!(err, DelegationError::LevelCeiling { .. }), "{err:?}");
+    let err = enforce_delegation(&chain, &tags(&[]), &role("oper"), 6, None, None).unwrap_err();
+    assert!(
+        matches!(err, DelegationError::LevelCeiling { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -306,9 +325,11 @@ fn requested_level_above_leaf_max_integrity_rejected() {
     let ca = build_cert(true, Some(&cons), DAYS);
     let chain = vec![leaf, ca];
     // Leaf max_integrity ceiling = 3; request level 4 → reject.
-    let err =
-        enforce_delegation(&chain, &tags(&[]), &role("oper"), 4, Some(3), None).unwrap_err();
-    assert!(matches!(err, DelegationError::LevelCeiling { .. }), "{err:?}");
+    let err = enforce_delegation(&chain, &tags(&[]), &role("oper"), 4, Some(3), None).unwrap_err();
+    assert!(
+        matches!(err, DelegationError::LevelCeiling { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -329,8 +350,7 @@ fn link_lifetime_exceeds_parent_max_ttl_rejected() {
     let leaf = build_cert(false, None, 10);
     let ca = build_cert(true, Some(&cons), 30);
     let chain = vec![leaf, ca];
-    let err =
-        enforce_delegation(&chain, &tags(&[]), &role("oper"), 0, None, None).unwrap_err();
+    let err = enforce_delegation(&chain, &tags(&[]), &role("oper"), 0, None, None).unwrap_err();
     assert!(matches!(err, DelegationError::TtlCeiling { .. }), "{err:?}");
 }
 
@@ -355,7 +375,10 @@ fn wildcard_leaf_under_north_ca_rejects_south_device() {
         None,
     )
     .unwrap_err();
-    assert!(matches!(err, DelegationError::TagEnvelope { .. }), "{err:?}");
+    assert!(
+        matches!(err, DelegationError::TagEnvelope { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -407,7 +430,10 @@ fn canonical_north_ca_wildcard_leaf_end_to_end() {
         None,
     )
     .unwrap_err();
-    assert!(matches!(err, DelegationError::TagEnvelope { .. }), "{err:?}");
+    assert!(
+        matches!(err, DelegationError::TagEnvelope { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -417,7 +443,6 @@ fn delegation_constraints_on_leaf_rejected() {
     let leaf = build_cert(false, Some(&cons), DAYS);
     let ca = build_cert(true, None, DAYS);
     let chain = vec![leaf, ca];
-    let err =
-        enforce_delegation(&chain, &tags(&[]), &role("oper"), 0, None, None).unwrap_err();
+    let err = enforce_delegation(&chain, &tags(&[]), &role("oper"), 0, None, None).unwrap_err();
     assert!(matches!(err, DelegationError::Malformed { .. }), "{err:?}");
 }

@@ -4,8 +4,8 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::panic)]
 
-use tessera_core::mac::IntegrityLabel;
 use proptest::prelude::*;
+use tessera_core::mac::IntegrityLabel;
 
 #[test]
 fn roundtrip_basic() {

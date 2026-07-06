@@ -201,9 +201,9 @@ impl IntegrityLabel {
             let payload = bs
                 .get(2..2 + bs_len)
                 .ok_or(LabelDerError::Malformed("bad BIT STRING length"))?;
-            let (&unused, bits) = payload
-                .split_first()
-                .ok_or(LabelDerError::Malformed("BIT STRING missing unused-bits byte"))?;
+            let (&unused, bits) = payload.split_first().ok_or(LabelDerError::Malformed(
+                "BIT STRING missing unused-bits byte",
+            ))?;
             if unused > 7 {
                 return Err(LabelDerError::Malformed("BIT STRING unused-bits > 7"));
             }

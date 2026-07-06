@@ -11,8 +11,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![allow(clippy::indexing_slicing)]
 
-use tessera_core::usb::{wait_for_usb_devices, UsbError};
 use std::time::Duration;
+use tessera_core::usb::{wait_for_usb_devices, UsbError};
 
 #[test]
 #[ignore = "requires Linux + a real plugged-in USB block device"]
@@ -25,7 +25,6 @@ fn waits_and_returns_device() {
 #[test]
 #[ignore = "no device — short timeout exercises the timeout path"]
 fn timeouts_when_no_device() {
-    let err =
-        wait_for_usb_devices(Duration::from_millis(200), &[(0xDEAD, 0xBEEF)], 8).unwrap_err();
+    let err = wait_for_usb_devices(Duration::from_millis(200), &[(0xDEAD, 0xBEEF)], 8).unwrap_err();
     assert!(matches!(err, UsbError::Timeout));
 }

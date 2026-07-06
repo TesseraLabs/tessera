@@ -154,7 +154,9 @@ fn split_authority(authority: &str) -> Result<(&str, Option<&str>), String> {
             return Ok((host, None));
         }
         let Some(port) = after.strip_prefix(':') else {
-            return Err(format!("unexpected characters after IPv6 literal: {after:?}"));
+            return Err(format!(
+                "unexpected characters after IPv6 literal: {after:?}"
+            ));
         };
         return Ok((host, Some(port)));
     }
@@ -446,9 +448,7 @@ pub fn post_ocsp_request(
     transport
         .write_all(request_der)
         .map_err(|e| map_io(&e, "write request body"))?;
-    transport
-        .flush()
-        .map_err(|e| map_io(&e, "flush request"))?;
+    transport.flush().map_err(|e| map_io(&e, "flush request"))?;
 
     let (head_text, early_body) = read_head(&mut transport, deadline)?;
     let head = parse_head(&head_text)?;
@@ -572,7 +572,10 @@ mod tests {
             let body_len: usize = head
                 .to_ascii_lowercase()
                 .lines()
-                .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().to_owned()))
+                .find_map(|l| {
+                    l.strip_prefix("content-length:")
+                        .map(|v| v.trim().to_owned())
+                })
                 .and_then(|v| v.parse().ok())
                 .expect("request Content-Length");
             let mut got = buf.len() - head_end - 4;
@@ -631,7 +634,10 @@ mod tests {
             // Drop the stream: 100 bytes promised, ~9 delivered.
         });
         let err = post_ocsp_request(&url_for(addr), b"request", TIMEOUT).unwrap_err();
-        assert!(matches!(err, TrustError::OcspTransport { .. }), "got {err:?}");
+        assert!(
+            matches!(err, TrustError::OcspTransport { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -679,7 +685,8 @@ mod tests {
     #[test]
     fn missing_content_length_is_rejected() {
         let addr = spawn_server(|mut s| {
-            s.write_all(b"HTTP/1.1 200 OK\r\n\r\nbody-without-length").unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\n\r\nbody-without-length")
+                .unwrap();
         });
         let err = post_ocsp_request(&url_for(addr), b"request", TIMEOUT).unwrap_err();
         match err {

@@ -7,8 +7,8 @@
     clippy::pedantic
 )]
 
-use tessera_cli::peercred::verify_peer_credentials;
 use std::os::unix::net::UnixStream;
+use tessera_cli::peercred::verify_peer_credentials;
 use tokio::net::UnixStream as TokioUnixStream;
 
 #[tokio::test]

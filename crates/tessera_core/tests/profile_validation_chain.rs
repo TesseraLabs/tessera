@@ -69,7 +69,8 @@ fn build_cert<F: FnOnce(&mut X509Builder)>(is_ca: bool, extra: F) -> Certificate
     b.set_subject_name(&name).unwrap();
     b.set_issuer_name(&name).unwrap();
     b.set_pubkey(&pkey).unwrap();
-    b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+    b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
     b.set_not_after(&Asn1Time::days_from_now(365).unwrap())
         .unwrap();
     if is_ca {

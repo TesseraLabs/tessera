@@ -8,9 +8,9 @@
     clippy::let_underscore_must_use
 )]
 
+use std::time::SystemTime;
 use tessera_cli::registry::{ActiveSession, SessionRegistry};
 use tessera_proto::SessionTarget;
-use std::time::SystemTime;
 use uuid::Uuid;
 
 fn make(id: u128, serial: Option<&str>) -> ActiveSession {

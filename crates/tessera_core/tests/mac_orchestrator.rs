@@ -223,7 +223,8 @@ fn role_mask_exceeds_ceiling_denies() {
     });
 
     let p = policy(CertIntegrityMode::Required);
-    let err = apply_session_policy(&backend, &p, Some(cert), Some(mask), &ctx("login")).unwrap_err();
+    let err =
+        apply_session_policy(&backend, &p, Some(cert), Some(mask), &ctx("login")).unwrap_err();
     assert!(matches!(err, OrchestratorError::MaskExceedsCeiling));
 }
 

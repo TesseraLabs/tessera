@@ -53,11 +53,7 @@ pub fn session_uuid_from_string(s: &str) -> Uuid {
 ///
 /// The callable receives the constructed [`SessionTarget`] so tests
 /// can verify the variant + payload without needing a live socket.
-pub fn capture_xdg<F>(
-    session_id: Uuid,
-    xdg_session_id: Option<&str>,
-    push: F,
-) -> CaptureOutcome
+pub fn capture_xdg<F>(session_id: Uuid, xdg_session_id: Option<&str>, push: F) -> CaptureOutcome
 where
     F: FnOnce(SessionTarget) -> Result<(), IpcError>,
 {
@@ -69,7 +65,9 @@ where
         );
         return CaptureOutcome::Skipped;
     };
-    let target = SessionTarget::LogindSession { id: xdg.to_string() };
+    let target = SessionTarget::LogindSession {
+        id: xdg.to_string(),
+    };
     match push(target) {
         Ok(()) => {
             tracing::info!(

@@ -330,8 +330,7 @@ pub unsafe fn child_setup(
     #[cfg(target_os = "linux")]
     {
         // SAFETY: prctl is async-signal-safe.
-        let prctl_rc =
-            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) };
+        let prctl_rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) };
         if prctl_rc != 0 {
             // SAFETY: die is async-signal-safe.
             unsafe {
@@ -345,26 +344,28 @@ pub unsafe fn child_setup(
     // NO allocations — Vec::clone here would deadlock on the heap mutex if a
     // sibling parent thread held it at fork() time.
     if let Some(user) = run_as {
-        if groups_len > 0 {
-            // SAFETY: setgroups is async-signal-safe. `groups_ptr` points into
-            // stable parent-owned memory for `groups_len` `gid_t` values
-            // (caller contract).
-            #[cfg(target_os = "linux")]
-            let rc = unsafe { libc::setgroups(groups_len as libc::size_t, groups_ptr) };
-            #[cfg(not(target_os = "linux"))]
-            let rc = {
-                let len_int = libc::c_int::try_from(groups_len).unwrap_or(libc::c_int::MAX);
-                // SAFETY: setgroups is async-signal-safe; `groups_ptr` points
-                // into stable parent-owned memory for `groups_len` `gid_t`
-                // values (caller contract).
-                unsafe { libc::setgroups(len_int, groups_ptr) }
-            };
-
-            if rc != 0 {
-                // SAFETY: die is async-signal-safe.
-                unsafe {
-                    die(b"hook child: setgroups failed\n");
-                }
+        // Always set the supplementary group list, even when it is empty.
+        // An empty list means `setgroups(0, ...)`, which clears root's
+        // inherited supplementary groups (gid 0, disk, shadow, sudo, ...);
+        // skipping the call would leave the dropped-privilege child carrying
+        // them. This is the fail-safe: never keep more groups than intended.
+        // SAFETY: setgroups is async-signal-safe. `groups_ptr` points into
+        // stable parent-owned memory for `groups_len` `gid_t` values (caller
+        // contract); with `groups_len == 0` the pointer is not dereferenced.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe { libc::setgroups(groups_len as libc::size_t, groups_ptr) };
+        #[cfg(not(target_os = "linux"))]
+        let rc = {
+            let len_int = libc::c_int::try_from(groups_len).unwrap_or(libc::c_int::MAX);
+            // SAFETY: setgroups is async-signal-safe; `groups_ptr` points
+            // into stable parent-owned memory for `groups_len` `gid_t`
+            // values (caller contract); with 0 it is not dereferenced.
+            unsafe { libc::setgroups(len_int, groups_ptr) }
+        };
+        if rc != 0 {
+            // SAFETY: die is async-signal-safe.
+            unsafe {
+                die(b"hook child: setgroups failed\n");
             }
         }
 
