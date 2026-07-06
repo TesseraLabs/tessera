@@ -115,33 +115,6 @@ pub unsafe fn set_auth_context(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cleanup_with_null_data_is_a_noop() {
-        // libpam may invoke the callback with a null data pointer; it must
-        // return without dereferencing anything.
-        // SAFETY: null data is the documented early-return path; pamh is
-        // unused by the callback.
-        unsafe {
-            auth_context_cleanup(std::ptr::null_mut(), std::ptr::null_mut(), 0);
-        }
-    }
-
-    #[test]
-    fn teardown_panic_is_contained() {
-        // The cleanup wraps the drop in catch_unwind so a panicking teardown
-        // cannot unwind across the C boundary. Exercise that primitive: a
-        // panicking closure must be caught, not propagated.
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            panic!("simulated Drop panic");
-        }));
-        assert!(caught.is_err(), "panic must be contained, not propagated");
-    }
-}
-
 /// Retrieve a previously-stored [`AuthContext`].
 ///
 /// Returns `None` when no context was stored (e.g. `pam_sm_acct_mgmt`
@@ -163,4 +136,34 @@ pub unsafe fn get_auth_context<'a>(pamh: *mut pam_sys::pam_handle_t) -> Option<&
     // SAFETY: contract — the only setter is `set_auth_context`, which
     // stores a `Box<AuthContext>`; PAM hands the same pointer back here.
     Some(unsafe { &*data_ptr.cast::<AuthContext>() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_with_null_data_is_a_noop() {
+        // libpam may invoke the callback with a null data pointer; it must
+        // return without dereferencing anything.
+        // SAFETY: null data is the documented early-return path; pamh is
+        // unused by the callback.
+        unsafe {
+            auth_context_cleanup(std::ptr::null_mut(), std::ptr::null_mut(), 0);
+        }
+    }
+
+    // The deliberate panic below is the simulated fault under test, not a
+    // reachable failure mode of production code.
+    #[allow(clippy::panic)]
+    #[test]
+    fn teardown_panic_is_contained() {
+        // The cleanup wraps the drop in catch_unwind so a panicking teardown
+        // cannot unwind across the C boundary. Exercise that primitive: a
+        // panicking closure must be caught, not propagated.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("simulated Drop panic");
+        }));
+        assert!(caught.is_err(), "panic must be contained, not propagated");
+    }
 }
