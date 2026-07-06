@@ -201,10 +201,7 @@ mod tests {
         let store =
             atomic_update(&target, &staged, RoleOs::Linux, &UpdateTrust::Standalone).unwrap();
         assert_eq!(store.len(), 2);
-        assert_eq!(
-            store.get(&RoleId::new("oper").unwrap()).unwrap().version,
-            2
-        );
+        assert_eq!(store.get(&RoleId::new("oper").unwrap()).unwrap().version, 2);
         // On disk: target now holds the new set; staged is gone.
         assert!(target.join("serv.toml").exists());
         assert!(!staged.exists());
@@ -247,9 +244,12 @@ mod tests {
 
         // Active base unchanged: target still holds the old single slice.
         assert!(target.join("oper.toml").exists());
-        let reloaded =
-            RoleStore::load(&target, RoleOs::Linux, super::super::store::TrustMode::Standalone)
-                .unwrap();
+        let reloaded = RoleStore::load(
+            &target,
+            RoleOs::Linux,
+            super::super::store::TrustMode::Standalone,
+        )
+        .unwrap();
         assert_eq!(reloaded.len(), 1);
         // Staged dir is untouched (caller cleans up).
         assert!(staged.exists());

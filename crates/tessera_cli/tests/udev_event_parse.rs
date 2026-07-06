@@ -7,8 +7,8 @@
     clippy::pedantic
 )]
 
-use tessera_cli::udev_monitor::{parse_udev_fields, UdevAction};
 use std::collections::HashMap;
+use tessera_cli::udev_monitor::{parse_udev_fields, UdevAction};
 
 #[test]
 fn parses_add_with_serial() {

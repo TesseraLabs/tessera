@@ -16,9 +16,9 @@
     clippy::manual_let_else
 )]
 
+use std::path::PathBuf;
 use tessera_core::mount::usb::{mount_usb_device, MountError};
 use tessera_core::usb::UsbDevice;
-use std::path::PathBuf;
 
 #[test]
 #[ignore = "requires root + a real USB device with a vfat partition"]

@@ -22,8 +22,7 @@ pub fn init() -> Result<()> {
     if INIT.get().is_some() {
         return Ok(());
     }
-    let env =
-        EnvFilter::try_from_env("TESSERA_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let env = EnvFilter::try_from_env("TESSERA_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     // The filter sits behind a reload layer so `apply_config_level` can
     // replace it after the config file has been parsed (logging must come
     // up before config loading so load errors are visible).

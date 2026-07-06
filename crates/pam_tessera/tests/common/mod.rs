@@ -53,6 +53,15 @@ pub fn stage_mount(p12_name: &str, with_chain: bool) -> tempfile::TempDir {
 pub fn build_verifier(crl_pems: Vec<Vec<u8>>) -> OpensslVerifier {
     let ca = Certificate::from_pem(&fixture_bytes("ca.pem")).unwrap();
     let int_ = Certificate::from_pem(&fixture_bytes("int.pem")).unwrap();
+    // A supplied CRL store is consulted (crl mode); with no CRLs there is
+    // nothing to consult, which is the "no revocation" posture (none mode).
+    // crl mode with an empty store is rejected at construction as a
+    // silently-disabled revocation check, so pick the mode by emptiness.
+    let revocation_mode = if crl_pems.is_empty() {
+        tessera_core::config::validated::RevocationMode::None
+    } else {
+        tessera_core::config::validated::RevocationMode::Crl
+    };
     OpensslVerifier::new(OpensslVerifierConfig {
         max_supported_profile_version:
             tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
@@ -66,9 +75,7 @@ pub fn build_verifier(crl_pems: Vec<Vec<u8>>) -> OpensslVerifier {
         spki_pins: vec![],
         max_depth: 4,
         gost_engine_path: None,
-        // CRL mode so a supplied CRL store is consulted; an empty store is a
-        // no-op early return, matching the suites' "no CRL = success" cases.
-        revocation_mode: tessera_core::config::validated::RevocationMode::Crl,
+        revocation_mode,
         ocsp_responder_url: None,
         ocsp_timeout: Duration::from_secs(5),
         ocsp_cache_dir: std::path::PathBuf::from("/var/cache/tessera/ocsp"),

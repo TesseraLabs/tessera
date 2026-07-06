@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
-use tessera_core::host_identity::normalize_host_id;
 use proptest::prelude::*;
+use tessera_core::host_identity::normalize_host_id;
 
 proptest! {
     #[test]

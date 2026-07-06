@@ -112,8 +112,7 @@ impl Drop for BasicResponse {
 }
 
 fn parse_request(der: &[u8]) -> Result<Request, String> {
-    let len =
-        c_long::try_from(der.len()).map_err(|_| "OCSP request DER too large".to_string())?;
+    let len = c_long::try_from(der.len()).map_err(|_| "OCSP request DER too large".to_string())?;
     let mut pp = der.as_ptr();
     // SAFETY: `pp` points to `len` readable bytes; with a null first
     // argument d2i allocates a fresh structure and only advances our local
@@ -125,8 +124,7 @@ fn parse_request(der: &[u8]) -> Result<Request, String> {
 }
 
 fn parse_response(der: &[u8]) -> Result<Response, String> {
-    let len =
-        c_long::try_from(der.len()).map_err(|_| "OCSP response DER too large".to_string())?;
+    let len = c_long::try_from(der.len()).map_err(|_| "OCSP response DER too large".to_string())?;
     let mut pp = der.as_ptr();
     // SAFETY: `pp` points to `len` readable bytes; with a null first
     // argument d2i allocates a fresh structure and only advances our local

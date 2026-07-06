@@ -7,24 +7,20 @@
 
 use tessera_core::config::validated::MacRuntimeMode;
 use tessera_core::config::ValidatedConfig;
-use tessera_core::ipc::{
-    ConnectPerCall, FailModeWrapper, MonitorClient, MonitorClientFactory,
-};
+use tessera_core::ipc::{ConnectPerCall, FailModeWrapper, MonitorClient, MonitorClientFactory};
 #[cfg(feature = "astra-mac")]
 use tessera_core::mac::audit::{
     emit_mac_runtime_required, emit_runtime_disabled, emit_runtime_fallback,
 };
 use tessera_core::mac::backend::MacBackend;
-use tessera_core::mac::backend::StubBackend;
 #[cfg(feature = "astra-mac")]
 use tessera_core::mac::backend::MacRuntime;
-#[cfg(feature = "astra-mac")]
-use tessera_mac_parsec::ParsecBackend;
-use tessera_core::mac::orchestrator::{
-    apply_session_policy, OrchestratorError, SessionContext,
-};
+use tessera_core::mac::backend::StubBackend;
+use tessera_core::mac::orchestrator::{apply_session_policy, OrchestratorError, SessionContext};
 use tessera_core::pam_data::AuthContext;
 use tessera_core::x509::CertIdent;
+#[cfg(feature = "astra-mac")]
+use tessera_mac_parsec::ParsecBackend;
 
 /// `PAM_AUTH_ERR` — same numeric value as in `entry.rs`.
 const PAM_AUTH_ERR: i32 = 7;
@@ -207,10 +203,7 @@ pub fn run_open_session_pipeline_with_backend_and_monitor(
             // role.audit role_deny (reason=mask_exceeds_ceiling) in addition to
             // the mac.audit detail the orchestrator already logged, then refuse
             // the session (no silent narrowing — mac-integrity spec).
-            let requested_role = ctx
-                .role
-                .as_ref()
-                .map_or("", |r| r.role.as_str());
+            let requested_role = ctx.role.as_ref().map_or("", |r| r.role.as_str());
             tessera_core::role::audit::emit_role_deny(
                 pam_user,
                 requested_role,

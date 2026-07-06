@@ -7,10 +7,10 @@
     clippy::pedantic
 )]
 
-use tessera_cli::registry::{ActiveSession, RegistryStore};
-use tessera_proto::SessionTarget;
 use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
+use tessera_cli::registry::{ActiveSession, RegistryStore};
+use tessera_proto::SessionTarget;
 use uuid::Uuid;
 
 fn s(i: u128) -> ActiveSession {

@@ -233,10 +233,7 @@ mod tests {
         assert_eq!(entry(&envv, "TESSERA_USB_SERIAL"), Some(""));
         assert_eq!(entry(&envv, "TESSERA_USB_VID_PID"), Some(""));
         assert_eq!(entry(&envv, "TESSERA_SESSION_ID"), Some(""));
-        assert_eq!(
-            entry(&envv, "TESSERA_STAGE"),
-            Some("post_auth_success")
-        );
+        assert_eq!(entry(&envv, "TESSERA_STAGE"), Some("post_auth_success"));
     }
 
     #[test]

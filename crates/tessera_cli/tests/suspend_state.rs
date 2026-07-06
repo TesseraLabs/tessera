@@ -7,8 +7,8 @@
     clippy::pedantic
 )]
 
-use tessera_cli::state::SuspendState;
 use std::time::{Duration, Instant};
+use tessera_cli::state::SuspendState;
 
 #[test]
 fn awake_is_not_in_grace() {

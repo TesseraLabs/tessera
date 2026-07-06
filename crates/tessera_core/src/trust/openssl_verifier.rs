@@ -218,6 +218,13 @@ impl OpensslVerifier {
         }
         let crl_refs: Vec<&[u8]> = cfg.crl_pems.iter().map(Vec::as_slice).collect();
         let crl_store = CrlStore::from_pems(&crl_refs)?;
+        // Defense-in-depth: `crl` mode with an empty store makes the
+        // revocation check short-circuit to Ok for every certificate. Config
+        // validation already rejects this, but refuse construction rather
+        // than risk a silently disabled revocation check at auth time.
+        if matches!(cfg.revocation_mode, RevocationMode::Crl) && crl_store.is_empty() {
+            return Err(TrustError::PathBuild("crl mode requires at least one CRL"));
+        }
         let ocsp_cache = OcspCache::new(cfg.ocsp_cache_dir, cfg.ocsp_cache_ttl);
         Ok(Self {
             anchors: cfg.anchors,

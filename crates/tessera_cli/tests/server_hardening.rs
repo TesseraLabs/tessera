@@ -12,12 +12,10 @@
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
+use tempfile::TempDir;
 use tessera_cli::server::{self, AcceptConfig};
 use tessera_proto::wire::encode_message;
-use tessera_proto::{
-    error_codes, ClientMessage, ServerMessage, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-};
-use tempfile::TempDir;
+use tessera_proto::{error_codes, ClientMessage, ServerMessage, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -35,9 +33,8 @@ async fn spawn(cfg: AcceptConfig) -> (TempDir, std::path::PathBuf, CancellationT
     // manager would normally do this).
     tokio::spawn(async move {
         while let Some(ev) = event_rx.recv().await {
-            if let tessera_cli::state::Event::Ipc(
-                tessera_cli::state::IpcRequest::Ping { reply },
-            ) = ev
+            if let tessera_cli::state::Event::Ipc(tessera_cli::state::IpcRequest::Ping { reply }) =
+                ev
             {
                 let _ = reply.send(ServerMessage::Pong);
             }

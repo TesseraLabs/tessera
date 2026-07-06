@@ -45,11 +45,12 @@ impl OcspRequestData {
     /// * [`TrustError::OcspRequestBuild`] when any OpenSSL primitive fails
     ///   (`CertID` construction, DER encoding, RNG, nonce attachment).
     pub fn build(subject: &X509Ref, issuer: &X509Ref) -> Result<Self, TrustError> {
-        let cert_id = OcspCertId::from_cert(MessageDigest::sha1(), subject, issuer).map_err(
-            |e| TrustError::OcspRequestBuild {
-                reason: format!("CertID: {e}"),
-            },
-        )?;
+        let cert_id =
+            OcspCertId::from_cert(MessageDigest::sha1(), subject, issuer).map_err(|e| {
+                TrustError::OcspRequestBuild {
+                    reason: format!("CertID: {e}"),
+                }
+            })?;
         let mut request = OcspRequest::new().map_err(|e| TrustError::OcspRequestBuild {
             reason: format!("OCSP_REQUEST_new: {e}"),
         })?;

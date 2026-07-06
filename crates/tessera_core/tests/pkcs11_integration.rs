@@ -45,10 +45,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use secrecy::SecretString;
 use tessera_core::token::pkcs11::{
     acquire_pkcs11_session, test_helpers, AcquireError, LockingMode, Pkcs11Backend, Pkcs11Error,
 };
-use secrecy::SecretString;
 
 /// Runtime-skip helper that combines the module-path check with the
 /// `SOFTHSM2_CONF` env-var check.  Returns `true` when the test

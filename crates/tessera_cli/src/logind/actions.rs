@@ -91,10 +91,7 @@ mod real {
             Ok(())
         }
         async fn reboot(&self) -> anyhow::Result<()> {
-            self.proxy()
-                .await?
-                .call_method("Reboot", &(false,))
-                .await?;
+            self.proxy().await?.call_method("Reboot", &(false,)).await?;
             Ok(())
         }
     }

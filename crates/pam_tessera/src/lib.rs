@@ -33,10 +33,10 @@ mod host_identity {
     use std::fmt::Write as _;
     use std::path::PathBuf;
 
+    use sha2::{Digest, Sha256};
     use tessera_core::config::ValidatedConfig;
     use tessera_core::error::HostIdentityError;
     use tessera_core::host_identity::{HostIdSourceKind, HostIdentityResolver};
-    use sha2::{Digest, Sha256};
 
     /// Resolved host identity tuple consumed by the auth flow:
     /// `(source kind, raw value, hex-encoded sha256 hash)`.
@@ -113,8 +113,8 @@ mod host_identity {
     }
 }
 
-use tessera_core::pam_data::AuthContext;
 use std::time::{Duration, SystemTime};
+use tessera_core::pam_data::AuthContext;
 
 /// PAM `pam_sm_acct_mgmt` core, decoupled from the PAM handle for testing.
 ///
@@ -156,8 +156,8 @@ pub const PAM_AUTHINFO_UNAVAIL: i32 = panic_guard::PAM_AUTHINFO_UNAVAIL;
 )]
 mod tests {
     use super::*;
-    use tessera_core::host_identity::HostIdSourceKind;
     use std::time::Duration;
+    use tessera_core::host_identity::HostIdSourceKind;
 
     fn ctx_with_not_after(not_after: Option<SystemTime>) -> AuthContext {
         ctx_with_skew(not_after, 0)

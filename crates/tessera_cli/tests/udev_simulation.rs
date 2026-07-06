@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tessera_cli::registry::{ActiveSession, RegistryStore, SessionRegistry};
-use tessera_cli::state::{
-    spawn_state_manager, ActionRequest, Event, OnUsbRemoved, StateConfig,
-};
+use tessera_cli::state::{spawn_state_manager, ActionRequest, Event, OnUsbRemoved, StateConfig};
 use tessera_cli::udev_monitor::{UdevAction, UdevEvent};
 use tessera_cli::udev_query::AlwaysPresent;
 use tessera_proto::SessionTarget;

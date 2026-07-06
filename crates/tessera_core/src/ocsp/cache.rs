@@ -68,9 +68,11 @@ impl OcspCacheKey {
     /// primitives fail (same failure class as building the request the key
     /// mirrors).
     pub fn for_pair(subject: &Certificate, issuer: &Certificate) -> Result<Self, TrustError> {
-        let material = super::sys::cert_id_cache_material(subject.der(), issuer.der())
-            .map_err(|reason| TrustError::OcspRequestBuild {
-                reason: format!("cache-key CertID: {reason}"),
+        let material =
+            super::sys::cert_id_cache_material(subject.der(), issuer.der()).map_err(|reason| {
+                TrustError::OcspRequestBuild {
+                    reason: format!("cache-key CertID: {reason}"),
+                }
             })?;
         Ok(Self(hex::encode(Sha256::digest(&material))))
     }
@@ -346,7 +348,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_in(&dir, 60);
         let key = key();
-        cache.put(&key, &response_der(), &CertStatus::Good).expect("put");
+        cache
+            .put(&key, &response_der(), &CertStatus::Good)
+            .expect("put");
         assert!(cache.get(&key).is_some(), "fresh entry hits");
         // Age the entry past the ttl by rewinding its mtime.
         let path = dir.path().join(format!("{}.der", key.as_hex()));
@@ -395,7 +399,9 @@ mod tests {
         let key = key();
         cache.remove(&key); // absent entry: no panic, no error
         assert_eq!(cache.get(&key), None);
-        cache.put(&key, &response_der(), &CertStatus::Good).expect("put");
+        cache
+            .put(&key, &response_der(), &CertStatus::Good)
+            .expect("put");
         cache.remove(&key);
         assert_eq!(cache.get(&key), None);
     }
@@ -406,7 +412,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_in(&dir, 3600);
         let key = key();
-        cache.put(&key, &response_der(), &CertStatus::Good).expect("put");
+        cache
+            .put(&key, &response_der(), &CertStatus::Good)
+            .expect("put");
         let path = dir.path().join(format!("{}.der", key.as_hex()));
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o640, "spec mode regardless of umask");

@@ -3,12 +3,12 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::duration_suboptimal_units)]
 
+use std::time::{Duration, SystemTime};
 use tessera_core::trust::openssl_verifier::{
     OpensslVerifier, OpensslVerifierConfig, Stage2TrustVerifier,
 };
 use tessera_core::x509::pinning::spki_sha256;
 use tessera_core::x509::{Certificate, TrustError};
-use std::time::{Duration, SystemTime};
 
 const LEAF_RSA: &[u8] = include_bytes!("fixtures/leaf_rsa.pem");
 const LEAF_ECDSA: &[u8] = include_bytes!("fixtures/leaf_ecdsa.pem");
@@ -23,7 +23,8 @@ fn whitelist() -> Vec<String> {
 
 fn config_builder() -> OpensslVerifierConfig {
     OpensslVerifierConfig {
-        max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
+        max_supported_profile_version:
+            tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         anchors: vec![Certificate::from_pem(CA).unwrap()],
         intermediates: vec![Certificate::from_pem(INT).unwrap()],
         crl_pems: vec![CRL_VALID.to_vec()],
@@ -153,6 +154,17 @@ fn empty_anchor_set_is_a_construction_error() {
 fn zero_max_depth_is_a_construction_error() {
     let mut cfg = config_builder();
     cfg.max_depth = 0;
+    let err = OpensslVerifier::new(cfg).unwrap_err();
+    assert!(matches!(err, TrustError::PathBuild(_)), "{err:?}");
+}
+
+#[test]
+fn crl_mode_with_empty_store_is_a_construction_error() {
+    // crl mode consults the CRL store for every certificate; an empty store
+    // would short-circuit to Ok and silently disable revocation, so refuse
+    // to construct the verifier (fail closed).
+    let mut cfg = config_builder();
+    cfg.crl_pems = vec![];
     let err = OpensslVerifier::new(cfg).unwrap_err();
     assert!(matches!(err, TrustError::PathBuild(_)), "{err:?}");
 }

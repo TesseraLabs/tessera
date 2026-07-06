@@ -106,6 +106,26 @@ async fn fail_closed_no_logind_id(
     actions.reboot().await
 }
 
+/// Runs the operator-configured USB-removal hook as root.
+///
+/// # Security
+///
+/// Several environment variables passed to the hook are UNTRUSTED and must
+/// never be interpolated into a shell command unquoted by the hook script:
+///
+/// * `USB_SERIAL` — taken from the udev attributes of a physically-inserted
+///   device, so an attacker controls its bytes (it can contain shell
+///   metacharacters);
+/// * `CERT_CN` — derived from the presented certificate's subject and is
+///   likewise attacker-influenced.
+///
+/// This function spawns the hook with [`std::process::Command`], which passes
+/// the environment verbatim and performs no shell interpretation, so there is
+/// no injection here. The residual risk is entirely downstream: a hook that
+/// does `eval`/`sh -c` with `$USB_SERIAL` or `$CERT_CN` would execute
+/// attacker input as root. Hook authors must treat these values as data and
+/// always quote them (or avoid the shell). `PAM_USER`, `PAM_SERVICE`,
+/// `HOST_ID_HASH`, and `SESSION_ID` originate from validated/internal state.
 fn run_hook(
     path: &std::path::Path,
     session: &crate::registry::ActiveSession,

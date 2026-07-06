@@ -10,8 +10,9 @@
 //!    the certificate's issuer, which is the standard semantics of that
 //!    call); when any involved certificate is GOST-signed the gost-engine
 //!    is pinned first, failing closed when unavailable;
-//! 3. the nonce, when present in the response, equals the request nonce
-//!    (absence in the response is allowed: pre-signed responses);
+//! 3. the nonce echoing is honoured: when the request carried a nonce the
+//!    response must echo a matching one; a nonce-less response is accepted
+//!    only when the request itself carried none (pre-signed interop);
 //! 4. the `thisUpdate`/`nextUpdate` window is valid at the current time
 //!    with `clock_skew_seconds` tolerance; when the responder omits
 //!    `nextUpdate` the window cannot bound replay, so `thisUpdate` age is
@@ -129,10 +130,9 @@ pub fn verify_ocsp_response(
     request_der: Option<&[u8]>,
     ctx: &OcspVerifyContext<'_>,
 ) -> Result<CertStatus, TrustError> {
-    let response =
-        OcspResponse::from_der(response_der).map_err(|e| TrustError::OcspMalformed {
-            reason: format!("OCSPResponse DER: {e}"),
-        })?;
+    let response = OcspResponse::from_der(response_der).map_err(|e| TrustError::OcspMalformed {
+        reason: format!("OCSPResponse DER: {e}"),
+    })?;
     let status = response.status();
     if status != OcspResponseStatus::SUCCESSFUL {
         return Err(TrustError::OcspResponderRefused {
@@ -219,8 +219,8 @@ fn verify_signature(
     ctx: &OcspVerifyContext<'_>,
 ) -> Result<(), TrustError> {
     let sig_err = |reason: String| TrustError::OcspSignatureInvalid { reason };
-    let mut store = X509StoreBuilder::new()
-        .map_err(|e| sig_err(format!("trust store init: {e}")))?;
+    let mut store =
+        X509StoreBuilder::new().map_err(|e| sig_err(format!("trust store init: {e}")))?;
     for anchor in ctx.anchors {
         store
             .add_cert(anchor.x509().clone())
@@ -244,19 +244,31 @@ fn verify_signature(
 }
 
 /// Runs the RFC 8954 nonce comparison and maps the outcome fail-closed.
+///
+/// This runs only on the network path, where `request_der` is the request we
+/// just sent. When that request carried a nonce, a response that omits it
+/// cannot prove freshness: an attacker with network control could replay a
+/// captured nonce-less "good" response within its validity window. So a
+/// nonce we sent MUST be echoed back.
+///
+/// The pre-signed-responder interop allowance is preserved only where *we
+/// did not send a nonce* (`AbsentInBoth`): then there is nothing to echo and
+/// replay protection rightly rests on the validity window. The cache-replay
+/// path re-verifies with `request_der = None` and never reaches this check,
+/// so cached pre-signed responses are unaffected.
 fn check_nonce(request_der: &[u8], response_der: &[u8]) -> Result<(), TrustError> {
     use super::sys::NonceCheck;
     let outcome = super::sys::check_nonce(request_der, response_der)
         .map_err(|reason| TrustError::OcspMalformed { reason })?;
     match outcome {
-        // Absence of a nonce in the response is allowed (pre-signed
-        // responses); replay protection then rests on the
-        // thisUpdate/nextUpdate window — and, when nextUpdate is also
-        // absent, on the thisUpdate age cap applied in verify_ocsp_response.
-        NonceCheck::Match | NonceCheck::AbsentInResponse | NonceCheck::AbsentInBoth => Ok(()),
-        // A differing nonce, or a nonce we provably never sent, is a
-        // replayed/foreign response.
-        NonceCheck::Mismatch | NonceCheck::PresentOnlyInResponse => {
+        // Both sides carry the same nonce, or neither does (we sent no
+        // nonce — the pre-signed allowance). Both are acceptable.
+        NonceCheck::Match | NonceCheck::AbsentInBoth => Ok(()),
+        // We sent a nonce but the response did not echo it: on the network
+        // path this leaves replay bounded only by the validity window, so
+        // reject. A differing nonce, or a nonce we provably never sent, is
+        // likewise a replayed/foreign response.
+        NonceCheck::AbsentInResponse | NonceCheck::Mismatch | NonceCheck::PresentOnlyInResponse => {
             Err(TrustError::OcspNonceMismatch)
         }
     }
@@ -397,6 +409,24 @@ mod tests {
         )
         .expect("matching nonce verifies");
         assert_eq!(status, CertStatus::Good);
+    }
+
+    #[test]
+    fn nonceless_response_to_a_nonced_request_is_rejected() {
+        // Network path: we sent a nonce (req_rsa_nonce.der) but good.der
+        // carries none. Accepting it would let an attacker replay a captured
+        // nonce-less "good" response within its validity window, so the
+        // missing echo must fail closed.
+        let pki = Pki::load();
+        let err = verify_ocsp_response(
+            &load_der("ocsp/good.der"),
+            &load_cert("leaf_rsa.pem"),
+            &load_cert("int.pem"),
+            Some(&load_der("ocsp/req_rsa_nonce.der")),
+            &pki.ctx(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TrustError::OcspNonceMismatch), "got {err:?}");
     }
 
     #[test]
@@ -590,7 +620,10 @@ mod tests {
             &pki.ctx(),
         )
         .unwrap_err();
-        assert!(matches!(err, TrustError::OcspMalformed { .. }), "got {err:?}");
+        assert!(
+            matches!(err, TrustError::OcspMalformed { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

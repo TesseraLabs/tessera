@@ -293,6 +293,12 @@ pub enum TrustError {
         /// Path.
         path: PathBuf,
     },
+    /// CRL revocation mode selected with no CRLs configured.
+    #[error(
+        "trust.revocation.mode = \"crl\" requires at least one entry in crl_paths; \
+         an empty CRL set would make every certificate pass the revocation check"
+    )]
+    CrlPathsEmpty,
     /// OCSP responder invalid.
     #[error("OCSP responder invalid: {reason}")]
     OcspResponderInvalid {
