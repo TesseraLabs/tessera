@@ -10,7 +10,7 @@
 
 ### Requirement: Ленивая загрузка engine
 
-Engine ДОЛЖЕН (MUST) загружаться once-per-process (OnceLock) и ТОЛЬКО если в цепочке есть GOST-подписанный сертификат (`ensure_loaded_if_any_gost`, engine.rs:104–113). На чистых RSA/ECDSA цепочках engine НЕ ДОЛЖЕН (MUST NOT) затрагиваться (банкоматный RSA-only кейс работает без gost-engine).
+Engine ДОЛЖЕН (MUST) загружаться once-per-process (OnceLock) и ТОЛЬКО если в цепочке есть GOST-подписанный сертификат (`ensure_loaded_if_any_gost`, engine.rs:104–113). На чистых RSA/ECDSA цепочках engine НЕ ДОЛЖЕН (MUST NOT) затрагиваться (терминальный RSA-only кейс работает без gost-engine).
 
 #### Scenario: GOST-цепочка, engine не грузится
 - **WHEN** предъявлена GOST-цепочка, engine отсутствует/сломан

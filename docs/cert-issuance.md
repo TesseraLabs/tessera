@@ -88,7 +88,7 @@ openssl x509 -req -in user.csr -CA int.pem -CAkey int.key \
     -extfile openssl.cnf -extensions user_exts -out user.pem
 ```
 
-## Сценарий 2 — оператор банкоматов: несколько хостов, один пользователь
+## Сценарий 2 — оператор терминалов: несколько хостов, один пользователь
 
 ```ini
 [ hb_three_atms ]

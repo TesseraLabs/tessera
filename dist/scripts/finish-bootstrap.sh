@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # finish-bootstrap.sh — flip tessera from bootstrap to production layout.
 #
-# Designed for cloned ATM images:
+# Designed for cloned device images:
 #   1. The golden image ships with `[host_identity].sources = ["override"]`
 #      so the bootstrap cert (issued for host_id="installation") is valid
 #      everywhere out of the box.

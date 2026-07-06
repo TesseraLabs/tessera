@@ -915,7 +915,7 @@ fn imported_managed_tags_readable_via_trusted_source() {
         &PkgSpec {
             bundle_version: 1,
             slices: &[("oper", 1)],
-            tags: &[("region", "north"), ("class", "atm")],
+            tags: &[("region", "north"), ("class", "terminal")],
             crl: None,
             p12_pin: false,
         },
@@ -934,7 +934,7 @@ fn imported_managed_tags_readable_via_trusted_source() {
     )
     .unwrap();
     assert_eq!(tags.get("region"), Some("north"));
-    assert_eq!(tags.get("class"), Some("atm"));
+    assert_eq!(tags.get("class"), Some("terminal"));
 }
 
 #[test]

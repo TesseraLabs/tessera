@@ -159,5 +159,5 @@ Apache-2.0 and remain available under it.
 
 ## Maintainer contact
 
-- Repository: <https://github.com/RoboNET/tessera>.
+- Repository: <https://github.com/TesseraLabs/tessera>.
 - Bug tracker: GitHub Issues.

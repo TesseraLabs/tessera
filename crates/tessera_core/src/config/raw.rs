@@ -210,7 +210,7 @@ pub struct RawRoles {
 /// Raw `[fly_dm_greeter]` block: Astra fly-dm login-screen wallpaper
 /// banner integration.
 ///
-/// On Astra МКЦ-3 (production ATM) the `fly-modern` greeter theme
+/// On Astra МКЦ-3 (production terminal) the `fly-modern` greeter theme
 /// hard-codes "Усиленный уровень защищенности" into the headline place
 /// from `fly-dm_greet_modern.mo`; the `GreetString` xdmcp setting is
 /// ignored. The only reliable surface for showing `host_id` to the

@@ -48,7 +48,7 @@ OID-дуги >int64 → выпуск таких сертов ДОЛЖЕН (MUST)
 
 #### Scenario: Malformed host_binding
 - **WHEN** `sha256:` с пустым/неверным hex
-- **THEN** reject (fail-closed, подтверждено на боевом банкомате 27.05.2026: «sha256 digest must be 64 lowercase hex chars, got ""»)
+- **THEN** reject (fail-closed, подтверждено на боевом терминале 27.05.2026: «sha256 digest must be 64 lowercase hex chars, got ""»)
 
 ### Requirement: verify_user_binding
 

@@ -13,7 +13,7 @@ edition = "2021"
 rust-version = "1.95"
 # Dual-licensed: AGPL-3.0-only OR commercial (LICENSE.commercial).
 license = "AGPL-3.0-only"
-repository = "https://github.com/RoboNET/tessera"
+repository = "https://github.com/TesseraLabs/tessera"
 authors = ["Mikhail Korolev <mikhail@robonet.me>"]
 
 [workspace.dependencies]

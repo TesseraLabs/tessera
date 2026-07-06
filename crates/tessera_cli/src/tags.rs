@@ -122,7 +122,7 @@ mod tests {
     fn show_reads_applied_tags() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tags.toml");
-        fs::write(&path, b"[tags]\nregion = \"north\"\nclass = \"atm\"\n").unwrap();
+        fs::write(&path, b"[tags]\nregion = \"north\"\nclass = \"terminal\"\n").unwrap();
         let tags = read_applied(&path).unwrap();
         assert_eq!(tags.len(), 2);
         assert_eq!(tags.get("region"), Some("north"));

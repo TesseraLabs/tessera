@@ -136,7 +136,7 @@
   daemon резолвит host identity и переписывает `GreetString.desktop`
   с short hash + source:
   ```
-  Банкомат astra184 · host_id=abc12345 (dmi_board_serial)
+  Устройство astra184 · host_id=abc12345 (dmi_board_serial)
   ```
   Original сохраняется как `.orig` при первом запуске. Atomic write
   (tmpfile + rename). Silent skip на хостах без `/etc/X11/fly-dm/`.
@@ -184,7 +184,7 @@
   заявили, что капчурят `XDG_SESSION_ID` и отправляют
   `UpdateSessionTarget` в monitord, но в cdylib код этого не было —
   `pam_sm_open_session` не вызывал `pam_getenv`, не открывал IPC и не
-  слал `UpdateSessionTarget`. На production-банкоматах USB-removal
+  слал `UpdateSessionTarget`. На production-терминалах USB-removal
   Logout/Lock молча не работал три релиза подряд: action handler не
   имел logind id и падал на `terminate_session`.
 - Добавлены: `crate::pam_helpers::pam_get_env_string` (thin
@@ -288,7 +288,7 @@
   `[mac].runtime` (`required` | `auto` | `disabled`, default `auto`)
   разводит compile-time feature `astra-mac` от runtime-выбора backend'а.
   Боевой кейс: один `.deb` (собранный с `astra-mac`) ставится на
-  банкоматы с МКЦ и без — поведение управляется через `config.toml`.
+  терминалы с МКЦ и без — поведение управляется через `config.toml`.
   - `disabled` — гарантированный `StubBackend`, никаких `pdp_*`
     вызовов даже на сборке с `astra-mac` (фиксирует событие
     `mac_runtime_disabled` в syslog).
@@ -300,7 +300,7 @@
     одноразовым `mac_runtime_fallback` (WARN) иначе.
   - Валидация: `disabled + cert_integrity=required` и `required` без
     `astra-mac` отвергаются на старте.
-  - Снимает блокер на банкомате МКЦ: `pam_parsec_mac: Can't obtain
+  - Снимает блокер на терминале МКЦ: `pam_parsec_mac: Can't obtain
     required data` теперь решается выставлением `runtime = "disabled"`
     + удалением `pam_parsec_mac` из стека, а не пересборкой `.deb`.
 
@@ -312,19 +312,19 @@
   (`resolve()` остаётся first-working-wins). cdylib теперь на старте
   каждой auth-сессии логирует по строке INFO на источник в
   `pam_certauth.host_identity` (`probe ok` / `probe error` +
-  `probe selected`). Источник истины для регистрации банкомата в
+  `probe selected`). Источник истины для регистрации терминала в
   реестре — этот лог; `sha256sum /etc/machine-id` вручную больше
   не нужен и даёт расхождение, если `[host_identity].sources`
   содержит не только `machine_id`.
 - `ResolvedHostId::hash_prefix()` — первые 8 hex символов sha256 для
   on-screen диагностик. Сообщение `host_binding` mismatch на лок-скрине
-  банкомата теперь показывает короткий `host_id=a1b2c3d4 (source=…)`
+  терминала теперь показывает короткий `host_id=a1b2c3d4 (source=…)`
   вместо нечитаемых 64 hex. Полный hash остаётся в syslog.
 - fly-dm greeter baseline: в начале `pam_sm_authenticate` модуль
   отправляет `PAM_TEXT_INFO` с короткой идентификацией машины
-  («Этот банкомат: host_id=… (source=…)»). `fly-dm` показывает её
+  («Это устройство: host_id=… (source=…)»). `fly-dm` показывает её
   в greeter UI при `greeter-show-messages = true` в
-  `/etc/X11/fly-dm/fly-dmrc` — инженер у банкомата мгновенно сверяет
+  `/etc/X11/fly-dm/fly-dmrc` — инженер у терминала мгновенно сверяет
   hash с реестром, не заходя в shell.
 
 ### Документация
@@ -336,7 +336,7 @@
   `.deb` для трёх сценариев (МКЦ выключен / включён / смешанный парк).
   Подсекция §8.5.1 — baseline для fly-dm greeter.
 - `install.md` Troubleshooting — команда `journalctl … 'host_identity:
-  probe'` теперь источник истины для регистрации банкомата.
+  probe'` теперь источник истины для регистрации терминала.
 
 ### Внутреннее
 
@@ -355,7 +355,7 @@
 
 - `host_id` логируется при каждом `resolve()` с указанием `source`,
   `raw` и полного `host_id_hash` (target `pam_certauth.host_identity`).
-  Fallback на `unknown` тоже логируется. **Регистрация банкомата в
+  Fallback на `unknown` тоже логируется. **Регистрация терминала в
   реестре теперь по факту resolved hash из syslog**, не ручное
   вычисление `sha256(/etc/machine-id)` — устраняет drift между скриптом
   выпуска cert'а и развёрнутыми `[host_identity].sources`.
@@ -386,7 +386,7 @@
 
 ### Документация
 
-- `install.md` — новая секция «Сертификат не принимается на банкомате»
+- `install.md` — новая секция «Сертификат не принимается на терминале»
   (чек-лист: host_id из syslog → сверка с реестром → перевыпуск или
   чтение cert plaintext из .p12). Обновлён раздел `host_binding
   mismatch` (cert в новом формате читается без PIN).
@@ -418,7 +418,7 @@
   для startup-логирования и admin-troubleshooting'а.
 - `host_id_hash_prefix` (первые 8 hex) в PAM_TEXT_INFO — полный
   64-char hash на экране нечитаем.
-- Baseline-строка `«Этот банкомат: source=… hash_prefix=…»` для
+- Baseline-строка `«Это устройство: source=… hash_prefix=…»` для
   fly-dm greeter (до prompt'а PIN).
 
 ## [0.3.5] — 2026-05-25
@@ -587,8 +587,7 @@
   approver-EKU / external policy TOML / `pam-certauth execute|policy|gc`.
   Бинарь оставляет только `pam-certauth daemon`. IPC v2 retains
   `engineer_ski` + `engineer_cert_sha256` (МКЦ-audit), `scopes`
-  убран. Подробности см. в плане
-  `docs/superpowers/plans/2026-05-14-strip-scopes-mofn.md`.
+  убран.
 
 ## [0.1.1] — 2026-05-06
 

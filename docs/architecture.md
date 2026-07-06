@@ -35,7 +35,7 @@
   (`mode ∈ {ocsp, crl_then_ocsp}`): синхронный HTTP POST на заданный
   конфигом `ocsp_responder_url`, с жёстким таймаутом и дисковым кэшем.
   В режимах `none`/`crl` сети нет вовсе (offline CRL). Zero-egress
-  контуры (банкоматы) остаются на `none`/`crl`.
+  контуры (терминалы) остаются на `none`/`crl`.
 
 Полное описание границ TOE — в [docs/threat-model.md](threat-model.md).
 

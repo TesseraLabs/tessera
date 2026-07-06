@@ -6,7 +6,7 @@ CI сегодня: `build.yml` (matrix ubuntu stub / astra container, тесты
 `lint.yml` (clippy -D warnings, cargo deny/audit). Пять направлений ручной верификации
 перечислены KNOWN GAP'ами build-release спеки. Ограничения: PR-cycle быстрый (~3 мин ubuntu),
 замедлять нельзя; shared GH-раннеры — RLIMIT_NPROC=64 на shared-UID, нет физических токенов,
-нет ядра Astra/parsec; репо приватный (минуты Actions не бесплатны — тяжёлое не чаще nightly).
+нет ядра Astra/parsec; бюджет CI-минут ограничен — тяжёлые прогоны не чаще nightly.
 
 ## Goals / Non-Goals
 
@@ -28,7 +28,7 @@ CI сегодня: `build.yml` (matrix ubuntu stub / astra container, тесты
    08:00–19:00 МСК) + workflow_dispatch; concurrency-группа; щедрые `timeout-minutes`.
    Состав: release-профиль тестов (обе ветки matrix), gost-tests, hook-security job.
    Альтернатива «всё в PR» отвергнута: +8–10 мин на каждый PR ради инвариантов, меняющихся
-   редко; nightly ловит регрессию с лагом ≤24h — приемлемо для личного проекта.
+   редко; nightly ловит регрессию с лагом ≤24h — приемлемо для текущего темпа разработки.
 2. **GOST-фикстуры: генерация скриптом, коммит в репо.** `tests/scripts/gen-gost-fixtures.sh`
    (openssl+gost-engine, доступен в astra-builder образе и любом Linux с libgost): корневой
    GOST-CA, intermediate, leaf 2012-256/512, p12-контейнеры, отозванный leaf + CRL.
@@ -46,8 +46,8 @@ CI сегодня: `build.yml` (matrix ubuntu stub / astra container, тесты
    KVM (/dev/kvm) — vagrant-libvirt поднимает Astra VM из box'а; прогон test-mac.sh (T1–T11),
    отчёт — artifact. Открытые вопросы: где хостить Astra box (GHCR OCI-артефакт приватного
    репо — кандидат) и влезает ли образ в диск раннера (~14 GB свободных) — проверяется
-   первой задачей; fallback — self-hosted раннер на домашнем гипервизоре (есть VBox-образ
-   astra_1.8.4). Weekly, не nightly: прогон тяжёлый, MAC-слой меняется редко.
+   первой задачей; fallback — self-hosted раннер с уже существующим VBox-образом
+   astra_1.8.4. Weekly, не nightly: прогон тяжёлый, MAC-слой меняется редко.
 5. **SoftHSM2-smoke (компенсация гэпа №4).** Job (ubuntu, nightly): softhsm2 + импорт
    фикстурного RSA/ECDSA ключа/серта → прогон PKCS#11-пути (login, find, C_Sign, верификация)
    через существующие интеграционные тесты с `pkcs11_module=libsofthsm2.so`. GOST через
@@ -65,8 +65,8 @@ CI сегодня: `build.yml` (matrix ubuntu stub / astra container, тесты
   Поэтому она weekly, изолирована в свой workflow/job и не блокирует остальной nightly.
 - **Закоммиченные GOST-ключи** могут смутить сканеры секретов. Митигация: README в каталоге
   фикстур («тестовые ключи, генерируются gen-gost-fixtures.sh, не секреты») + allowlist-паттерн.
-- **Стоимость минут**: nightly ~30–40 мин/сутки + weekly ~1ч — в пределах разумного для
-  приватного репо; concurrency cancel-in-progress предотвращает наложение.
+- **Стоимость минут**: nightly ~30–40 мин/сутки + weekly ~1ч — в пределах разумного бюджета
+  CI; concurrency cancel-in-progress предотвращает наложение.
 
 ## Open Questions
 

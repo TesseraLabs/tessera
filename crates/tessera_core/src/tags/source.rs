@@ -247,12 +247,12 @@ mod tests {
             &key,
             5,
             &[("oper", 1)],
-            &[("region", "north"), ("class", "atm")],
+            &[("region", "north"), ("class", "terminal")],
         );
         let tags = load_managed(dir.path(), RoleOs::Linux, &key.pub_pem, persist.path()).unwrap();
         assert_eq!(tags.len(), 2);
         assert_eq!(tags.get("region"), Some("north"));
-        assert_eq!(tags.get("class"), Some("atm"));
+        assert_eq!(tags.get("class"), Some("terminal"));
     }
 
     #[test]

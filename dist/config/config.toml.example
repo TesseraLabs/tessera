@@ -258,7 +258,7 @@ level = "info"
 # ------------------------------------------------------------------
 # [fly_dm_greeter] — fly-dm login-screen wallpaper banner
 # ------------------------------------------------------------------
-# On Astra МКЦ-3 (production ATM) fly-modern theme hardcoded'но
+# On Astra МКЦ-3 (production terminal) fly-modern theme hardcoded'но
 # подставляет в headline place "Усиленный уровень защищенности"
 # из fly-dm_greet_modern.mo; GreetString игнорируется. Единственный
 # надёжный канал показать host_id оператору — впечатать его в
@@ -292,5 +292,5 @@ update_wallpaper = false
 # wallpaper_gravity    = "south"   # north | south | east | west | center
 # wallpaper_offset_x   = 0
 # wallpaper_offset_y   = 120
-# template_ru          = "Банкомат %n  host_id={host_id_short} ({source})"
-# template_en          = "ATM %n  host_id={host_id_short} ({source})"
+# template_ru          = "Устройство %n  host_id={host_id_short} ({source})"
+# template_en          = "Device %n  host_id={host_id_short} ({source})"

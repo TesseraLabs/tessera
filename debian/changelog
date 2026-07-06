@@ -23,7 +23,7 @@ tessera (0.4.0-1) unstable; urgency=medium
 pam-certauth (0.3.19-1) unstable; urgency=medium
 
   * fly-dm greeter pivot #2: GreetString.desktop writer was no-op
-    on production МКЦ-3 ATM (fly-modern hardcodes "Усиленный
+    on production МКЦ-3 terminal (fly-modern hardcodes "Усиленный
     уровень защищенности" in the headline place). Replaced by a
     wallpaper writer that bakes host_id into the JPG that
     settings.ini [background].path points to. Opt-in via
@@ -71,7 +71,7 @@ pam-certauth (0.3.18-1) unstable; urgency=medium
     debian/postinst, debconf from debian/control Depends, and
     confmodule sourcing at the top of postinst.
 
- -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 17:15:00 +0300
+ -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 23:15:00 +0300
 
 pam-certauth (0.3.17-1) unstable; urgency=medium
 
@@ -93,7 +93,7 @@ pam-certauth (0.3.17-1) unstable; urgency=medium
   * No source-code changes vs 0.3.16. Same .deb behaviour, faster
     CI.
 
- -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 16:35:00 +0300
+ -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 22:35:00 +0300
 
 pam-certauth (0.3.16-1) unstable; urgency=medium
 
@@ -108,7 +108,7 @@ pam-certauth (0.3.16-1) unstable; urgency=medium
     true, pam-certauth resolves the host identity on each daemon
     start and rewrites GreetString.desktop with the short hash and
     source, e.g.
-        Банкомат astra184 · host_id=abc12345 (dmi_board_serial)
+        Устройство astra184 · host_id=abc12345 (dmi_board_serial)
     The original file is preserved as .orig on first run. Atomic
     write (tmpfile + rename). Silent skip on hosts without
     /etc/X11/fly-dm/. Failures log-and-continue (auth never blocked
@@ -123,12 +123,12 @@ pam-certauth (0.3.16-1) unstable; urgency=medium
     --no-greeter-messages flags and the fly-dmrc patcher introduced
     in 0.3.15. Script is back to PAM-stack-editing only.
 
- -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 15:30:00 +0300
+ -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 21:30:00 +0300
 
 pam-certauth (0.3.15-1) unstable; urgency=medium
 
   * fly-dm greeter: surface PAM_TEXT_INFO on the lock screen.
-    pam_certauth sends "Этот банкомат: host_id=..." and the
+    pam_certauth sends "Это устройство: host_id=..." and the
     p12_wrong_pin_diagnostic via io.show_info(), but fly-dm only
     forwards info-messages to the greeter UI when
     `greeter-show-messages = true` is set under `[greeter]` in
@@ -147,7 +147,7 @@ pam-certauth (0.3.15-1) unstable; urgency=medium
         (sshd-only hosts, server stands). Wired into
         run_startup_checks and re-exported as check_fly_dm_greeter.
 
- -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 10:05:00 +0300
+ -- Mikhail Korolev <michael443959@gmail.com>  Tue, 26 May 2026 20:05:00 +0300
 
 pam-certauth (0.3.14-1) unstable; urgency=medium
 
@@ -183,7 +183,7 @@ pam-certauth (0.3.13-1) unstable; urgency=high
   * No daemon-side changes; relies on the `UpdateSessionTarget` wire
     contract already shipped in 0.3.10.
 
- -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 12:00:00 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 22:00:00 +0300
 
 pam-certauth (0.3.12-1) unstable; urgency=medium
 
@@ -228,7 +228,7 @@ pam-certauth (0.3.12-1) unstable; urgency=medium
     operators at the new startup-check ID and the
     `integrate-pam.sh` re-run as the canonical fix.
 
- -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 18:00:00 +0300
+ -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 23:30:00 +0300
 
 pam-certauth (0.3.11-1) unstable; urgency=medium
 
@@ -241,7 +241,7 @@ pam-certauth (0.3.11-1) unstable; urgency=medium
     --features astra-mac` на CI падал с E0599. Релиз 0.3.10 был отгружен
     без .deb артефактов (release job skipped because build failed).
 
- -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 17:00:00 +0300
+ -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 23:00:00 +0300
 
 pam-certauth (0.3.10-1) unstable; urgency=medium
 
@@ -254,7 +254,7 @@ pam-certauth (0.3.10-1) unstable; urgency=medium
     вызвать `terminate_session` без logind id, и при извлечении
     USB-токена logout НЕ происходил — `WARN pam_certauth.monitord:
     Logout requested but session has no logind id`. Воспроизведено на
-    Astra SE 1.8.3 production-банкомате.
+    Astra SE 1.8.3 production-терминале.
   * IPC v2 расширен обратно совместимо: добавлены `ClientMessage::
     UpdateSessionTarget { session_id, new_target }` и
     `ServerMessage::SessionTargetUpdated { session_id }`. Старые
@@ -297,7 +297,7 @@ pam-certauth (0.3.8-1) unstable; urgency=medium
     `success=done` jump из `certauth-only` snippet'а обходил
     auth-инстанс pam_parsec_mac, и account/session-инстансы валились
     с `"Can't obtain required data"` → login deny несмотря на
-    успешную cert-аутентификацию. Подтверждено на боевом банкомате
+    успешную cert-аутентификацию. Подтверждено на боевом терминале
     (Astra SE 1.8.3, kernel 6.1.141): после ручного reordering и
     автоматически с новым скриптом login проходит до конца.
   * Test harness обновлён: `tests/scripts/test_integrate_pam.sh`
@@ -306,7 +306,7 @@ pam-certauth (0.3.8-1) unstable; urgency=medium
   * docs/install.md §8 обновлён: документирована логика placement
     anchor.
 
- -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 15:40:00 +0300
+ -- Mikhail Korolev <michael443959@gmail.com>  Mon, 25 May 2026 21:40:00 +0300
 pam-certauth (0.3.9-1) unstable; urgency=medium
 
   * Startup validation pipeline: daemon на старте прогоняет шесть
@@ -321,7 +321,7 @@ pam-certauth (0.3.9-1) unstable; urgency=medium
     навешан на `ExecStartPre=` для hard-gate boot'а. Документация в
     `docs/install.md` §2.4½.
 
- -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 16:00:00 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 22:00:30 +0300
 
 pam-certauth (0.3.8-1) unstable; urgency=medium
 
@@ -339,7 +339,7 @@ pam-certauth (0.3.8-1) unstable; urgency=medium
     DMI host_id drift, fly-dm greeter banner и DIGSIG enforce без
     подписи.
 
- -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 15:50:00 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 21:50:00 +0300
 
 pam-certauth (0.3.7-1) unstable; urgency=medium
 
@@ -352,13 +352,13 @@ pam-certauth (0.3.7-1) unstable; urgency=medium
     `parsec_strict_mode()` и при отсутствии ядра падает на stub с
     `mac_runtime_fallback` (WARN); `required` fail-closed
     отвергает аутентификацию с `mac_runtime_required` при отсутствии
-    активного МКЦ. Снимает блокер банкомата
+    активного МКЦ. Снимает блокер терминала
     «pam_parsec_mac: Can't obtain required data» без пересборки .deb.
   * Диагностика: `HostIdentityResolver::probe_all()` + cdylib теперь
     на старте каждой auth-сессии логирует по строке INFO на каждый
     источник из `[host_identity].sources` (target
     `pam_certauth.host_identity`, тег `host_identity: probe`).
-    Источник истины для регистрации банкомата в реестре — этот лог.
+    Источник истины для регистрации терминала в реестре — этот лог.
   * Диагностика: `ResolvedHostId::hash_prefix()` (первые 8 hex).
     `PAM_TEXT_INFO` при `host_binding` mismatch теперь показывает
     `host_id=a1b2c3d4 (source=…)` вместо 64-char hash; полный hash
@@ -376,14 +376,14 @@ pam-certauth (0.3.7-1) unstable; urgency=medium
     про fly-dm greeter. Troubleshooting обновлён под новый
     `host_identity: probe` лог.
 
- -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 15:00:00 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 21:00:00 +0300
 
 pam-certauth (0.3.6-1) unstable; urgency=medium
 
   * Диагностика: при resolve `host_id` в syslog логируется source/raw/
     `host_id_hash` (target `pam_certauth.host_identity`). Fallback на
     `unknown` тоже логируется. Источник истины для регистрации
-    банкомата в реестре — этот лог, а не ручной
+    терминала в реестре — этот лог, а не ручной
     `sha256sum /etc/machine-id` (устраняет drift между скриптом
     выпуска и развёрнутым `[host_identity].sources`).
   * Диагностика: при отказе `host_binding` модуль показывает на экране
@@ -410,7 +410,7 @@ pam-certauth (0.3.6-1) unstable; urgency=medium
     partition-iteration тестам — гарантирует, что failed-партиция
     полностью разнесена (umount + rmdir), а не только размонтирована.
   * Документация: install.md — раздел «Сертификат не принимается на
-    банкомате» (чек-лист host_id из syslog + чтение cert plaintext
+    терминале» (чек-лист host_id из syslog + чтение cert plaintext
     из .p12), обновлён раздел host_binding mismatch (cert в новом
     формате читается без PIN), новая секция 8.5 про PAM-стек на
     Astra SE с/без МКЦ (PARSEC MAC).
@@ -423,7 +423,7 @@ pam-certauth (0.3.6-1) unstable; urgency=medium
     host_identity, host_id_hash_prefix в PAM_TEXT_INFO, baseline-
     строка для fly-dm greeter.
 
- -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 14:00:00 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 20:00:00 +0300
 
 pam-certauth (0.3.5-1) unstable; urgency=medium
 
@@ -442,7 +442,7 @@ pam-certauth (0.3.5-1) unstable; urgency=medium
     `PAM_AUTHINFO_UNAVAIL` (9), как и остальные «нет валидного
     credential на шине» состояния.
 
- -- Mikhail Korolev <mikhail@robonet.me>  Sun, 25 May 2026 12:00:00 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 21:55:00 +0300
 
 pam-certauth (0.3.4-1) unstable; urgency=medium
 
@@ -465,7 +465,7 @@ pam-certauth (0.3.4-1) unstable; urgency=medium
     version and debian/changelog top entry disagree (prevents recurrence
     of the metadata mismatch above).
 
- -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 11:30:00 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Mon, 25 May 2026 20:30:00 +0300
 
 pam-certauth (0.3.1-1) unstable; urgency=medium
 
@@ -484,7 +484,7 @@ pam-certauth (0.3.1-1) unstable; urgency=medium
     - Mandatory Depends are now limited to libpam0g, lsb-base and
       adduser (plus shlibs/misc substvars).
 
- -- Mikhail Korolev <mikhail@robonet.me>  Fri, 22 May 2026 16:07:06 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Fri, 22 May 2026 22:07:06 +0300
 
 pam-certauth (0.3.0-1) unstable; urgency=medium
 
@@ -520,7 +520,7 @@ pam-certauth (0.3.0-1) unstable; urgency=medium
     earlier execaps-wrapper approach which failed under
     User=pamcertauth (no PARSEC_CAP_CAP → EPERM in execaps).
 
- -- Mikhail Korolev <mikhail@robonet.me>  Fri, 15 May 2026 14:43:40 +0300
+ -- Mikhail Korolev <mikhail@robonet.me>  Fri, 15 May 2026 20:43:40 +0300
 
 pam-certauth (0.2.1-1) unstable; urgency=medium
 

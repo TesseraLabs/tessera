@@ -144,7 +144,7 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
 
     // Astra greeter wallpaper: resolve the host identity once and (when
     // enabled) bake the host_id into the fly-dm login-screen background
-    // JPG so it is visible to the ATM operator. On Astra МКЦ-3 the
+    // JPG so it is visible to the operator. On Astra МКЦ-3 the
     // fly-modern theme hard-codes the headline string and ignores
     // GreetString, so the wallpaper is the only reliable surface. Failures
     // MUST NOT block startup — a broken filesystem / missing image is not
