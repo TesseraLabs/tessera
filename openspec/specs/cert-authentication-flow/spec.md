@@ -30,11 +30,11 @@
 
 ### Requirement: Greeter-баннер перед prompt
 
-Модуль ДОЛЖЕН (MUST) перед любым prompt'ом показать через `PAM_TEXT_INFO` баннер `"Этот банкомат: host_id=<prefix8> (source=...)"` (flow.rs:394–400). Показ best-effort и НЕ ДОЛЖЕН (MUST NOT) влиять на вердикт.
+Модуль ДОЛЖЕН (MUST) перед любым prompt'ом показать через `PAM_TEXT_INFO` баннер `"Это устройство: host_id=<prefix8> (source=...)"` (flow.rs:394–400). Показ best-effort и НЕ ДОЛЖЕН (MUST NOT) влиять на вердикт.
 
 #### Scenario: Показ баннера перед prompt
 - **WHEN** начинается аутентификация и host identity резолвлена
-- **THEN** через `PAM_TEXT_INFO` показывается баннер `"Этот банкомат: host_id=<prefix8> (source=...)"` до любого prompt'а; сбой показа не влияет на вердикт
+- **THEN** через `PAM_TEXT_INFO` показывается баннер `"Это устройство: host_id=<prefix8> (source=...)"` до любого prompt'а; сбой показа не влияет на вердикт
 
 ### Requirement: PKCS#12 путь (порядок проверок)
 
@@ -42,7 +42,7 @@
 
 #### Scenario: host_binding нарушен
 - **WHEN** ни один дескриптор `pam_cert_host_binding` не совпал с host_id_hash
-- **THEN** WARN + on-screen диагностика «Сертификат выпущен для другого банкомата…» → `FlowError::CertScope` → `PAM_AUTH_ERR` (7), fail-closed (flow.rs:631–655)
+- **THEN** WARN + on-screen диагностика «Сертификат выпущен для другого устройства…» → `FlowError::CertScope` → `PAM_AUTH_ERR` (7), fail-closed (flow.rs:631–655)
 
 #### Scenario: monitord недоступен при SessionOpen
 - **WHEN** `monitor.open_session` вернул ошибку на auth-пути

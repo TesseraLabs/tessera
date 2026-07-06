@@ -32,7 +32,7 @@ sudo tail -f /var/log/auth.log
 `HostExtensionMissing`. С 0.3.6 на banner'е (TTY/sshd/sudo):
 
 ```
-Сертификат выпущен для другого банкомата.
+Сертификат выпущен для другого устройства.
 host_id_hash этой машины: <hex>
 источник host_id: DmiBoardSerial
 Передайте администратору для перевыпуска.
@@ -48,7 +48,7 @@ sudo journalctl -t tessera | grep 'host_identity: probe' | tail -20
 # probe selected source=MachineId (first successful) host_id_hash_prefix=a1b2c3d4
 
 # Что зашито в сертификате
-openssl x509 -in /etc/tessera/<atm>.pem -noout -text \
+openssl x509 -in /etc/tessera/<host>.pem -noout -text \
     | grep -A1 '2\.25\.183976554325829274683049824615098'
 ```
 
@@ -86,7 +86,7 @@ pamtester sudo alice authenticate
 В журнале искать `tessera.auth.fail.<reason>`. Список причин —
 [architecture.md](architecture.md#fail-closed-rules).
 
-### Сертификат не принимается на банкомате (общий чек-лист)
+### Сертификат не принимается на терминале (общий чек-лист)
 
 С 0.3.6 PAM выводит на экран `PAM_TEXT_INFO` с диагностикой для
 несовпадения `host_binding` и неверного PIN. Смотреть на экран **и**
@@ -101,7 +101,7 @@ sudo journalctl -t tessera --since '5 min ago' \
     | grep -E 'tessera\.(flow|host_identity)'
 ```
 
-Сверять с реестром выпуска (`atm-registry.tsv` на админ-машине):
+Сверять с реестром выпуска (`host-registry.tsv` на админ-машине):
 
 - `host_id_hash` в логе ≠ значение в cert → cert выпущен для другого
   АРМ. Перевыпустить.

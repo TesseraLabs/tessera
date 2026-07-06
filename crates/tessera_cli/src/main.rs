@@ -31,7 +31,7 @@ enum Cmd {
     /// before `systemctl restart tessera`.
     Check(CheckArgs),
     /// Probe every `[host_identity]` source and emit a TSV report of the
-    /// resulting `host_id_hash` values. Use on freshly cloned ATM images
+    /// resulting `host_id_hash` values. Use on freshly cloned device images
     /// to learn which `host_id` the daemon will resolve so the CA admin can
     /// issue a per-host service cert. Output destinations: `--output PATH`,
     /// `--usb` (writes to first viable USB partition), or stdout.

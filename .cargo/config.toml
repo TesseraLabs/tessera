@@ -1,5 +1,5 @@
 [build]
-# rustflags applied to all crates; cdylib gets extra flags via crates/pam_certauth/build.rs (added later if needed)
+# rustflags applied to all crates; cdylib gets extra flags via crates/pam_tessera/build.rs (added later if needed)
 
 [target.'cfg(all())']
 rustflags = [

@@ -36,7 +36,7 @@
 
 ### Requirement: Контекст платформы (зачем wallpaper)
 
-Будущие изменения greeter'а ДОЛЖНЫ (MUST) учитывать ограничения платформы fly-modern theme: layout зашит в .so (не редактируется); при МКЦ-3 headline занят hardcoded MAC-статусом из `.mo`; `PAM_TEXT_INFO` fly-dm не показывает (фильтруется; работает на TTY/sshd/GDM/LightDM). На банкоматах AutoLogin → greeter виден только при logout оператора. Wallpaper — единственная поверхность, не зависящая от theme/MAC-статуса; в kiosk-сессии скрыт fullscreen-окном.
+Будущие изменения greeter'а ДОЛЖНЫ (MUST) учитывать ограничения платформы fly-modern theme: layout зашит в .so (не редактируется); при МКЦ-3 headline занят hardcoded MAC-статусом из `.mo`; `PAM_TEXT_INFO` fly-dm не показывает (фильтруется; работает на TTY/sshd/GDM/LightDM). На терминалах AutoLogin → greeter виден только при logout оператора. Wallpaper — единственная поверхность, не зависящая от theme/MAC-статуса; в kiosk-сессии скрыт fullscreen-окном.
 
 #### Scenario: МКЦ-3 headline недоступен
 - **WHEN** хост на боевом МКЦ-3, fly-modern theme хардкодит MAC-статус в headline

@@ -208,11 +208,11 @@ mod tests {
 
     #[test]
     fn valid_tags_parse() {
-        let doc = "[tags]\nregion = \"north\"\nclass = \"atm\"\n";
+        let doc = "[tags]\nregion = \"north\"\nclass = \"terminal\"\n";
         let tags = parse_tags(doc.as_bytes()).unwrap();
         assert_eq!(tags.len(), 2);
         assert_eq!(tags.get("region"), Some("north"));
-        assert_eq!(tags.get("class"), Some("atm"));
+        assert_eq!(tags.get("class"), Some("terminal"));
         assert_eq!(tags.get("absent"), None);
     }
 
@@ -285,12 +285,12 @@ mod tests {
 
     #[test]
     fn satisfies_superset_generic() {
-        let device = parse_tags(b"[tags]\nregion = \"north\"\nclass = \"atm\"\n").unwrap();
+        let device = parse_tags(b"[tags]\nregion = \"north\"\nclass = \"terminal\"\n").unwrap();
         // Subset requirement is satisfied.
         let req = DeviceTags::from_pairs([("region", "north")]).unwrap();
         assert!(device.satisfies(&req));
         // Full match satisfied.
-        let req = DeviceTags::from_pairs([("region", "north"), ("class", "atm")]).unwrap();
+        let req = DeviceTags::from_pairs([("region", "north"), ("class", "terminal")]).unwrap();
         assert!(device.satisfies(&req));
         // Wrong value not satisfied.
         let req = DeviceTags::from_pairs([("region", "south")]).unwrap();

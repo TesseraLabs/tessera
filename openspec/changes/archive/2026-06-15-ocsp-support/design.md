@@ -4,7 +4,7 @@
 
 Tessera v0.3.19: проверка отзыва = offline CRL (`crl/store.rs`), режим конфига сводится к булеву
 `crl_strict` в di.rs:121–139. OCSP заявлен в конфиге и доках, в runtime отсутствует. Целевая
-аудитория OCSP — машины с сетью до responder'а (НЕ zero-egress банкоматы: те остаются на
+аудитория OCSP — машины с сетью до responder'а (НЕ zero-egress терминалы: те остаются на
 `mode="none"`+короткий TTL либо offline CRL).
 
 Ограничения: `tessera_core` — sync, без tokio; собственная криптография запрещена (сертификационная

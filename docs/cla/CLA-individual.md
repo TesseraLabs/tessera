@@ -1,7 +1,7 @@
 # Individual Contributor License Agreement (ICLA)
 
 **Document version:** 1
-**Project:** Tessera — https://github.com/RoboNET/tessera
+**Project:** Tessera — https://github.com/TesseraLabs/tessera
 **Project Owner:** Mikhail Korolev (Королёв Михаил Юрьевич), an individual ("Owner")
 
 Thank you for your interest in contributing to the Tessera project (the

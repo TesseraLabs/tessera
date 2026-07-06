@@ -3,7 +3,7 @@
 ## Why
 
 `qr-login-core` даёт вход по QR в текстовом виде (режим 1) — работает везде, но без графики. На
-production-банкоматах Astra (fly-dm, тема `fly-modern`) нужен **графический QR на экране логина**,
+production-терминалах Astra (fly-dm, тема `fly-modern`) нужен **графический QR на экране логина**,
 не ломая родную тему. `fly-modern` (UiGreeter) плагины не грузит, а PAM info-сообщения выбрасывает
 модальным `QMessageBox` — картинку так не показать. Решение (спайк-верифицировано на живой Astra
 1.8.4, дизайн `tessera-ws/specs/2026-07-03-qr-login-display-design.md`): внешний X-оверлей поверх
@@ -52,4 +52,4 @@ greeter'а.
 - Развёртывание: оверлей-демон + конфиг fly-dm; xauth-доступ к дисплею greeter (fragile PID-
   discovery — зафиксировано в hardening).
 - **Pre-merge gate:** `threat-model` + `vuln-scan` — оверлей это pre-auth код на публичном
-  банкомате.
+  терминале.

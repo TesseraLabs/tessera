@@ -14,8 +14,8 @@ Cargo.lock.bak
 # Linux+gost-engine.  Not committed because they cannot be produced on macOS
 # dev hosts (no engine available).  The directory itself is preserved by the
 # committed `.keep` placeholder.
-crates/pam_certauth_core/tests/fixtures/gost/*
-!crates/pam_certauth_core/tests/fixtures/gost/.keep
+crates/tessera_core/tests/fixtures/gost/*
+!crates/tessera_core/tests/fixtures/gost/.keep
 .claude/scheduled_tasks.lock
 
 # Не для публичного репозитория (open-core split, design D6):

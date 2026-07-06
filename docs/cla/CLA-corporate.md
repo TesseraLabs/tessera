@@ -1,7 +1,7 @@
 # Corporate Contributor License Agreement (CCLA)
 
 **Document version:** 1
-**Project:** Tessera — https://github.com/RoboNET/tessera
+**Project:** Tessera — https://github.com/TesseraLabs/tessera
 **Project Owner:** Mikhail Korolev (Королёв Михаил Юрьевич), an individual ("Owner")
 
 This Agreement is for corporations and other legal entities whose employees

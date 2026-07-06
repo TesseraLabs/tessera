@@ -14,9 +14,9 @@ Build-Depends:
  libsystemd-dev,
  pkg-config
 Standards-Version: 4.6.2
-Homepage: https://github.com/RoboNET/tessera
-Vcs-Git: https://github.com/RoboNET/tessera.git
-Vcs-Browser: https://github.com/RoboNET/tessera
+Homepage: https://github.com/TesseraLabs/tessera
+Vcs-Git: https://github.com/TesseraLabs/tessera.git
+Vcs-Browser: https://github.com/TesseraLabs/tessera
 Rules-Requires-Root: binary-targets
 
 Package: tessera

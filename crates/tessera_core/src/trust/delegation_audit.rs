@@ -174,12 +174,12 @@ mod tests {
     fn snapshot_tags_is_sorted_and_empty_safe() {
         assert_eq!(snapshot_tags(&DeviceTags::empty()), "");
         let tags = DeviceTags::from_pairs(
-            [("region", "north"), ("class", "atm")]
+            [("region", "north"), ("class", "terminal")]
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned())),
         )
         .unwrap();
         // BTreeMap ordering: class before region.
-        assert_eq!(snapshot_tags(&tags), "class=atm,region=north");
+        assert_eq!(snapshot_tags(&tags), "class=terminal,region=north");
     }
 }

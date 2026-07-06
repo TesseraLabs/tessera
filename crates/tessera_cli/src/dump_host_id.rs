@@ -9,7 +9,7 @@
 //!
 //! Operator workflow this supports:
 //!
-//! 1. Boot cloned ATM image — `[host_identity].sources = ["override"]`
+//! 1. Boot cloned device image — `[host_identity].sources = ["override"]`
 //!    keeps the bootstrap cert valid.
 //! 2. Ansible flips `sources` to real values (`dmi_board_serial`,
 //!    `machine_id`, …).
@@ -567,12 +567,12 @@ mod tests {
         ];
         let tsv = render_tsv(
             &probes,
-            "atm-001",
+            "terminal-001",
             "2026-05-27T10:15:30Z",
             Some(HostIdSourceKind::MachineId),
         );
         let lines: Vec<&str> = tsv.lines().collect();
-        assert!(lines[0].starts_with("# tessera host identity probe — atm-001"));
+        assert!(lines[0].starts_with("# tessera host identity probe — terminal-001"));
         assert!(lines[0].ends_with("2026-05-27T10:15:30Z"));
         // header row
         let header_idx = lines

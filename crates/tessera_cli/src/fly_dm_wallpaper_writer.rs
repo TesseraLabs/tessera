@@ -1,7 +1,7 @@
 //! Wallpaper writer: bakes the resolved host identity into a banner over
 //! the fly-dm login-screen background image.
 //!
-//! Rationale: on Astra МКЦ-3 (production ATM) the `fly-modern` theme
+//! Rationale: on Astra МКЦ-3 (production terminal) the `fly-modern` theme
 //! hard-codes "Усиленный уровень защищенности" into the headline place
 //! from `fly-dm_greet_modern.mo`; the `GreetString` xdmcp setting is
 //! ignored. The only reliable surface for showing `host_id` to the
@@ -430,8 +430,8 @@ mod tests {
             wallpaper_gravity: Gravity::South,
             wallpaper_offset_x: 0,
             wallpaper_offset_y: 4,
-            template_ru: "Банкомат %n host_id={host_id_short} ({source})".to_string(),
-            template_en: "ATM %n host_id={host_id_short} ({source})".to_string(),
+            template_ru: "Устройство %n host_id={host_id_short} ({source})".to_string(),
+            template_en: "Device %n host_id={host_id_short} ({source})".to_string(),
         }
     }
 
@@ -444,8 +444,8 @@ mod tests {
     #[test]
     fn substitute_replaces_host_id_short_source_n() {
         let r = fixture_resolved(HostIdSourceKind::DmiBoardSerial, "abc12345deadbeef");
-        let out = substitute("ATM %n host_id={host_id_short} ({source})", &r, "astra184");
-        assert_eq!(out, "ATM astra184 host_id=abc12345 (dmi_board_serial)");
+        let out = substitute("Device %n host_id={host_id_short} ({source})", &r, "astra184");
+        assert_eq!(out, "Device astra184 host_id=abc12345 (dmi_board_serial)");
     }
 
     #[test]

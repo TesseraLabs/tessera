@@ -58,12 +58,12 @@ peer), `unlink`+cleanup при закрытии/крэше.
 
 ### Requirement: Overlay hardening (pre-auth)
 
-Оверлей — pre-auth код на публичном банкомате. Система ДОЛЖНА (MUST) работать с минимумом
+Оверлей — pre-auth код на публичном терминале. Система ДОЛЖНА (MUST) работать с минимумом
 capabilities, без наследования shell/env, без сети, без файл-диалогов, с ограниченной длиной
 ввода, с определённым crash-поведением (watchdog/cleanup), под seccomp + AppArmor-профилем.
 
 #### Scenario: Попытка kiosk-breakout из оверлея
-- **WHEN** пользователь у банкомата пытается выйти из оверлея в систему (hotkeys/файл-диалог/сеть)
+- **WHEN** пользователь у терминала пытается выйти из оверлея в систему (hotkeys/файл-диалог/сеть)
 - **THEN** нет пути наружу — минимум capabilities, no shell/network/file-диалоги, AppArmor-профиль
 
 ### Requirement: Terminal-состояния и cleanup

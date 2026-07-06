@@ -156,8 +156,8 @@ impl Default for FlyDmGreeterSection {
             wallpaper_gravity: Gravity::South,
             wallpaper_offset_x: 0,
             wallpaper_offset_y: 120,
-            template_ru: "Банкомат %n  host_id={host_id_short} ({source})".to_string(),
-            template_en: "ATM %n  host_id={host_id_short} ({source})".to_string(),
+            template_ru: "Устройство %n  host_id={host_id_short} ({source})".to_string(),
+            template_en: "Device %n  host_id={host_id_short} ({source})".to_string(),
         }
     }
 }

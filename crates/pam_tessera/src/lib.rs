@@ -69,7 +69,7 @@ mod host_identity {
         // Probe every configured source first and emit one INFO line per
         // source so the syslog has the full picture of which sources
         // answered and which failed. This is what admins eyeball on the
-        // ATM to register a fresh box into the registry, instead of
+        // device to register a fresh box into the registry, instead of
         // running `sha256sum /etc/machine-id` by hand. `probe_all` does
         // NOT influence selection — `resolve()` still keeps its
         // first-working-wins policy.
