@@ -183,7 +183,12 @@ fn resolved(source_kind: HostIdSourceKind, raw: String, normalized: String) -> R
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use crate::config::validated::HostIdFallback;

@@ -55,7 +55,8 @@ pub fn extract_allowed_roles(
         parse_seq_of_utf8(&value).map_err(|e| AllowedRolesExtError::Parse(e.to_string()))?;
     let mut roles: Vec<RoleId> = Vec::with_capacity(strings.len());
     for s in strings {
-        let role = RoleId::new(&s).map_err(|e| AllowedRolesExtError::InvalidRoleId(e.to_string()))?;
+        let role =
+            RoleId::new(&s).map_err(|e| AllowedRolesExtError::InvalidRoleId(e.to_string()))?;
         roles.push(role);
     }
     Ok(Some(roles))

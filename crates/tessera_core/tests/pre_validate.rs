@@ -3,9 +3,9 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::duration_suboptimal_units)]
 
+use std::time::{Duration, SystemTime};
 use tessera_core::x509::pre_validate::{pre_validate_end_entity, PreValidateConfig};
 use tessera_core::x509::{Certificate, TrustError};
-use std::time::{Duration, SystemTime};
 
 const LEAF: &[u8] = include_bytes!("fixtures/leaf_rsa.pem");
 const INT: &[u8] = include_bytes!("fixtures/int.pem");

@@ -16,8 +16,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
-use tessera_core::pam_conv::PamConvError;
 use secrecy::SecretString;
+use tessera_core::pam_conv::PamConvError;
 
 // ----- Constants pulled from <security/pam_appl.h> ----------------------------
 //

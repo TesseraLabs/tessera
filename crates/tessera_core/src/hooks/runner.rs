@@ -147,8 +147,8 @@ mod tests {
     fn cfg_with_hooks(hooks: Vec<HookConfig>) -> ValidatedConfig {
         // Config validation rejects empty `[trust].anchors`, so point at a
         // real PEM fixture.
-        let anchor = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/ca.pem");
+        let anchor =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ca.pem");
         let raw_toml = r#"
 crypto_backend = "openssl"
 mode = "pkcs12"
@@ -186,8 +186,7 @@ level = "info"
 syslog_facility = "auth"
 journald_priority = false
 "#;
-        let raw_toml =
-            raw_toml.replace("@ANCHOR@", &format!("{:?}", anchor.to_string_lossy()));
+        let raw_toml = raw_toml.replace("@ANCHOR@", &format!("{:?}", anchor.to_string_lossy()));
         let raw: crate::config::raw::RawConfig = toml::from_str(&raw_toml).unwrap();
         let mut cfg = ValidatedConfig::try_from(&raw).unwrap();
         cfg.hooks = hooks;

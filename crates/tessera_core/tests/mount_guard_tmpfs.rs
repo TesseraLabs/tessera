@@ -73,9 +73,8 @@ fn mount_guard_real_ops_placeholder_lifecycle() {
     let tmp = tempfile::tempdir().unwrap_or_else(|err| panic!("tempdir: {err}"));
     {
         let ops = std::sync::Arc::new(tessera_core::mount_guard::RealMountOps);
-        let _guard =
-            tessera_core::mount_guard::MountGuard::new_tmpfs(ops, tmp.path(), "abc-test")
-                .unwrap_or_else(|err| panic!("guard: {err}"));
+        let _guard = tessera_core::mount_guard::MountGuard::new_tmpfs(ops, tmp.path(), "abc-test")
+            .unwrap_or_else(|err| panic!("guard: {err}"));
     }
     assert!(!tmp.path().join("abc-test").exists());
 }

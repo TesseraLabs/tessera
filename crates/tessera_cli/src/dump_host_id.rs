@@ -27,11 +27,11 @@ use std::process::ExitCode;
 
 use clap::Args;
 
+use sha2::{Digest, Sha256};
 use tessera_core::config::validated::HostIdentitySection;
 use tessera_core::host_identity::chain::{ProbeResult, ResolvedHostId};
 use tessera_core::host_identity::{normalize_host_id, HostIdSourceKind, HostIdentityResolver};
 use tessera_core::usb::{UdevEnumerator, UsbDevice, UsbEnumerator};
-use sha2::{Digest, Sha256};
 
 /// CLI arguments for `tessera dump-host-id`.
 #[derive(Debug, Args)]
@@ -137,13 +137,19 @@ pub fn render_tsv(
     // Запись в String инфаллибельна, fmt::Result игнорируем намеренно.
     let _fmt = writeln!(out, "# tessera host identity probe — {hostname} — {ts}");
     out.push_str("# probes EVERY known source kind (not just [host_identity].sources).\n");
-    out.push_str("# active_under_current_config=yes marks the source the daemon currently picks.\n");
+    out.push_str(
+        "# active_under_current_config=yes marks the source the daemon currently picks.\n",
+    );
     out.push_str(
         "source\tstatus\thash_hex\thash_prefix\traw\tnormalized\tactive_under_current_config\treason\n",
     );
     for p in probes {
         let source = p.source.to_string();
-        let active = if active_kind == Some(p.source) { "yes" } else { "no" };
+        let active = if active_kind == Some(p.source) {
+            "yes"
+        } else {
+            "no"
+        };
         match &p.outcome {
             Ok(r) => {
                 // Запись в String инфаллибельна, fmt::Result игнорируем намеренно.
@@ -356,7 +362,8 @@ fn pick_usb_partition() -> Result<UsbDevice, DumpError> {
             .as_deref()
             .is_some_and(|fs| ALLOWED_FS.contains(&fs))
     });
-    candidate.ok_or_else(|| DumpError::Usb("no USB partition with writable filesystem found".into()))
+    candidate
+        .ok_or_else(|| DumpError::Usb("no USB partition with writable filesystem found".into()))
 }
 
 /// Mount `dev` read-write at a unique subdirectory of
@@ -417,9 +424,8 @@ fn write_to_usb(dev: &UsbDevice, filename: &str, content: &str) -> Result<PathBu
     })();
 
     // Best-effort unmount + rmdir regardless of write outcome.
-    let umount_res = umount(&mp).map_err(|e| {
-        DumpError::Usb(format!("umount {}: {e}", mp.display()))
-    });
+    let umount_res =
+        umount(&mp).map_err(|e| DumpError::Usb(format!("umount {}: {e}", mp.display())));
     // Best-effort: rmdir после umount, чтобы /run не накапливал mountpoint'ы.
     drop(fs::remove_dir(&mp));
 
@@ -446,12 +452,13 @@ pub fn run(opts: DumpHostIdOptions) -> Result<DumpDestination, DumpError> {
     let fan_resolver = HostIdentityResolver::from_validated(&fanout, fs_root.clone());
     let mut probes = fan_resolver.probe_all();
     // Append synthetic `override` probe (chain skips Override entirely).
-    probes.push(override_probe(validated.host_identity.override_value.as_deref()));
+    probes.push(override_probe(
+        validated.host_identity.override_value.as_deref(),
+    ));
 
     // Determine which source the daemon would actually pick under the
     // *configured* sources list — that's the row flagged `active=yes`.
-    let live_resolver =
-        HostIdentityResolver::from_validated(&validated.host_identity, fs_root);
+    let live_resolver = HostIdentityResolver::from_validated(&validated.host_identity, fs_root);
     let active_kind: Option<HostIdSourceKind> = match live_resolver.resolve() {
         Ok(r) => Some(r.source_kind),
         Err(_) => None,
@@ -467,7 +474,8 @@ pub fn run(opts: DumpHostIdOptions) -> Result<DumpDestination, DumpError> {
     let tsv = render_tsv(&probes, &hostname, &iso, active_kind);
 
     if let Some(path) = opts.output {
-        write_atomic(&path, &tsv).map_err(|e| DumpError::Output(format!("{}: {e}", path.display())))?;
+        write_atomic(&path, &tsv)
+            .map_err(|e| DumpError::Output(format!("{}: {e}", path.display())))?;
         return Ok(DumpDestination::File(path));
     }
     if opts.usb {
@@ -552,7 +560,10 @@ mod tests {
                 "abc123",
                 "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
             ),
-            err_probe(HostIdSourceKind::Hostname, "hostname source not in [host_identity].sources"),
+            err_probe(
+                HostIdSourceKind::Hostname,
+                "hostname source not in [host_identity].sources",
+            ),
         ];
         let tsv = render_tsv(
             &probes,

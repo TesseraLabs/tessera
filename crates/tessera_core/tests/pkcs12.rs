@@ -3,10 +3,10 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::indexing_slicing)]
 
+use secrecy::SecretString;
 use tessera_core::pkcs12::{
     validate_p12_envelope, LoadedKeyMaterial, P12EnvelopeError, Pkcs12Error,
 };
-use secrecy::SecretString;
 
 const RSA: &[u8] = include_bytes!("fixtures/leaf_rsa.p12");
 const ECDSA: &[u8] = include_bytes!("fixtures/leaf_ecdsa.p12");

@@ -114,13 +114,12 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     // Operators previously had to edit the systemd unit's CLI flags AND
     // config.toml in lockstep; with this change the daemon reads the same
     // file as PAM and CLI flags only act as overrides.
-    let validated =
-        tessera_core::config::load_validated_config(&args.config).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to load monitord config from {}: {e}",
-                args.config.display()
-            )
-        })?;
+    let validated = tessera_core::config::load_validated_config(&args.config).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to load monitord config from {}: {e}",
+            args.config.display()
+        )
+    })?;
 
     // Logging came up before the config could be read; now that
     // `[logging].level` is known, swap it into the live filter.  The

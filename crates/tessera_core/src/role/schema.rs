@@ -436,7 +436,8 @@ mod tests {
 
     #[test]
     fn unknown_field_rejected() {
-        let doc = "role = \"serv\"\nversion = 1\nos = \"linux\"\nname = \"n\"\nlevel = 0\nbogus = 1\n";
+        let doc =
+            "role = \"serv\"\nversion = 1\nos = \"linux\"\nname = \"n\"\nlevel = 0\nbogus = 1\n";
         let err = parse_slice(doc.as_bytes(), "serv", RoleOs::Linux).unwrap_err();
         assert!(matches!(err, RoleSchemaError::TomlParse { .. }));
     }
@@ -566,7 +567,10 @@ mod tests {
         let err = parse_slice(doc.as_bytes(), "serv", RoleOs::Astra).unwrap_err();
         assert!(matches!(
             err,
-            RoleSchemaError::PayloadOsMismatch { field: "groups", .. }
+            RoleSchemaError::PayloadOsMismatch {
+                field: "groups",
+                ..
+            }
         ));
     }
 

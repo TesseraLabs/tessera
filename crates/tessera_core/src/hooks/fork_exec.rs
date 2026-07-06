@@ -40,6 +40,30 @@ use crate::hooks::validator::{HookConfig, RunAs};
 use crate::hooks::vars::HookVars;
 use crate::hooks::wait::wait_with_timeout;
 
+/// Creates a pipe whose two ends both carry `O_CLOEXEC`.
+///
+/// The close-on-exec flag stops a sibling thread that forks and execs in the
+/// window before this module's own `fork()` from inheriting the pipe ends. A
+/// leaked write end would keep the pipe open after the hook child exits, so
+/// the reader's `read_to_end` would never see EOF and its join would block
+/// forever. On Linux the flag is set atomically with `pipe2(2)`; on other
+/// Unix dev targets (no `pipe2`) it is set immediately after `pipe(2)` — the
+/// production multithreaded PAM host is always Linux.
+fn cloexec_pipe() -> nix::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    {
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        let (r, w) = nix::unistd::pipe()?;
+        fcntl(&r, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(&w, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        Ok((r, w))
+    }
+}
+
 /// Build a stable, parent-owned supplementary groups slice from a resolved
 /// [`crate::hooks::user::UserInfo`]. Returns an empty slice when `run_as = Root`
 /// (i.e. `user_info` is `None`). Used by [`ForkExecExecutor::execute`] to
@@ -209,20 +233,28 @@ impl HookExecutor for ForkExecExecutor {
         // can deadlock writers once the pipe buffer (~64 KB) fills.
         // nix 0.30+ returns (OwnedFd, OwnedFd); we manage the lifetime
         // manually across fork/exec so convert into raw fds immediately.
+        //
+        // Create the pipes with O_CLOEXEC so a sibling thread that forks and
+        // execs in the window before our own fork() cannot inherit these
+        // write ends. A leaked write end would keep the pipe open after our
+        // child exits, so the reader's read_to_end never sees EOF and the
+        // join blocks forever (login stall), besides leaking hook output to
+        // an unrelated process. Our child hands these fds to the grandchild
+        // via dup2, which produces a fresh descriptor without CLOEXEC, so
+        // the child's stdout/stderr survive execve unaffected.
         #[allow(clippy::similar_names)]
-        let (stdout_pipe_r, stdout_pipe_w) = nix::unistd::pipe().map_err(HookError::Pipe)?;
+        let (stdout_pipe_r, stdout_pipe_w) = cloexec_pipe().map_err(HookError::Pipe)?;
         #[allow(clippy::similar_names)]
-        let (stderr_pipe_r, stderr_pipe_w) = nix::unistd::pipe().map_err(HookError::Pipe)?;
+        let (stderr_pipe_r, stderr_pipe_w) = cloexec_pipe().map_err(HookError::Pipe)?;
         let out_r = stdout_pipe_r.into_raw_fd();
         let out_w = stdout_pipe_w.into_raw_fd();
         let err_r = stderr_pipe_r.into_raw_fd();
         let err_w = stderr_pipe_w.into_raw_fd();
 
         // Compute basename for log tagging.
-        let basename = Path::new(command0).file_name().map_or_else(
-            || command0.clone(),
-            |s| s.to_string_lossy().into_owned(),
-        );
+        let basename = Path::new(command0)
+            .file_name()
+            .map_or_else(|| command0.clone(), |s| s.to_string_lossy().into_owned());
 
         let stage = hook.stage;
         let command = hook.command.clone();

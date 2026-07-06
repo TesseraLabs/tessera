@@ -15,6 +15,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use tessera_core::config::validated::RevocationMode;
@@ -27,10 +29,6 @@ const REVOKED: &[u8] = include_bytes!("fixtures/revoked_leaf.pem");
 const INT: &[u8] = include_bytes!("fixtures/int.pem");
 const CA: &[u8] = include_bytes!("fixtures/ca.pem");
 const CRL_VALID: &[u8] = include_bytes!("fixtures/crl_valid.pem");
-
-const GOOD_DER: &[u8] = include_bytes!("fixtures/ocsp/good.der");
-const GOOD_INT_DER: &[u8] = include_bytes!("fixtures/ocsp/good_int.der");
-const REVOKED_DER: &[u8] = include_bytes!("fixtures/ocsp/revoked.der");
 
 // Serials of the fixture certificates (lowercase, as in the DER CertID).
 const LEAF_RSA_SERIAL_HEX: &str = "44E056A8B426D4727A82EC2A41EDFFFEA4B3D0E3";
@@ -67,7 +65,8 @@ fn config(
     crl_pems: Vec<Vec<u8>>,
 ) -> OpensslVerifierConfig {
     OpensslVerifierConfig {
-        max_supported_profile_version: tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
+        max_supported_profile_version:
+            tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         anchors: vec![Certificate::from_pem(CA).unwrap()],
         intermediates: vec![Certificate::from_pem(INT).unwrap()],
         crl_pems,
@@ -137,25 +136,167 @@ fn write_500(stream: &mut TcpStream) {
     let _ = stream.flush();
 }
 
-/// Spawns a multi-connection mock OCSP responder.
+/// Absolute path to the committed PKI fixtures directory.
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// Whether an `openssl` CLI usable as an OCSP responder is on `PATH`. These
+/// tests sign responses live so they echo the client's per-request nonce
+/// (the client requires the echo on the network path); without the CLI the
+/// scenario cannot be reproduced, so the caller skips.
+fn openssl_available() -> bool {
+    Command::new("openssl")
+        .arg("version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Which fixture CA signs a route's response.
+#[derive(Clone)]
+struct Signer {
+    /// `-CA`: the issuer whose index lists the certificate.
+    ca: PathBuf,
+    /// `-rsigner`: the responder certificate.
+    cert: PathBuf,
+    /// `-rkey`: the responder private key.
+    key: PathBuf,
+}
+
+/// One answerable certificate: how to recognise its request and how to sign
+/// a fresh (nonce-echoing) response for it.
+#[derive(Clone)]
+struct Route {
+    /// Serial bytes located as a contiguous window of the request body.
+    serial_match: Vec<u8>,
+    /// Serial in `openssl x509 -serial` form (uppercase hex) for the index.
+    serial_hex: String,
+    /// Index subject column.
+    subject: String,
+    /// Whether the index marks the serial revoked.
+    revoked: bool,
+    /// Signing material.
+    signer: Signer,
+}
+
+fn int_signer() -> Signer {
+    let d = fixture_dir();
+    Signer {
+        ca: d.join("int.pem"),
+        cert: d.join("int.pem"),
+        key: d.join("int.key"),
+    }
+}
+
+fn ca_signer() -> Signer {
+    let d = fixture_dir();
+    Signer {
+        ca: d.join("ca.pem"),
+        cert: d.join("ca.pem"),
+        key: d.join("ca.key"),
+    }
+}
+
+fn leaf_good_route() -> Route {
+    Route {
+        serial_match: serial_bytes_hex(LEAF_RSA_SERIAL_HEX),
+        serial_hex: LEAF_RSA_SERIAL_HEX.to_string(),
+        subject: "/CN=alice".to_string(),
+        revoked: false,
+        signer: int_signer(),
+    }
+}
+
+fn int_good_route() -> Route {
+    Route {
+        serial_match: serial_bytes_hex(INT_SERIAL_HEX),
+        serial_hex: INT_SERIAL_HEX.to_string(),
+        subject: "/CN=CertAuth Test Intermediate".to_string(),
+        revoked: false,
+        signer: ca_signer(),
+    }
+}
+
+fn revoked_leaf_route() -> Route {
+    Route {
+        serial_match: serial_bytes_hex(REVOKED_SERIAL_HEX),
+        serial_hex: REVOKED_SERIAL_HEX.to_string(),
+        subject: "/CN=mallory".to_string(),
+        revoked: true,
+        signer: int_signer(),
+    }
+}
+
+/// Signs a fresh OCSP response for `request_der`, echoing its nonce, by
+/// running the `openssl ocsp` responder against a one-line index for the
+/// route's serial. Returns `None` if the CLI invocation fails.
+fn sign_response(request_der: &[u8], route: &Route) -> Option<Vec<u8>> {
+    let dir = tempfile::tempdir().ok()?;
+    let req_path = dir.path().join("req.der");
+    let resp_path = dir.path().join("resp.der");
+    let index_path = dir.path().join("index.txt");
+    std::fs::write(&req_path, request_der).ok()?;
+    // Fixed far-future expiry (2049) and a fixed past revocation date; the
+    // responder consults the index only for the serial's V/R status, and the
+    // response's own validity window comes from `-ndays` below.
+    let index_line = if route.revoked {
+        format!(
+            "R\t491231235959Z\t230101000000Z\t{}\tunknown\t{}\n",
+            route.serial_hex, route.subject
+        )
+    } else {
+        format!(
+            "V\t491231235959Z\t\t{}\tunknown\t{}\n",
+            route.serial_hex, route.subject
+        )
+    };
+    std::fs::write(&index_path, index_line).ok()?;
+    let out = Command::new("openssl")
+        .arg("ocsp")
+        .args(["-index"])
+        .arg(&index_path)
+        .args(["-CA"])
+        .arg(&route.signer.ca)
+        .args(["-rsigner"])
+        .arg(&route.signer.cert)
+        .args(["-rkey"])
+        .arg(&route.signer.key)
+        .args(["-reqin"])
+        .arg(&req_path)
+        .args(["-respout"])
+        .arg(&resp_path)
+        .args(["-ndays", "3650"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::fs::read(&resp_path).ok()
+}
+
+/// Spawns a multi-connection mock OCSP responder that signs each response
+/// live so it echoes the client's per-request nonce.
 ///
-/// `routes` is a list of `(serial_bytes, response_der)`.  For each incoming
-/// connection the responder reads the request, finds the route whose serial
-/// bytes appear as a contiguous window of the request body, and returns that
-/// DER; a request whose serial matches no route gets a 500.  The accept loop
-/// is a detached daemon thread — the test process tears it down on exit.
-fn spawn_responder(routes: Vec<(Vec<u8>, Vec<u8>)>) -> String {
+/// For each connection the responder reads the request, finds the route
+/// whose serial bytes appear as a contiguous window of the request body, and
+/// signs a fresh response for it; a request whose serial matches no route (or
+/// a signing failure) gets a 500. The accept loop is a detached daemon thread
+/// — the test process tears it down on exit.
+fn spawn_responder(routes: Vec<Route>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind responder");
     let port = listener.local_addr().expect("addr").port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let body = read_request(&mut stream);
-            let matched = routes.iter().find(|(serial, _)| {
-                !serial.is_empty() && body.windows(serial.len()).any(|w| w == serial.as_slice())
+            let matched = routes.iter().find(|r| {
+                !r.serial_match.is_empty()
+                    && body
+                        .windows(r.serial_match.len())
+                        .any(|w| w == r.serial_match.as_slice())
             });
-            match matched {
-                Some((_, der)) => write_response(&mut stream, der),
+            match matched.and_then(|r| sign_response(&body, r)) {
+                Some(der) => write_response(&mut stream, &der),
                 None => write_500(&mut stream),
             }
         }
@@ -178,12 +319,13 @@ fn url(raw: &str) -> OcspUrl {
 
 #[test]
 fn ocsp_mode_good_chain_verifies() {
-    let responder = spawn_responder(vec![
-        (serial_bytes_hex(LEAF_RSA_SERIAL_HEX), GOOD_DER.to_vec()),
-        (serial_bytes_hex(INT_SERIAL_HEX), GOOD_INT_DER.to_vec()),
-    ]);
-    let v = OpensslVerifier::new(config(RevocationMode::Ocsp, Some(url(&responder)), vec![]))
-        .unwrap();
+    if !openssl_available() {
+        eprintln!("skipping: openssl CLI not available for live nonce-echoing responder");
+        return;
+    }
+    let responder = spawn_responder(vec![leaf_good_route(), int_good_route()]);
+    let v =
+        OpensslVerifier::new(config(RevocationMode::Ocsp, Some(url(&responder)), vec![])).unwrap();
     let leaf = Certificate::from_pem(LEAF_RSA).unwrap();
     let presented = vec![Certificate::from_pem(INT).unwrap()];
     v.verify_at(&leaf, &presented, SystemTime::now())
@@ -192,12 +334,13 @@ fn ocsp_mode_good_chain_verifies() {
 
 #[test]
 fn ocsp_mode_revoked_is_rejected() {
-    let responder = spawn_responder(vec![
-        (serial_bytes_hex(REVOKED_SERIAL_HEX), REVOKED_DER.to_vec()),
-        (serial_bytes_hex(INT_SERIAL_HEX), GOOD_INT_DER.to_vec()),
-    ]);
-    let v = OpensslVerifier::new(config(RevocationMode::Ocsp, Some(url(&responder)), vec![]))
-        .unwrap();
+    if !openssl_available() {
+        eprintln!("skipping: openssl CLI not available for live nonce-echoing responder");
+        return;
+    }
+    let responder = spawn_responder(vec![revoked_leaf_route(), int_good_route()]);
+    let v =
+        OpensslVerifier::new(config(RevocationMode::Ocsp, Some(url(&responder)), vec![])).unwrap();
     let leaf = Certificate::from_pem(REVOKED).unwrap();
     let presented = vec![Certificate::from_pem(INT).unwrap()];
     let err = v
@@ -210,8 +353,7 @@ fn ocsp_mode_revoked_is_rejected() {
 #[test]
 fn ocsp_mode_responder_unreachable_is_rejected() {
     let dead = dead_responder_url();
-    let v =
-        OpensslVerifier::new(config(RevocationMode::Ocsp, Some(url(&dead)), vec![])).unwrap();
+    let v = OpensslVerifier::new(config(RevocationMode::Ocsp, Some(url(&dead)), vec![])).unwrap();
     let leaf = Certificate::from_pem(LEAF_RSA).unwrap();
     let presented = vec![Certificate::from_pem(INT).unwrap()];
     let err = v
@@ -231,11 +373,13 @@ fn ocsp_mode_responder_unreachable_is_rejected() {
 /// would fail — Ok proves the CRL short-circuit.
 #[test]
 fn crl_then_ocsp_covering_crl_uses_crl_not_ocsp_for_leaf() {
-    let responder = spawn_responder(vec![
-        // Only the intermediate is routed; the leaf serial deliberately has
-        // no route, so any OCSP query for the leaf would 500.
-        (serial_bytes_hex(INT_SERIAL_HEX), GOOD_INT_DER.to_vec()),
-    ]);
+    if !openssl_available() {
+        eprintln!("skipping: openssl CLI not available for live nonce-echoing responder");
+        return;
+    }
+    // Only the intermediate is routed; the leaf serial deliberately has no
+    // route, so any OCSP query for the leaf would 500.
+    let responder = spawn_responder(vec![int_good_route()]);
     let v = OpensslVerifier::new(config(
         RevocationMode::CrlThenOcsp,
         Some(url(&responder)),
@@ -252,10 +396,11 @@ fn crl_then_ocsp_covering_crl_uses_crl_not_ocsp_for_leaf() {
 /// live responder serving `good` for both, verification succeeds.
 #[test]
 fn crl_then_ocsp_no_crl_uses_ocsp_good() {
-    let responder = spawn_responder(vec![
-        (serial_bytes_hex(LEAF_RSA_SERIAL_HEX), GOOD_DER.to_vec()),
-        (serial_bytes_hex(INT_SERIAL_HEX), GOOD_INT_DER.to_vec()),
-    ]);
+    if !openssl_available() {
+        eprintln!("skipping: openssl CLI not available for live nonce-echoing responder");
+        return;
+    }
+    let responder = spawn_responder(vec![leaf_good_route(), int_good_route()]);
     let v = OpensslVerifier::new(config(
         RevocationMode::CrlThenOcsp,
         Some(url(&responder)),

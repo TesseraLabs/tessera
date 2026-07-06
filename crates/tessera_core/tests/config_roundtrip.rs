@@ -535,15 +535,28 @@ fn validated_config_rejects_ocsp_keys_outside_ocsp_modes() -> Result<(), Box<dyn
     // Each ocsp_* key would be silently ignored at runtime in non-OCSP
     // modes, so validation must reject it (same footgun-guard pattern as
     // monitor.on_usb_removed_hook_path).
-    for (mode, key_line) in [
-        ("crl", "ocsp_responder_url = \"https://ocsp.example.org/\""),
-        ("none", "ocsp_responder_url = \"https://ocsp.example.org/\""),
-        ("none", "ocsp_timeout_seconds = 5"),
-        ("none", "ocsp_cache_ttl_seconds = 600"),
+    // `crl` mode with empty crl_paths is rejected on its own (a silently
+    // disabled revocation check), so give the crl case a real CRL path — any
+    // regular file satisfies the existence check — to isolate the ocsp-key
+    // guard under test. `none` mode does not consult crl_paths.
+    let crl_line = format!("crl_paths = [{:?}]", anchor.display().to_string());
+    for (mode, crl_paths_line, key_line) in [
+        (
+            "crl",
+            crl_line.as_str(),
+            "ocsp_responder_url = \"https://ocsp.example.org/\"",
+        ),
+        (
+            "none",
+            "crl_paths = []",
+            "ocsp_responder_url = \"https://ocsp.example.org/\"",
+        ),
+        ("none", "crl_paths = []", "ocsp_timeout_seconds = 5"),
+        ("none", "crl_paths = []", "ocsp_cache_ttl_seconds = 600"),
     ] {
         let body = fixture_with_revocation(
             &anchor,
-            &format!("mode = {mode:?}\ncrl_paths = []\n{key_line}"),
+            &format!("mode = {mode:?}\n{crl_paths_line}\n{key_line}"),
         );
         let raw: RawConfig = toml::from_str(&body)?;
         let err = ValidatedConfig::try_from(&raw)

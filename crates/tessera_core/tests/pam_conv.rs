@@ -4,8 +4,8 @@
 #![allow(clippy::unnecessary_wraps)] // mocks must match the trait signature
 #![allow(clippy::panic_in_result_fn)]
 
-use tessera_core::pam_conv::{prompt_pin_via_callback, PamConvError};
 use secrecy::ExposeSecret;
+use tessera_core::pam_conv::{prompt_pin_via_callback, PamConvError};
 
 fn mock_ok(prompt: &str) -> Result<String, PamConvError> {
     assert_eq!(prompt, "Smart-card PIN: ");

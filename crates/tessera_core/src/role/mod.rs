@@ -23,9 +23,7 @@ pub use manifest::{
     verify_manifest, verify_signature, Manifest, ManifestCrl, ManifestError, ManifestRole,
     VerifiedManifest,
 };
-pub use schema::{
-    parse_slice, Payload, RoleId, RoleOs, RoleSchemaError, RoleSlice, SessionLimits,
-};
+pub use schema::{parse_slice, Payload, RoleId, RoleOs, RoleSchemaError, RoleSlice, SessionLimits};
 pub use selection::{
     bounded_ttl, payload_backend_available, resolve_and_cover, CoverageMethod, Resolution,
     RoleDenyReason, RoleEnforce, SessionFixError, SessionRolePayload,

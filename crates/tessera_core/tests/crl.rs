@@ -5,11 +5,11 @@
 #![allow(clippy::semicolon_if_nothing_returned)]
 #![allow(clippy::duration_suboptimal_units)]
 
-use tessera_core::crl::{check_revocation, Crl, CrlStore, RevocationConfig};
-use tessera_core::x509::{Certificate, TrustError};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tessera_core::crl::{check_revocation, Crl, CrlStore, RevocationConfig};
+use tessera_core::x509::{Certificate, TrustError};
 
 const REVOKED: &[u8] = include_bytes!("fixtures/revoked_leaf.pem");
 const LEAF: &[u8] = include_bytes!("fixtures/leaf_rsa.pem");

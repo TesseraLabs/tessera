@@ -177,9 +177,7 @@ fn run_lint(args: &RoleLintArgs) -> ExitCode {
     let total = report.entries.len();
     println!("summary: {total} slices, {fail} invalid");
     if report.over_cap {
-        println!(
-            "ERROR: base has more than {MAX_ROLES} slices (the role cap)"
-        );
+        println!("ERROR: base has more than {MAX_ROLES} slices (the role cap)");
     }
     if report.is_clean() {
         ExitCode::SUCCESS

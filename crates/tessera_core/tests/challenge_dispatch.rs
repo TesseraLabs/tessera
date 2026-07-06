@@ -2,9 +2,9 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 
+use secrecy::SecretString;
 use tessera_core::challenge::{challenge_response, CryptoError};
 use tessera_core::pkcs12::LoadedKeyMaterial;
-use secrecy::SecretString;
 
 const RSA: &[u8] = include_bytes!("fixtures/leaf_rsa.p12");
 const ECDSA: &[u8] = include_bytes!("fixtures/leaf_ecdsa.p12");

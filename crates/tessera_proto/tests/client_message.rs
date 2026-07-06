@@ -7,8 +7,8 @@
     clippy::pedantic
 )]
 
-use tessera_proto::{ClientMessage, SessionTarget};
 use std::time::{Duration, UNIX_EPOCH};
+use tessera_proto::{ClientMessage, SessionTarget};
 use uuid::Uuid;
 
 fn sample_open() -> ClientMessage {
@@ -67,9 +67,7 @@ fn session_open_without_role_omits_fields_and_defaults_to_none() {
     // role_version entirely; the frame stays valid and decodes back to None.
     let mut msg = sample_open();
     if let ClientMessage::SessionOpen {
-        role,
-        role_version,
-        ..
+        role, role_version, ..
     } = &mut msg
     {
         *role = None;
@@ -77,7 +75,10 @@ fn session_open_without_role_omits_fields_and_defaults_to_none() {
     }
     let s = serde_json::to_string(&msg).expect("encode");
     assert!(!s.contains("\"role\""), "role must be absent: {s}");
-    assert!(!s.contains("\"role_version\""), "role_version must be absent: {s}");
+    assert!(
+        !s.contains("\"role_version\""),
+        "role_version must be absent: {s}"
+    );
     let back: ClientMessage = serde_json::from_str(&s).expect("decode");
     assert_eq!(back, msg);
 
@@ -96,9 +97,7 @@ fn session_open_without_role_omits_fields_and_defaults_to_none() {
     let parsed: ClientMessage = serde_json::from_str(legacy).expect("legacy frame parses");
     match parsed {
         ClientMessage::SessionOpen {
-            role,
-            role_version,
-            ..
+            role, role_version, ..
         } => {
             assert_eq!(role, None);
             assert_eq!(role_version, None);
