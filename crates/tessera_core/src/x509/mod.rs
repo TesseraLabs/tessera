@@ -37,7 +37,7 @@ pub use error::TrustError;
 pub use ext::BasicConstraintsView;
 pub use sig_alg::SignatureAlg;
 
-use openssl::asn1::Asn1TimeRef;
+use openssl::asn1::{Asn1StringRef, Asn1TimeRef};
 use openssl::nid::Nid;
 use openssl::pkey::{PKey, Public};
 use openssl::x509::{X509NameRef, X509};
@@ -74,11 +74,7 @@ impl From<&VerifiedX509> for CertIdent {
             .entries()
             .map(|e| {
                 let nid = e.object().nid().short_name().unwrap_or("").to_string();
-                let val = e
-                    .data()
-                    .as_utf8()
-                    .map(|u| u.to_string())
-                    .unwrap_or_default();
+                let val = asn1_str_strict(e.data()).unwrap_or_default();
                 format!("{nid}={val}")
             })
             .collect::<Vec<_>>()
@@ -87,7 +83,7 @@ impl From<&VerifiedX509> for CertIdent {
             .subject_name()
             .entries_by_nid(Nid::COMMONNAME)
             .next()
-            .and_then(|e| e.data().as_utf8().ok().map(|u| u.to_string()))
+            .and_then(|e| asn1_str_strict(e.data()))
             .unwrap_or_default();
         let fingerprint = x
             .digest(MessageDigest::sha256())
@@ -379,11 +375,36 @@ impl Certificate {
     }
 }
 
+/// Strictly decodes an ASN.1 string field to a Rust `String`, or `None`.
+///
+/// Returns the value only when the raw bytes are valid UTF-8 and contain no
+/// interior NUL. Both conditions are enforced fail-closed because these
+/// fields feed identity matching (`subject_cn` -> `mapping::match_user`): a
+/// crafted subject such as `"engineer\0evil"` must never be silently
+/// truncated to `"engineer"` (openssl's `Asn1StringRef::as_utf8` truncates at
+/// the first NUL) nor lossily transformed (`to_string` substitutes U+FFFD for
+/// invalid bytes), since either could let one certificate impersonate a
+/// shorter legitimate identity. A rejected field simply behaves as absent,
+/// which the callers already handle (empty audit value / `FieldMissing`).
+fn asn1_str_strict(s: &Asn1StringRef) -> Option<String> {
+    strict_utf8_no_nul(s.as_slice())
+}
+
+/// Byte-level core of [`asn1_str_strict`]: accepts `bytes` only if they are
+/// valid UTF-8 with no interior NUL. Extracted so the fail-closed rule can be
+/// unit-tested without fabricating an [`Asn1StringRef`].
+fn strict_utf8_no_nul(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    if text.contains('\0') {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
 fn first_text_by_nid(name: &X509NameRef, nid: Nid) -> Option<String> {
     name.entries_by_nid(nid)
         .next()
-        .and_then(|e| e.data().as_utf8().ok())
-        .map(|d| d.to_string())
+        .and_then(|e| asn1_str_strict(e.data()))
 }
 
 fn asn1_to_system(t: &Asn1TimeRef) -> SystemTime {
@@ -403,5 +424,46 @@ fn asn1_to_system(t: &Asn1TimeRef) -> SystemTime {
     } else {
         let unsigned = u64::try_from(-secs).unwrap_or(0);
         UNIX_EPOCH - Duration::from_secs(unsigned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strict_utf8_no_nul;
+
+    #[test]
+    fn accepts_plain_ascii() {
+        assert_eq!(strict_utf8_no_nul(b"engineer").as_deref(), Some("engineer"));
+    }
+
+    #[test]
+    fn accepts_valid_multibyte_utf8() {
+        assert_eq!(
+            strict_utf8_no_nul("инженер".as_bytes()).as_deref(),
+            Some("инженер"),
+        );
+    }
+
+    #[test]
+    fn rejects_interior_nul_no_truncation() {
+        // The deprecated as_utf8 would truncate this to "engineer"; a strict
+        // decode must reject it so it cannot impersonate the shorter name.
+        assert_eq!(strict_utf8_no_nul(b"engineer\0evil"), None);
+    }
+
+    #[test]
+    fn rejects_trailing_nul() {
+        assert_eq!(strict_utf8_no_nul(b"engineer\0"), None);
+    }
+
+    #[test]
+    fn rejects_invalid_utf8() {
+        assert_eq!(strict_utf8_no_nul(&[0xff, 0xfe, 0x00]), None);
+        assert_eq!(strict_utf8_no_nul(&[0x80]), None);
+    }
+
+    #[test]
+    fn accepts_empty() {
+        assert_eq!(strict_utf8_no_nul(b"").as_deref(), Some(""));
     }
 }
