@@ -1,9 +1,12 @@
 //! Core types, configuration, and traits for Tessera.
 //!
-//! Crate-level safety rule: `unsafe_code` is `deny`'d everywhere except in
-//! `hooks::child_setup` and `hooks::fork_exec`, which `#[allow(unsafe_code)]`
-//! locally because the post-fork child path requires raw FFI calls
-//! (`libc::execve`, `libc::_exit`, ...) under async-signal-safe constraints.
+//! Crate-level safety rule: `unsafe_code` is `deny`'d everywhere except for a
+//! few narrow FFI sites that `#[allow]`/`#[expect]` it locally:
+//! `hooks::child_setup` and `hooks::fork_exec`, whose post-fork child path
+//! requires raw FFI calls (`libc::execve`, `libc::_exit`, ...) under
+//! async-signal-safe constraints; and `x509::asn1_string_type`, which reads an
+//! ASN.1 string's type tag via `ASN1_STRING_type` because the safe `openssl`
+//! API exposes no accessor for it.
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![allow(clippy::module_name_repetitions)]

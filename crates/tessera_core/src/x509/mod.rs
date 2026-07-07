@@ -37,6 +37,7 @@ pub use error::TrustError;
 pub use ext::BasicConstraintsView;
 pub use sig_alg::SignatureAlg;
 
+use foreign_types::ForeignTypeRef;
 use openssl::asn1::{Asn1StringRef, Asn1TimeRef};
 use openssl::nid::Nid;
 use openssl::pkey::{PKey, Public};
@@ -377,28 +378,100 @@ impl Certificate {
 
 /// Strictly decodes an ASN.1 string field to a Rust `String`, or `None`.
 ///
-/// Returns the value only when the raw bytes are valid UTF-8 and contain no
-/// interior NUL. Both conditions are enforced fail-closed because these
-/// fields feed identity matching (`subject_cn` -> `mapping::match_user`): a
-/// crafted subject such as `"engineer\0evil"` must never be silently
-/// truncated to `"engineer"` (openssl's `Asn1StringRef::as_utf8` truncates at
-/// the first NUL) nor lossily transformed (`to_string` substitutes U+FFFD for
-/// invalid bytes), since either could let one certificate impersonate a
-/// shorter legitimate identity. A rejected field simply behaves as absent,
-/// which the callers already handle (empty audit value / `FieldMissing`).
+/// Only the string types this module explicitly supports are decoded, each
+/// fail-closed:
+///
+/// * `UTF8String`, `PrintableString`, `IA5String` — the raw bytes are already
+///   UTF-8-compatible, so they are accepted only when valid UTF-8 with no
+///   interior NUL.
+/// * `BMPString` — the raw bytes are UTF-16BE, decoded strictly (see
+///   [`strict_utf16be_no_nul`]) and likewise rejected on any interior NUL.
+///
+/// Every other type tag (`TeletexString`/T61, `UniversalString`/UTF-32,
+/// numeric/visible, …) is rejected outright rather than decoded: those
+/// encodings are legacy or ambiguous, and guessing at them on attacker-supplied
+/// input has no place in an authentication path.
+///
+/// The fail-closed discipline exists because these fields feed identity
+/// matching (`subject_cn` -> `mapping::match_user`): a crafted subject such as
+/// `"engineer\0evil"` must never be silently truncated to `"engineer"`
+/// (openssl's `Asn1StringRef::as_utf8` truncates at the first NUL) nor lossily
+/// transformed (`to_string` substitutes U+FFFD for invalid bytes), since either
+/// could let one certificate impersonate a shorter legitimate identity. A
+/// rejected field simply behaves as absent, which the callers already handle
+/// (empty audit value / `FieldMissing`).
 fn asn1_str_strict(s: &Asn1StringRef) -> Option<String> {
-    strict_utf8_no_nul(s.as_slice())
+    let bytes = s.as_slice();
+    match asn1_string_type(s) {
+        openssl_sys::V_ASN1_UTF8STRING
+        | openssl_sys::V_ASN1_PRINTABLESTRING
+        | openssl_sys::V_ASN1_IA5STRING => strict_utf8_no_nul(bytes),
+        openssl_sys::V_ASN1_BMPSTRING => strict_utf16be_no_nul(bytes),
+        _ => None,
+    }
 }
 
-/// Byte-level core of [`asn1_str_strict`]: accepts `bytes` only if they are
-/// valid UTF-8 with no interior NUL. Extracted so the fail-closed rule can be
-/// unit-tested without fabricating an [`Asn1StringRef`].
+/// Returns the ASN.1 string type tag (`V_ASN1_*`) of `s`.
+///
+/// The safe `openssl` API deliberately hides the tag (`to_string` decodes by
+/// it internally but never exposes it), so the tag is read via the same
+/// `ASN1_STRING_type` accessor the crate itself uses. Distinguishing the type
+/// is mandatory here: `as_slice` hands back the raw value octets, whose meaning
+/// (UTF-8 vs UTF-16BE …) is defined entirely by the tag.
+#[expect(
+    unsafe_code,
+    reason = "the safe openssl API exposes no ASN.1 type-tag accessor; \
+              reading the tag requires the same FFI call the crate uses internally"
+)]
+fn asn1_string_type(s: &Asn1StringRef) -> std::os::raw::c_int {
+    // SAFETY: `s.as_ptr()` yields the non-null `ASN1_STRING` pointer backing
+    // this borrowed reference and stays valid for the borrow, which outlives
+    // this call. `ASN1_STRING_type` only reads the tag field; it neither
+    // mutates nor frees the object, and the `*mut` coerces to the expected
+    // `*const` argument.
+    unsafe { openssl_sys::ASN1_STRING_type(s.as_ptr()) }
+}
+
+/// Byte-level core for UTF-8-compatible ASN.1 string types
+/// (`UTF8String`/`PrintableString`/`IA5String`): accepts `bytes` only if they
+/// are valid UTF-8 with no interior NUL. Extracted so the fail-closed rule can
+/// be unit-tested without fabricating an [`Asn1StringRef`].
 fn strict_utf8_no_nul(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
     if text.contains('\0') {
         return None;
     }
     Some(text.to_owned())
+}
+
+/// Byte-level core for `BMPString`: interprets `bytes` as UTF-16BE and decodes
+/// them strictly. Extracted so the fail-closed rule can be unit-tested without
+/// fabricating an [`Asn1StringRef`].
+///
+/// Returns `None` (fail-closed) on any of: an odd byte count (a truncated code
+/// unit), an unpaired/lone surrogate, or an interior NUL (`U+0000`) in the
+/// decoded text — the last mirrors the UTF-8 path so a `BMPString` encoding of
+/// `"alice\0attacker"` cannot slip past identity matching.
+fn strict_utf16be_no_nul(bytes: &[u8]) -> Option<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        // `chunks_exact(2)` only yields 2-byte slices; the slice pattern reads
+        // both octets without panicking indexing, and the `else` is unreachable.
+        let [hi, lo] = pair else { return None };
+        units.push(u16::from_be_bytes([*hi, *lo]));
+    }
+    let mut text = String::with_capacity(units.len());
+    for decoded in char::decode_utf16(units) {
+        let ch = decoded.ok()?;
+        if ch == '\0' {
+            return None;
+        }
+        text.push(ch);
+    }
+    Some(text)
 }
 
 fn first_text_by_nid(name: &X509NameRef, nid: Nid) -> Option<String> {
@@ -428,8 +501,14 @@ fn asn1_to_system(t: &Asn1TimeRef) -> SystemTime {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::strict_utf8_no_nul;
+    use super::{strict_utf16be_no_nul, strict_utf8_no_nul};
+
+    /// Encodes `s` as UTF-16BE octets, the on-the-wire form of a `BMPString`.
+    fn utf16be(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_be_bytes).collect()
+    }
 
     #[test]
     fn accepts_plain_ascii() {
@@ -465,5 +544,127 @@ mod tests {
     #[test]
     fn accepts_empty() {
         assert_eq!(strict_utf8_no_nul(b"").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn bmp_accepts_plain_ascii() {
+        assert_eq!(
+            strict_utf16be_no_nul(&utf16be("alice")).as_deref(),
+            Some("alice"),
+        );
+    }
+
+    #[test]
+    fn bmp_accepts_multibyte() {
+        // Cyrillic "инженер" round-trips through UTF-16BE unchanged.
+        assert_eq!(
+            strict_utf16be_no_nul(&utf16be("инженер")).as_deref(),
+            Some("инженер"),
+        );
+    }
+
+    #[test]
+    fn bmp_accepts_empty() {
+        assert_eq!(strict_utf16be_no_nul(b"").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn bmp_rejects_odd_length() {
+        // A trailing half code unit is a malformed UTF-16 encoding.
+        assert_eq!(strict_utf16be_no_nul(&[0x00, 0x61, 0x00]), None);
+    }
+
+    #[test]
+    fn bmp_rejects_lone_high_surrogate() {
+        // 0xD800 with no following low surrogate is unpaired -> reject.
+        assert_eq!(strict_utf16be_no_nul(&[0xD8, 0x00]), None);
+    }
+
+    #[test]
+    fn bmp_rejects_lone_low_surrogate() {
+        // 0xDC00 with no preceding high surrogate is unpaired -> reject.
+        assert_eq!(strict_utf16be_no_nul(&[0xDC, 0x00]), None);
+    }
+
+    #[test]
+    fn bmp_rejects_interior_nul() {
+        // A u16 0x0000 mid-string decodes to '\0'; it must be rejected the same
+        // way the UTF-8 path rejects an interior NUL, so a BMPString encoding of
+        // "alice\0attacker" cannot impersonate the shorter "alice".
+        let mut bytes = utf16be("alice");
+        bytes.extend_from_slice(&[0x00, 0x00]); // interior NUL
+        bytes.extend_from_slice(&utf16be("attacker"));
+        assert_eq!(strict_utf16be_no_nul(&bytes), None);
+    }
+
+    #[test]
+    fn bmp_rejects_trailing_nul() {
+        let mut bytes = utf16be("alice");
+        bytes.extend_from_slice(&[0x00, 0x00]);
+        assert_eq!(strict_utf16be_no_nul(&bytes), None);
+    }
+
+    /// Builds a single-CN X.509 name whose CN entry carries `wire` verbatim
+    /// under the given ASN.1 string type. `X509_NAME_add_entry_by_NID` with a
+    /// concrete type (not an `MBSTRING_*` sentinel) stores the input bytes as-is
+    /// without transcoding, and `build` DER-round-trips them — so `wire` must
+    /// already be the on-the-wire octets for `ty` (UTF-16BE for a `BMPString`).
+    /// This exercises the real openssl encoder plus our FFI type detection end
+    /// to end.
+    fn cn_with_type(wire: &[u8], ty: openssl::asn1::Asn1Type) -> openssl::x509::X509Name {
+        use openssl::nid::Nid;
+        use openssl::x509::X509Name;
+        // The value crosses the FFI boundary as a byte string; passing it as
+        // `&str` is only a transport detail, not a claim that it is UTF-8 text.
+        let value =
+            std::str::from_utf8(wire).expect("test wire bytes are valid utf8 for transport");
+        let mut builder = X509Name::builder().expect("name builder");
+        builder
+            .append_entry_by_nid_with_type(Nid::COMMONNAME, value, ty)
+            .expect("append CN");
+        builder.build()
+    }
+
+    #[test]
+    fn ffi_detects_real_bmpstring_ascii() {
+        use openssl::asn1::Asn1Type;
+        use openssl::nid::Nid;
+        let name = cn_with_type(&utf16be("alice"), Asn1Type::BMPSTRING);
+        assert_eq!(
+            super::first_text_by_nid(&name, Nid::COMMONNAME).as_deref(),
+            Some("alice"),
+        );
+    }
+
+    #[test]
+    fn ffi_detects_real_bmpstring_multibyte() {
+        use openssl::asn1::Asn1Type;
+        use openssl::nid::Nid;
+        let name = cn_with_type(&utf16be("инженер"), Asn1Type::BMPSTRING);
+        assert_eq!(
+            super::first_text_by_nid(&name, Nid::COMMONNAME).as_deref(),
+            Some("инженер"),
+        );
+    }
+
+    #[test]
+    fn ffi_detects_real_utf8string() {
+        use openssl::asn1::Asn1Type;
+        use openssl::nid::Nid;
+        let name = cn_with_type(b"alice", Asn1Type::UTF8STRING);
+        assert_eq!(
+            super::first_text_by_nid(&name, Nid::COMMONNAME).as_deref(),
+            Some("alice"),
+        );
+    }
+
+    #[test]
+    fn ffi_rejects_real_unsupported_type() {
+        use openssl::asn1::Asn1Type;
+        use openssl::nid::Nid;
+        // TeletexString (T61) is deliberately unsupported: its encoding is
+        // ambiguous/legacy, so the decoder must fail closed rather than guess.
+        let name = cn_with_type(b"alice", Asn1Type::TELETEXSTRING);
+        assert_eq!(super::first_text_by_nid(&name, Nid::COMMONNAME), None);
     }
 }
