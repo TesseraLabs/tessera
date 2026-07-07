@@ -206,8 +206,10 @@ source  status  hash_hex  hash_prefix  raw  normalized  active_under_current_con
 Одна строка на каждый **известный** источник (не только настроенные):
 `machine_id`, `dmi_board_serial`, `dmi_system_uuid`,
 `dmi_system_serial`, `hostname`, плюс `custom_command` (если в
-конфиге). Строка с `active_under_current_config=yes` — тот источник,
-что демон **сейчас** использует. Из неё CA-админ берёт `hash_hex`.
+конфиге) и всегда синтетическая строка `override` (при не настроенном
+override — со `status=err`). Строка с `active_under_current_config=yes` —
+тот источник, что демон **сейчас** использует. Из неё CA-админ берёт
+`hash_hex`.
 
 `status` ∈ {`ok`, `err`}. `reason` поясняет `err` (пустое значение,
 `dmi_board_serial = 0` в VM, `custom_command exited 1` и т.п.).

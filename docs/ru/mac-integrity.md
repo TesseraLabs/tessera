@@ -23,7 +23,7 @@ Tessera интегрируется с МКЦ Astra Linux SE (Biba): X.509-сер
 активация на strict-mode (capdb, systemd drop-in, PAMName), защита
 конфигурации МКЦ-метками и полная интеграционная документация — в составе
 коммерческого пакета (`tessera-enterprise`). Контакт — см.
-[LICENSE.commercial](../LICENSE.commercial).
+[LICENSE.commercial](../../LICENSE.commercial).
 
 ## Поведение открытой сборки
 

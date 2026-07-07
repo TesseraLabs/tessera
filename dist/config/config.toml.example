@@ -173,11 +173,14 @@ allowed_signature_algorithms = []
 
 # --- Trust → revocation ------------------------------------------------------
 [trust.revocation]
-# "none" | "crl". OCSP modes ("ocsp", "crl_then_ocsp") and the ocsp_* keys
-# (ocsp_responder_url / ocsp_timeout_seconds / ocsp_cache_ttl_seconds) are
-# rejected at config validation until OCSP is implemented
-# (openspec/changes/ocsp-support).
+# "none" | "crl" | "ocsp" | "crl_then_ocsp". OCSP modes require
+# ocsp_responder_url; optional knobs: ocsp_timeout_seconds,
+# ocsp_cache_ttl_seconds. Zero-egress fleets stay on "none" (short-TTL
+# discipline) or offline "crl".
 mode = "none"
+# ocsp_responder_url = "http://ocsp.example.org"
+# ocsp_timeout_seconds = 5
+# ocsp_cache_ttl_seconds = 3600
 # CRL files (PEM/DER). Required when mode = "crl".
 crl_paths = []
 # Maximum accepted CRL age in hours, measured from thisUpdate (1..=8760).
@@ -241,7 +244,7 @@ level = "info"
 # Each hook is invoked with placeholders ${pam_user}, ${cert_cn},
 # ${cert_serial}, ${host_id}, etc. expanded at call time. Always run as
 # root; drop privileges via `run_as` if available.
-# Stages: "pre_auth" | "post_auth_success" | "post_auth_failure"
+# Stages: "pre_auth" | "post_auth_success"
 #         "session_open" | "session_close" | "usb_removed"
 
 # [[hooks]]

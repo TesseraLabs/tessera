@@ -76,5 +76,5 @@ repos:
       - id: no-max-integrity-placeholder
         name: Forbid MAX_INTEGRITY OID placeholders in fixtures, code and docs
         language: system
-        entry: bash -c 'if git grep -InE "<MAX_OID>|<TBD-uuid>|2\.25\.<" -- "*.md" "*.rs" "*.cnf" "*.cnf.in" ":(exclude)crates/tessera_core/src/x509/oids.rs" ":(exclude)crates/tessera_core/src/x509/der.rs" ":(exclude)crates/tessera_core/src/x509/der_helpers.rs" ":(exclude)docs/cert-issuance.md" ":(exclude)docs/x509-extensions.md" ":(exclude)docs/superpowers/specs/2026-05-14-mac-integrity-design.md" ":(exclude)docs/superpowers/plans/2026-05-14-mac-integrity.md"; then echo "ERROR: MAX_INTEGRITY OID placeholders found in tracked files" >&2; exit 1; fi'
+        entry: bash -c 'if git grep -InE "<MAX_OID>|<TBD-uuid>|2\.25\.<" -- "*.md" "*.rs" "*.cnf" "*.cnf.in" ":(exclude)crates/tessera_core/src/x509/oids.rs" ":(exclude)crates/tessera_core/src/x509/der.rs" ":(exclude)crates/tessera_core/src/x509/der_helpers.rs" ":(exclude)docs/ru/cert-issuance.md" ":(exclude)docs/en/cert-issuance.md" ":(exclude)docs/x509-extensions.md" ":(exclude)docs/superpowers/specs/2026-05-14-mac-integrity-design.md" ":(exclude)docs/superpowers/plans/2026-05-14-mac-integrity.md"; then echo "ERROR: MAX_INTEGRITY OID placeholders found in tracked files" >&2; exit 1; fi'
         pass_filenames: false

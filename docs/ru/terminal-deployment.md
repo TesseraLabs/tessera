@@ -54,6 +54,13 @@
 группы и `sudo`-правила, по которым ОС пускает инженера к этому ПО и его
 служебным операциям.
 
+> **Статус в v0.4.0.** Матрица описывает целевой профиль. Сегодня Tessera
+> применяет к сессии личность, срок (TTL) и — на Astra, через коммерческий
+> МКЦ-адаптер — маску целостности `mac_mask`. Группы, `sudo`-правила и лимиты
+> определены форматом роли и валидируются, но к сессии пока не применяются:
+> OS-enforcement для них в разработке
+> ([linux-session-enforcement](../../openspec/changes/linux-session-enforcement/proposal.md)).
+
 | Операция | `oper` | `serv` | `admin` |
 |---|:---:|:---:|:---:|
 | Вход на устройство по удостоверению | ✓ | ✓ | ✓ |
@@ -122,7 +129,7 @@ anchors = ["/etc/tessera/ca/bundle.pem"]
 # "none"  — отзыв по сроку жизни сертификата (TTL-backstop);
 # "crl"   — плюс локальный список отзыва, обновляемый при наличии связи.
 mode = "crl"
-crl_paths = ["/var/lib/tessera/crl/parkruntime.crl"]
+crl_paths = ["/etc/tessera/crl/parkruntime.crl"]
 crl_max_age_hours = 24
 
 [host_identity]
@@ -167,6 +174,12 @@ sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sudo
 Права выдаются через стандартные механизмы ОС: дополнительные группы,
 `sudo`-роли, лимиты systemd на сессию. Группы Engine выставляет сам (не через
 `pam_group`) — чтобы права нельзя было обойти через DBus или sudo.
+
+> **Важно.** Этот раздел описывает целевую механику. В v0.4.0 `groups`,
+> `sudo_role` и `limits` разбираются и валидируются (`tessera role lint`),
+> но к сессии не применяются — реализация ведётся в change
+> [linux-session-enforcement](../../openspec/changes/linux-session-enforcement/proposal.md).
+> Примеры ниже корректны как формат роли и заработают без изменений.
 
 Оператор — минимальный профиль:
 

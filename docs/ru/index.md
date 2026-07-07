@@ -1,7 +1,7 @@
 # Документация Tessera
 
-Все документы — на русском языке (primary). Английская обзорная
-страница доступна отдельно.
+Русская документация — первичная (канон). Английский перевод —
+в [docs/en/](../en/index.md); changelog ведётся только по-русски.
 
 > **Примечание:** ранее проект назывался `pam_certauth`.
 
@@ -9,17 +9,20 @@
 
 ### Оператор / интегратор (раскатка на машинах)
 
-1. [install.md](install.md) — пошаговая установка `tessera`.
-2. [pam-integration.md](pam-integration.md) — правка `/etc/pam.d/*`,
+1. [terminal-deployment.md](terminal-deployment.md) — типовая
+   конфигурация терминального парка: картина развёртывания, роли,
+   границы прав (читать первым перед пилотом).
+2. [install.md](install.md) — пошаговая установка `tessera`.
+3. [pam-integration.md](pam-integration.md) — правка `/etc/pam.d/*`,
    режимы (`2fa` / `optional` / `cert-only`), SysV.
-3. [configuration.md](configuration.md) — справочник по `config.toml`.
-4. [mac-integrity.md](mac-integrity.md) — opt-in активация МКЦ
+4. [configuration.md](configuration.md) — справочник по `config.toml`.
+5. [mac-integrity.md](mac-integrity.md) — opt-in активация МКЦ
    на Astra strict-mode.
-5. [clone-image.md](clone-image.md) — раскатка парка через
+6. [clone-image.md](clone-image.md) — раскатка парка через
    клонированный образ.
-6. [fly-dm-greeter.md](fly-dm-greeter.md) — wallpaper banner на
+7. [fly-dm-greeter.md](fly-dm-greeter.md) — wallpaper banner на
    fly-dm под МКЦ.
-7. [operations.md](operations.md) — runbook регулярных операций.
+8. [operations.md](operations.md) — runbook регулярных операций.
 
 ### CA-админ (выпуск сертификатов)
 
@@ -50,6 +53,17 @@
   диагностике. Cert/auth-ошибки, USB, monitord, PAM lockout, МКЦ,
   fly-dm, clone-image, инциденты безопасности.
 
+## Что нового в 0.4.0
+
+- Проект переименован `pam_certauth` → **Tessera**: пакет `tessera`,
+  модуль `/lib/security/pam_tessera.so`, бинарь `/usr/bin/tessera`.
+- Пути перенесены: `/etc/tessera`, `/run/tessera`, `/var/lib/tessera`,
+  `/var/cache/tessera`; юнит `tessera.service`, системный пользователь `tessera`.
+- Контракт окружения хуков `PAM_CERTAUTH_*` → `TESSERA_*`;
+  фильтр логов `TESSERA_LOG`.
+- Неизменны: OID X.509-расширений, схема `config.toml`, IPC-протокол.
+- Первый публичный релиз (dual-license AGPL-3.0 OR commercial).
+
 ## Что нового в 0.3.19
 
 - `tessera dump-host-id` — TSV-дамп всех host_identity-источников.
@@ -73,4 +87,5 @@
 
 ## English documentation
 
-- [README.md](../README.md) (primary, English)
+- [docs/en/index.md](../en/index.md) — английское дерево документации.
+- [README.md](../../README.md) — English entry point.
