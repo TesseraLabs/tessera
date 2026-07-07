@@ -33,36 +33,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  # Формирует matrix динамически: PR из форков собираются только на
+  # ubuntu-ноге. Astra-нога требует приватный builder-образ (внутри пакеты
+  # Astra SE, публиковать его нельзя по лицензионным ограничениям), а
+  # GITHUB_TOKEN форк-PR к нему доступа не имеет. Astra-нога догоняет
+  # изменения на push в main. Job-level `if` не видит контекст matrix,
+  # поэтому исключение ноги делается здесь.
+  plan:
     # Skip когда триггер — упавший/cancelled upstream builder-image.
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    outputs:
+      targets: ${{ steps.matrix.outputs.targets }}
+    steps:
+      - id: matrix
+        env:
+          INCLUDE_ASTRA: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: |
+          set -euo pipefail
+          # Держать в синхроне с доками ниже: ubuntu — быстрый PR-чек,
+          # astra — релизный артефакт в pre-built builder-образе.
+          # NB (astra): tests run in debug profile (no --release).
+          # Workflow-level env forces release builds to codegen-units=1 +
+          # LTO=thin which are needed for the final .deb but kill test
+          # compile time — baseline run #25 spent 510s compiling tests vs
+          # 56s on ubuntu. Production release-mode validation lives in the
+          # nightly workflow. Открытая astra-сборка — без МКЦ-FFI (закрытый
+          # crate tessera_mac_parsec живёт в tessera-enterprise).
+          ubuntu='{"id":"ubuntu","container":"","features":"","test_cmd":"cargo test --workspace","build_extra":"","artifact_name":"tessera-deb-ubuntu","skip_lintian":false}'
+          astra='{"id":"astra","container":"ghcr.io/tesseralabs/tessera-astra-builder:latest","features":"","test_cmd":"cargo nextest run --workspace","build_extra":"--skip-lintian","artifact_name":"tessera-deb-astra","skip_lintian":true}'
+          if [ "${INCLUDE_ASTRA}" = "true" ]; then
+            echo "targets=[${ubuntu},${astra}]" >> "$GITHUB_OUTPUT"
+          else
+            echo "targets=[${ubuntu}]" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - id: ubuntu
-            container: ""
-            features: ""
-            test_cmd: "cargo test --workspace"
-            build_extra: ""
-            artifact_name: tessera-deb-ubuntu
-            skip_lintian: false
-          - id: astra
-            container: "ghcr.io/tesseralabs/tessera-astra-builder:latest"
-            # Открытая сборка: без МКЦ-FFI (закрытый crate tessera_mac_parsec
-            # живёт в tessera-enterprise; коммерческий CI — там же).
-            features: ""
-            # NB: tests run in debug profile (no --release). Workflow-level
-            # env forces release builds to codegen-units=1 + LTO=thin which
-            # are needed for the final .deb but kill test compile time —
-            # baseline run #25 spent 510s compiling tests vs 56s on ubuntu.
-            # Production release-mode validation lives in a separate
-            # nightly workflow.
-            test_cmd: "cargo nextest run --workspace"
-            build_extra: "--skip-lintian"
-            artifact_name: tessera-deb-astra
-            skip_lintian: true
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
     name: build (${{ matrix.target.id }})
     # Workflow-level env: одинаковые knobs для cargo test и build-deb.sh,
     # чтобы Swatinem кэш не инвалидировался между шагами.
