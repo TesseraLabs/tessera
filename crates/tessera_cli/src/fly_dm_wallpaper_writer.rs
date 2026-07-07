@@ -444,7 +444,11 @@ mod tests {
     #[test]
     fn substitute_replaces_host_id_short_source_n() {
         let r = fixture_resolved(HostIdSourceKind::DmiBoardSerial, "abc12345deadbeef");
-        let out = substitute("Device %n host_id={host_id_short} ({source})", &r, "astra184");
+        let out = substitute(
+            "Device %n host_id={host_id_short} ({source})",
+            &r,
+            "astra184",
+        );
         assert_eq!(out, "Device astra184 host_id=abc12345 (dmi_board_serial)");
     }
 
