@@ -418,9 +418,12 @@ pub struct RawTrust {
     /// Signature algorithms.
     #[serde(default)]
     pub allowed_signature_algorithms: Vec<String>,
-    /// Revocation.
+    /// Revocation. `None` means the operator omitted the whole
+    /// `[trust.revocation]` section; the validated layer rejects that so an
+    /// operator cannot end up with revocation checking silently disabled.
+    /// Opting out is still possible, but only by writing `mode = "none"`.
     #[serde(default)]
-    pub revocation: RawRevocation,
+    pub revocation: Option<RawRevocation>,
     /// Pinning.
     #[serde(default)]
     pub pinning: RawPinning,
@@ -441,9 +444,11 @@ const fn default_max_chain_depth() -> u32 {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawRevocation {
-    /// Mode.
+    /// Mode. `None` means the `mode` key was omitted; the validated layer
+    /// rejects that (an absent mode would otherwise disable revocation
+    /// checking silently). Opting out requires an explicit `mode = "none"`.
     #[serde(default)]
-    pub mode: RawRevocationMode,
+    pub mode: Option<RawRevocationMode>,
     /// CRL paths.
     #[serde(default)]
     pub crl_paths: Vec<PathBuf>,
@@ -467,25 +472,12 @@ pub struct RawRevocation {
     pub ocsp_cache_ttl_seconds: Option<u64>,
 }
 
-impl Default for RawRevocation {
-    fn default() -> Self {
-        Self {
-            mode: RawRevocationMode::None,
-            crl_paths: Vec::new(),
-            ocsp_responder_url: None,
-            crl_max_age_hours: None,
-            ocsp_timeout_seconds: None,
-            ocsp_cache_ttl_seconds: None,
-        }
-    }
-}
-
 /// Raw revocation mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawRevocationMode {
-    /// None.
-    #[default]
+    /// None. Revocation checking is disabled; a revoked certificate still
+    /// authenticates. Valid only when written explicitly by the operator.
     None,
     /// CRL.
     Crl,

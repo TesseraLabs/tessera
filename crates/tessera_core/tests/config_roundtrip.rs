@@ -373,6 +373,77 @@ fn fixture_with_revocation(anchor: &Path, revocation_body: &str) -> String {
 }
 
 #[test]
+fn validated_config_rejects_absent_revocation_section() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // Drop the whole [trust.revocation] block; a missing section must now be
+    // a validation error rather than a silent fall-back to no checking.
+    let body = fixture_with_anchor(&anchor).replace(
+        "[trust.revocation]\nmode = \"none\"\ncrl_paths = []\n\n",
+        "",
+    );
+    assert!(!body.contains("[trust.revocation]"), "section not removed");
+    let raw: RawConfig = toml::from_str(&body)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("must reject absent revocation section");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("trust.revocation.mode is required")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_revocation_section_without_mode(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // Section present but no `mode` key: still ambiguous, still rejected.
+    let body = fixture_with_revocation(&anchor, "crl_paths = []");
+    let raw: RawConfig = toml::from_str(&body)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("must reject missing mode key");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("trust.revocation.mode is required")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_empty_revocation_table() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // Header present but the table carries no keys at all: the `mode` is
+    // still absent, so validation must reject it just like a missing key.
+    let body = fixture_with_revocation(&anchor, "");
+    assert!(body.contains("[trust.revocation]"), "header must survive");
+    let raw: RawConfig = toml::from_str(&body)?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("must reject empty revocation table");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("trust.revocation.mode is required")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_accepts_explicit_none_mode() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // Explicit opt-out stays valid: the fixture already carries mode = "none".
+    let body = fixture_with_anchor(&anchor);
+    let raw: RawConfig = toml::from_str(&body)?;
+    let v = ValidatedConfig::try_from(&raw)?;
+    assert_eq!(
+        v.trust.revocation.mode,
+        tessera_core::config::validated::RevocationMode::None
+    );
+    Ok(())
+}
+
+#[test]
 fn validated_config_accepts_ocsp_mode_with_url_and_defaults(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
