@@ -7,9 +7,10 @@
 > published under Apache-2.0 and remain available under it.
 > Contributions require a CLA (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
-> Russian translation: [README.ru.md](README.ru.md). Detailed
-> reference docs in [docs/](docs/) are Russian-primary; this README is
-> the English entry point.
+> Russian translation: [README.ru.md](README.ru.md). Reference
+> documentation: [docs/en/](docs/en/index.md) (English),
+> [docs/ru/](docs/ru/index.md) (Russian, canonical); the changelog is
+> Russian-only.
 
 Tessera is a Linux PAM module that replaces
 password-based authentication with X.509 certificate verification. The
@@ -62,18 +63,17 @@ flowchart LR
     cdylib -. NDJSON .-> daemon
 ```
 
-Detailed architecture: [docs/architecture.md](docs/architecture.md)
-(Russian).
+Detailed architecture: [docs/en/architecture.md](docs/en/architecture.md).
 
 ## Install
 
 ```bash
-sudo apt install ./tessera_0.3.0-1_amd64.deb
+sudo apt install ./tessera_0.4.0-1_amd64.deb
 ```
 
 Dependencies (`gost-engine`, `pcsc-lite`, `libssl3`, `lsb-base` for the
 SysV init wrapper on non-systemd hosts) are pulled in by APT. Full
-step-by-step walkthrough: [docs/install.md](docs/install.md) (Russian).
+step-by-step walkthrough: [docs/en/install.md](docs/en/install.md).
 
 ## Authorisation model
 
@@ -89,7 +89,7 @@ When present, these extensions are the **sole source** of authorisation
 — they decide which hosts and which PAM users a certificate may sign in
 to. The `[[user_mapping]]` list in `config.toml` is a **legacy fallback**
 used only for certificates that ship without `pam_cert_user_binding`.
-See [docs/cert-issuance.md](docs/cert-issuance.md) for the
+See [docs/en/cert-issuance.md](docs/en/cert-issuance.md) for the
 `openssl.cnf` cookbook.
 
 ## Authentication modes
@@ -112,8 +112,8 @@ sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sudo
 The legacy flags `--strict` / `--optional` are still accepted as
 deprecated aliases for `--mode=2fa` / `--mode=optional`. Before
 deploying `cert-only`, read the lockout warning in
-[docs/install.md §8](docs/install.md) and
-[docs/operations.md §3.6](docs/operations.md).
+[docs/en/install.md §8](docs/en/install.md) and
+[docs/en/operations.md §3.6](docs/en/operations.md).
 
 ## Logging
 
@@ -145,11 +145,11 @@ validating with `pamtester`.
 │   └─ tessera_cli/      # tessera daemon
 ├─ debian/                    # Debian packaging
 ├─ dist/                      # example configs, systemd unit, integrate-pam.sh
-├─ docs/                      # documentation (Russian)
+├─ docs/                      # documentation (en/ + ru/, cla/)
 └─ scripts/                   # build + checksum + reproducibility scripts
 ```
 
-Documentation index: [docs/index.md](docs/index.md) (Russian).
+Documentation index: [docs/en/index.md](docs/en/index.md) (English), [docs/ru/index.md](docs/ru/index.md) (Russian, canonical).
 
 ## License
 

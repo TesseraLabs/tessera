@@ -68,7 +68,7 @@ sudo systemctl restart tessera
 3. Рендерит template (`template_ru` / `template_en` по locale) с
    подстановкой:
    - `{host_id_short}` — первые 8 hex символов sha256;
-   - `{source}` — имя источника (`MachineId`, `DmiBoardSerial` ...);
+   - `{source}` — имя источника в snake_case (`machine_id`, `dmi_board_serial` ...);
    - `%n` — hostname машины.
 4. Atomic save → `wallpaper_target` (tmpfile + rename).
 
@@ -143,7 +143,7 @@ backed_up: true }` на первом запуске, дальше `backed_up: fa
 (continuing)`, демон продолжает работу.
 
 Затем визуально на экране login fly-dm: внизу должна появиться
-строка `Устройство astra184  host_id=a1b2c3d4 (DmiBoardSerial)`.
+строка `Устройство astra184  host_id=a1b2c3d4 (dmi_board_serial)`.
 
 ## Troubleshooting
 

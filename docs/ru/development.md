@@ -18,7 +18,7 @@ sudo apt install -y \
     pamtester clang
 ```
 
-Toolchain Rust — фиксирован в [`rust-toolchain.toml`](../rust-toolchain.toml).
+Toolchain Rust — фиксирован в [`rust-toolchain.toml`](../../rust-toolchain.toml).
 При наличии `rustup` toolchain скачивается автоматически:
 
 ```bash
@@ -72,7 +72,7 @@ PKCS#11-тесты добавляют дополнительный набор и
 
 ```bash
 # В отдельной VM Astra SE 1.7.5:
-sudo apt install ./target/release/tessera_0.1.1-1_amd64.deb
+sudo apt install ./target/release/tessera_0.4.0-1_amd64.deb
 sudo /usr/share/tessera/integrate-pam.sh --mode=2fa /etc/pam.d/sudo
 pamtester sudo alice authenticate
 ```
@@ -80,7 +80,7 @@ pamtester sudo alice authenticate
 ## 3. Pre-commit hooks
 
 В корне репозитория поставляется
-[`.pre-commit-config.yaml`](../.pre-commit-config.yaml). Установка:
+[`.pre-commit-config.yaml`](../../.pre-commit-config.yaml). Установка:
 
 ```bash
 pip install pre-commit
@@ -93,7 +93,9 @@ pre-commit install
 - `cargo clippy --workspace --all-targets -- -D warnings`;
 - `cargo deny check`;
 - `cargo test --workspace`;
-- `markdownlint-cli2 "**/*.md"` (для `*.md` файлов в коммите).
+- синтаксис bash-скриптов (`bash -n`);
+- совпадение версии `Cargo.toml` ↔ `debian/changelog`;
+- отсутствие placeholder'ов MAX_INTEGRITY OID в трекаемых файлах.
 
 Если у вас нет `pre-commit`-фреймворка, можно запускать команды
 вручную:
@@ -116,14 +118,14 @@ cargo test --workspace
 <footer>
 ```
 
-Примеры:
+Сообщения коммитов — на английском. Примеры:
 
-- `feat(monitord): добавлена обработка suspend/resume через D-Bus`
-- `fix(core): исправлена проверка свежести CRL при mode = "crl"`
-- `docs(install): добавлен сценарий для Mode A с FAT32-носителем`
-- `chore: обновлена зависимость serde до 1.0.x`
-- `refactor(proto): переименован Pong в HelloAck для консистентности`
-- `test(monitord): добавлен e2e-тест suspend_grace`
+- `feat(monitord): handle suspend/resume via D-Bus`
+- `fix(core): correct CRL freshness check for mode = "crl"`
+- `docs(install): add Mode A scenario with FAT32 media`
+- `chore: bump serde to 1.0.x`
+- `refactor(proto): rename Pong to HelloAck for consistency`
+- `test(monitord): add suspend_grace e2e test`
 
 `<scope>` соответствует крейту или модулю: `monitord`, `core`, `proto`,
 `pam`, `install`, `arch`, `security`, `release`, `dev`.
@@ -138,14 +140,15 @@ cargo test --workspace
 
 2. **Атомарные коммиты:** один логически целостный коммит за раз. PR
    обычно содержит 1–5 коммитов.
-3. **Авто-запуск CI:** GitHub Actions
-   ([`.github/workflows/build-deb.yml`](../.github/workflows/build-deb.yml))
-   проверяет:
-   - `cargo fmt`;
-   - `cargo clippy`;
-   - `cargo test`;
-   - сборку `.deb`;
-   - `lintian`.
+3. **Авто-запуск CI:** GitHub Actions:
+   - [`.github/workflows/build.yml`](../../.github/workflows/build.yml) —
+     тесты (ubuntu: `cargo test`, astra-контейнер: `cargo nextest run`),
+     сборка `.deb` в обоих вариантах, `lintian` (ubuntu-нога);
+   - [`.github/workflows/lint.yml`](../../.github/workflows/lint.yml) —
+     `cargo clippy -D warnings` и supply-chain (`cargo deny`, `cargo audit`);
+   - [`.github/workflows/nightly.yml`](../../.github/workflows/nightly.yml) —
+     ежесуточный прогон тестов в release-профиле.
+   `cargo fmt --check` гоняется pre-commit-хуком, не в CI.
 4. **Code review checklist:**
    - есть ли тест на новую функциональность?
    - обновлены ли соответствующие docs (configuration, architecture,
@@ -160,7 +163,7 @@ cargo test --workspace
 ## 6. Как добавить новый PKCS#11-провайдер
 
 Текущая поддержка реализована в
-[`crates/tessera_core/src/token/`](../crates/tessera_core/src/token/).
+[`crates/tessera_core/src/token/`](../../crates/tessera_core/src/token/).
 
 Шаги:
 
@@ -173,7 +176,7 @@ cargo test --workspace
    - negative: модуль не загрузился (несуществующий путь);
    - non-extractable: проверка `CKA_EXTRACTABLE = false`.
 5. Обновить документацию:
-   - [README.md](../README.md) — раздел «Поддерживаемые токены»;
+   - [README.md](../../README.md) — раздел «Поддерживаемые токены»;
    - [docs/install.md](install.md) — раздел установки драйвера;
    - [docs/configuration.md](configuration.md) — таблица модулей;
    - [docs/threat-model.md](threat-model.md) — §3.3 (если меняется
@@ -181,7 +184,7 @@ cargo test --workspace
 
 ## 7. Как добавить новый источник host_id
 
-См. [`crates/tessera_core/src/host_identity/`](../crates/tessera_core/src/host_identity/).
+См. [`crates/tessera_core/src/host_identity/`](../../crates/tessera_core/src/host_identity/).
 
 Шаги:
 
@@ -224,7 +227,7 @@ cargo test --workspace
 
 - миграционной заметки в [docs/changelog.md](changelog.md);
 - обновления `PROTOCOL_VERSION` в
-  [`crates/tessera_proto/src/version.rs`](../crates/tessera_proto/src/version.rs)
+  [`crates/tessera_proto/src/version.rs`](../../crates/tessera_proto/src/version.rs)
   (если изменяется wire-протокол);
 - обновления модели угроз ([docs/threat-model.md](threat-model.md)).
 

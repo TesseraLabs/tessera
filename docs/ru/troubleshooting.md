@@ -33,10 +33,12 @@ sudo tail -f /var/log/auth.log
 
 ```
 Сертификат выпущен для другого устройства.
-host_id_hash этой машины: <hex>
-источник host_id: DmiBoardSerial
+host_id этой машины: <8-hex-префикс> (source=DmiBoardSerial)
 Передайте администратору для перевыпуска.
 ```
+
+(Полный `host_id_hash` — в syslog; на экране показывается 8-символьный
+префикс.)
 
 **Диагностика:**
 
@@ -56,7 +58,7 @@ openssl x509 -in /etc/tessera/<host>.pem -noout -text \
 с правильным `host_id_hash`. **НЕ** считать hash вручную
 через `sha256sum /etc/machine-id` — source-of-truth определяется
 развёрнутым `[host_identity].sources`. См.
-[architecture.md](architecture.md#host-identity-chain).
+[architecture.md](architecture.md#12-host-identity-chain).
 
 ### `user_binding mismatch`
 
@@ -84,7 +86,7 @@ pamtester sudo alice authenticate
 ```
 
 В журнале искать `tessera.auth.fail.<reason>`. Список причин —
-[architecture.md](architecture.md#fail-closed-rules).
+[architecture.md](architecture.md#13-fail-closed-правила).
 
 ### Сертификат не принимается на терминале (общий чек-лист)
 
@@ -120,15 +122,17 @@ openssl pkcs12 -in service.p12 -nokeys -nomacver -passin pass: \
 ### `[trust.revocation] mode = "ocsp"` — конфиг не загружается
 
 **Симптом:** демон/модуль отказывает на загрузке конфига при
-`mode = "ocsp"` / `mode = "crl_then_ocsp"` или при любых
-`ocsp_*`-ключах в `[trust.revocation]`.
+`mode = "ocsp"` / `mode = "crl_then_ocsp"`.
 
-**Причина:** OCSP не реализован — такие значения отвергаются
-валидацией конфига (fail-closed). Поддерживаются только `"none"` и
-`"crl"`.
+**Причина:** OCSP-режимы требуют `ocsp_responder_url` — без него
+валидация конфига отклоняет секцию (fail-closed). Также проверьте
+диапазоны `ocsp_timeout_seconds` / `ocsp_cache_ttl_seconds`.
 
-**Фикс:** `mode = "crl"` с регулярно обновляемым локальным CRL;
-свежесть контролировать через `crl_max_age_hours`. См.
+**Фикс:** задайте `ocsp_responder_url`; для zero-egress контуров
+(терминалы без сети до responder'а) OCSP не подходит — используйте
+`mode = "crl"` с регулярно обновляемым локальным CRL и контролем
+свежести через `crl_max_age_hours`, либо `mode = "none"` с дисциплиной
+короткого TTL. См.
 [configuration.md](configuration.md#секция-trustrevocation).
 
 ---
@@ -331,8 +335,7 @@ journald (`grace window expired, dispatching action`), но logout не
 происходит:
 
 ```
-WARN tessera.monitord: USB-removal action dropped: session has no logind id action=Logout target=Tty("/dev/tty1") ...
-INFO tessera.monitord: tip: pam_sm_open_session pushes XDG_SESSION_ID ...
+ERROR tessera.monitord: ALERT: USB-removal Logout has no logind id; failing closed with reboot ...
 ```
 
 **Причина:** на момент `pam_sm_open_session` `XDG_SESSION_ID` не был
@@ -340,14 +343,18 @@ INFO tessera.monitord: tip: pam_sm_open_session pushes XDG_SESSION_ID ...
 (`Tty` / `Display` / `Unknown`), захваченным на auth-фазе.
 Action-runner не может вызвать `terminate_session` без logind id.
 
-**Action-runner fallback (0.3.10):**
+**Action-runner fail-closed (0.4.0):**
 
-| Конфигурация              | Без logind id                              |
-|---------------------------|--------------------------------------------|
-| `action = "lock"`         | Дропается с WARN; сессия остаётся открытой |
-| `action = "logout"`       | Дропается с WARN; сессия остаётся открытой |
-| `action = "shutdown"`     | Срабатывает — `power_off` не требует logind|
-| `action = "hook"`         | Срабатывает — hook получает SESSION_ID env |
+| Конфигурация              | Без logind id                                        |
+|---------------------------|------------------------------------------------------|
+| `action = "lock"`         | Fail-closed: **reboot** устройства (ALERT в журнале) |
+| `action = "logout"`       | Fail-closed: **reboot** устройства (ALERT в журнале) |
+| `action = "shutdown"`     | Срабатывает — `power_off` не требует logind          |
+| `action = "hook"`         | Срабатывает — hook получает SESSION_ID env           |
+
+Сессия без logind id не может быть завершена адресно, поэтому вместо
+тихого дропа действие деградирует в перезагрузку — носитель извлечён,
+незакрытая сессия недопустима.
 
 **Причина 1 (типичная, 0.3.11 и старше — pre-fix):** `@include tessera*`
 включал `session required pam_tessera.so` внутри snippet'а, и сниппет

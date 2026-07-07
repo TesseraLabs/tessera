@@ -13,7 +13,7 @@ SysV-init.
 ## 1. Поставочный snippet и `integrate-pam.sh`
 
 `tessera` поставляет включаемый сниппет `/etc/pam.d/tessera`
-(см. [`dist/pam.d/tessera`](../dist/pam.d/tessera)). Подключать его
+(см. [`dist/pam.d/tessera`](../../dist/pam.d/tessera)). Подключать его
 строкой `@include tessera`.
 
 Поставочный скрипт `/usr/share/tessera/integrate-pam.sh`
@@ -137,10 +137,13 @@ auth        required    pam_env.so
 ...
 ```
 
-Включение через `sufficient` (контроль определён в
-[`dist/pam.d/tessera`](../dist/pam.d/tessera)): если модуль успешно
-аутентифицировал — пропустить пользователя; если нет — попробовать
-следующие модули (`pam_unix.so`).
+Контроль в сниппете [`dist/pam.d/tessera`](../../dist/pam.d/tessera) —
+`required`: без успешной cert-аутентификации вход невозможен, парольного
+fallback'а НЕТ (это дефолтный режим `2fa` скрипта `integrate-pam.sh`).
+Мягкий вариант с fallback'ом на следующие модули (`pam_unix.so`) — это
+отдельный сниппет [`dist/pam.d/tessera-optional`](../../dist/pam.d/tessera-optional)
+с контролем `sufficient`; используйте его только на переходный период,
+пока токены есть не у всех.
 
 ### Screen-locker (отдельный стек)
 

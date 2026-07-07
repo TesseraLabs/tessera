@@ -180,10 +180,12 @@ IntegrityLabel ::= SEQUENCE {
 Пример строки в `openssl.cnf` для `level=2, categories={0}`:
 
 ```ini
-2.25.273824307386008814506455310913083078403 = critical,DER:30:06:02:01:02:03:02:00:01
+2.25.273824307386008814506455310913083078403 = DER:30:07:02:01:02:03:02:00:01
 ```
 
-DER здесь — три TLV: `SEQUENCE`, `INTEGER 2`, `BIT STRING '01'B`.
+DER здесь — три TLV: `SEQUENCE` (длина 7), `INTEGER 2`,
+`BIT STRING '01'B`. Расширение объявлено non-critical (см. выше);
+парсер терпим к critical-флагу, но выпускать следует non-critical.
 
 ## Расширение `allowed_roles` (выбор роли на логине, role-format)
 

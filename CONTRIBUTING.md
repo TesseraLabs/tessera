@@ -30,7 +30,7 @@ you to re-sign the new version on your next pull request.
 
 ## Development
 
-See [docs/development.md](docs/development.md) for build instructions, test
+See [docs/ru/development.md](docs/ru/development.md) for build instructions, test
 setup, and coding conventions.
 
 ## Pull requests

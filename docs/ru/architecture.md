@@ -1,6 +1,6 @@
 # Архитектура Tessera
 
-Этот документ — единая ссылочная архитектура версии 0.1.1. После
+Этот документ — единая ссылочная архитектура версии 0.4.0. После
 прочтения инженер должен корректно отвечать на вопросы:
 
 - что происходит при вызове `pam_sm_authenticate`?
@@ -86,20 +86,23 @@ PAM service module. Содержит:
 
 - PAM entry points: `pam_sm_authenticate`, `pam_sm_setcred`,
   `pam_sm_acct_mgmt`, `pam_sm_open_session`, `pam_sm_close_session`
-  (см. [`crates/pam_tessera/src/entry.rs`](../crates/pam_tessera/src/entry.rs)).
+  (см. [`crates/pam_tessera/src/entry.rs`](../../crates/pam_tessera/src/entry.rs)).
 - Panic guard (`panic_guard.rs`) — каждая C-граница защищена
   `catch_unwind`, panic → `PAM_AUTHINFO_UNAVAIL`.
 - DI wiring (`di.rs`) — собирает зависимости ядра из конфига.
 - Flow orchestrator (`flow.rs`) — основной авторизационный пайплайн.
 - PAM conversation helpers (`pam_conv.rs`).
-- Persistent data между `pam_sm_*` вызовами (`pam_data.rs`).
+- Persistent data между `pam_sm_*` вызовами (`data_handle.rs`).
 
 Билдится в `/lib/security/pam_tessera.so` (см.
-[`debian/rules`](../debian/rules)).
+[`debian/rules`](../../debian/rules)).
 
 ### 2.4 `tessera_cli` (бинарь `tessera`)
 
-Долгоживущий демон, владеющий:
+Мульти-командный CLI: `tessera daemon` (долгоживущий демон, юнит
+`tessera.service` со строкой запуска `/usr/bin/tessera daemon`),
+`tessera check`, `tessera dump-host-id`, `tessera role`, `tessera tags`,
+`tessera enroll`. Демон владеет:
 
 - Сокетом IPC (`/run/tessera/monitord.sock`).
 - udev-мониторингом USB-устройств (`udev_monitor.rs`).
@@ -109,7 +112,7 @@ PAM service module. Содержит:
 Основан на `tokio` multi-thread (см. `main.rs`). Использует
 `sd_notify` для интеграции с systemd `Type=notify`. Билдится в
 `/usr/bin/tessera` и поставляется юнитом
-[`tessera.service`](../dist/systemd/tessera.service).
+[`tessera.service`](../../dist/systemd/tessera.service).
 
 ### 2.5 Внешние зависимости
 
@@ -188,7 +191,7 @@ PAM-стек делает несколько вызовов в порядке `a
 10. Вернуть `PAM_SUCCESS`. Любая ошибка маппится в
     `PAM_AUTHINFO_UNAVAIL` / `PAM_PERM_DENIED` / `PAM_MAXTRIES` /
     `PAM_AUTH_ERR` / `PAM_SYSTEM_ERR` по семантике
-    [`flow::FlowError::pam_code`](../crates/pam_tessera/src/flow.rs)
+    [`flow::FlowError::pam_code`](../../crates/pam_tessera/src/flow.rs)
     (таблица — в §13).
 
 ### 4.2 `pam_sm_setcred`
@@ -253,10 +256,10 @@ flowchart LR
 
 `/run/tessera/` и `/var/lib/tessera/` создаются systemd
 через директивы `RuntimeDirectory` и `StateDirectory` юнита
-(см. [`tessera.service`](../dist/systemd/tessera.service)
-и [`dist/tmpfiles/tessera.conf`](../dist/tmpfiles/tessera.conf)).
+(см. [`tessera.service`](../../dist/systemd/tessera.service)
+и [`dist/tmpfiles/tessera.conf`](../../dist/tmpfiles/tessera.conf)).
 `/var/cache/tessera/ocsp/` создаёт postinst пакета
-([`debian/postinst`](../debian/postinst)).
+([`debian/postinst`](../../debian/postinst)).
 
 ## 6. Sequence diagram — `pam_sm_authenticate` happy path с PKCS#11
 
@@ -366,7 +369,7 @@ sequenceDiagram
   RuntimeDirectory).
 - Аутентификация peer'а: `SO_PEERCRED` — monitord проверяет, что
   `uid == 0`. Любой иной peer закрывается.
-- Реализация: [`crates/tessera_cli/src/peercred.rs`](../crates/tessera_cli/src/peercred.rs).
+- Реализация: [`crates/tessera_cli/src/peercred.rs`](../../crates/tessera_cli/src/peercred.rs).
 
 ### 10.2 Кадрирование
 
@@ -375,7 +378,7 @@ Newline-delimited JSON (NDJSON):
 - каждый кадр — единственная строка UTF-8 JSON;
 - терминатор — единственный байт `\n`;
 - максимальный размер кадра — `MAX_FRAME_BYTES = 64 KiB` (см.
-  [`crates/tessera_proto/src/wire.rs`](../crates/tessera_proto/src/wire.rs)).
+  [`crates/tessera_proto/src/wire.rs`](../../crates/tessera_proto/src/wire.rs)).
 
 Обоснование выбора NDJSON:
 
@@ -388,7 +391,7 @@ Newline-delimited JSON (NDJSON):
 ### 10.3 Версионирование
 
 - `PROTOCOL_VERSION: u32 = 2` (см.
-  [`crates/tessera_proto/src/version.rs`](../crates/tessera_proto/src/version.rs)).
+  [`crates/tessera_proto/src/version.rs`](../../crates/tessera_proto/src/version.rs)).
   Версия 2 добавила `GetActiveSessionByUid` / `ActiveSession`,
   опциональные поля `SessionOpen` (`engineer_ski`,
   `engineer_cert_sha256`, `uid`) и код ошибки `NO_ACTIVE_SESSION`
@@ -403,10 +406,10 @@ Newline-delimited JSON (NDJSON):
 
 #### Client → Server (`ClientMessage`)
 
-Из [`crates/tessera_proto/src/client.rs`](../crates/tessera_proto/src/client.rs):
+Из [`crates/tessera_proto/src/client.rs`](../../crates/tessera_proto/src/client.rs):
 
 ```json
-{"type": "hello", "protocol_version": 2, "agent": "libpam_tessera/0.1.1"}
+{"type": "hello", "protocol_version": 2, "agent": "libpam_tessera/0.4.0"}
 ```
 
 ```json
@@ -423,10 +426,10 @@ Newline-delimited JSON (NDJSON):
 
 #### Server → Client (`ServerMessage`)
 
-Из [`crates/tessera_proto/src/server.rs`](../crates/tessera_proto/src/server.rs):
+Из [`crates/tessera_proto/src/server.rs`](../../crates/tessera_proto/src/server.rs):
 
 ```json
-{"type": "hello_ack", "server_version": "0.1.1", "protocol_version": 2}
+{"type": "hello_ack", "server_version": "0.4.0", "protocol_version": 2}
 ```
 
 ```json
@@ -452,7 +455,7 @@ Newline-delimited JSON (NDJSON):
 
 ### 10.6 Коды ошибок
 
-Из [`crates/tessera_proto/src/server.rs`](../crates/tessera_proto/src/server.rs):
+Из [`crates/tessera_proto/src/server.rs`](../../crates/tessera_proto/src/server.rs):
 
 | Код  | Имя                | Семантика                                                     | Действие cdylib                |
 |------|--------------------|---------------------------------------------------------------|--------------------------------|
@@ -529,7 +532,7 @@ Newline-delimited JSON (NDJSON):
 
 `host_id` вычисляется в момент `pam_sm_authenticate` через цепочку
 источников из секции `[host_identity]`. Реализация —
-[`crates/tessera_core/src/host_identity/chain.rs`](../crates/tessera_core/src/host_identity/chain.rs).
+[`crates/tessera_core/src/host_identity/chain.rs`](../../crates/tessera_core/src/host_identity/chain.rs).
 
 Источники в порядке предпочтения:
 
@@ -574,7 +577,7 @@ Newline-delimited JSON (NDJSON):
 
 Полная таблица соответствия `FlowError` → PAM-код — doc-comment
 `FlowError::pam_code` в
-[`crates/pam_tessera/src/flow.rs`](../crates/pam_tessera/src/flow.rs).
+[`crates/pam_tessera/src/flow.rs`](../../crates/pam_tessera/src/flow.rs).
 
 Принципы:
 

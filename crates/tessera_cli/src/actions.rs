@@ -100,7 +100,7 @@ async fn fail_closed_no_logind_id(
         target: "tessera.monitord",
         "tip: pam_sm_open_session pushes XDG_SESSION_ID to monitord via UpdateSessionTarget; \
          ensure pam_systemd.so precedes pam_tessera.so in the session phase of /etc/pam.d/<{service}> \
-         (see docs/install.md §10)",
+         (see docs/ru/install.md §10)",
         service = session.pam_service,
     );
     actions.reboot().await
