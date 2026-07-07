@@ -173,7 +173,10 @@ allowed_signature_algorithms = []
 
 # --- Trust → revocation ------------------------------------------------------
 [trust.revocation]
-# "none" | "crl" | "ocsp" | "crl_then_ocsp". OCSP modes require
+# REQUIRED. "none" | "crl" | "ocsp" | "crl_then_ocsp". Omitting this section
+# or the `mode` key is a validation error — there is no silent default, so a
+# revoked certificate can never authenticate by oversight. "none" disables
+# revocation checking and must be chosen deliberately. OCSP modes require
 # ocsp_responder_url; optional knobs: ocsp_timeout_seconds,
 # ocsp_cache_ttl_seconds. Zero-egress fleets stay on "none" (short-TTL
 # discipline) or offline "crl".

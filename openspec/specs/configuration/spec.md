@@ -53,7 +53,7 @@ PAM-cdylib ДОЛЖЕН (MUST) перечитывать конфиг с диск
 
 - `[monitor]`: socket_path, state_file_path, timeout_ms (2000, 100..=60000), fail_mode (`degraded`→Permissive; при отсутствии — fallback на legacy top-level `monitor_fail_mode`, validated.rs:1137–1152), on_usb_removed (+`on_usb_removed_hook_path`: обязателен при `on_usb_removed="hook"`, абсолютный путь, ЗАПРЕЩЁН в не-hook режиме — raw.rs:282–285, validated.rs:1166–1183), grace-поля (≤600), idle_timeout_seconds (30, 1..=3600), max_concurrent_connections (64, 1..=4096). Последние два пробрасываются в accept-loop через `AcceptConfig::from_monitor` (см. [ipc-protocol](../ipc-protocol/spec.md)).
 - `[trust]`: anchors (непустой список — пустые anchors отклоняются валидацией конфига (`TrustError::AnchorsEmpty`); конструктор verifier'а дублирует проверку как defense-in-depth; каждый файл — PEM с BEGIN CERTIFICATE), intermediates, max_chain_depth (5, 1..=16), clock_skew_seconds (0, ≤600), allowed_signature_algorithms (пусто/опущено = безопасный дефолт `DEFAULT_SIGNATURE_ALGORITHMS`: SHA-256/384/512 RSA + ECDSA, без SHA-1 и GOST; GOST — только явный opt-in; см. [trust-chain-validation](../trust-chain-validation/spec.md)).
-- `[trust.revocation]`: mode (none|crl|ocsp|crl_then_ocsp; см. [revocation](../revocation/spec.md)). `crl_max_age_hours` (опционален, 1..=8760) пробрасывается в runtime как `crl_max_age`. `is_file`-проверка CRL — только при mode=crl. OCSP-ключи `ocsp_responder_url` (http/https, ОБЯЗАТЕЛЕН при mode ∈ {ocsp, crl_then_ocsp}), `ocsp_timeout_seconds` (5, 1..=30), `ocsp_cache_ttl_seconds` (3600, 0..=86400) пробрасываются в `RevocationSection`; при mode ∉ {ocsp, crl_then_ocsp} любой заданный `ocsp_*`-ключ ОТВЕРГАЕТСЯ валидацией (по образцу `on_usb_removed_hook_path` — мёртвых ключей нет).
+- `[trust.revocation]`: mode (none|crl|ocsp|crl_then_ocsp; ОБЯЗАТЕЛЕН — c 2026-07 пропуск секции `[trust.revocation]` или ключа `mode` = ошибка валидации, молчаливого дефолта `none` больше нет; `none` выбирается только явно; см. [revocation](../revocation/spec.md)). `crl_max_age_hours` (опционален, 1..=8760) пробрасывается в runtime как `crl_max_age`. `is_file`-проверка CRL — только при mode=crl. OCSP-ключи `ocsp_responder_url` (http/https, ОБЯЗАТЕЛЕН при mode ∈ {ocsp, crl_then_ocsp}), `ocsp_timeout_seconds` (5, 1..=30), `ocsp_cache_ttl_seconds` (3600, 0..=86400) пробрасываются в `RevocationSection`; при mode ∉ {ocsp, crl_then_ocsp} любой заданный `ocsp_*`-ключ ОТВЕРГАЕТСЯ валидацией (по образцу `on_usb_removed_hook_path` — мёртвых ключей нет).
 - `[trust.pinning]`: enabled (false), allowed_root_spki_sha256 (64 hex, валидируется только при enabled).
 - `[[trust_override]]`: when_host_id_in (непустой) + anchors/intermediates.
 - `[host_identity]`: sources (обязателен, непустой, без дублей), fallback (deny), override, custom_command (absolute) + timeout (clamp 1..30).
@@ -79,6 +79,10 @@ PAM-cdylib ДОЛЖЕН (MUST) перечитывать конфиг с диск
 #### Scenario: hook-режим без on_usb_removed_hook_path
 - **WHEN** `on_usb_removed = "hook"`, а `on_usb_removed_hook_path` не задан или не абсолютный
 - **THEN** валидация секции завершается ошибкой
+
+#### Scenario: [trust.revocation] или mode отсутствует
+- **WHEN** секция `[trust.revocation]` опущена целиком, либо присутствует, но без ключа `mode`
+- **THEN** валидация конфига завершается ошибкой (`mode` обязателен) — молчаливого отката к «отзыв не проверяется» нет; отказ от проверки требует явного `mode = "none"`
 
 #### Scenario: mode="ocsp" без ocsp_responder_url
 - **WHEN** `mode = "ocsp"` (или `"crl_then_ocsp"`), `ocsp_responder_url` отсутствует или не начинается с `http(s)://`

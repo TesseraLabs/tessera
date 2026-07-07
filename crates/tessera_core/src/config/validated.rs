@@ -1065,6 +1065,33 @@ fn validate_logging(raw: &RawLogging) -> Result<LoggingSection, Error> {
     })
 }
 
+/// Rejection message when the revocation mode is not stated explicitly
+/// (missing `[trust.revocation]` section or missing `mode` key). Naming all
+/// accepted values keeps the fix actionable, and forces an operator who wants
+/// no revocation checking to opt in deliberately with `mode = "none"`.
+const REVOCATION_MODE_REQUIRED: &str =
+    "trust.revocation.mode is required: set \"crl\", \"ocsp\" or \"crl_then_ocsp\"; \
+     if you accept running WITHOUT revocation checking, set mode = \"none\" explicitly";
+
+/// Resolve the operator's explicitly-configured revocation section and mode.
+///
+/// The mode must be chosen deliberately. A missing `[trust.revocation]`
+/// section, or a section without a `mode` key, would otherwise fall back to
+/// no CRL/OCSP checking at all — a revoked certificate would authenticate
+/// silently. Opting out stays possible, but only by writing `mode = "none"`.
+fn resolve_revocation_mode(raw: &RawTrust) -> Result<(&RawRevocation, RawRevocationMode), Error> {
+    let revocation = raw
+        .revocation
+        .as_ref()
+        .ok_or_else(|| Error::ConfigInvalid {
+            reason: REVOCATION_MODE_REQUIRED.to_string(),
+        })?;
+    let mode = revocation.mode.ok_or_else(|| Error::ConfigInvalid {
+        reason: REVOCATION_MODE_REQUIRED.to_string(),
+    })?;
+    Ok((revocation, mode))
+}
+
 fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
     // Reject an empty anchor list at config-validation time so the
     // misconfiguration surfaces with a clear message; the verifier
@@ -1089,18 +1116,19 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
     for path in raw.anchors.iter().chain(raw.intermediates.iter()) {
         validate_pem(path)?;
     }
-    check_crl_mode_has_paths(raw.revocation.mode, &raw.revocation.crl_paths)?;
-    if matches!(raw.revocation.mode, RawRevocationMode::Crl) {
-        for path in &raw.revocation.crl_paths {
+    let (revocation, mode) = resolve_revocation_mode(raw)?;
+    check_crl_mode_has_paths(mode, &revocation.crl_paths)?;
+    if matches!(mode, RawRevocationMode::Crl) {
+        for path in &revocation.crl_paths {
             if !path.is_file() {
                 return Err(TrustError::CrlPathMissing { path: path.clone() }.into());
             }
         }
     }
-    if revocation_is_disabled(raw.revocation.mode) {
-        // Absent or explicit `mode = "none"` means no CRL/OCSP consultation:
-        // a revoked certificate still authenticates. Surface this loudly so
-        // an operator cannot run without revocation unknowingly.
+    if revocation_is_disabled(mode) {
+        // Explicit `mode = "none"` means no CRL/OCSP consultation: a revoked
+        // certificate still authenticates. Surface this loudly so an operator
+        // who opted out cannot forget they are running without revocation.
         tracing::warn!(
             target: "tessera.config",
             "trust.revocation.mode is \"none\": certificate revocation is NOT checked; \
@@ -1108,8 +1136,8 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
              \"crl_then_ocsp\" to enable revocation."
         );
     }
-    let ocsp = validate_ocsp(&raw.revocation)?;
-    let crl_max_age = match raw.revocation.crl_max_age_hours {
+    let ocsp = validate_ocsp(mode, revocation)?;
+    let crl_max_age = match revocation.crl_max_age_hours {
         None => None,
         Some(hours) if (1..=8760).contains(&hours) => {
             Some(Duration::from_secs(hours.saturating_mul(3600)))
@@ -1136,13 +1164,13 @@ fn validate_trust(raw: &RawTrust) -> Result<TrustSection, Error> {
         anchors: raw.anchors.clone(),
         intermediates: raw.intermediates.clone(),
         revocation: RevocationSection {
-            mode: match raw.revocation.mode {
+            mode: match mode {
                 RawRevocationMode::None => RevocationMode::None,
                 RawRevocationMode::Crl => RevocationMode::Crl,
                 RawRevocationMode::Ocsp => RevocationMode::Ocsp,
                 RawRevocationMode::CrlThenOcsp => RevocationMode::CrlThenOcsp,
             },
-            crl_paths: raw.revocation.crl_paths.clone(),
+            crl_paths: revocation.crl_paths.clone(),
             crl_max_age,
             ocsp_responder_url: ocsp.responder_url,
             ocsp_timeout: ocsp.timeout,
@@ -1225,9 +1253,9 @@ struct OcspSettings {
 /// back to their defaults and are range-checked.  In every other mode any
 /// `ocsp_*` key is rejected outright: a key that would be silently ignored
 /// at runtime is a footgun (same guard as `monitor.on_usb_removed_hook_path`).
-fn validate_ocsp(raw: &RawRevocation) -> Result<OcspSettings, Error> {
+fn validate_ocsp(mode: RawRevocationMode, raw: &RawRevocation) -> Result<OcspSettings, Error> {
     let ocsp_capable = matches!(
-        raw.mode,
+        mode,
         RawRevocationMode::Ocsp | RawRevocationMode::CrlThenOcsp
     );
     if !ocsp_capable {
