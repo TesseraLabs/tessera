@@ -576,3 +576,51 @@ here is a single ranked registry (impact × likelihood, descending).
 | Check the rescue channel in finish-bootstrap.sh for cert-only (clock_skew tolerance in acct_mgmt — done) | T8 | partial | S | open |
 | MS_NOSYMFOLLOW in mount(2) + canonicalize/boundary check in discover_credentials before fs::read | T12 | yes | S | canonicalize/boundary check implemented 2026-06; MS_NOSYMFOLLOW — open (defense-in-depth) |
 | CRL issuer-DN binding in check_revocation: compare the cert's issuer_dn_der with the CRL issuer before matching by serial number (RFC 5280 §6.3.3) | T1, T8 | yes | S | implemented 2026-06 |
+
+## 11. Issuance tooling (`tessera_issuer`, issuer-tooling 2026-07)
+
+TOE extension: the client-side certificate issuance tooling — the
+`tessera_issuer` core, the `issuer` CLI, the static web cabinet (WASM) and the
+local `issuer serve` agent (browser ↔ PKCS#11 bridge). The tool is not a
+custodian: private keys live in the token/HSM/Vault Transit and never pass
+through the issuance code. The requirements canon is the openspec specs
+`cert-issuance`, `issuer-signing`, `issuer-cabinet`, `issuance-journal`.
+
+### 11.1 Attack surface
+
+| #      | Surface                               | Threat                                                                              | Mitigation                                                                                                                                                                              |
+|--------|---------------------------------------|--------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 11.1.1 | `issuer serve` HTTP agent (127.0.0.1) | CSRF / DNS rebinding from the operator's browser; an arbitrary local process asks for a signature | binds strictly to 127.0.0.1; Origin allowlist — a request with a missing/foreign Origin is rejected before the signing module is touched; paired session token (CSPRNG, constant-time comparison); no PIN over HTTP — the protocol has no such field; per-operation operator confirmation in the agent's interface showing the parsed TBS fields (the agent is the trusted display; the token authenticates the cabinet, the confirmation authorises the operation) |
+| 11.1.2 | Issuing-key PIN                       | leak via logs, argv, the journal, error messages                                       | entered only on the agent side (terminal/pinentry); `Secret`+`zeroize` for the duration of the operation; absent from error `Debug`/`Display` and from the issuance journal                 |
+| 11.1.3 | Web-cabinet static assets (SPA + WASM) | artifact substitution during hosting/delivery                                          | pinned artifact hashes in the release; self-hosting is a first-class scenario; keys are unreachable even from a substituted SPA (signing sits behind the agent + token). Residual risk — see 11.3 |
+| 11.1.4 | Vault/OpenBao Transit                 | Transit signs whatever TBS it is sent                                                  | every issuance check runs client-side before signing; Vault policy restricts who may call `sign`; the Vault token is never logged                                                           |
+| 11.1.5 | Inventory snapshot feeding the forms  | a forged snapshot plants foreign devices/roles into the forms                          | the snapshot signature is verified, a broken one → rejection; an unsigned snapshot is explicitly marked as manual, its age is displayed                                                     |
+| 11.1.6 | Issuance journal                      | hiding/rewriting the fact of an issuance                                               | hash chain with a fixed genesis + signed head; the record is written before the artifact is released (fail-closed); secondary to the primary truth — the login audit on the devices          |
+
+### 11.2 What bounds the damage of issuance abuse
+
+Monotonic narrowing of the delegation envelope is checked on the issuance side
+by the same shared code (`tessera_ext`) as the Engine's enforcement: even a
+fully compromised issuance tool cannot produce a certificate wider than the
+parent CA's envelope — the Engine rejects it on the device (AND/MIN envelope
+semantics, §3.8). Serials are random 128-bit — no serial coordination between
+operators is needed, and serials cannot serve as a channel.
+
+### 11.3 What it does NOT protect against
+
+- **Operator machine compromise** = compromise of the issuance session: an
+  attacker with the operator's privileges can issue certificates within the
+  envelope of the presented CA (but cannot steal the key — it is in the
+  token/HSM; and cannot escape the envelope — see 11.2). Parity with 4.1
+  (host compromise is outside the TOE).
+- **A substituted cabinet slips in a different TBS** — closed by the mandatory
+  per-operation confirmation (11.1.1): the agent parses the TBS and displays
+  subject/validity/roles/envelope in the trusted channel before the PIN
+  prompt; the operator confirms what is actually being signed. What remains is
+  operator inattention (confirming without reading) — an organisational
+  control.
+- **Four-eyes on a pure client**: the standalone issuance path provides no
+  second signature by construction; this is explicitly the organisation's
+  responsibility (the server-side path is out of scope for the open part).
+- **A withheld CRL**: the tool issues CRLs but does not deliver them; the
+  backstop is short leaf TTLs (`revocation` semantics).

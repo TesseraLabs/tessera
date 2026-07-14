@@ -33,10 +33,10 @@ fn der_integer(v: u32) -> Vec<u8> {
     // Minimal big-endian encoding with a leading 0x00 only when the high bit
     // would otherwise make it negative.
     let mut bytes = v.to_be_bytes().to_vec();
-    while bytes.len() > 1 && bytes[0] == 0 {
+    while bytes.len() > 1 && bytes.first() == Some(&0) {
         bytes.remove(0);
     }
-    if bytes[0] & 0x80 != 0 {
+    if bytes.first().is_some_and(|&b| b & 0x80 != 0) {
         bytes.insert(0, 0x00);
     }
     let mut out = vec![TAG_INTEGER, u8::try_from(bytes.len()).unwrap()];

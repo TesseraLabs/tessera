@@ -18,14 +18,17 @@
 //! extension appearing on a non-CA (leaf) certificate all reject the whole
 //! extension.
 //!
+//! The raw byte-level parse of the `extnValue` body lives in
+//! [`tessera_ext::delegation`] so the issuer and the Engine agree on it; this
+//! module keeps the OpenSSL glue (pulling the extension out of the certificate,
+//! checking `basicConstraints`) and validates each `allowRoles` entry against
+//! the Engine's [`RoleId`] grammar.
+//!
 //! Placement rule (design decision 3): the extension is valid **only** on a
 //! cert whose `basicConstraints` asserts `cA = TRUE`.  Presence on a leaf
 //! (`cA = FALSE`, or `basicConstraints` absent) is malformed.
 
-use super::der::{read_tlv, read_tlv_expect, TAG_INTEGER, TAG_SEQUENCE};
-use super::der_helpers::{
-    extract_extension_by_oid, parse_der_integer_i64, DerError, TAG_UTF8_STRING,
-};
+use super::der_helpers::extract_extension_by_oid;
 use super::oids::DELEGATION_CONSTRAINTS_OID;
 use super::VerifiedX509;
 use crate::role::RoleId;
@@ -113,112 +116,44 @@ pub fn extract_delegation_constraints(
     parse_constraints(&value).map(Some)
 }
 
-/// Parses the `extnValue` body into a [`DelegationConstraints`].  Split out so
-/// the DER walk can be unit-tested without building a certificate.
+/// Parses the `extnValue` body into a [`DelegationConstraints`].  The raw DER
+/// walk is shared with the issuer via [`tessera_ext::delegation`]; the injected
+/// validator applies the Engine's `role_id` grammar to each `allowRoles` entry
+/// at the exact position the strict Engine parser used to, so error precedence
+/// is unchanged.
 fn parse_constraints(
     value_der: &[u8],
 ) -> Result<DelegationConstraints, DelegationConstraintsExtError> {
-    let outer = read_tlv_expect(value_der, TAG_SEQUENCE).map_err(parse_err)?;
-    if !outer.rest.is_empty() {
-        return Err(DelegationConstraintsExtError::Parse(
-            "trailing bytes after outer SEQUENCE".to_owned(),
-        ));
-    }
-
-    // Field 1 — requireTags: SEQUENCE OF SEQUENCE { key UTF8String, value UTF8String }.
-    let require_tags_tlv = read_tlv_expect(outer.value, TAG_SEQUENCE).map_err(parse_err)?;
-    let require_tags = parse_require_tags(require_tags_tlv.value)?;
-
-    // Field 2 — allowRoles: SEQUENCE OF UTF8String, each a valid role_id.
-    let allow_roles_tlv =
-        read_tlv_expect(require_tags_tlv.rest, TAG_SEQUENCE).map_err(parse_err)?;
-    let allow_roles = parse_allow_roles(allow_roles_tlv.value)?;
-
-    // Field 3 — maxLevel: INTEGER (i8 range).
-    let max_level_tlv = read_tlv_expect(allow_roles_tlv.rest, TAG_INTEGER).map_err(parse_err)?;
-    let max_level_raw = parse_der_integer_i64(max_level_tlv.value).map_err(parse_err)?;
-    let max_level = MaxLevel::try_from(max_level_raw)
-        .map_err(|_| DelegationConstraintsExtError::MaxLevelOutOfRange(max_level_raw))?;
-
-    // Field 4 — maxTtl: INTEGER (non-negative seconds).  Must close out the body.
-    let max_ttl_tlv = read_tlv_expect(max_level_tlv.rest, TAG_INTEGER).map_err(parse_err)?;
-    if !max_ttl_tlv.rest.is_empty() {
-        return Err(DelegationConstraintsExtError::Parse(
-            "trailing bytes after maxTtl".to_owned(),
-        ));
-    }
-    let max_ttl_raw = parse_der_integer_i64(max_ttl_tlv.value).map_err(parse_err)?;
-    let max_ttl = u64::try_from(max_ttl_raw)
-        .map_err(|_| DelegationConstraintsExtError::NegativeMaxTtl(max_ttl_raw))?;
+    let mut allow_roles: Vec<RoleId> = Vec::new();
+    let raw =
+        tessera_ext::delegation::parse_constraints_with(value_der, |role| {
+            match RoleId::new(role) {
+                Ok(id) => {
+                    allow_roles.push(id);
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .map_err(map_parse_err)?;
 
     Ok(DelegationConstraints {
-        require_tags,
+        require_tags: raw.require_tags,
         allow_roles,
-        max_level,
-        max_ttl,
+        max_level: raw.max_level,
+        max_ttl: raw.max_ttl,
     })
 }
 
-/// Maps any DER-walk error (whether [`DerError`] or the lower-level
-/// [`super::TrustError`] from `read_tlv*`) into a fail-closed parse error.
-fn parse_err(e: impl std::fmt::Display) -> DelegationConstraintsExtError {
-    DelegationConstraintsExtError::Parse(e.to_string())
-}
-
-/// Parses the *content* of the `requireTags` SEQUENCE: a run of
-/// `SEQUENCE { key UTF8String, value UTF8String }` pairs.  Rejects duplicate
-/// keys (consistency with the device-tags schema).
-fn parse_require_tags(
-    content: &[u8],
-) -> Result<Vec<(String, String)>, DelegationConstraintsExtError> {
-    let mut rest = content;
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    while !rest.is_empty() {
-        let pair = read_tlv_expect(rest, TAG_SEQUENCE).map_err(parse_err)?;
-        rest = pair.rest;
-        let key_tlv = read_tlv_expect(pair.value, TAG_UTF8_STRING).map_err(parse_err)?;
-        let val_tlv = read_tlv_expect(key_tlv.rest, TAG_UTF8_STRING).map_err(parse_err)?;
-        if !val_tlv.rest.is_empty() {
-            return Err(DelegationConstraintsExtError::Parse(
-                "trailing bytes in requireTags pair".to_owned(),
-            ));
-        }
-        let key = std::str::from_utf8(key_tlv.value)
-            .map_err(|_| {
-                DelegationConstraintsExtError::Parse("invalid utf-8 in tag key".to_owned())
-            })?
-            .to_owned();
-        let value = std::str::from_utf8(val_tlv.value)
-            .map_err(|_| {
-                DelegationConstraintsExtError::Parse("invalid utf-8 in tag value".to_owned())
-            })?
-            .to_owned();
-        if !seen.insert(key.clone()) {
-            return Err(DelegationConstraintsExtError::DuplicateTagKey(key));
-        }
-        out.push((key, value));
+/// Maps the shared parse error into the Engine-facing error, preserving each
+/// fail-closed variant.
+fn map_parse_err(err: tessera_ext::delegation::ParseError) -> DelegationConstraintsExtError {
+    use tessera_ext::delegation::ParseError as Ext;
+    match err {
+        Ext::Malformed(s) => DelegationConstraintsExtError::Parse(s),
+        Ext::DuplicateTagKey(k) => DelegationConstraintsExtError::DuplicateTagKey(k),
+        Ext::InvalidRole(s) => DelegationConstraintsExtError::InvalidRoleId(s),
+        Ext::MaxLevelOutOfRange(v) => DelegationConstraintsExtError::MaxLevelOutOfRange(v),
+        Ext::NegativeMaxTtl(v) => DelegationConstraintsExtError::NegativeMaxTtl(v),
     }
-    Ok(out)
-}
-
-/// Parses the *content* of the `allowRoles` SEQUENCE: a run of `UTF8String`s,
-/// each of which must be a valid `role_id`.
-fn parse_allow_roles(content: &[u8]) -> Result<Vec<RoleId>, DelegationConstraintsExtError> {
-    let mut rest = content;
-    let mut out: Vec<RoleId> = Vec::new();
-    while !rest.is_empty() {
-        let tlv = read_tlv(rest).map_err(parse_err)?;
-        if tlv.tag != TAG_UTF8_STRING {
-            return Err(parse_err(DerError::UnexpectedTag(tlv.tag)));
-        }
-        let s = std::str::from_utf8(tlv.value).map_err(|_| {
-            DelegationConstraintsExtError::Parse("invalid utf-8 in role".to_owned())
-        })?;
-        let role = RoleId::new(s)
-            .map_err(|e| DelegationConstraintsExtError::InvalidRoleId(e.to_string()))?;
-        out.push(role);
-        rest = tlv.rest;
-    }
-    Ok(out)
 }
