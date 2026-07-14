@@ -28,9 +28,10 @@ use secrecy::{ExposeSecret, SecretString};
 use subtle::ConstantTimeEq as _;
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use crate::confirm::{parse_operation_summary, Confirmer};
+use crate::confirm::Confirmer;
 use crate::l10n::{Locale, Msg};
 use crate::sign::{KeyId, SignatureAlgorithm, SignatureBackend};
+use crate::summary::parse_operation_summary;
 
 pub use crate::confirm::DefaultConfirmer;
 
@@ -565,8 +566,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::confirm::{ConfirmError, OperationSummary};
+    use crate::confirm::ConfirmError;
     use crate::sign::{MockSigner, SignError, Signature};
+    use crate::summary::OperationSummary;
     use crate::test_support::{self_signed_ca, spki_fixture, MemoryStorage};
     use crate::{issue_leaf, CaRequest, IntegrityCeiling, Journal, LeafRequest, Serial, Validity};
     use tessera_ext::delegation::DelegationConstraints;

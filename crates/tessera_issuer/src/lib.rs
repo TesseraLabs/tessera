@@ -79,6 +79,7 @@ pub mod monotonicity;
 mod profile;
 pub mod serial;
 pub mod sign;
+pub mod summary;
 mod tbs;
 mod verify;
 
@@ -114,6 +115,9 @@ pub use l10n::Locale;
 pub use profile::{CaRequest, IntegrityCeiling, LeafRequest, Validity};
 pub use serial::Serial;
 pub use sign::{KeyId, SignError, Signature, SignatureAlgorithm, SignatureBackend};
+pub use summary::{
+    parse_operation_summary, OperationKind, OperationSummary, SummaryError, SummaryLine,
+};
 
 use monotonicity::{check_ca_within_parent, check_leaf_within_parent, parent_constraints};
 use tessera_ext::ext::extract_subject_der;
@@ -125,6 +129,36 @@ pub struct IssuedCert {
     pub der: Vec<u8>,
     /// The serial's DER `INTEGER` content octets.
     pub serial: Vec<u8>,
+}
+
+/// Assembles a `Certificate` from a TBS that was signed out of band.
+///
+/// The browser cabinet builds a `TBSCertificate` in its WASM core, hands it to
+/// the local signing agent, and receives back only a signature. This frames the
+/// final `Certificate` from the exact TBS bytes that were signed and the
+/// returned signature. The outer `signatureAlgorithm` is `algorithm`; the caller
+/// MUST ensure it equals the `signature` `AlgorithmIdentifier` already inside the
+/// TBS, or the certificate is internally inconsistent.
+///
+/// This is the assembly half of split signing; the build and self-check halves
+/// stay with the caller (the cabinet re-parses the assembled certificate with
+/// the shared parsers before releasing it).
+///
+/// # Errors
+///
+/// [`IssueError::Encoding`] if the signature `AlgorithmIdentifier` cannot be
+/// encoded.
+pub fn assemble_signed_certificate(
+    tbs_der: &[u8],
+    algorithm: SignatureAlgorithm,
+    signature_bytes: &[u8],
+) -> Result<Vec<u8>, IssueError> {
+    let algid_der = tbs::algorithm_identifier_der(algorithm)?;
+    Ok(tbs::assemble_certificate(
+        tbs_der,
+        &algid_der,
+        signature_bytes,
+    ))
 }
 
 /// Validates that a validity window is non-empty and correctly ordered.

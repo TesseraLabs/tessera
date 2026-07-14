@@ -2498,6 +2498,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera_issuer_wasm"
+version = "0.4.0"
+dependencies = [
+ "base64",
+ "der 0.7.10",
+ "getrandom 0.2.17",
+ "p256",
+ "serde",
+ "serde_json",
+ "tessera_ext",
+ "tessera_issuer",
+ "wasm-bindgen",
+ "x509-cert",
+]
+
+[[package]]
 name = "tessera_proto"
 version = "0.4.0"
 dependencies = [

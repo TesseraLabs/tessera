@@ -29,7 +29,10 @@ see [../ru/changelog.md](../ru/changelog.md) (Russian).
 1. [cert-issuance.md](cert-issuance.md) — the
    `pam_cert_host_binding`, `pam_cert_user_binding`, and
    `pam_cert_max_integrity` extensions, and issuance scenarios.
-2. [clone-image.md §6](clone-image.md) — the CA side of the clone-image
+2. [issuer.md](issuer.md) — the issuer tooling (`tessera_issuer`):
+   the `issuer` CLI, the `serve` agent, the CSR flow, the PKCS#11 and
+   Vault Transit backends, the issuance journal, and the web cabinet.
+3. [clone-image.md §6](clone-image.md) — the CA side of the clone-image
    workflow (per-host issuance).
 
 ### Security engineer

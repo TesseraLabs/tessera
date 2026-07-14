@@ -279,6 +279,42 @@ pub fn extract_subject_der(cert_der: &[u8]) -> Result<Vec<u8>, DerError> {
     Ok(subject_start.get(..consumed).unwrap_or(&[]).to_vec())
 }
 
+/// Returns the raw DER of a certificate's `issuer` `Name` (the whole `SEQUENCE`
+/// element, header included).
+///
+/// The issuer tooling compares a CA's `issuer` against its `subject` to tell a
+/// self-signed fleet root (issue CAs) from an issued organisation CA (issue
+/// leaves). As with [`extract_subject_der`], a Tessera CA carries wide
+/// `2.25.<UUID>` extension OIDs that `x509-cert` cannot decode, so the name is
+/// pulled out with a byte-level walk instead.
+///
+/// # Errors
+///
+/// [`DerError`] if the certificate is malformed or ends before the issuer.
+pub fn extract_issuer_der(cert_der: &[u8]) -> Result<Vec<u8>, DerError> {
+    let outer = read_tlv_expect(cert_der, TAG_SEQUENCE)?;
+    let tbs = read_tlv_expect(outer.value, TAG_SEQUENCE)?;
+    let mut rest = tbs.value;
+
+    // Optional `version [0] EXPLICIT`.
+    let peek = read_tlv(rest)?;
+    if peek.tag == 0xA0 {
+        rest = peek.rest;
+    }
+    // Skip serialNumber and signature — the two elements before issuer in
+    // `TBSCertificate`.
+    for _ in 0..2 {
+        rest = read_tlv(rest)?.rest;
+    }
+    let issuer_start = rest;
+    let issuer = read_tlv_expect(rest, TAG_SEQUENCE)?;
+    let consumed = issuer_start
+        .len()
+        .checked_sub(issuer.rest.len())
+        .ok_or(DerError::ValueTruncated)?;
+    Ok(issuer_start.get(..consumed).unwrap_or(&[]).to_vec())
+}
+
 /// The decoded `basicConstraints` of a certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BasicConstraints {
