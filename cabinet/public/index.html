@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      Serverless invariant (spec issuer-cabinet: "Кабинет НЕ ДОЛЖЕН отправлять
+      данные выпуска на какие-либо внешние адреса"): the only network the
+      cabinet may reach is the local signing agent on 127.0.0.1/localhost.
+      No remote fonts/scripts/images/styles, no telemetry beacons — the CSP
+      below is the browser-enforced backstop for that invariant, not just a
+      hint to reviewers.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    />
+    <title>Tessera Issuer Cabinet</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

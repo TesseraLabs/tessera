@@ -1,0 +1,180 @@
+name: deploy-issuer
+
+# Деплой веб-кабинета выпуска (D13) на оба домена — только через CI, паритет с
+# доками: руками не деплоим. Один двуязычный артефакт SPA публикуется на
+# issuer.tessera-access.com (Cloudflare Pages) и issuer.tessera-access.ru
+# (YC Object Storage + CDN). SHA-256 артефакта фиксируется в GitHub Release.
+#
+# ─── СЕКРЕТЫ (repo secrets, только основной репозиторий) ──────────────────────
+#   CLOUDFLARE_API_TOKEN      — токен с правами Pages:Edit на проект.
+#   CLOUDFLARE_ACCOUNT_ID     — id аккаунта Cloudflare.
+#   YC_S3_ACCESS_KEY_ID       — статический ключ сервис-аккаунта (S3).
+#   YC_S3_SECRET_ACCESS_KEY   — секрет того же ключа.
+#   YC_SA_KEY_JSON            — authorized_key.json сервис-аккаунта для yc CLI
+#                               (нужен только для purge CDN; если пуст — purge
+#                               пропускается, кэш вытечет по TTL).
+#   YC_CDN_RESOURCE_ID        — id CDN-ресурса issuer.tessera-access.ru.
+#
+# ─── РУЧНОЕ ПРОВИЖИНИРОВАНИЕ (один раз, до первого деплоя) ────────────────────
+#   Cloudflare:
+#     1. Создать Pages-проект `tessera-issuer` (Direct Upload, без Git-интеграции).
+#     2. Привязать custom domain issuer.tessera-access.com.
+#     3. DNS: CNAME issuer → <project>.pages.dev в зоне tessera-access.com (CF).
+#   Yandex Cloud:
+#     4. Создать бакет issuer-tessera-access-ru (public-read, website-хостинг,
+#        index.html как индекс и как 404).
+#     5. Поднять CDN-ресурс на бакет-ориджин, привязать issuer.tessera-access.ru,
+#        выпустить/загрузить TLS-сертификат.
+#     6. DNS в зоне tessera-access.ru (Cloudflare, DNS-only): CNAME issuer →
+#        <cdn>.gcdn.co (или адрес CDN-эндпоинта).
+#     7. Сервис-аккаунт: статический ключ (S3) + authorized_key.json (для yc CLI
+#        purge). Роли: storage.editor на бакет, cdn.editor на CDN-ресурс.
+#
+# Деплой-джобы идут только в основном репозитории (форки и PR-клоны их не
+# запускают — тег-триггер и dispatch там не возникают, плюс явный if по
+# github.repository).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег для повторного деплоя того же релиза (например v0.4.0)'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  YC_S3_BUCKET: issuer-tessera-access-ru
+  CF_PAGES_PROJECT: tessera-issuer
+
+concurrency:
+  # Один деплой на тег; повторный dispatch того же тега отменяет предыдущий.
+  group: deploy-issuer-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'TesseraLabs/tessera'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # приложить SHA256SUMS к ассетам релиза
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve release tag
+        id: resolve
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      # Кабинет — npm/esbuild/TypeScript SPA поверх wasm-ядра: build.sh нужны
+      # Node и Rust+wasm32 (см. issuer.yml). Скрипт самодостаточен.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: issuer-cabinet
+
+      - name: Build cabinet
+        # Контракт: cabinet/build.sh кладёт статику в cabinet/dist/ + SHA256SUMS.
+        run: bash cabinet/build.sh
+
+      - name: Upload cabinet artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tessera-cabinet
+          path: cabinet/dist/**
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach SHA256SUMS to the release (if it exists)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" cabinet/dist/SHA256SUMS --clobber
+          else
+            echo "::notice::Release $TAG not found — skipping SHA256SUMS upload."
+          fi
+
+  deploy-com:
+    needs: build
+    if: github.repository == 'TesseraLabs/tessera'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download cabinet artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: tessera-cabinet
+          path: dist
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: >
+            pages deploy dist
+            --project-name=${{ env.CF_PAGES_PROJECT }}
+            --branch=main
+
+  deploy-ru:
+    needs: build
+    if: github.repository == 'TesseraLabs/tessera'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download cabinet artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: tessera-cabinet
+          path: dist
+
+      # aws CLI предустановлен на ubuntu-раннере; YC S3-совместим.
+      - name: Sync to YC Object Storage
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.YC_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_S3_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ru-central1
+        run: |
+          set -euo pipefail
+          aws s3 sync dist/ "s3://${YC_S3_BUCKET}/" \
+            --endpoint-url=https://storage.yandexcloud.net \
+            --delete
+
+      # Один purge на весь деплой — CDN purge лимитирован 1/мин, per-file нельзя.
+      # Требует yc CLI + service-account key; если ключа/ресурса нет — пропускаем
+      # (кэш вытечет по TTL, деплой не падает).
+      - name: Purge YC CDN cache
+        env:
+          YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
+          YC_CDN_RESOURCE_ID: ${{ secrets.YC_CDN_RESOURCE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${YC_SA_KEY_JSON:-}" ] || [ -z "${YC_CDN_RESOURCE_ID:-}" ]; then
+            echo "::notice::YC_SA_KEY_JSON / YC_CDN_RESOURCE_ID not set — skipping CDN purge (TTL will expire)."
+            exit 0
+          fi
+          curl -sSL https://storage.yandexcloud.net/yandexcloud/yandex-cloud-install.sh | bash
+          export PATH="$HOME/yandex-cloud/bin:$PATH"
+          printf '%s' "$YC_SA_KEY_JSON" > "$RUNNER_TEMP/yc-sa-key.json"
+          yc config profile create ci >/dev/null 2>&1 || yc config profile activate ci
+          yc config set service-account-key "$RUNNER_TEMP/yc-sa-key.json"
+          # Полный purge ресурса одним вызовом (без per-path).
+          yc cdn cache purge --resource-id "$YC_CDN_RESOURCE_ID"

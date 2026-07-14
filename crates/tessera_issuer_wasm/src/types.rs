@@ -252,6 +252,42 @@ pub(crate) struct RequestedExtensionJson {
     pub value_b64: String,
 }
 
+/// The requested integrity ceiling, semantically decoded.
+#[derive(Debug, Serialize)]
+pub(crate) struct ParsedIntegrityJson {
+    /// Astra МКЦ linear integrity level.
+    pub level: i8,
+    /// Category bitmask.
+    pub categories: u64,
+}
+
+/// Semantically decoded *known* Tessera extensions from a CSR's requested
+/// attributes, for labelled form prefill.
+///
+/// A field is present only when the matching extension was requested **and**
+/// decoded cleanly with the shared [`tessera_ext`] parsers; an unrecognized or
+/// malformed extension is left out here (it still appears in the raw
+/// `requested_extensions`). None of this influences issuance — the operator sets
+/// the scope.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct RequestedParsedJson {
+    /// Roles the CSR asked its leaf to allow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_roles: Option<Vec<String>>,
+    /// Host descriptors the CSR asked to bind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_binding: Option<Vec<String>>,
+    /// User descriptors the CSR asked to bind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_binding: Option<Vec<String>>,
+    /// The integrity ceiling the CSR asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_integrity: Option<ParsedIntegrityJson>,
+    /// The certificate-format version the CSR asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_version: Option<u32>,
+}
+
 /// Output of `inspect_csr`.
 #[derive(Debug, Serialize)]
 pub(crate) struct InspectCsrResponse {
@@ -261,8 +297,11 @@ pub(crate) struct InspectCsrResponse {
     pub signature_valid: bool,
     /// Base64 DER of the CSR's `SubjectPublicKeyInfo`.
     pub spki_b64: String,
-    /// Extensions the CSR requested (for labelled form prefill).
+    /// Every extension the CSR requested, raw (including unrecognized and
+    /// malformed ones), for reference.
     pub requested_extensions: Vec<RequestedExtensionJson>,
+    /// The known Tessera extensions among them, semantically decoded for prefill.
+    pub requested_parsed: RequestedParsedJson,
 }
 
 // --- assemble_and_verify ----------------------------------------------------

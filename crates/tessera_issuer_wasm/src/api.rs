@@ -20,7 +20,10 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use tessera_ext::delegation::{narrows, DelegationConstraints};
-use tessera_ext::der::{read_tlv, read_tlv_expect, TAG_INTEGER, TAG_SEQUENCE};
+use tessera_ext::der::{
+    encode_oid, oid_to_dotted, read_tlv, read_tlv_expect, DerError, TAG_BOOLEAN, TAG_INTEGER,
+    TAG_OCTET_STRING, TAG_OID, TAG_SEQUENCE,
+};
 use tessera_ext::ext::{
     extract_basic_constraints, extract_extension_value, extract_issuer_der, extract_subject_der,
     parse_max_integrity, parse_profile_version, parse_seq_of_utf8,
@@ -46,11 +49,19 @@ use crate::types::{
     CaRequestJson, CrlRequestJson, EnvelopeJson, InspectCsrInput, InspectCsrResponse,
     InspectParentInput, InspectParentResponse, IntegrityJson, JournalAppendInput,
     JournalAppendResponse, JournalEntryJson, JournalVerifyInput, JournalVerifyResponse,
-    RequestedExtensionJson, SummaryJson, SummaryLineJson, ValidityJson,
+    ParsedIntegrityJson, RequestedExtensionJson, RequestedParsedJson, SummaryJson, SummaryLineJson,
+    ValidityJson,
 };
 
 /// The standard `keyUsage` extension OID (asserted on every CA).
 const KEY_USAGE_OID: &str = "2.5.29.15";
+/// PKCS#9 `extensionRequest` attribute OID — the CSR's requested-extensions
+/// carrier.
+const EXTENSION_REQUEST_OID: &str = "1.2.840.113549.1.9.14";
+/// DER tag for `[0] IMPLICIT` — the CSR `attributes` wrapper.
+const TAG_CONTEXT_0: u8 = 0xA0;
+/// DER tag for `SET`/`SET OF`.
+const TAG_SET: u8 = 0x31;
 /// The opaque key handle the capturing backend answers to; a real key never
 /// enters the WASM core.
 const CABINET_KEY: &str = "cabinet";
@@ -580,25 +591,152 @@ pub(crate) fn inspect_csr(input: &str) -> Result<String, String> {
 
 fn inspect_csr_inner(input: &str) -> Result<InspectCsrResponse, ApiError> {
     let request: InspectCsrInput = parse_input(input)?;
-    let bytes = b64_decode(&request.csr_b64)?;
-    let csr = Csr::parse(&bytes)?;
+    let der = pem_or_der(&b64_decode(&request.csr_b64)?)?;
+    let csr = Csr::parse(&der)?;
     let signature_valid = csr.verify_proof_of_possession().is_ok();
-    let contents = csr.contents();
-    let requested_extensions = contents
-        .requested_extensions
-        .iter()
+
+    // Walk the requested extensions with the shared DER primitives rather than
+    // `x509-cert`: `const-oid` cannot represent the project's wide `2.25.<UUID>`
+    // arcs, so an `x509-cert` decode would silently drop exactly the Tessera
+    // extensions this prefill needs. This walk is best-effort and advisory.
+    let requested = csr_requested_extensions(&der);
+    let requested_parsed = parse_known_extensions(&requested);
+    let requested_extensions = requested
+        .into_iter()
         .map(|ext| RequestedExtensionJson {
-            oid: ext.oid.clone(),
+            oid: ext.oid,
             critical: ext.critical,
             value_b64: b64_encode(&ext.value_der),
         })
         .collect();
+
     Ok(InspectCsrResponse {
-        subject: contents.subject,
+        subject: csr.subject().to_owned(),
         signature_valid,
-        spki_b64: b64_encode(&contents.subject_spki_der),
+        spki_b64: b64_encode(csr.subject_spki_der()),
         requested_extensions,
+        requested_parsed,
     })
+}
+
+/// One requested extension as walked out of a CSR's `extensionRequest`
+/// attribute: its dotted OID, criticality, and raw `extnValue` bytes.
+struct RawRequestedExtension {
+    oid: String,
+    critical: bool,
+    value_der: Vec<u8>,
+}
+
+/// Best-effort extraction of every extension in a CSR's PKCS#9
+/// `extensionRequest` attribute, robust to the wide `2.25.<UUID>` OIDs. A
+/// malformed attribute framing yields an empty list — this is advisory data and
+/// never blocks issuance.
+fn csr_requested_extensions(csr_der: &[u8]) -> Vec<RawRequestedExtension> {
+    walk_csr_requested_extensions(csr_der).unwrap_or_default()
+}
+
+/// The fallible walk behind [`csr_requested_extensions`].
+fn walk_csr_requested_extensions(csr_der: &[u8]) -> Result<Vec<RawRequestedExtension>, DerError> {
+    // CertificationRequest -> CertificationRequestInfo.
+    let outer = read_tlv_expect(csr_der, TAG_SEQUENCE)?;
+    let info = read_tlv_expect(outer.value, TAG_SEQUENCE)?;
+
+    // Skip version INTEGER, subject SEQUENCE, subjectPKInfo SEQUENCE.
+    let mut rest = read_tlv_expect(info.value, TAG_INTEGER)?.rest;
+    rest = read_tlv_expect(rest, TAG_SEQUENCE)?.rest;
+    rest = read_tlv_expect(rest, TAG_SEQUENCE)?.rest;
+
+    // attributes [0] IMPLICIT SET OF Attribute — optional; absent means none.
+    let Ok(attributes) = read_tlv(rest) else {
+        return Ok(Vec::new());
+    };
+    if attributes.tag != TAG_CONTEXT_0 {
+        return Ok(Vec::new());
+    }
+
+    let extension_request = encode_oid(EXTENSION_REQUEST_OID)?;
+    let mut out = Vec::new();
+    let mut attrs = attributes.value;
+    while !attrs.is_empty() {
+        let attribute = read_tlv_expect(attrs, TAG_SEQUENCE)?;
+        attrs = attribute.rest;
+        let type_oid = read_tlv_expect(attribute.value, TAG_OID)?;
+        if type_oid.value != extension_request.as_slice() {
+            continue;
+        }
+        // values SET { ExtensionRequest ::= SEQUENCE OF Extension }.
+        let values = read_tlv_expect(type_oid.rest, TAG_SET)?;
+        let mut sequences = values.value;
+        while !sequences.is_empty() {
+            let ext_seq = read_tlv_expect(sequences, TAG_SEQUENCE)?;
+            sequences = ext_seq.rest;
+            let mut exts = ext_seq.value;
+            while !exts.is_empty() {
+                let extension = read_tlv_expect(exts, TAG_SEQUENCE)?;
+                exts = extension.rest;
+                out.push(read_one_extension(extension.value)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode one `Extension ::= SEQUENCE { extnID, critical DEFAULT FALSE,
+/// extnValue OCTET STRING }` from its `SEQUENCE` content.
+fn read_one_extension(fields: &[u8]) -> Result<RawRequestedExtension, DerError> {
+    let oid = read_tlv_expect(fields, TAG_OID)?;
+    let mut inner = oid.rest;
+    let mut critical = false;
+    let peek = read_tlv(inner)?;
+    if peek.tag == TAG_BOOLEAN {
+        critical = peek.value.first().copied().unwrap_or(0) != 0;
+        inner = peek.rest;
+    }
+    let octet = read_tlv_expect(inner, TAG_OCTET_STRING)?;
+    Ok(RawRequestedExtension {
+        oid: oid_to_dotted(oid.value)?,
+        critical,
+        value_der: octet.value.to_vec(),
+    })
+}
+
+/// Semantically decode the *known* Tessera extensions among the requested ones,
+/// with the same [`tessera_ext`] parsers the Engine uses. A known extension whose
+/// value does not decode is skipped (it stays only in the raw list); an unknown
+/// OID is ignored here.
+fn parse_known_extensions(extensions: &[RawRequestedExtension]) -> RequestedParsedJson {
+    let mut parsed = RequestedParsedJson::default();
+    for extension in extensions {
+        match extension.oid.as_str() {
+            ALLOWED_ROLES_OID => {
+                if let Ok(roles) = parse_seq_of_utf8(&extension.value_der) {
+                    parsed.allowed_roles = Some(roles);
+                }
+            }
+            HOST_BINDING_OID => {
+                if let Ok(hosts) = parse_seq_of_utf8(&extension.value_der) {
+                    parsed.host_binding = Some(hosts);
+                }
+            }
+            USER_BINDING_OID => {
+                if let Ok(users) = parse_seq_of_utf8(&extension.value_der) {
+                    parsed.user_binding = Some(users);
+                }
+            }
+            MAX_INTEGRITY_OID => {
+                if let Ok((level, categories)) = parse_max_integrity(&extension.value_der) {
+                    parsed.max_integrity = Some(ParsedIntegrityJson { level, categories });
+                }
+            }
+            PROFILE_VERSION_OID => {
+                if let Ok(version) = parse_profile_version(&extension.value_der) {
+                    parsed.profile_version = Some(version);
+                }
+            }
+            _ => {}
+        }
+    }
+    parsed
 }
 
 // --- assemble_and_verify ----------------------------------------------------

@@ -17,7 +17,13 @@ use der::Encode as _;
 use serde_json::{json, Value};
 
 use tessera_ext::delegation::DelegationConstraints;
-use tessera_ext::der::{encode_tlv, TAG_INTEGER, TAG_SEQUENCE};
+use tessera_ext::der::{
+    encode_oid, encode_tlv, TAG_INTEGER, TAG_OCTET_STRING, TAG_OID, TAG_SEQUENCE,
+};
+use tessera_ext::ext::{encode_max_integrity, encode_profile_version, encode_seq_of_utf8};
+use tessera_ext::oids::{
+    ALLOWED_ROLES_OID, HOST_BINDING_OID, MAX_INTEGRITY_OID, PROFILE_VERSION_OID, USER_BINDING_OID,
+};
 
 use tessera_issuer::sign::{KeyId, MockSigner, SignatureAlgorithm, SignatureBackend};
 use tessera_issuer::test_support::{self_signed_ca, spki_fixture, MemoryStorage};
@@ -126,8 +132,9 @@ fn leaf_cert(org_ca: &[u8]) -> Vec<u8> {
     .der
 }
 
-/// A genuine, self-signed P-256 CSR (valid proof of possession).
-fn valid_p256_csr(subject: &str, seed: [u8; 32]) -> Vec<u8> {
+/// A genuine, self-signed P-256 CSR (valid proof of possession) carrying the
+/// given `attributes [0]` block verbatim.
+fn build_p256_csr(subject: &str, seed: [u8; 32], attributes_ctx0: &[u8]) -> Vec<u8> {
     use core::str::FromStr as _;
 
     use p256::ecdsa::signature::Signer as _;
@@ -149,7 +156,7 @@ fn valid_p256_csr(subject: &str, seed: [u8; 32]) -> Vec<u8> {
     info.extend_from_slice(&encode_tlv(TAG_INTEGER, &[0x00]));
     info.extend_from_slice(&subject_der);
     info.extend_from_slice(&spki_der);
-    info.extend_from_slice(&encode_tlv(0xA0, &[]));
+    info.extend_from_slice(attributes_ctx0);
     let info_der = encode_tlv(TAG_SEQUENCE, &info);
 
     let signature: p256::ecdsa::Signature = signing_key.sign(&info_der);
@@ -159,6 +166,30 @@ fn valid_p256_csr(subject: &str, seed: [u8; 32]) -> Vec<u8> {
         signature.to_der().as_bytes(),
     )
     .unwrap()
+}
+
+/// A CSR with an empty `attributes [0]`.
+fn valid_p256_csr(subject: &str, seed: [u8; 32]) -> Vec<u8> {
+    build_p256_csr(subject, seed, &encode_tlv(0xA0, &[]))
+}
+
+/// Build a CSR `attributes [0]` block carrying one PKCS#9 `extensionRequest`
+/// attribute with the given `(oid, extnValue)` extensions (all non-critical).
+fn extension_request_attrs(extensions: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    const EXTENSION_REQUEST_OID: &str = "1.2.840.113549.1.9.14";
+    const TAG_SET: u8 = 0x31;
+
+    let mut ext_seq_body = Vec::new();
+    for (oid, value) in extensions {
+        let mut fields = encode_tlv(TAG_OID, &encode_oid(oid).unwrap());
+        fields.extend_from_slice(&encode_tlv(TAG_OCTET_STRING, value));
+        ext_seq_body.extend_from_slice(&encode_tlv(TAG_SEQUENCE, &fields));
+    }
+    let ext_request = encode_tlv(TAG_SEQUENCE, &ext_seq_body);
+    let values_set = encode_tlv(TAG_SET, &ext_request);
+    let mut attribute = encode_tlv(TAG_OID, &encode_oid(EXTENSION_REQUEST_OID).unwrap());
+    attribute.extend_from_slice(&values_set);
+    encode_tlv(0xA0, &encode_tlv(TAG_SEQUENCE, &attribute))
 }
 
 /// Parse a binding's `Ok` JSON, panicking with the error JSON on `Err`.
@@ -436,6 +467,52 @@ fn inspect_csr_rejects_unparseable_input() {
         &json!({ "csr_b64": b64(b"garbage") }).to_string()
     ))["error"]
         .is_string());
+}
+
+#[test]
+fn inspect_csr_semantically_parses_known_tessera_extensions() {
+    let attrs = extension_request_attrs(&[
+        (ALLOWED_ROLES_OID, encode_seq_of_utf8(&["oper", "serv"])),
+        (HOST_BINDING_OID, encode_seq_of_utf8(&["*"])),
+        (USER_BINDING_OID, encode_seq_of_utf8(&["ivanov"])),
+        (MAX_INTEGRITY_OID, encode_max_integrity(5, 0b101)),
+        (PROFILE_VERSION_OID, encode_profile_version(2)),
+    ]);
+    let csr = build_p256_csr("CN=ivanov,O=Org", [0x44; 32], &attrs);
+    let out = ok(inspect_csr(&json!({ "csr_b64": b64(&csr) }).to_string()));
+
+    assert_eq!(out["signature_valid"], true);
+    // Raw list carries all five, including the wide-OID Tessera extensions.
+    assert_eq!(out["requested_extensions"].as_array().unwrap().len(), 5);
+
+    let parsed = &out["requested_parsed"];
+    assert_eq!(parsed["allowed_roles"], json!(["oper", "serv"]));
+    assert_eq!(parsed["host_binding"], json!(["*"]));
+    assert_eq!(parsed["user_binding"], json!(["ivanov"]));
+    assert_eq!(parsed["max_integrity"]["level"], 5);
+    assert_eq!(parsed["max_integrity"]["categories"], 5);
+    assert_eq!(parsed["profile_version"], 2);
+}
+
+#[test]
+fn inspect_csr_broken_known_extension_stays_in_raw_only() {
+    let attrs = extension_request_attrs(&[
+        // A well-framed extension whose value is not `SEQUENCE OF UTF8String`.
+        (ALLOWED_ROLES_OID, b"not valid der".to_vec()),
+        (PROFILE_VERSION_OID, encode_profile_version(3)),
+    ]);
+    let csr = build_p256_csr("CN=ivanov", [0x55; 32], &attrs);
+    let out = ok(inspect_csr(&json!({ "csr_b64": b64(&csr) }).to_string()));
+
+    // The broken extension does not crash the call and does not leak into parsed.
+    assert_eq!(out["signature_valid"], true);
+    assert!(out["requested_parsed"].get("allowed_roles").is_none());
+    // The good sibling still parses.
+    assert_eq!(out["requested_parsed"]["profile_version"], 3);
+    // Both remain in the raw list.
+    let raw = out["requested_extensions"].as_array().unwrap();
+    assert_eq!(raw.len(), 2);
+    assert!(raw.iter().any(|e| e["oid"] == ALLOWED_ROLES_OID));
 }
 
 // --- assemble_and_verify ----------------------------------------------------
