@@ -74,12 +74,19 @@ pub mod crl;
 pub mod csr;
 mod error;
 pub mod journal;
+pub mod l10n;
 pub mod monotonicity;
 mod profile;
 pub mod serial;
 pub mod sign;
 mod tbs;
 mod verify;
+
+// The command-line surface, built only for the `issuer` binary. Its handlers
+// wrap the same core the cabinet uses (no re-implemented checks), so it lives in
+// the library where it can be unit-tested without spawning a process.
+#[cfg(feature = "cli")]
+pub mod cli;
 
 // Native-only signing adapters, each behind its feature flag so the wasm core
 // (built with `--no-default-features`) pulls none of them.
@@ -103,6 +110,7 @@ pub use error::IssueError;
 pub use journal::{
     verify_lines, Journal, JournalError, JournalReport, JournalStatus, JournalStorage,
 };
+pub use l10n::Locale;
 pub use profile::{CaRequest, IntegrityCeiling, LeafRequest, Validity};
 pub use serial::Serial;
 pub use sign::{KeyId, SignError, Signature, SignatureAlgorithm, SignatureBackend};

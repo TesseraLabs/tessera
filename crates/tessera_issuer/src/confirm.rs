@@ -32,6 +32,8 @@ use tessera_ext::oids::{
     PROFILE_VERSION_OID, USER_BINDING_OID,
 };
 
+use crate::l10n::{Caption, Locale, Msg};
+
 /// DER tag for `[0] EXPLICIT` — the `TBSCertificate` version wrapper (a cert)
 /// and the `TBSCertList` `crlExtensions` wrapper (a CRL).
 const TAG_CONTEXT_0: u8 = 0xA0;
@@ -54,15 +56,33 @@ pub enum OperationKind {
 }
 
 impl OperationKind {
-    /// A short human label.
+    /// The operation's name in `locale`.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: Locale) -> &'static str {
+        self.caption().text(locale)
+    }
+
+    /// The caption naming this kind.
+    fn caption(self) -> Caption {
         match self {
-            OperationKind::ShiftLeaf => "shift-leaf certificate",
-            OperationKind::OrgCa => "organisation CA certificate",
-            OperationKind::Crl => "certificate revocation list",
+            OperationKind::ShiftLeaf => Caption::KindShiftLeaf,
+            OperationKind::OrgCa => Caption::KindOrgCa,
+            OperationKind::Crl => Caption::KindCrl,
         }
     }
+}
+
+/// One detail line of an [`OperationSummary`]: a localizable caption and its
+/// value.
+///
+/// The value is a technical datum (a role list, a bound host, a `crlNumber`) and
+/// is identical in every locale; only the caption is translated when rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryLine {
+    /// The field caption.
+    pub caption: Caption,
+    /// The already-formatted value shown beside the caption.
+    pub value: String,
 }
 
 /// A human-readable summary of the operation the agent is being asked to sign.
@@ -77,23 +97,31 @@ pub struct OperationSummary {
     /// End of the validity window (`notAfter`, or a CRL's `nextUpdate`).
     pub not_after: String,
     /// Extra detail lines: roles, bindings, envelope, `crlNumber`.
-    pub lines: Vec<String>,
+    pub lines: Vec<SummaryLine>,
 }
 
 impl OperationSummary {
-    /// Render the summary as a multi-line block for display.
+    /// Renders the summary as a multi-line block, captioned in `locale`.
+    ///
+    /// Only the captions are translated; every value is reproduced verbatim, so
+    /// a Russian and an English rendering carry byte-identical data.
     #[must_use]
-    pub fn render(&self) -> String {
+    pub fn render(&self, locale: Locale) -> String {
         let mut out = format!(
-            "Operation: {}\nSubject:   {}\nValidity:  {} .. {}",
-            self.kind.label(),
+            "{}: {}\n{}: {}\n{}: {} .. {}",
+            Caption::Operation.text(locale),
+            self.kind.label(locale),
+            Caption::Subject.text(locale),
             self.subject,
+            Caption::Validity.text(locale),
             self.not_before,
             self.not_after,
         );
         for line in &self.lines {
-            out.push_str("\n           ");
-            out.push_str(line);
+            out.push_str("\n  ");
+            out.push_str(line.caption.text(locale));
+            out.push_str(": ");
+            out.push_str(&line.value);
         }
         out
     }
@@ -152,12 +180,18 @@ fn parse_certificate_summary(tbs_der: &[u8]) -> Result<OperationSummary, Summary
             .map_err(|_| SummaryError::Malformed)?
         {
             let envelope = parse_constraints(&value).map_err(|_| SummaryError::Malformed)?;
-            lines.push(format!(
-                "roles:     {}",
-                join_or_none(&envelope.allow_roles)
-            ));
-            lines.push(format!("max level: {}", envelope.max_level));
-            lines.push(format!("max TTL:   {} s", envelope.max_ttl));
+            lines.push(SummaryLine {
+                caption: Caption::Roles,
+                value: join_or_none(&envelope.allow_roles),
+            });
+            lines.push(SummaryLine {
+                caption: Caption::MaxLevel,
+                value: envelope.max_level.to_string(),
+            });
+            lines.push(SummaryLine {
+                caption: Caption::MaxTtl,
+                value: format!("{} s", envelope.max_ttl),
+            });
             if !envelope.require_tags.is_empty() {
                 let tags = envelope
                     .require_tags
@@ -165,28 +199,35 @@ fn parse_certificate_summary(tbs_der: &[u8]) -> Result<OperationSummary, Summary
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                lines.push(format!("req tags:  {tags}"));
+                lines.push(SummaryLine {
+                    caption: Caption::RequiredTags,
+                    value: tags,
+                });
             }
         }
         OperationKind::OrgCa
     } else {
-        push_seq_line(&cert_like, HOST_BINDING_OID, "hosts:", &mut lines)?;
-        push_seq_line(&cert_like, USER_BINDING_OID, "users:", &mut lines)?;
-        push_seq_line(&cert_like, ALLOWED_ROLES_OID, "roles:", &mut lines)?;
+        push_seq_line(&cert_like, HOST_BINDING_OID, Caption::Hosts, &mut lines)?;
+        push_seq_line(&cert_like, USER_BINDING_OID, Caption::Users, &mut lines)?;
+        push_seq_line(&cert_like, ALLOWED_ROLES_OID, Caption::Roles, &mut lines)?;
         if let Some(value) = extract_extension_value(&cert_like, MAX_INTEGRITY_OID)
             .map_err(|_| SummaryError::Malformed)?
         {
             let (level, categories) =
                 parse_max_integrity(&value).map_err(|_| SummaryError::Malformed)?;
-            lines.push(format!(
-                "integrity: level {level}, categories {categories:#x}"
-            ));
+            lines.push(SummaryLine {
+                caption: Caption::Integrity,
+                value: format!("level {level}, categories {categories:#x}"),
+            });
         }
         if let Some(value) = extract_extension_value(&cert_like, PROFILE_VERSION_OID)
             .map_err(|_| SummaryError::Malformed)?
         {
             let version = parse_profile_version(&value).map_err(|_| SummaryError::Malformed)?;
-            lines.push(format!("profile:   v{version}"));
+            lines.push(SummaryLine {
+                caption: Caption::Profile,
+                value: format!("v{version}"),
+            });
         }
         OperationKind::ShiftLeaf
     };
@@ -204,14 +245,17 @@ fn parse_certificate_summary(tbs_der: &[u8]) -> Result<OperationSummary, Summary
 fn push_seq_line(
     cert_like: &[u8],
     oid: &str,
-    label: &str,
-    lines: &mut Vec<String>,
+    caption: Caption,
+    lines: &mut Vec<SummaryLine>,
 ) -> Result<(), SummaryError> {
     if let Some(value) =
         extract_extension_value(cert_like, oid).map_err(|_| SummaryError::Malformed)?
     {
         let items = parse_seq_of_utf8(&value).map_err(|_| SummaryError::Malformed)?;
-        lines.push(format!("{label:10} {}", join_or_none(&items)));
+        lines.push(SummaryLine {
+            caption,
+            value: join_or_none(&items),
+        });
     }
     Ok(())
 }
@@ -280,7 +324,10 @@ fn parse_crl_summary(fields: &[u8]) -> Result<OperationSummary, SummaryError> {
     // Best-effort crlNumber from crlExtensions [0].
     let mut lines = Vec::new();
     if let Some(number) = crl_number(rest) {
-        lines.push(format!("crlNumber: {number}"));
+        lines.push(SummaryLine {
+            caption: Caption::CrlNumber,
+            value: number.to_string(),
+        });
     }
 
     Ok(OperationSummary {
@@ -403,25 +450,27 @@ const PINENTRY_NAMES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct PinentryConfirmer {
     program: PathBuf,
+    locale: Locale,
 }
 
 impl PinentryConfirmer {
-    /// Wrap a specific pinentry program.
+    /// Wrap a specific pinentry program, rendering summaries in `locale`.
     #[must_use]
-    pub fn new(program: PathBuf) -> Self {
-        Self { program }
+    pub fn new(program: PathBuf, locale: Locale) -> Self {
+        Self { program, locale }
     }
 
     /// Locate a pinentry program: an explicit path (from config/env) if it
-    /// exists, otherwise the first known name found on `PATH`.
+    /// exists, otherwise the first known name found on `PATH`. Summaries render
+    /// in `locale`.
     #[must_use]
-    pub fn discover(explicit: Option<PathBuf>) -> Option<Self> {
+    pub fn discover(explicit: Option<PathBuf>, locale: Locale) -> Option<Self> {
         if let Some(path) = explicit {
             if path.exists() {
-                return Some(Self::new(path));
+                return Some(Self::new(path, locale));
             }
         }
-        find_in_path(PINENTRY_NAMES).map(Self::new)
+        find_in_path(PINENTRY_NAMES).map(|program| Self::new(program, locale))
     }
 
     /// Run one Assuan `SETDESC`/`CONFIRM` exchange.
@@ -447,7 +496,7 @@ impl PinentryConfirmer {
             read_ok(&mut reader)?; // greeting
             send(
                 &mut stdin,
-                &format!("SETDESC {}", assuan_escape(&summary.render())),
+                &format!("SETDESC {}", assuan_escape(&summary.render(self.locale))),
             )?;
             read_ok(&mut reader)?;
             send(&mut stdin, "SETPROMPT Tessera")?;
@@ -478,15 +527,26 @@ impl Confirmer for PinentryConfirmer {
 /// A confirmer that prompts on the controlling terminal.
 ///
 /// The summary and prompt go to stderr (stdout carries machine output such as
-/// the session token); the answer is read from stdin.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TerminalConfirmer;
+/// the session token); the answer is read from stdin. The summary, header, and
+/// prompt render in the configured [`Locale`].
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalConfirmer {
+    locale: Locale,
+}
+
+impl TerminalConfirmer {
+    /// A terminal confirmer that renders in `locale`.
+    #[must_use]
+    pub fn new(locale: Locale) -> Self {
+        Self { locale }
+    }
+}
 
 impl Confirmer for TerminalConfirmer {
     fn confirm(&self, summary: &OperationSummary) -> Result<bool, ConfirmError> {
-        eprintln!("\n=== Confirm issuance operation ===");
-        eprintln!("{}", summary.render());
-        eprint!("Sign this operation? [y/N]: ");
+        eprintln!("\n{}", Msg::ConfirmHeader.text(self.locale));
+        eprintln!("{}", summary.render(self.locale));
+        eprint!("{} ", Msg::ConfirmPrompt.text(self.locale));
         std::io::stderr()
             .flush()
             .map_err(|e| ConfirmError::Io(e.to_string()))?;
@@ -494,9 +554,16 @@ impl Confirmer for TerminalConfirmer {
         std::io::stdin()
             .read_line(&mut line)
             .map_err(|e| ConfirmError::Io(e.to_string()))?;
-        let answer = line.trim().to_ascii_lowercase();
-        Ok(answer == "y" || answer == "yes")
+        Ok(is_affirmative(&line))
     }
+}
+
+/// Whether a typed answer approves the operation. The English `y`/`yes` and the
+/// Russian `д`/`да` are all accepted regardless of locale, so an operator is
+/// never trapped by a locale mismatch.
+fn is_affirmative(line: &str) -> bool {
+    let answer = line.trim().to_lowercase();
+    matches!(answer.as_str(), "y" | "yes" | "д" | "да")
 }
 
 /// The production confirmer: pinentry if one is available, else the terminal.
@@ -506,15 +573,17 @@ impl Confirmer for TerminalConfirmer {
 #[derive(Debug, Clone)]
 pub struct DefaultConfirmer {
     pinentry: Option<PinentryConfirmer>,
+    locale: Locale,
 }
 
 impl DefaultConfirmer {
     /// Build the default confirmer, preferring `explicit_pinentry` then a
-    /// pinentry program discovered on `PATH`.
+    /// pinentry program discovered on `PATH`; all surfaces render in `locale`.
     #[must_use]
-    pub fn new(explicit_pinentry: Option<PathBuf>) -> Self {
+    pub fn new(explicit_pinentry: Option<PathBuf>, locale: Locale) -> Self {
         Self {
-            pinentry: PinentryConfirmer::discover(explicit_pinentry),
+            pinentry: PinentryConfirmer::discover(explicit_pinentry, locale),
+            locale,
         }
     }
 }
@@ -525,11 +594,11 @@ impl Confirmer for DefaultConfirmer {
             match pinentry.confirm(summary) {
                 Ok(decision) => return Ok(decision),
                 Err(e) => {
-                    eprintln!("issuer serve: pinentry unavailable ({e}); using terminal prompt");
+                    eprintln!("{} {e}", Msg::ServePinentryFellBack.text(self.locale));
                 }
             }
         }
-        TerminalConfirmer.confirm(summary)
+        TerminalConfirmer::new(self.locale).confirm(summary)
     }
 }
 
@@ -742,10 +811,20 @@ mod tests {
         let summary = parse_operation_summary(&tbs_of(&leaf.der)).expect("leaf summary");
         assert_eq!(summary.kind, OperationKind::ShiftLeaf);
         assert!(summary.subject.contains("ivanov"), "{}", summary.subject);
-        let rendered = summary.render();
+        let rendered = summary.render(Locale::En);
         assert!(rendered.contains("shift-leaf"));
         assert!(rendered.contains("ivanov"));
-        assert!(summary.lines.iter().any(|l| l.contains("oper")));
+        assert!(summary.lines.iter().any(|l| l.value.contains("oper")));
+
+        // The Russian rendering translates captions but reproduces every value
+        // byte-for-byte (the data never changes with locale).
+        let ru = summary.render(Locale::Ru);
+        assert!(ru.contains("сертификат смены"), "{ru}");
+        assert!(ru.contains("ivanov"), "{ru}");
+        assert!(
+            summary.lines.iter().all(|l| ru.contains(l.value.as_str())),
+            "{ru}"
+        );
     }
 
     #[test]
@@ -775,7 +854,7 @@ mod tests {
         let summary = parse_operation_summary(&tbs_of(&ca.der)).expect("ca summary");
         assert_eq!(summary.kind, OperationKind::OrgCa);
         assert!(summary.subject.contains("Org CA"));
-        assert!(summary.lines.iter().any(|l| l.contains("max level")));
+        assert!(summary.lines.iter().any(|l| l.caption == Caption::MaxLevel));
     }
 
     #[test]
@@ -796,7 +875,10 @@ mod tests {
         let summary = parse_operation_summary(&tbs_of(&crl.der)).expect("crl summary");
         assert_eq!(summary.kind, OperationKind::Crl);
         assert!(
-            summary.lines.iter().any(|l| l.contains("crlNumber: 7")),
+            summary
+                .lines
+                .iter()
+                .any(|l| l.caption == Caption::CrlNumber && l.value == "7"),
             "{:?}",
             summary.lines
         );

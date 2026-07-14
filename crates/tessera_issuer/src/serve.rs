@@ -29,6 +29,7 @@ use subtle::ConstantTimeEq as _;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::confirm::{parse_operation_summary, Confirmer};
+use crate::l10n::{Locale, Msg};
 use crate::sign::{KeyId, SignatureAlgorithm, SignatureBackend};
 
 pub use crate::confirm::DefaultConfirmer;
@@ -53,6 +54,8 @@ pub struct AgentConfig {
     pub advertised_algorithms: Vec<SignatureAlgorithm>,
     /// How the pairing token is delivered at startup.
     pub token_delivery: TokenDelivery,
+    /// The locale for the agent's operator messages.
+    pub locale: Locale,
 }
 
 /// Where the startup pairing token is delivered.
@@ -74,6 +77,7 @@ pub struct Agent<B: SignatureBackend, C: Confirmer> {
     allowed_origins: Vec<String>,
     advertised_algorithms: Vec<SignatureAlgorithm>,
     session_token: SecretString,
+    locale: Locale,
 }
 
 /// The HTTP method, decoupled from `tiny_http` so the handler is unit-testable.
@@ -147,6 +151,7 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
             allowed_origins: config.allowed_origins,
             advertised_algorithms: config.advertised_algorithms,
             session_token,
+            locale: config.locale,
         }
     }
 
@@ -216,7 +221,7 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         // refuse anything unreadable *before* prompting — what cannot be shown
         // cannot be signed.
         let Ok(summary) = parse_operation_summary(&tbs) else {
-            println!("issuer serve: rejected sign — TBS not a readable issuance operation");
+            println!("{}", Msg::ServeUnreadableTbs.text(self.locale));
             return HttpOutput::json(400, error_json("TBS is not a readable operation"), origin);
         };
         // The session token authenticated the cabinet; operator confirmation
@@ -225,8 +230,9 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
             Ok(true) => {}
             Ok(false) => {
                 println!(
-                    "issuer serve: operator declined — {} for {}",
-                    summary.kind.label(),
+                    "{} {} — {}",
+                    Msg::ServeOperatorDeclined.text(self.locale),
+                    summary.kind.label(self.locale),
                     summary.subject
                 );
                 return HttpOutput::json(
@@ -236,7 +242,7 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
                 );
             }
             Err(e) => {
-                println!("issuer serve: confirmation channel failed — {e}");
+                println!("{} {e}", Msg::ServeConfirmChannelFailed.text(self.locale));
                 return HttpOutput::json(
                     500,
                     error_json("confirmation channel unavailable"),
@@ -296,14 +302,20 @@ pub fn serve<B: SignatureBackend, C: Confirmer>(
         .server_addr()
         .to_ip()
         .map_or_else(|| "127.0.0.1".to_owned(), |a| a.to_string());
-    println!("issuer serve: listening on http://{bound}");
+    println!("{} http://{bound}", Msg::ServeListening.text(config.locale));
     // Deliver the pairing token: printed for an interactive operator, or written
     // to a private per-user runtime file for a background/daemon agent.
     match config.token_delivery {
-        TokenDelivery::Stdout => println!("issuer serve: session token: {hex}"),
+        TokenDelivery::Stdout => {
+            println!("{} {hex}", Msg::ServeSessionToken.text(config.locale));
+        }
         TokenDelivery::RuntimeFile => {
             let path = write_token_file(&hex)?;
-            println!("issuer serve: session token written to {}", path.display());
+            println!(
+                "{} {}",
+                Msg::ServeTokenWritten.text(config.locale),
+                path.display()
+            );
         }
     }
     let agent = Agent::new(backend, confirmer, config, SecretString::from(hex));
@@ -617,6 +629,7 @@ mod tests {
             allowed_origins: vec![ORIGIN.to_owned()],
             advertised_algorithms: vec![SignatureAlgorithm::EcdsaWithSha256],
             token_delivery: TokenDelivery::Stdout,
+            locale: Locale::En,
         }
     }
 
