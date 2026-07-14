@@ -112,7 +112,7 @@ pub use journal::{
     verify_lines, Journal, JournalError, JournalReport, JournalStatus, JournalStorage,
 };
 pub use l10n::Locale;
-pub use profile::{CaRequest, IntegrityCeiling, LeafRequest, Validity};
+pub use profile::{CaRequest, IntegrityCeiling, LeafRequest, RootRequest, Validity};
 pub use serial::Serial;
 pub use sign::{KeyId, SignError, Signature, SignatureAlgorithm, SignatureBackend};
 pub use summary::{
@@ -350,6 +350,58 @@ pub fn issue_ca<B: SignatureBackend, S: JournalStorage>(
     })
 }
 
+/// Issues a self-signed fleet root: a CA whose issuer equals its subject,
+/// establishing the fleet's first delegation envelope.
+///
+/// A root has no parent to narrow against, so its envelope is taken as given; it
+/// is the bootstrap of the serverless issuance model, which cannot start without
+/// one. The certificate is assembled with issuer == subject, self-checked
+/// against the shared parsers before it is returned, and journaled (`op` =
+/// `issue_root`, with the root's own fingerprint as its parent) before the
+/// artifact is released — a failed journal write withholds it (fail-closed).
+///
+/// # Errors
+///
+/// A typed [`IssueError`]: an ill-formed validity, an encoding failure, a
+/// signing failure, a self-check rejection, or a journal-append failure.
+pub fn issue_root<B: SignatureBackend, S: JournalStorage>(
+    backend: &B,
+    key_id: &KeyId,
+    req: &RootRequest,
+    serial: &Serial,
+    journal: &mut Journal<S>,
+    now_unix: u64,
+) -> Result<IssuedCert, IssueError> {
+    check_validity(req.validity)?;
+
+    let subject_der = tbs::subject_name_der(&req.subject)?;
+    let validity_der = tbs::validity_der(&req.validity)?;
+    let spki_der = tbs::validated_spki_der(&req.subject_spki_der)?;
+    let extensions_body = tbs::ca_extensions(req)?;
+
+    // Self-signed: the subject is also the issuer.
+    let cert = sign_and_assemble(
+        backend,
+        key_id,
+        &CertParts {
+            issuer_der: &subject_der,
+            subject_der: &subject_der,
+            validity_der: &validity_der,
+            spki_der: &spki_der,
+            extensions_body: &extensions_body,
+            serial,
+        },
+    )?;
+
+    verify::self_check_ca(&cert, req, None)?;
+    // Journal before releasing the artifact; the root is its own parent.
+    journal.record_root(serial.as_bytes(), &cert, &req.subject, now_unix)?;
+    Ok(IssuedCert {
+        der: cert,
+        serial: serial.as_bytes().to_vec(),
+    })
+}
+
 /// Test scaffolding: minting a self-signed root and a fixture public key.
 ///
 /// A fleet root has to be created without a parent; production roots are minted
@@ -358,16 +410,18 @@ pub fn issue_ca<B: SignatureBackend, S: JournalStorage>(
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::{
-        tbs, verify, CaRequest, IssueError, IssuedCert, Journal, JournalStorage, KeyId, Serial,
-        SignatureBackend,
+        CaRequest, IssueError, IssuedCert, Journal, JournalStorage, KeyId, Serial, SignatureBackend,
     };
 
     pub use super::journal::storage::{FailingStorage, MemoryStorage};
 
     /// Issues a self-signed CA (issuer == subject): the root of a chain, which
     /// establishes the first delegation envelope and has no parent to narrow.
-    /// The issuance is journaled (with the root's own fingerprint as parent)
-    /// before the artifact is returned.
+    ///
+    /// A thin wrapper over the product [`crate::issue_root`] (a [`CaRequest`] is
+    /// a [`crate::RootRequest`]), kept so the many tests and the contract suite
+    /// that mint an in-process root read the same regardless of the underlying
+    /// entry point.
     ///
     /// # Errors
     ///
@@ -381,34 +435,7 @@ pub mod test_support {
         journal: &mut Journal<S>,
         now_unix: u64,
     ) -> Result<IssuedCert, IssueError> {
-        super::check_validity(req.validity)?;
-
-        let subject_der = tbs::subject_name_der(&req.subject)?;
-        let validity_der = tbs::validity_der(&req.validity)?;
-        let spki_der = tbs::validated_spki_der(&req.subject_spki_der)?;
-        let extensions_body = tbs::ca_extensions(req)?;
-
-        // Self-signed: the subject is also the issuer.
-        let cert = super::sign_and_assemble(
-            backend,
-            key_id,
-            &super::CertParts {
-                issuer_der: &subject_der,
-                subject_der: &subject_der,
-                validity_der: &validity_der,
-                spki_der: &spki_der,
-                extensions_body: &extensions_body,
-                serial,
-            },
-        )?;
-
-        verify::self_check_ca(&cert, req, None)?;
-        // Journal before releasing the artifact; the root is its own parent.
-        journal.record_ca(serial.as_bytes(), &cert, &req.subject, now_unix)?;
-        Ok(IssuedCert {
-            der: cert,
-            serial: serial.as_bytes().to_vec(),
-        })
+        super::issue_root(backend, key_id, req, serial, journal, now_unix)
     }
 
     /// A syntactically valid `SubjectPublicKeyInfo` (a fixed P-256 point) for

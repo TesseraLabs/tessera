@@ -74,3 +74,11 @@ pub struct CaRequest {
     /// Certificate-format version.
     pub profile_version: u32,
 }
+
+/// A request to issue a self-signed fleet root.
+///
+/// A root is a CA whose issuer equals its subject and which establishes the
+/// fleet's first delegation envelope; it carries exactly the same fields as a
+/// [`CaRequest`], so it is that request shape (the distinction is the issuance
+/// operation — [`crate::issue_root`] takes no parent — not the request data).
+pub type RootRequest = CaRequest;

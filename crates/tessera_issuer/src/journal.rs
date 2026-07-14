@@ -104,6 +104,16 @@ struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op")]
 enum Payload {
+    /// A self-signed fleet-root issuance (issuer == subject).
+    #[serde(rename = "issue_root")]
+    IssueRoot {
+        /// Lowercase hex of the serial's DER `INTEGER` content octets.
+        serial: String,
+        /// Lowercase hex SHA-256 fingerprint of the root's own certificate.
+        parent: String,
+        /// The root's subject (RFC 4514).
+        subject: String,
+    },
     /// A shift-leaf issuance.
     #[serde(rename = "issue_leaf")]
     IssueLeaf {
@@ -236,6 +246,31 @@ impl<S: JournalStorage> Journal<S> {
             Payload::IssueLeaf {
                 serial: hex::encode(serial),
                 parent: fingerprint(parent_cert_der),
+                subject: subject.to_owned(),
+            },
+            now_unix,
+        )
+    }
+
+    /// Records a self-signed fleet-root issuance.
+    ///
+    /// The root is its own parent, so `root_cert_der` is the root's own
+    /// certificate (its fingerprint is recorded as the `parent`).
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError`] if the line cannot be encoded or durably appended.
+    pub fn record_root(
+        &mut self,
+        serial: &[u8],
+        root_cert_der: &[u8],
+        subject: &str,
+        now_unix: u64,
+    ) -> Result<(), JournalError> {
+        self.append(
+            Payload::IssueRoot {
+                serial: hex::encode(serial),
+                parent: fingerprint(root_cert_der),
                 subject: subject.to_owned(),
             },
             now_unix,

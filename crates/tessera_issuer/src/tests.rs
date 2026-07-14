@@ -1085,3 +1085,86 @@ mod journal {
         assert_eq!(report.last_signed_seq, Some(1));
     }
 }
+
+/// The self-signed fleet root: it is a CA carrying the delegation envelope, an
+/// organisation CA issues under it, and the journal records `op=issue_root`.
+mod root {
+    use super::{envelope, key, spki_fixture, validity, CaRequest, MockSigner, TS};
+    use crate::test_support::MemoryStorage;
+    use crate::{issue_ca, issue_root, verify_lines, Journal, JournalStatus, RootRequest, Serial};
+    use tessera_ext::delegation::parse_constraints;
+    use tessera_ext::ext::{extract_basic_constraints, extract_extension_value};
+    use tessera_ext::oids::DELEGATION_CONSTRAINTS_OID;
+
+    #[test]
+    fn self_signed_root_bootstraps_the_fleet() {
+        let backend = MockSigner::ecdsa_sha256(key());
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+
+        let root_req = RootRequest {
+            subject: "CN=Tessera Root".to_owned(),
+            subject_spki_der: spki_fixture(),
+            validity: validity(9_000_000),
+            constraints: envelope(&["oper"], 5, 86_400),
+            profile_version: 1,
+        };
+        // A successful return means the post-sign self-check already passed.
+        let root = issue_root(
+            &backend,
+            &key(),
+            &root_req,
+            &Serial::generate(),
+            &mut journal,
+            TS,
+        )
+        .unwrap();
+
+        // The artifact is a CA (basicConstraints cA=TRUE) — a root inspect_parent
+        // classifies as a root.
+        let basic = extract_basic_constraints(&root.der)
+            .unwrap()
+            .expect("a root carries basicConstraints");
+        assert!(basic.ca, "a fleet root must be a CA");
+
+        // The delegation envelope is present and reads back unchanged.
+        let envelope_der = extract_extension_value(&root.der, DELEGATION_CONSTRAINTS_OID)
+            .unwrap()
+            .expect("a root carries its delegation envelope");
+        let parsed = parse_constraints(&envelope_der).unwrap();
+        assert_eq!(parsed.allow_roles, vec!["oper".to_owned()]);
+        assert_eq!(parsed.max_level, 5);
+
+        // An organisation CA issues under the root (the chain bootstraps).
+        let org_req = CaRequest {
+            subject: "CN=Org CA".to_owned(),
+            subject_spki_der: spki_fixture(),
+            validity: validity(3_600_000),
+            constraints: envelope(&["oper"], 5, 86_400),
+            profile_version: 1,
+        };
+        let org = issue_ca(
+            &backend,
+            &key(),
+            &root.der,
+            &org_req,
+            &Serial::generate(),
+            &mut journal,
+            TS,
+        )
+        .unwrap();
+        assert!(!org.der.is_empty(), "an org CA issues under the root");
+
+        // The journal recorded the root under its own op, and the chain (now
+        // carrying the new op) still verifies.
+        let lines = journal.storage().lines();
+        assert!(
+            lines[0].contains("\"op\":\"issue_root\""),
+            "the root line carries op=issue_root: {}",
+            lines[0]
+        );
+        assert!(
+            !matches!(verify_lines(&lines).status, JournalStatus::Broken { .. }),
+            "a journal with an issue_root record verifies"
+        );
+    }
+}

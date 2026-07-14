@@ -38,10 +38,12 @@ use crate::csr::{Csr, LeafRequestFromCsr, LeafScope};
 use crate::error::IssueError;
 use crate::journal::{FileStorage, Journal, JournalStatus, JournalStorage};
 use crate::l10n::{Locale, Msg};
-use crate::profile::{CaRequest, IntegrityCeiling, LeafRequest, Validity};
+use crate::profile::{CaRequest, IntegrityCeiling, LeafRequest, RootRequest, Validity};
 use crate::serial::Serial;
 use crate::sign::{KeyId, SignatureAlgorithm, SignatureBackend};
-use crate::{issue_ca, issue_crl, issue_leaf, issue_leaf_from_csr, verify_lines, IssuedCert};
+use crate::{
+    issue_ca, issue_crl, issue_leaf, issue_leaf_from_csr, issue_root, verify_lines, IssuedCert,
+};
 
 /// The top-level `issuer` command line.
 #[derive(Debug, Parser)]
@@ -58,6 +60,8 @@ struct Cli {
 /// The issuing subcommands.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Issue a self-signed fleet root (issuer == subject).
+    IssueRoot(IssueRootArgs),
     /// Issue an organisation CA under a parent certificate.
     IssueCa(IssueCaArgs),
     /// Issue an engineer shift-leaf under a parent CA.
@@ -122,6 +126,54 @@ struct BackendArgs {
     /// Send a locally computed digest with `prehashed=true` (vault backend).
     #[arg(long)]
     prehashed: bool,
+}
+
+/// Flags for `issuer issue-root`.
+///
+/// Like `issue-ca` but without a parent (the root is self-signed). The root
+/// key's public key is supplied with `--spki` (exported from the token whose key
+/// `--key` signs with); on-token public-key extraction is not implemented, for
+/// the same signing-only reason as `csr`.
+#[derive(Debug, Args)]
+struct IssueRootArgs {
+    #[command(flatten)]
+    backend: BackendArgs,
+    /// The root's `SubjectPublicKeyInfo` (PEM or DER).
+    #[arg(long)]
+    spki: PathBuf,
+    /// The root's subject distinguished name (RFC 4514).
+    #[arg(long)]
+    subject: String,
+    /// `notBefore`, Unix seconds.
+    #[arg(long)]
+    not_before: u64,
+    /// `notAfter`, Unix seconds.
+    #[arg(long)]
+    not_after: u64,
+    /// A role the root envelope allows (repeat for several).
+    #[arg(long = "allow-role")]
+    allow_roles: Vec<String>,
+    /// The root envelope's integrity-level ceiling.
+    #[arg(long, default_value_t = 0)]
+    max_level: i8,
+    /// The root envelope's TTL ceiling, seconds.
+    #[arg(long, default_value_t = 0)]
+    max_ttl: u64,
+    /// A required tag `key=value` the envelope demands (repeat for several).
+    #[arg(long = "require-tag")]
+    require_tags: Vec<String>,
+    /// Certificate-format version.
+    #[arg(long, default_value_t = 1)]
+    profile_version: u32,
+    /// NDJSON issuance journal file.
+    #[arg(long)]
+    journal: PathBuf,
+    /// Output path for the issued root certificate.
+    #[arg(long)]
+    out: PathBuf,
+    /// Write DER instead of PEM.
+    #[arg(long)]
+    der: bool,
 }
 
 /// Flags for `issuer issue-ca`.
@@ -336,6 +388,9 @@ pub fn main() -> ExitCode {
 /// Dispatch one parsed command.
 fn run(command: Command, locale: Locale) -> Result<(), CliError> {
     match command {
+        Command::IssueRoot(args) => {
+            dispatch_with_backend(&args.backend, locale, IssueRootJob { args: &args })
+        }
         Command::IssueCa(args) => {
             dispatch_with_backend(&args.backend, locale, IssueCaJob { args: &args })
         }
@@ -490,6 +545,40 @@ fn run_vault(_args: &BackendArgs, _locale: Locale, _job: impl BackendJob) -> Res
 }
 
 // --- Jobs -------------------------------------------------------------------
+
+/// `issue-root`.
+struct IssueRootJob<'a> {
+    args: &'a IssueRootArgs,
+}
+
+impl BackendJob for IssueRootJob<'_> {
+    fn run<B: SignatureBackend>(self, backend: &B, locale: Locale) -> Result<(), CliError> {
+        let a = self.args;
+        let key = KeyId::new(&a.backend.key);
+        let spki = decode_pem_or_der(&read_file(&a.spki)?)?;
+        let req = RootRequest {
+            subject: a.subject.clone(),
+            subject_spki_der: spki,
+            validity: Validity {
+                not_before: a.not_before,
+                not_after: a.not_after,
+            },
+            constraints: DelegationConstraints {
+                require_tags: parse_require_tags(&a.require_tags)?,
+                allow_roles: a.allow_roles.clone(),
+                max_level: a.max_level,
+                max_ttl: a.max_ttl,
+            },
+            profile_version: a.profile_version,
+        };
+        let mut journal = open_journal(&a.journal)?;
+        let serial = Serial::generate();
+        let issued = issue_root(backend, &key, &req, &serial, &mut journal, now_unix()?)?;
+        write_artifact(&a.out, &issued.der, "CERTIFICATE", a.der)?;
+        println!("{} {}", Msg::CliCertWritten.text(locale), a.out.display());
+        Ok(())
+    }
+}
 
 /// `issue-ca`.
 struct IssueCaJob<'a> {
