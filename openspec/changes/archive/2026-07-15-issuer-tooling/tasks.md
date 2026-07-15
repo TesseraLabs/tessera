@@ -58,4 +58,4 @@
 - [x] 7.3 Документация: доки issuer в docs/ru + перевод в docs/en (выпуск через CLI, кабинет, Vault Transit, ограничение Vault PKI; запуск агента на Linux/macOS/Windows и автостарт)
 - [x] 7.5 CI-матрица issuer: build+test `tessera_issuer`+`tessera_ext` на ubuntu/macos/windows-раннерах (только эти крейты — PAM/udev-часть workspace не для Windows)
 - [x] 7.6 Деплой кабинета (D13): CI-workflow `deploy-issuer.yml` — на релизный тег собирает SPA, публикует на Cloudflare Pages (issuer.tessera-access.com) и в YC Object Storage+CDN (issuer.tessera-access.ru), фиксирует SHA-256 артефакта в релизе; purge CDN с учётом лимита 1/мин; секреты — repo secrets (CF token, YC keys); ручной деплой запрещён (паритет с deploy-docs)
-- [ ] 7.4 Обновить openspec/specs/README.md (индекс) после архивирования change
+- [x] 7.4 Обновить openspec/specs/README.md (индекс) после архивирования change
