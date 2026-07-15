@@ -41,8 +41,13 @@
 
 ## 2. Компоненты
 
-`tessera` — это workspace из четырёх крейтов и одна
-ОС-интеграция (systemd, udev, logind).
+`tessera` — это workspace из семи крейтов и одна ОС-интеграция
+(systemd, udev, logind). Ниже — четыре runtime-крейта, работающие на
+устройстве. Остальные три относятся к выпуску сертификатов:
+`tessera_ext` — общие определения X.509-расширений Tessera (OID,
+DER-кодеки), используется и ядром, и инструментами выпуска;
+`tessera_issuer` и `tessera_issuer_wasm` — инструменты выпуска и их
+WASM-обвязка для веб-кабинета, описаны в [issuer.md](issuer.md).
 
 ### 2.1 `tessera_core` (rlib)
 
