@@ -1,8 +1,19 @@
 # Runbook эксплуатации Tessera
 
-Этот документ — операционный runbook для администратора Astra Linux SE,
-обслуживающего парк машин с установленным `tessera`. Каждый
-инцидент описан по схеме «симптом → диагностика → действие → проверка».
+Для дежурного администратора Astra Linux SE, обслуживающего парк
+машин с установленным `tessera`. Здесь собрано то, что делают на
+дежурстве, — сгруппировано по поводу запуска:
+
+- **регулярно, по расписанию** — мониторинг (§1), ежедневное
+  обновление CRL (§2.2), бэкап конфигурации (§4);
+- **по событию** — обновление CA (§2.1), изменение области
+  сертификата (§2.3), раскатка клонированного образа (§2.4),
+  ротация `gost-engine` после обновления Astra (§5);
+- **при аварии** — инциденты безопасности, потеря токена, отказ
+  демона: вынесены в [troubleshooting.md](troubleshooting.md) (§3).
+
+Где у операции есть срок или триггер, он указан в поле **Когда**.
+Логи, МКЦ и экстренный контакт — в конце (§6–§8).
 
 ## 1. Мониторинг
 
@@ -36,16 +47,17 @@ journalctl -u tessera --since '5 min ago' -p err --no-pager -q
 
 Пустой вывод — норма; любая строка — повод посмотреть руками.
 
-### 1.4 Snippet для Zabbix UserParameter
+### 1.4 Шаблон для Zabbix UserParameter
+
+`UserParameter=<key>,<command>` — одна строка на ключ (перенос строки
+Zabbix не разрешает):
 
 ```ini
-UserParameter=tessera.active,
-    systemctl is-active tessera
-UserParameter=tessera.socket,
-    test -S /run/tessera/monitord.sock && echo 1 || echo 0
+UserParameter=tessera.active,systemctl is-active tessera
+UserParameter=tessera.socket,test -S /run/tessera/monitord.sock && echo 1 || echo 0
 ```
 
-### 1.5 Snippet для Prometheus textfile collector
+### 1.5 Шаблон для Prometheus textfile collector
 
 `/var/lib/node_exporter/textfile_collector/tessera.prom`:
 
@@ -77,7 +89,7 @@ TMP=$(mktemp)
 mv "$TMP" /var/lib/node_exporter/textfile_collector/tessera.prom
 ```
 
-## 2. Регулярные операции
+## 2. Операции с сертификатами и CRL
 
 ### 2.1 Обновление CA-сертификата
 
@@ -154,7 +166,8 @@ openssl crl -in /etc/tessera/crl/staff.crl -noout -lastupdate -nextupdate
 (`pam_cert_host_binding`, `pam_cert_user_binding`), отдельной
 конфигурации обновлять не нужно. Жизненный цикл — через УЦ:
 
-1. Отозвать текущий сертификат через CRL (см. §3.1).
+1. Отозвать текущий сертификат через CRL (процедура отзыва —
+   [troubleshooting.md §8](troubleshooting.md#8-инциденты-безопасности)).
 2. Перевыпустить сертификат с обновлёнными списками в расширениях
    (рецепты `openssl.cnf` — в [cert-issuance.md](cert-issuance.md)).
 3. Распространить новый сертификат на USB/токен пользователя.
@@ -206,7 +219,8 @@ Ansible-выкатка, troubleshooting.
 ### 4.2 Что НЕ бэкапить
 
 - `/run/tessera/` — runtime (сокет, `sessions.json`,
-  `daemon.lock`), восстанавливается systemd-tmpfiles при загрузке.
+  `daemon.lock`), создаётся директивой `RuntimeDirectory=tessera`
+  юнита при каждом старте демона.
 - `/var/cache/tessera/` — зарезервировано под кэши,
   восстанавливается при работе.
 
@@ -270,52 +284,104 @@ sudo journalctl -u tessera -g 'tessera.monitord'
 > путь к Unix-сокету (`/run/tessera/monitord.sock`) остаются
 > историческими — переименование сломало бы фильтры в проде.
 
-Полезные теги:
+Отдельных таргетов вида `tessera.monitord.start` / `.removal` / `.lock`
+**нет**: у демона один таргет `tessera.monitord` со свободным текстом
+сообщения. Исход и детали события лежат в тексте сообщения и полях
+`key=value`, а не в имени таргета. Основные таргеты демона и примеры
+реальных сообщений (дословно из журнала):
 
-- `tessera.monitord.start` — запуск.
-- `tessera.monitord.removal` — udev REMOVE-события.
-- `tessera.monitord.reinsert` — отмена в grace-окне.
-- `tessera.monitord.lock` — отправка `LockSession` к logind.
-- `tessera.monitord.reload` — reload конфига.
-- `USB-removal action dropped` (WARN, 0.3.10+) — action не отправлен,
-  потому что в сессии нет logind id. См. §3.6.1.
-- `pushed logind session target to monitord` (INFO, `tessera.session`,
-  0.3.10+) — `pam_sm_open_session` успешно проксировал `XDG_SESSION_ID`
-  в monitord; норма для logind-сессии.
+- `tessera.monitord` — жизненный цикл демона, udev-события, grace-окно,
+  диспетчеризация действий:
+  - `starting` — старт демона;
+  - `grace window expired, dispatching action` (поле `serial=…`) —
+    grace-окно после извлечения носителя истекло, действие уходит
+    в action-runner;
+  - `grace cancelled` (`serial=…`) — носитель вернули в grace-окне,
+    действие отменено;
+  - `session target updated` (`session_id=…`, `new_target=…`) —
+    `pam_sm_open_session` прислал реальный `XDG_SESSION_ID`, запись
+    сессии в реестре обновлена с placeholder-цели на `LogindSession`.
+- `tessera.mount` — монтирование и очистка stale-точек под
+  mountpoint-base.
+- `tessera.daemon.singleton` — singleton-замок `daemon.lock`.
+- `tessera.fly_dm_greeter` — перерисовка wallpaper-баннера.
+- `tessera.startup_check` — стартовая валидация конфигурации.
+- `role.audit` — события ролевого стора (`role_deny`,
+  `role_session_open` с полем `reason=…`); таргет **без** префикса
+  `tessera.`.
+
+**Извлечение носителя из сессии без logind id.** В 0.4.0 действие
+не «дропается» (строки `USB-removal action dropped` нет) — оно
+завершается fail-closed перезагрузкой хоста. Это ERROR-строка
+(поле `action=Lock` или `Logout`):
+
+```
+ERROR tessera.monitord: ALERT: USB-removal Logout has no logind id; failing closed with reboot session_id=… target=… pam_user=… pam_service=…
+```
+
+Следом идёт INFO-подсказка (текст начинается с
+`tip: pam_sm_open_session pushes XDG_SESSION_ID to monitord`) о том,
+что нужно поправить порядок `pam_systemd.so` / `pam_tessera.so` в
+session-фазе. Разбор причины и починка —
+[troubleshooting.md §4](troubleshooting.md#4-pam-стек-и-lockout).
 
 ### 6.2 cdylib (PAM-модуль)
 
 ```bash
 sudo tail -f /var/log/auth.log
-sudo journalctl -t tessera
+sudo journalctl -t pam_tessera
 ```
 
-Полезные теги:
+> PAM-модуль пишет в syslog (facility `auth`) под идентификатором
+> процесса `pam_tessera` — отсюда фильтр `-t pam_tessera`, а не
+> `-t tessera`. На journald-хостах строки видны и в
+> `journalctl -t pam_tessera`, и в `/var/log/auth.log`.
 
-- `tessera.auth.start` — начало `pam_sm_authenticate`.
-- `tessera.auth.success` — успех.
-- `tessera.auth.fail.<reason>` — отказ; `<reason>` — категория.
-- `tessera.cert_scope.host_mismatch` — `host_id_hash` не входит
-  в `pam_cert_host_binding`.
-- `tessera.cert_scope.user_mismatch` — `pam_user` не входит в
-  `pam_cert_user_binding`.
-- `tessera.session.open` — открыта сессия.
-- `tessera.session.close` — закрыта сессия.
+Отдельных таргетов вида `tessera.auth.success` / `.fail.<reason>` или
+`tessera.cert_scope.*` **нет** — исход аутентификации и причина отказа
+лежат в тексте сообщения и полях (`error=…`, `reason=…`), а не в имени
+таргета. Основные таргеты модуля:
+
+- `tessera.auth` — вход и итог `pam_sm_authenticate`:
+  - `authentication failed` (WARN, поле `error=…` несёт категорию
+    отказа);
+  - `host identity unresolved` (ERROR, `error=…`).
+- `tessera.flow` — пошаговая трасса flow:
+  - `usb devices/partitions enumerated` (`count=…`);
+  - `trying USB candidate` (`devnode=…`, `vid=…`, `pid=…`, `fs_type=…`);
+  - `candidate mounted` (`devnode=…`, `mountpoint=…`);
+  - `no .p12 on this partition, trying next` (`mountpoint=…`, `missing=…`);
+  - `cert chain validated`;
+  - `auth result: success (pkcs12)` — успех PKCS#12-пути.
+- `tessera.session` — `pam_sm_open_session` / `pam_sm_close_session`:
+  - `open_session: running session_open hooks` (`session_id=…`, `pam_user=…`);
+  - `close_session: running session_close hooks` (`session_id=…`).
+- `role.audit` — ролевой отказ/выдача: `role_deny` с полем `reason=…`
+  (`not_found` / `not_covered` / `backend_unavailable` /
+  `mask_exceeds_ceiling` / `syntax`), `role_session_open`.
 
 ### 6.3 Полезные `grep`-фильтры
 
 ```bash
-# Все отказы за сутки:
-sudo journalctl -t tessera --since="1 day ago" | grep -F 'auth.fail'
+# Все неуспешные аутентификации за сутки:
+sudo journalctl -t pam_tessera --since="1 day ago" \
+    | grep -F 'authentication failed'
 
-# Все события извлечения USB:
-sudo journalctl -u tessera | grep -F 'monitord.removal'
+# Все ролевые отказы (реестр role-store):
+sudo journalctl -t pam_tessera | grep -F 'role_deny'
 
-# Все mismatch'и cert scope (host/user binding):
-sudo journalctl -t tessera | grep -E 'cert_scope\.(host|user)_mismatch'
+# События извлечения USB, по которым сработало действие:
+sudo journalctl -u tessera | grep -F 'grace window expired, dispatching action'
 
-# Сессии конкретного пользователя:
-sudo journalctl -t tessera | grep -E 'pam_user[=:]"alice"'
+# Fail-closed перезагрузки из-за отсутствия logind id:
+sudo journalctl -u tessera | grep -F 'failing closed with reboot'
+
+# Пошаговая трасса подбора раздела на multi-partition носителе:
+sudo journalctl -t pam_tessera \
+    | grep -E 'trying USB candidate|candidate mounted|no \.p12 on this partition'
+
+# Сессии/отказы конкретного пользователя (ролевой аудит):
+sudo journalctl -t pam_tessera | grep -E 'role_(deny|session_open)' | grep alice
 ```
 
 ### 6.4 Что не логируется (по политике)
@@ -330,28 +396,31 @@ sudo journalctl -t tessera | grep -E 'pam_user[=:]"alice"'
 ## 7. МКЦ (MAC integrity)
 
 Активация мандатного контроля целостности — опциональный шаг,
-выполняется оператором вручную после установки пакета. Демон
-`tessera.service` работает как `tessera` без
-`CAP_MAC_ADMIN`/`PARSEC_CAP_CHMAC`, пока оператор не установит
-шипованный drop-in
-`/usr/share/tessera/systemd/mac-integrity.conf.example` в
-`/etc/systemd/system/tessera.service.d/`, парный PAM-стек
-`/usr/share/tessera/pam.d/tessera.example` в
-`/etc/pam.d/tessera` (использует `pam_parsec_cap.so` +
-`pam_parsec_mac.so`) и не выдаст `PARSEC_CAP_CHMAC` через
-`usercaps -m "+3" tessera` плюс `pdpl-user --ilevel 63 tessera`.
+выполняется оператором вручную после установки пакета. По
+умолчанию демон `tessera.service` работает как `tessera` без
+`CAP_MAC_ADMIN`/`PARSEC_CAP_CHMAC`. Активация — три шага оператора:
+
+1. установить drop-in
+   `/usr/share/tessera/systemd/mac-integrity.conf.example` в
+   `/etc/systemd/system/tessera.service.d/`;
+2. установить парный PAM-стек
+   `/usr/share/tessera/pam.d/tessera.example` в `/etc/pam.d/tessera`
+   (использует `pam_parsec_cap.so` + `pam_parsec_mac.so`);
+3. выдать демону `PARSEC_CAP_CHMAC` через `usercaps -m "+3" tessera`
+   плюс `pdpl-user --ilevel 63 tessera`.
+
 Полная процедура активации, проверки и отката описана в
 [docs/install.md §«МКЦ (MAC integrity) — опциональная активация»](install.md#мкц-mac-integrity--опциональная-активация).
 
 **Состояние сессий.** Реестр `sessions.json` лежит на tmpfs
-(`/run/tessera/sessions.json`, `RuntimeDirectory=`). Volatile
-across reboot — это by design: sshd/login/sudo-процессы, держащие
-эти сессии, всё равно умирают на reboot. Singleton-замок
+(`/run/tessera/sessions.json`, `RuntimeDirectory=`). Реестр
+обнуляется при перезагрузке — так и задумано: sshd/login/sudo-процессы,
+держащие эти сессии, всё равно умирают при reboot. Singleton-замок
 `daemon.lock` живёт рядом с `sessions.json` (fallback —
 `/var/lib/tessera/`); постоянное состояние — wallpaper-backup в
 `/var/lib/tessera/`.
 
-## 8. Emergency contact
+## 8. Экстренный контакт
 
 Для конфиденциальных сообщений о безопасности — см. контакты в
 [README.md](../../README.md#безопасность-и-сообщения-об-уязвимостях).

@@ -1,48 +1,46 @@
-# fly-dm greeter: показать host_id на экране входа
+# Host_id на экране входа
 
-`tessera` отправляет короткую идентификацию машины в PAM в
-начале `pam_sm_authenticate`:
+Сертификат Tessera привязан к конкретному устройству: в него зашит
+`host_id_hash` (см. [cert-issuance.md](cert-issuance.md)). Из-за этого
+у оператора в поле возникает замкнутый круг: чтобы узнать `host_id`
+устройства, нужно войти в систему, а войти без сертификата на этот
+самый `host_id` нельзя.
+
+Tessera разрывает круг, показывая `host_id` прямо на экране входа.
+Это позволяет без входа в систему:
+
+- прочитать `host_id` нового устройства и передать его для выпуска
+  per-host сертификата (типовой шаг раскатки через клонированный
+  образ — [clone-image.md](clone-image.md) §2.4);
+- при отказе входа сверить, совпадает ли `host_id` на экране с тем,
+  на который выписан сертификат (`host_binding mismatch` —
+  [troubleshooting.md](troubleshooting.md#host_binding-mismatch)).
+
+## Где host_id виден сразу, а где нужна настройка
+
+`tessera` в начале `pam_sm_authenticate` отправляет в PAM
+информационное сообщение (`PAM_TEXT_INFO`):
 
 ```
 Это устройство: host_id=a1b2c3d4 (source=MachineId)
 ```
 
-Это `PAM_TEXT_INFO`-сообщение. Полный `host_id_hash` остаётся в
-syslog: `journalctl -t tessera | grep host_identity`. Цель —
-оператор/инженер у терминала видит, к какому `host_id` привязан
-сертификат, не заходя в shell.
+Оно видно без настройки везде, где PAM-диалог доходит до
+пользователя: вход на консоли (`/etc/pam.d/login`), интерактивный
+sshd, sudo. Полный `host_id_hash` пишется в журнал PAM-модуля:
+`journalctl -t pam_tessera -g host_identity`.
 
-Где сообщение показывается **без дополнительной настройки**:
+Исключение — графический вход fly-dm на Astra: тема `fly-modern`
+под МКЦ-3 игнорирует PAM-сообщения и `GreetString`, подставляя в
+заголовок жёстко зашитую строку «Усиленный уровень защищенности»
+(из `.mo`-файла темы, выбор по PARSEC API). Поэтому для fly-dm
+`host_id` выводится иначе — впечатывается в фоновое изображение
+экрана входа. Тема при этом не трогается: текст становится частью
+JPG-обоев, на которые указывает `[background].path` в
+`/etc/X11/fly-dm/fly-modern/settings.ini`. (История отвергнутых
+подходов — в [changelog.md](changelog.md), 0.3.15–0.3.19.)
 
-- TTY-login (`/etc/pam.d/login` на консоли);
-- sshd interactive (`/etc/pam.d/sshd`);
-- sudo (`/etc/pam.d/sudo`).
-
-Где **нужны настройки** — fly-dm (Astra GUI display manager): см. ниже.
-
-## Проблема fly-dm
-
-На Astra с МКЦ-3 (production-терминалы) `fly-dm` под темой
-`fly-modern` **игнорирует** PAM-сообщения и `GreetString` —
-hardcoded'но рендерит в headline place строку «Усиленный уровень
-защищенности» из `/usr/share/locale/ru/LC_MESSAGES/fly-dm_greet_modern.mo`
-(определяется по PARSEC API).
-
-История попыток (для контекста):
-
-| Версия | Подход                                     | Результат               |
-|--------|--------------------------------------------|-------------------------|
-| 0.3.15 | `greeter-show-messages = true` в fly-dmrc  | KDM/LightDM legacy key, fly-qdm 2.15+ не парсит. **Cargo-cult**. |
-| 0.3.16 | `/etc/X11/fly-dm/override/GreetString.desktop` | На fly-modern МКЦ-3 GreetString hardcode'ом замещается. **No-op**. |
-| 0.3.19 | Wallpaper writer — впечатать в JPG-фон     | **Работает**.           |
-
-## Workaround: wallpaper writer (0.3.19+)
-
-Идея: впечатать `host_id` прямо в JPG, на который смотрит
-`[background].path` в `/etc/X11/fly-dm/fly-modern/settings.ini`.
-Daemon делает это автоматически, без зависимостей от темы.
-
-### Включение
+## Включение
 
 ```toml
 # /etc/tessera/config.toml
@@ -50,29 +48,43 @@ Daemon делает это автоматически, без зависимос
 update_wallpaper = true
 ```
 
-Restart:
+Применить:
 
 ```bash
 sudo systemctl restart tessera
 ```
 
-### Поведение
+На экране входа fly-dm внизу появится строка вида:
 
-При каждом старте `tessera.service`:
+```
+Устройство astra184  host_id=a1b2c3d4 (dmi_board_serial)
+```
 
-1. **Первый раз**: `cp wallpaper_target → wallpaper_backup` (one-time
-   снимок оригинала). Дальнейшие правки источника НЕ перезаписывают
-   backup — изменение оригинала фона требует ручного удаления
-   `wallpaper_backup`.
-2. Открывает `wallpaper_backup` как source-изображение.
-3. Рендерит template (`template_ru` / `template_en` по locale) с
-   подстановкой:
-   - `{host_id_short}` — первые 8 hex символов sha256;
-   - `{source}` — имя источника в snake_case (`machine_id`, `dmi_board_serial` ...);
+## Как это работает
+
+При каждом старте `tessera.service` демон:
+
+1. При первом запуске сохраняет оригинал обоев: копирует
+   `wallpaper_target` в `wallpaper_backup`. Дальше копия не
+   обновляется — если оригинальный фон поменялся, удалите
+   `wallpaper_backup` вручную, и демон снимет новую копию.
+2. Берёт за основу чистый оригинал из `wallpaper_backup` (поэтому
+   текст не наслаивается от запуска к запуску).
+3. Рендерит строку по шаблону `template_ru` или `template_en`
+   (по локали системы) с подстановками:
+   - `{host_id_short}` — первые 8 hex-символов sha256-хэша host_id;
+   - `{source}` — имя источника host identity в snake_case
+     (`machine_id`, `dmi_board_serial`, …);
    - `%n` — hostname машины.
-4. Atomic save → `wallpaper_target` (tmpfile + rename).
+4. Записывает результат в `wallpaper_target` атомарно (через
+   временный файл и переименование) — fly-dm никогда не увидит
+   недописанный JPG.
 
-### Полный набор опций
+Отрисовка не требует внешних программ (ImageMagick и т. п. не
+нужны). Любая ошибка на этом пути только логируется — вход
+инженера из-за проблем с обоями никогда не блокируется.
+
+## Справочник опций
 
 ```toml
 [fly_dm_greeter]
@@ -83,26 +95,18 @@ wallpaper_font        = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 wallpaper_font_size   = 64
 wallpaper_text_color  = "#000000"
 wallpaper_gravity     = "south"     # north | south | east | west | center
-wallpaper_offset_x    = 0           # пиксели от gravity-anchor по горизонтали
-wallpaper_offset_y    = 120         # пиксели от gravity-anchor (для south — вверх)
+wallpaper_offset_x    = 0           # смещение от точки привязки по горизонтали, px
+wallpaper_offset_y    = 120         # смещение от точки привязки (для south — вверх), px
 template_ru           = "Устройство %n  host_id={host_id_short} ({source})"
 template_en           = "Device %n  host_id={host_id_short} ({source})"
 ```
 
-### Реализация
-
-Pure Rust: crate `image` для JPG I/O + `ab_glyph` для растеризации
-шрифта. Без native deps (no ImageMagick / no Pango). Failures →
-log-and-continue, auth-flow **никогда** не блокируется ошибкой
-wallpaper writer'а.
-
 ## Видимость текста: `settings.ini`
 
-Daemon **не редактирует** `settings.ini` — этим управляет
-оператор/Ansible. Если на хосте включён сильный `color_overlay` или
-`blur` — текст может быть невидим.
-
-Baseline для production-терминала:
+Демон **не редактирует** `settings.ini` — этот файл остаётся за
+оператором (или Ansible). Если в теме включены сильное затемнение
+(`color_overlay`) или размытие (`blur`), впечатанный текст может
+быть не виден. Рабочая основа для production-терминала:
 
 ```ini
 # /etc/X11/fly-dm/fly-modern/settings.ini
@@ -114,40 +118,38 @@ color_overlay=0,0,0,30
 enable=false
 ```
 
-После правки `settings.ini`:
+После правки `settings.ini` перезапустите fly-dm:
 
 ```bash
 sudo systemctl restart fly-dm
 ```
 
-После правки `[fly_dm_greeter]` в `config.toml`:
+Правки `[fly_dm_greeter]` в `config.toml` применяются рестартом
+`tessera` (см. [Включение](#включение)).
 
-```bash
-sudo systemctl restart tessera
-```
+## Проверка
 
-## Verification
-
-После рестарта daemon'а:
+После рестарта демона:
 
 ```bash
 sudo journalctl -u tessera -g fly_dm_greeter -n 20
 ```
 
-Ожидаемая запись — одна INFO `fly-dm wallpaper update finished`
-(target `tessera.fly_dm_greeter`) с полем `outcome`: `Wrote {
-backed_up: true }` на первом запуске, дальше `backed_up: false`;
-`Disabled` — если `update_wallpaper = false`. Любая ошибка (нет
-прав, битый JPG, отсутствующий шрифт — поставить
-`fonts-dejavu-core`) — WARN `fly-dm wallpaper update failed
-(continuing)`, демон продолжает работу.
+Ожидаемая запись — одна INFO-строка `fly-dm wallpaper update finished`
+(таргет `tessera.fly_dm_greeter`) с полем `outcome`:
 
-Затем визуально на экране login fly-dm: внизу должна появиться
-строка `Устройство astra184  host_id=a1b2c3d4 (dmi_board_serial)`.
+- `Wrote { backed_up: true }` — первый запуск, снята копия оригинала;
+- `Wrote { backed_up: false }` — обычный последующий запуск;
+- `Disabled` — `update_wallpaper = false`.
 
-## Troubleshooting
+Любая ошибка (нет прав на файл, повреждённый JPG, отсутствующий
+шрифт — ставится пакетом `fonts-dejavu-core`) даёт WARN-строку
+`fly-dm wallpaper update failed (continuing)`; демон продолжает
+работу, вход не блокируется.
 
-См. [troubleshooting.md](troubleshooting.md) раздел
+## Диагностика
+
+См. [troubleshooting.md](troubleshooting.md), раздел
 «fly-dm не показывает host_id на экране входа».
 
 ## См. также
