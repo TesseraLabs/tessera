@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd LaunchAgent for the Tessera issuer local signing agent (macOS).
+
+  Install (per user, no root):
+    cp com.tesseralabs.issuer-serve.plist ~/Library/LaunchAgents/
+    # edit the ProgramArguments below for your token module / key / cabinet origin
+    launchctl load ~/Library/LaunchAgents/com.tesseralabs.issuer-serve.plist
+
+  The pairing token is written to
+  ~/Library/Application Support/tessera-issuer/token (0600); the cabinet reads
+  it there. The PIN is entered via pinentry-mac (Homebrew) or the terminal.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tesseralabs.issuer-serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/issuer</string>
+    <string>serve</string>
+    <string>--daemon-token-file</string>
+    <string>--allow-origin</string>
+    <string>https://cabinet.example</string>
+    <string>--module</string>
+    <string>/Library/OpenSC/lib/opensc-pkcs11.so</string>
+    <string>--key</string>
+    <string>tessera-ca</string>
+    <string>--algorithm</string>
+    <string>ecdsa-p256</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>

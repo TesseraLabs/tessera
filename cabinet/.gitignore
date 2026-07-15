@@ -1,0 +1,10 @@
+/dist/
+/node_modules/
+/tmp/
+
+# Generated WASM binary + wasm-bindgen's own bg-module declarations; the
+# hand-written tessera_issuer_wasm.js/.d.ts stubs in this directory are
+# checked in on purpose (see their file headers) and stay tracked even
+# though `build.sh` overwrites them locally.
+/wasm/tessera_issuer_wasm_bg.wasm
+/wasm/tessera_issuer_wasm_bg.wasm.d.ts

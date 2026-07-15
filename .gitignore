@@ -30,3 +30,6 @@ CertAuth-scopes-mofn/
 docs/superpowers/plans/
 notes/bootstrap-notes/
 /target-linux/
+
+# Local E2E scratch (issuer cabinet run)
+/e2e-tmp/

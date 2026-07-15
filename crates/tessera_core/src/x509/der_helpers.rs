@@ -7,15 +7,13 @@
 //! its dotted OID.
 //!
 //! Encoding strategy for OIDs: our project-private OIDs use the `2.25.<UUID>`
-//! arc, which produces arc values that exceed `u32::MAX` (the limit imposed by
-//! [`super::der::oid_to_dotted`]).  Rather than write a fresh wide-integer
-//! OID decoder, we let OpenSSL canonicalise our target OID once via
-//! `Asn1Object::from_str` and compare the raw DER bytes of each extension's
-//! OID against that canonical form.  This is bulletproof and avoids any
-//! custom encoder for huge unsigned integers.
+//! arc, whose single arc is ~128 bits wide.  We encode the target OID to its
+//! DER content octets with [`tessera_ext::der::encode_oid`] (a pure-Rust
+//! wide-integer encoder) and compare against each extension's OID content.
+//! This keeps the comparison off OpenSSL's `Asn1Object`, so the same code path
+//! is reusable by the wasm/issuer side.
 
 use super::der::{read_tlv, read_tlv_expect, TAG_INTEGER, TAG_OCTET_STRING, TAG_OID, TAG_SEQUENCE};
-use openssl::asn1::Asn1Object;
 use thiserror::Error;
 
 /// ASN.1 DER tag for `UTF8String`.
@@ -36,7 +34,7 @@ pub(crate) enum DerError {
     /// Underlying TLV parser reported a problem.
     #[error("der: tlv parse error: {0}")]
     Tlv(String),
-    /// `target_oid` could not be canonicalised by OpenSSL.
+    /// `target_oid` could not be encoded to DER content octets.
     #[error("der: invalid target oid: {0}")]
     InvalidOid(String),
     /// A DER `INTEGER` did not fit the target Rust integer type.
@@ -67,12 +65,11 @@ pub(crate) fn extract_extension_by_oid(
     cert_der: &[u8],
     target_oid: &str,
 ) -> Result<Option<Vec<u8>>, DerError> {
-    // Canonicalise the target OID via OpenSSL once and compare DER content
-    // bytes — this avoids implementing wide-integer OID arc decoding for
-    // OIDs with arcs that exceed `u32::MAX` (e.g. `2.25.<UUID>`).
-    let target_obj =
-        Asn1Object::from_str(target_oid).map_err(|e| DerError::InvalidOid(e.to_string()))?;
-    let target_bytes: &[u8] = target_obj.as_slice();
+    // Encode the target OID to its DER content octets once and compare against
+    // each extension's OID content — this handles the wide (~128-bit) arcs of
+    // our `2.25.<UUID>` OIDs without linking OpenSSL for canonicalisation.
+    let target_bytes = tessera_ext::der::encode_oid(target_oid)
+        .map_err(|e| DerError::InvalidOid(e.to_string()))?;
 
     // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
     let outer = read_tlv_expect(cert_der, TAG_SEQUENCE)?;
@@ -114,7 +111,7 @@ pub(crate) fn extract_extension_by_oid(
         }
 
         let octet = read_tlv_expect(inner, TAG_OCTET_STRING)?;
-        if oid.value == target_bytes {
+        if oid.value == target_bytes.as_slice() {
             return Ok(Some(octet.value.to_vec()));
         }
     }
@@ -185,6 +182,30 @@ pub(crate) fn parse_integer_only_i64(value_der: &[u8]) -> Result<i64, DerError> 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use openssl::asn1::Asn1Object;
+
+    /// Cross-check the pure-Rust OID encoder against OpenSSL's canonicalisation
+    /// for every project OID.  This is the ground truth the encoder replaced:
+    /// `encode_oid` must produce exactly `Asn1Object::as_slice()`.
+    #[test]
+    fn encode_oid_matches_openssl_for_project_oids() {
+        for oid in [
+            super::super::oids::HOST_BINDING_OID,
+            super::super::oids::USER_BINDING_OID,
+            super::super::oids::MAX_INTEGRITY_OID,
+            super::super::oids::ALLOWED_ROLES_OID,
+            super::super::oids::DELEGATION_CONSTRAINTS_OID,
+            super::super::oids::PROFILE_VERSION_OID,
+        ] {
+            let ours = tessera_ext::der::encode_oid(oid).expect("project OID encodes");
+            let openssl = Asn1Object::from_str(oid).expect("openssl parses");
+            assert_eq!(
+                ours.as_slice(),
+                openssl.as_slice(),
+                "encoder disagrees with OpenSSL for {oid}"
+            );
+        }
+    }
 
     /// Encodes a `SEQUENCE OF UTF8String` body (without the outer SEQUENCE
     /// header) for use in tests.
