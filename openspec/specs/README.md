@@ -40,6 +40,14 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 | [pam-integration](pam-integration/spec.md) | Режимы, parsec_mac/two-include ordering, postinst |
 | [build-release](build-release/spec.md) | CI matrix, packaging, тестовые gap'ы |
 
+### Выпуск сертификатов (issuer-tooling)
+| Capability | Что |
+|---|---|
+| [cert-issuance](cert-issuance/spec.md) | Сборка TBS с расширениями, монотонность рамок до подписи, самоподписанный корень, выпуск по CSR (PoP), случайные 128-бит серийники, CRL с монотонным crlNumber, самопроверка контрактом Engine |
+| [issuer-signing](issuer-signing/spec.md) | Единый интерфейс подписи готового TBS; адаптеры PKCS#11 (токен/HSM) и Vault Transit; локальный агент `issuer serve` (127.0.0.1, Origin-allowlist, парный токен, подтверждение оператором); кроссплатформенность; локализация RU/EN |
+| [issuer-cabinet](issuer-cabinet/spec.md) | Serverless-кабинет (SPA+WASM) и CLI: логика на клиенте, стейт — файлы; режим из родительского сертификата; SPKI/CSR как источник ключа; снапшот инвентаря; локализация |
+| [issuance-journal](issuance-journal/spec.md) | Локальный подписанный hash-chain журнал выпуска (запись до выдачи, fail-closed); верификация цепочки; подпись головы |
+
 ### Лицензирование
 | [licensing-distribution](licensing-distribution/spec.md) | Dual-license AGPL/commercial, граница open/commercial, SPI MacBackend, CLA |
 

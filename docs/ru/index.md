@@ -30,7 +30,10 @@
 1. [cert-issuance.md](cert-issuance.md) — расширения
    `pam_cert_host_binding`, `pam_cert_user_binding`,
    `pam_cert_max_integrity`, сценарии выпуска.
-2. [clone-image.md §6](clone-image.md) — CA-сторона clone-image
+2. [issuer.md](issuer.md) — инструменты выпуска (`tessera_issuer`):
+   CLI `issuer`, агент `serve`, CSR-поток, бэкенды PKCS#11 и
+   Vault Transit, журнал выпусков, веб-кабинет.
+3. [clone-image.md §6](clone-image.md) — CA-сторона clone-image
    workflow (выпуск per-host).
 
 ### Безопасник

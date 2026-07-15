@@ -54,10 +54,10 @@ fn int_i8(v: i8) -> Vec<u8> {
 /// leading `0x00` when the high bit would otherwise make it look negative.
 fn int_u32(v: u32) -> Vec<u8> {
     let mut be = v.to_be_bytes().to_vec();
-    while be.len() > 1 && be[0] == 0 {
+    while be.len() > 1 && be.first() == Some(&0) {
         be.remove(0);
     }
-    if be[0] & 0x80 != 0 {
+    if be.first().is_some_and(|&b| b & 0x80 != 0) {
         be.insert(0, 0x00);
     }
     tlv(TAG_INTEGER, &be)

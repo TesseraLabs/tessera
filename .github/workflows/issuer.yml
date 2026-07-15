@@ -1,0 +1,239 @@
+name: issuer
+
+# Кроссплатформенный CI стороны выпуска (D11). Отдельный workflow, а не нога
+# build.yml, потому что build.yml завязан на .deb-конвейер: Astra
+# builder-контейнер, сверку debian/changelog, deb-артефакты — всё это про
+# Linux-only агент. Крейты выпуска (tessera_ext / tessera_issuer /
+# tessera_issuer_wasm) — pure-Rust, собираются на ubuntu/macos/windows и в
+# wasm32, ставить их в ту же matrix значило бы смешать два несвязанных
+# конвейера. Держим по образцу lint.yml/nightly.yml — отдельный workflow на
+# свою заботу.
+#
+# Что покрывает:
+#   - build-test  — сборка+тесты tessera_issuer/tessera_ext на трёх ОС;
+#   - clippy      — линт issuer-крейтов со всеми фичами (адаптеры pkcs11/vault/
+#                   serve видны только под --all-features);
+#   - wasm        — сборка ядра и биндингов кабинета под wasm32;
+#   - cabinet     — сборка статики кабинета (gated: только если каталог есть);
+#   - mac-tests   — mac-gated сюиты tessera_core (в т.ч. issuer_contract),
+#                   которые до сих пор не исполнялись в CI (пробел из 7.1).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issuer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # tessera_issuer + tessera_ext собираются и тестируются там, где сидит
+  # диспетчер: Linux, macOS, Windows. Остальной workspace (PAM/udev) под
+  # Windows/macOS не собирается и сюда не входит.
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: build-test (${{ matrix.os }})
+    steps:
+      - uses: actions/checkout@v6
+
+      # native-tls (через фичу `vault`) на Linux линкует openssl; на macOS и
+      # Windows берёт системный TLS и системных пакетов не требует. Базовая
+      # сборка (default = native) openssl не тянет — ставим только под
+      # --all-features-прогон ниже.
+      - name: Install openssl for the vault (native-tls) feature (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libssl-dev pkg-config
+
+      # rustup на hosted-раннерах предустановлен; `rustup show` ставит
+      # toolchain, названный в rust-toolchain.toml (1.95.0 + clippy/rustfmt).
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        shell: bash
+        run: rustup show
+
+      - name: Print toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: issuer-${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Build (default features)
+        run: cargo build -p tessera_issuer -p tessera_ext
+
+      - name: Test (default features)
+        run: cargo test -p tessera_issuer -p tessera_ext
+
+      # На Linux — весь набор фич. pkcs11-tests/vault-tests компилируются, но
+      # без внешней зависимости (SoftHSM-модуль, бинарь vault) в рантайме
+      # печатают `skipped:` и возвращают Ok — железо в CI не требуется.
+      - name: Test (all features, Linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p tessera_issuer --all-features
+
+      # macOS/Windows: адаптеры собираются и тестируются с фичами, но без
+      # железозависимых -tests-фич (нечего к ним подключать на раннере).
+      - name: Test (adapters, macOS/Windows)
+        if: runner.os != 'Linux'
+        run: cargo test -p tessera_issuer -p tessera_ext --features cli,pkcs11,vault,serve
+
+  # Линт issuer-крейтов. lint.yml уже гоняет `clippy --workspace` с дефолтными
+  # фичами; здесь добавляем --all-features, потому что самый чувствительный код
+  # (PIN, Origin-allowlist, remote-подпись) живёт в pkcs11/vault/serve-модулях,
+  # невидимых без их фич.
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install openssl for the vault (native-tls) feature
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libssl-dev pkg-config
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: issuer-clippy
+
+      - name: cargo clippy (issuer crates, all features, -D warnings)
+        run: >
+          cargo clippy
+          -p tessera_issuer -p tessera_ext -p tessera_issuer_wasm
+          --all-targets --all-features -- -D warnings
+
+  # Ядро issuer собирается под wasm32 (браузерный кабинет). --no-default-features
+  # выключает native (rand/clap): в браузере энтропия — от хоста, бинаря нет.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: issuer-wasm
+
+      - name: Build issuer core for wasm32
+        run: >
+          cargo build -p tessera_issuer --lib
+          --target wasm32-unknown-unknown --no-default-features
+
+      - name: Build cabinet wasm bindings
+        run: >
+          cargo build -p tessera_issuer_wasm
+          --target wasm32-unknown-unknown --release
+
+  # Наличие кабинета определяем отдельным дешёвым job'ом: hashFiles() в
+  # job-level `if` не годится — он вычисляется до checkout, когда workspace ещё
+  # пуст, и всегда дал бы пусто. Скрипт кабинета создаёт смежный агент; пока его
+  # нет — cabinet-job корректно скипается (needs + output), а не краснеет.
+  detect-cabinet:
+    runs-on: ubuntu-latest
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: check
+        run: |
+          if [ -f cabinet/build.sh ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Сборка статики кабинета отдельным артефактом. КОНТРАКТ: cabinet/build.sh без
+  # аргументов кладёт статику в cabinet/dist/ вместе с SHA256SUMS. Артефакт
+  # `tessera-cabinet` в deb агента не входит (deb собирает build.yml, кабинет он
+  # не трогает).
+  cabinet:
+    needs: detect-cabinet
+    if: needs.detect-cabinet.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Кабинет — npm/esbuild/TypeScript SPA поверх wasm-ядра, поэтому build.sh
+      # нужны оба тулчейна: Node (сборка SPA) и Rust+wasm32 (ядро). Сам скрипт
+      # самодостаточен — ставит свои npm-зависимости и собирает wasm; job лишь
+      # даёт ему тулчейны.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: issuer-cabinet
+
+      - name: Build cabinet
+        run: bash cabinet/build.sh
+
+      - name: Upload cabinet artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tessera-cabinet
+          path: cabinet/dist/**
+          if-no-files-found: error
+          retention-days: 30
+
+  # mac-gated сюиты tessera_core (в т.ч. issuer_contract — «что выпустил issuer,
+  # то принял разбор Engine»). Без фичи mac-tests эти тесты не компилируются и в
+  # обычном build.yml/nightly не исполнялись — закрываем предсуществующий пробел
+  # (7.1).
+  mac-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # tessera_core тянет системные библиотеки агента (те же, что lint.yml).
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            libssl-dev libudev-dev libdbus-1-dev libpam0g-dev libsystemd-dev \
+            clang libclang-dev pkg-config
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: issuer-mac-tests
+
+      - name: cargo test (tessera_core, mac-tests)
+        run: cargo test -p tessera_core --features mac-tests
