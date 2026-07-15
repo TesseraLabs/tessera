@@ -14,17 +14,18 @@ Components:
 - **Core** (`tessera_issuer`, a library) — assembly of the shift-leaf and
   organisation-CA TBS, the envelope checks, random 128-bit serials, CRL
   issuance, and the issuance journal. The core is pure Rust and builds for
-  `wasm32` (for the future web cabinet); the signing adapters sit behind feature
+  `wasm32` (for the web cabinet); the signing adapters sit behind feature
   flags.
 - **CLI `issuer`** — the same issuing code for automation (ticketing systems,
   scripts). No check is re-implemented in the CLI: a request the core would
   refuse, the CLI refuses identically.
 - **Agent `issuer serve`** — a local browser-to-token HTTP bridge bound strictly
   to `127.0.0.1`, for the web cabinet.
-- **Web cabinet** — one static SPA (a WASM build of the same core). **This
-  release ships the core, the CLI and the agent; the cabinet is still under
-  development** (see the "Web cabinet" section below and the status of the
-  `issuer-tooling` OpenSpec change).
+- **Web cabinet** — one static SPA (a WASM build of the same core):
+  issuance through the browser with no server side. Published with every
+  release at `issuer.tessera-access.com` / `issuer.tessera-access.ru`;
+  for air-gapped environments it can be built self-hosted (see the
+  "Web cabinet" section below).
 
 The role model comes from the parent certificate presented: the fleet root
 issues organisation CAs, and organisation CAs issue engineers' shift-leaves
@@ -362,11 +363,6 @@ devices themselves; the journal serves issuance inventory and incident review.
 
 ## Web cabinet
 
-> **Status.** This release ships the core, the CLI and the `serve` agent. The
-> web cabinet (an SPA + a WASM build of the core) is **still under development** —
-> the current status is in the `issuer-tooling` OpenSpec change (the "Web
-> cabinet" tasks). What follows is the target design.
-
 The cabinet is one static artifact (an SPA + the WASM core) **with no
 server-side logic**: all checks and TBS assembly happen on the client, and all
 state is files (the parent certificate, the issued certificates, the journal, the
@@ -380,20 +376,52 @@ assigned envelope; organisation CA → issue shift-leaves within that envelope; 
 leaf/unsuitable certificate → operations unavailable, with an explanation).
 There are no separate "by job title" builds.
 
-The planned hosting is `issuer.tessera-access.com` and
+The cabinet is hosted at `issuer.tessera-access.com` and
 `issuer.tessera-access.ru` (one bilingual artifact, the default language by
-domain, with a UI switch). A self-hosted deployment remains a first-class
+domain, with a UI switch); the artifact is built and published by the release
+CI workflow — it is never deployed by hand. A self-hosted deployment remains a first-class
 scenario. Artifact integrity is checked against SHA-256 hashes fixed in the
 release, not by a signature (see [threat-model.md §11.1.3](threat-model.md)); the
 private cryptography is always behind the agent and the token — the keys are
 unreachable from a substituted SPA.
 
+### Self-hosted build
+
+`cabinet/build.sh` in the repository builds the `dist/` directory —
+`index.html`, `main.js`, `styles.css`, the WASM binary and a `SHA256SUMS`
+manifest. Serve the directory with any static web server; the cabinet has
+no server side.
+
+### How to work with the cabinet
+
+1. On the machine with the token, start the local agent:
+   `issuer serve --allow-origin <cabinet origin>`
+   (see ["The `issuer serve` agent"](#the-issuer-serve-agent)).
+2. Open the cabinet and present the parent certificate — the available
+   operations are derived from it: root → issue organisation CAs with an
+   assigned envelope; organisation CA → issue shift-leaves within that
+   envelope; a leaf or an unsuitable certificate → operations unavailable,
+   with an explanation.
+3. Device inventory: load a signed snapshot — the cabinet verifies the
+   signature (broken → refusal) and labels the source ("signed"/"manual")
+   with the snapshot age — or fill the data in manually.
+4. The leaf key: local generation or a CSR upload. From a CSR the cabinet
+   shows the subject and the self-signature status and prefills the
+   attributes marked "requested in the CSR"; with a broken self-signature
+   the issuance is unavailable.
+5. The agent signs on the token after the operator confirms
+   (see ["Operation confirmation"](#operation-confirmation)) — the PIN
+   never leaves the machine running the agent. The issued certificate is
+   downloaded as a file, and the operation is recorded in the issuance
+   journal.
+
 ## Localization
 
 The tool's operator surfaces (the confirmation summary in pinentry/the terminal,
-the `issuer serve` messages, the CLI output; in the future, the cabinet SPA) are
+the `issuer serve` messages, the CLI output, the cabinet SPA) are
 localized to Russian and English without an i18n framework (a compact string
-table). The locale is resolved once at startup:
+table). The cabinet picks its language by domain, with a UI switch; for the
+CLI and the agent the locale is resolved once at startup:
 
 1. an explicit setting — the `--lang` flag (`ru`/`en`);
 2. the `TESSERA_ISSUER_LANG` variable;

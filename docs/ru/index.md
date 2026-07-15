@@ -16,12 +16,13 @@
 3. [pam-integration.md](pam-integration.md) — правка `/etc/pam.d/*`,
    режимы (`2fa` / `optional` / `cert-only`), SysV.
 4. [configuration.md](configuration.md) — справочник по `config.toml`.
-5. [mac-integrity.md](mac-integrity.md) — opt-in активация МКЦ
-   на Astra strict-mode.
+5. [mac-integrity.md](mac-integrity.md) — граница open/commercial
+   по МКЦ и черта МКЦ/МРД (активация — [install.md](install.md)
+   и [operations.md §7](operations.md#7-мкц-mac-integrity)).
 6. [clone-image.md](clone-image.md) — раскатка парка через
    клонированный образ.
-7. [fly-dm-greeter.md](fly-dm-greeter.md) — wallpaper banner на
-   fly-dm под МКЦ.
+7. [fly-dm-greeter.md](fly-dm-greeter.md) — host_id на экране
+   входа (для fly-dm под МКЦ — через обои).
 8. [operations.md](operations.md) — runbook регулярных операций.
 
 ### CA-админ (выпуск сертификатов)
@@ -40,8 +41,8 @@
 1. [threat-model.md](threat-model.md) — модель угроз с evidence.
 2. [architecture.md](architecture.md) — IPC-протокол, fail-closed
    правила, host identity chain.
-3. [mac-integrity.md](mac-integrity.md) — МКЦ activation и защита
-   `config.toml` через ilevel=63.
+3. [mac-integrity.md](mac-integrity.md) — граница МКЦ/МРД, состав
+   открытой части и коммерческой поставки.
 
 ### Разработчик
 

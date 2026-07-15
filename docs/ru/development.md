@@ -37,11 +37,8 @@ cargo build --workspace --release
 
 - Default: без специальных фич.
 - `tessera_core/pkcs11-tests` — включает интеграционные тесты,
-  требующие реального `gost-engine` или softhsm2:
-
-  ```bash
-  cargo test --workspace --features tessera_core/pkcs11-tests
-  ```
+  требующие реального `gost-engine` или softhsm2. Рецепт запуска с
+  инициализацией токена softhsm2 — в §2.2.
 
 ## 2. Тесты
 
@@ -71,7 +68,7 @@ PKCS#11-тесты добавляют дополнительный набор и
 Требует Linux + root + установленный `tessera`:
 
 ```bash
-# В отдельной VM Astra SE 1.7.5:
+# В отдельной VM Astra SE 1.8:
 sudo apt install ./target/release/tessera_0.4.0-1_amd64.deb
 sudo /usr/share/tessera/integrate-pam.sh --mode=2fa /etc/pam.d/sudo
 pamtester sudo alice authenticate
@@ -160,7 +157,20 @@ cargo test --workspace
 5. **Слить через squash + rebase merge.** Большие PR — review по 3–5
    коммитов; squash в `main` для чистой истории.
 
-## 6. Как добавить новый PKCS#11-провайдер
+## 6. Git hooks
+
+Репозиторий поставляет хуки в `scripts/git-hooks/`, которые блокируют
+коммиты и пуши в `main` по будням с 08:00 до 19:00 локального времени.
+Включаются однократно на каждый клон:
+
+```sh
+git config core.hooksPath scripts/git-hooks
+```
+
+`git commit --no-verify` / `git push --no-verify` — обход в экстренных
+случаях.
+
+## 7. Как добавить новый PKCS#11-провайдер
 
 Текущая поддержка реализована в
 [`crates/tessera_core/src/token/`](../../crates/tessera_core/src/token/).
@@ -182,7 +192,7 @@ cargo test --workspace
    - [docs/threat-model.md](threat-model.md) — §3.3 (если меняется
      модель угроз).
 
-## 7. Как добавить новый источник host_id
+## 8. Как добавить новый источник host_id
 
 См. [`crates/tessera_core/src/host_identity/`](../../crates/tessera_core/src/host_identity/).
 
@@ -198,7 +208,7 @@ cargo test --workspace
 6. Обновить [docs/configuration.md](configuration.md) (таблица
    `[host_identity]`) и [architecture.md §12](architecture.md#12-host-identity-chain).
 
-## 7.1 Где живёт логика авторизации сертификата
+## 8.1 Где живёт логика авторизации сертификата
 
 Авторизация «какой пользователь на каком хосте» полностью описана в
 самом сертификате через X.509-расширения и проверяется в коде:
@@ -212,7 +222,7 @@ cargo test --workspace
   `host_id_hash` и `pam_user`. См. также
   [docs/cert-issuance.md](cert-issuance.md) для семантики записей.
 
-## 8. Версионирование
+## 9. Версионирование
 
 Семантика SemVer 2.0.0:
 
@@ -231,21 +241,9 @@ cargo test --workspace
   (если изменяется wire-протокол);
 - обновления модели угроз ([docs/threat-model.md](threat-model.md)).
 
-## 9. Дальнейшее чтение
+## 10. Дальнейшее чтение
 
 - [docs/architecture.md](architecture.md).
 - [docs/configuration.md](configuration.md).
 - [docs/threat-model.md](threat-model.md).
 - [docs/changelog.md](changelog.md).
-
-## Git hooks
-
-The repo ships hooks in `scripts/git-hooks/` that block commits and pushes to
-`main` on weekdays between 08:00 and 19:00 local time. Enable them once per
-clone:
-
-```sh
-git config core.hooksPath scripts/git-hooks
-```
-
-`git commit --no-verify` / `git push --no-verify` override in emergencies.
