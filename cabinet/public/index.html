@@ -10,10 +10,26 @@
       No remote fonts/scripts/images/styles, no telemetry beacons — the CSP
       below is the browser-enforced backstop for that invariant, not just a
       hint to reviewers.
+
+      `script-src` carries `'wasm-unsafe-eval'` (not `'unsafe-eval'`): this
+      grants only `WebAssembly.instantiate`/`compile`, not arbitrary
+      `eval`/`Function` — the WASM core (`core/wasmBridge.ts`) needs it to
+      instantiate the module esbuild bundled in; nothing here executes
+      dynamically-constructed JS strings.
+
+      `frame-ancestors` is deliberately NOT in this <meta> CSP: the spec
+      (https://www.w3.org/TR/CSP3/#meta-element) has browsers ignore
+      `frame-ancestors` (and `sandbox`, and report-* directives) when
+      delivered via <meta> — only an HTTP response header enforces it. A
+      self-hosted deployment MUST set it as a real header, e.g. (nginx)
+      `add_header Content-Security-Policy "frame-ancestors 'none'";` or
+      (Cloudflare Pages/YC Object Storage+CDN) the platform's header-rules
+      config. CI: `deploy-issuer.yml` (tasks.md 7.6, not yet written) MUST
+      set this header at both hosting targets — this file cannot.
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+      content="default-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self' data:; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; base-uri 'none'; form-action 'none'"
     />
     <title>Tessera Issuer Cabinet</title>
     <link rel="stylesheet" href="./styles.css" />

@@ -109,19 +109,66 @@ impl OperationSummary {
             Caption::Operation.text(locale),
             self.kind.label(locale),
             Caption::Subject.text(locale),
-            self.subject,
+            neutralize_bidi(&self.subject),
             Caption::Validity.text(locale),
-            self.not_before,
-            self.not_after,
+            neutralize_bidi(&self.not_before),
+            neutralize_bidi(&self.not_after),
         );
         for line in &self.lines {
             out.push_str("\n  ");
             out.push_str(line.caption.text(locale));
             out.push_str(": ");
-            out.push_str(&line.value);
+            out.push_str(&neutralize_bidi(&line.value));
         }
         out
     }
+}
+
+/// Whether `c` is a Unicode bidirectional-control codepoint.
+///
+/// These reorder surrounding text visually without changing its logical order,
+/// the basis of the "Trojan Source" spoof: a right-to-left override inside a
+/// subject can make a displayed distinguished name read as something other than
+/// the bytes that will be signed. None of them belong in a certificate subject
+/// or a scope value, so a summary must not display them raw.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c,
+        '\u{200E}' | '\u{200F}'          // LRM, RLM
+        | '\u{202A}'..='\u{202E}'        // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}') // LRI, RLI, FSI, PDI
+}
+
+/// Replaces every bidi-control codepoint in `value` with a visible `\uXXXX`
+/// marker, so a rendered summary cannot be visually reordered to mislead the
+/// operator. The underlying [`OperationSummary`] value is untouched — this
+/// neutralizes only what is shown, not the data itself.
+fn neutralize_bidi(value: &str) -> String {
+    if !value.contains(is_bidi_control) {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if is_bidi_control(c) {
+            // A stable, operator-legible `\uXXXX` marker; the codepoint never
+            // reaches the terminal or pinentry as an active control. Every
+            // neutralized codepoint fits in four hex digits.
+            out.push('\\');
+            out.push('u');
+            let cp = u32::from(c);
+            for shift in [12u32, 8, 4, 0] {
+                let nibble = (cp >> shift) & 0xF;
+                out.push(hex_upper_nibble(nibble));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// One uppercase hex digit for a nibble (`0..=15`).
+fn hex_upper_nibble(nibble: u32) -> char {
+    char::from_digit(nibble, 16).map_or('0', |c| c.to_ascii_uppercase())
 }
 
 /// Why a TBS could not be turned into a summary.
@@ -566,6 +613,40 @@ mod tests {
             "{:?}",
             summary.lines
         );
+    }
+
+    #[test]
+    fn render_neutralizes_bidi_control_in_subject() {
+        // A subject carrying a right-to-left override and a pop marker: raw, it
+        // could reorder the displayed distinguished name to spoof the operator.
+        let summary = OperationSummary {
+            kind: OperationKind::ShiftLeaf,
+            subject: "CN=admin\u{202E}elor\u{202C}, O=Corp".to_owned(),
+            not_before: "a".to_owned(),
+            not_after: "b".to_owned(),
+            lines: vec![SummaryLine {
+                caption: Caption::Users,
+                value: "\u{2066}root\u{2069}".to_owned(),
+            }],
+        };
+        let rendered = summary.render(Locale::En);
+        // No raw bidi-control codepoint survives into the rendered text.
+        for bad in ['\u{202E}', '\u{202C}', '\u{2066}', '\u{2069}'] {
+            assert!(
+                !rendered.contains(bad),
+                "raw bidi control {:#06X} leaked into render",
+                u32::from(bad)
+            );
+        }
+        // The neutralized markers are shown instead, and ordinary characters of
+        // the subject are preserved.
+        assert!(rendered.contains("\\u202E"), "{rendered}");
+        assert!(rendered.contains("\\u2069"), "{rendered}");
+        assert!(rendered.contains("admin"), "{rendered}");
+        assert!(rendered.contains("root"), "{rendered}");
+
+        // The stored value is untouched — neutralization is display-only.
+        assert!(summary.subject.contains('\u{202E}'));
     }
 
     #[test]

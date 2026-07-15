@@ -172,6 +172,20 @@ button.btn-primary {
   color: var(--error-fg);
 }
 
+.startup-error {
+  background: var(--error-bg);
+  color: var(--error-fg);
+  border-radius: 6px;
+  padding: 1.5rem;
+  margin: 2rem auto;
+  max-width: 40rem;
+}
+
+.startup-error h1 {
+  font-size: 1.1rem;
+  margin-top: 0;
+}
+
 pre {
   white-space: pre-wrap;
   background: var(--field-bg);

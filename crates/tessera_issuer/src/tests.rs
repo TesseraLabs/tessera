@@ -292,6 +292,41 @@ fn leaf_ttl_above_parent_rejected() {
 }
 
 #[test]
+fn self_check_leaf_independently_rejects_ttl_above_parent() {
+    // The self-check is a gate distinct from the pre-sign monotonicity check.
+    // Issue a leaf under a generous parent (so pre-sign passes and we get a
+    // real, well-formed artifact), then re-run the self-check against a tighter
+    // parent envelope: the post-sign gate must catch the over-long TTL on its
+    // own, without relying on pre-sign having run.
+    let backend = MockSigner::ecdsa_sha256(key());
+    let root = root_ca(&backend); // ttl ≤ 86400
+
+    let mut req = leaf_request();
+    req.validity = validity(7_200); // 2h
+    let leaf = issue_leaf(
+        &backend,
+        &key(),
+        &root,
+        &req,
+        &Serial::generate(),
+        &mut fresh_journal(),
+        TS,
+    )
+    .expect("issues under the roomy root")
+    .der;
+
+    let tight_parent = envelope(&["oper"], 5, 3_600); // ttl 1h < the leaf's 2h
+    let err = crate::verify::self_check_leaf(&leaf, &req, &tight_parent).unwrap_err();
+    assert_eq!(
+        err,
+        IssueError::ValidityExceedsParent {
+            requested_secs: 7_200,
+            max_ttl: 3_600
+        }
+    );
+}
+
+#[test]
 fn leaf_scope_equal_to_parent_is_accepted() {
     let backend = MockSigner::ecdsa_sha256(key());
     let root = root_ca(&backend);
@@ -620,15 +655,25 @@ mod csr {
         )
     }
 
-    /// A CSR built with the fixed RSA test key.
+    /// A fixed 1024-bit RSA test key (PKCS#1 DER, base64): below the issuer's
+    /// 2048-bit floor, so a CSR carrying it must be refused before issuance.
+    const WEAK_RSA_TEST_KEY_PKCS1_B64: &str = "MIICXgIBAAKBgQCvpfpB01HAG9jvWvVSDv+YQvBoMY/14YnKLdqrcTTU9MW+oMIeVeXb4XgW/9XUDb/l5cW8yvT73ymEGRX8Lt9QfHMlqZzMor/t/0cSUz1+5LPZ4lL8cpEEWqzbGeW2sWbZer6Hxz7Nm26M75RMRn2UDadFSwzK28HqciaMaY/YQwIDAQABAoGATZ6aPbaFnNBxiCx41l9cYcvK8zBbvruBKYAj7rkjMKxOKlReFAu/fPBhIkDCHGhLEev8+tXxdtCCRybSyVNpSStwZN9Zv9TxiLz0DX3u/sUhEorYOTNWbQHw0SokC5elIpV+YzTFRqnY4I/e+kTNGCY3G28f4GeAPEh+ytp59VkCQQDdNpZjsiCoefPtO1t0wNvrZjwj0X7xQmq5Dwu58SI/P0LzLVs9RVSI8iBWoxDXFOigHbwwL6urrZnF/R0QtoVlAkEAy0UUAkfGvwuu7j9r24DvaqBrHwjyKdyGDrb75Aqy1rlHN1uizQbIBnos5MDzIVghpO6VKzSH3Iys4SLa9NmAhwJBANv/gtdJepMzHbUL+CuH9e8JMLxKh922ON8sqHPW7UFLT/D6ZafswGKlsiWXbJMKt0Mt709YyXkmYCz4SiSp8MUCQQCiTP209GqUkFeUk78i/MgtcvkVRqdVFWdUyHZHluNE35slcF2FJyz/Pv4piIaY0S3L61Pfs4nnZ8uB17rMVf5xAkEAww/OY1RrjwHnHL8quEHh34lAKYaoY4Nmie8U40iwKlr4RrUTeBMG22PmerQ1D5+pHtt9HvXnJvVTswc6lvyIYA==";
+
+    /// A CSR built with the fixed 2048-bit RSA test key.
     fn rsa_csr(subject: &str, attributes: Attributes) -> Vec<u8> {
+        rsa_csr_with_key(RSA_TEST_KEY_PKCS1_B64, subject, attributes)
+    }
+
+    /// A CSR built with the RSA private key in `key_pkcs1_b64` (PKCS#1 DER,
+    /// base64), so both key sizes reuse one signing path.
+    fn rsa_csr_with_key(key_pkcs1_b64: &str, subject: &str, attributes: Attributes) -> Vec<u8> {
         use base64::Engine as _;
         use rsa::pkcs1::DecodeRsaPrivateKey as _;
         use rsa::pkcs1v15::Pkcs1v15Sign;
         use rsa::pkcs8::EncodePublicKey as _;
 
         let key_der = base64::engine::general_purpose::STANDARD
-            .decode(RSA_TEST_KEY_PKCS1_B64)
+            .decode(key_pkcs1_b64)
             .expect("decode RSA test key");
         let private_key = rsa::RsaPrivateKey::from_pkcs1_der(&key_der).expect("load RSA test key");
         let public_key = rsa::RsaPublicKey::from(&private_key);
@@ -789,6 +834,25 @@ mod csr {
         )
         .expect("RSA CSR leaf issues");
         assert!(!issued.der.is_empty());
+    }
+
+    #[test]
+    fn weak_rsa_csr_rejected_before_issuing() {
+        // A 1024-bit RSA CSR must be refused even though its self-signature is
+        // valid: the key is below the issuer's strength floor, so it never backs
+        // a leaf.
+        let csr_der = rsa_csr_with_key(WEAK_RSA_TEST_KEY_PKCS1_B64, "CN=weak", no_attributes());
+        let csr = Csr::parse(&csr_der).unwrap();
+        let err = csr
+            .verify_proof_of_possession()
+            .expect_err("a 1024-bit RSA key is too weak to certify");
+        assert_eq!(
+            err,
+            IssueError::CsrWeakRsaKey {
+                bits: 1024,
+                minimum: 2048,
+            }
+        );
     }
 
     #[test]

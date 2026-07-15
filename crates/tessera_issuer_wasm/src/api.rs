@@ -96,6 +96,28 @@ fn b64_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// The smallest accepted serial-entropy input, in bytes. `Serial::from_entropy`
+/// canonicalises to a positive ≤ 20-octet integer; 16 bytes is the 128-bit-class
+/// floor. Fewer bytes yields a short, guessable serial, so the cabinet must
+/// supply at least this many.
+const MIN_SERIAL_ENTROPY_BYTES: usize = 16;
+
+/// Decode caller-supplied serial entropy and enforce the minimum length before
+/// it reaches `Serial::from_entropy`.
+///
+/// A too-short (or empty) input would produce a predictable serial, so it is
+/// rejected here with a typed error rather than being silently accepted.
+fn decode_serial_entropy(value: &str) -> Result<Vec<u8>, ApiError> {
+    let bytes = b64_decode(value)?;
+    if bytes.len() < MIN_SERIAL_ENTROPY_BYTES {
+        return Err(ApiError::msg(format!(
+            "serial_entropy_b64 must decode to at least {MIN_SERIAL_ENTROPY_BYTES} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Return the certificate/CSR DER, decoding a PEM wrapper when the bytes begin
 /// (after whitespace) with `-`; otherwise pass the DER through unchanged.
 fn pem_or_der(bytes: &[u8]) -> Result<Vec<u8>, ApiError> {
@@ -417,7 +439,7 @@ fn build_leaf_inner(input: &str) -> Result<BuildTbsResponse, ApiError> {
     let request: BuildLeafInput = parse_input(input)?;
     let parent = pem_or_der(&b64_decode(&request.parent_b64)?)?;
     let algorithm = parse_algorithm(&request.algorithm)?;
-    let serial = Serial::from_entropy(&b64_decode(&request.serial_entropy_b64)?);
+    let serial = Serial::from_entropy(&decode_serial_entropy(&request.serial_entropy_b64)?);
     let locale = parse_locale(request.locale.as_deref());
     let backend = CapturingBackend::new(algorithm);
     let key = KeyId::new(CABINET_KEY);
@@ -493,7 +515,7 @@ fn build_ca_inner(input: &str) -> Result<BuildTbsResponse, ApiError> {
     let request: BuildCaInput = parse_input(input)?;
     let parent = pem_or_der(&b64_decode(&request.parent_b64)?)?;
     let algorithm = parse_algorithm(&request.algorithm)?;
-    let serial = Serial::from_entropy(&b64_decode(&request.serial_entropy_b64)?);
+    let serial = Serial::from_entropy(&decode_serial_entropy(&request.serial_entropy_b64)?);
     let locale = parse_locale(request.locale.as_deref());
     let backend = CapturingBackend::new(algorithm);
     let key = KeyId::new(CABINET_KEY);

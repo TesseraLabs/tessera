@@ -64,13 +64,24 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
-      - name: Resolve release tag
+      - name: Resolve and validate release tag
         id: resolve
-        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+        # Значение приходит из ненадёжного источника (имя тега / dispatch-инпут) —
+        # пробрасываем через env, не интерполируем в тело скрипта (script injection),
+        # и допускаем только строгий шаблон релизного тега `vN.N.N[...]`.
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RAW_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Refusing to deploy ref '$RAW_TAG' — expected a release tag like v0.4.0."
+            exit 1
+          fi
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v6
         with:
-          ref: ${{ steps.resolve.outputs.tag }}
+          ref: refs/tags/${{ steps.resolve.outputs.tag }}
 
       # Кабинет — npm/esbuild/TypeScript SPA поверх wasm-ядра: build.sh нужны
       # Node и Rust+wasm32 (см. issuer.yml). Скрипт самодостаточен.
@@ -118,6 +129,9 @@ jobs:
     needs: build
     if: github.repository == 'TesseraLabs/tessera'
     runs-on: ubuntu-latest
+    # Прод-деплой за environment-гейтом: required reviewers / branch-политику
+    # настраивает владелец репозитория в Settings → Environments → production.
+    environment: production
     steps:
       - name: Download cabinet artifact
         uses: actions/download-artifact@v8
@@ -126,7 +140,9 @@ jobs:
           path: dist
 
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
+        # Запиннен по commit-SHA (сторонний action с боевым CF-токеном) — паритет
+        # с остальными сторонними actions репозитория.
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -139,6 +155,7 @@ jobs:
     needs: build
     if: github.repository == 'TesseraLabs/tessera'
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - name: Download cabinet artifact
         uses: actions/download-artifact@v8
@@ -171,8 +188,15 @@ jobs:
             echo "::notice::YC_SA_KEY_JSON / YC_CDN_RESOURCE_ID not set — skipping CDN purge (TTL will expire)."
             exit 0
           fi
-          curl -sSL https://storage.yandexcloud.net/yandexcloud/yandex-cloud-install.sh | bash
-          export PATH="$HOME/yandex-cloud/bin:$PATH"
+          # Пиннутый бинарь yc + проверка SHA-256 вместо `curl | bash` (не исполняем
+          # неаудируемый remote-скрипт в шаге, где присутствует ключ сервис-аккаунта).
+          # Обновление версии — осознанное: заменить YC_VERSION и YC_SHA256 вместе.
+          YC_VERSION=1.18.0
+          YC_SHA256=6cc5dce883476fd1c6cf53d130231cac9d7021b22075969e981fb996e1d40bf5
+          curl -sSLf "https://storage.yandexcloud.net/yandexcloud-yc/release/${YC_VERSION}/linux/amd64/yc" -o "$RUNNER_TEMP/yc"
+          echo "${YC_SHA256}  ${RUNNER_TEMP}/yc" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/yc"
+          export PATH="$RUNNER_TEMP:$PATH"
           printf '%s' "$YC_SA_KEY_JSON" > "$RUNNER_TEMP/yc-sa-key.json"
           yc config profile create ci >/dev/null 2>&1 || yc config profile activate ci
           yc config set service-account-key "$RUNNER_TEMP/yc-sa-key.json"

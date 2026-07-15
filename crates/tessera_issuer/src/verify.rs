@@ -119,6 +119,18 @@ pub(crate) fn self_check_leaf(
         (None, Some(_)) => return Err(reject("max_integrity present but not requested")),
     }
 
+    // Validity duration ≤ parent.max_ttl. Pre-sign already enforces this; the
+    // self-check re-affirms it as an independent gate so a future path that
+    // reached signing without the pre-sign check could still not release a leaf
+    // that outlives its parent's ceiling.
+    let duration = req.validity.duration_secs();
+    if duration > parent.max_ttl {
+        return Err(IssueError::ValidityExceedsParent {
+            requested_secs: duration,
+            max_ttl: parent.max_ttl,
+        });
+    }
+
     Ok(())
 }
 

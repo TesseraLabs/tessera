@@ -34,10 +34,13 @@ use tessera_core::x509::{host_binding_ext, user_binding_ext, VerifiedX509};
 
 use tessera_ext::delegation::DelegationConstraints;
 use tessera_issuer::sign::{KeyId, SignError, Signature, SignatureAlgorithm, SignatureBackend};
-use tessera_issuer::test_support::{self_signed_ca, spki_fixture};
+use tessera_issuer::test_support::{self_signed_ca, spki_fixture, MemoryStorage};
 use tessera_issuer::{
-    issue_ca, issue_leaf, CaRequest, IntegrityCeiling, LeafRequest, Serial, Validity,
+    issue_ca, issue_leaf, CaRequest, IntegrityCeiling, Journal, LeafRequest, Serial, Validity,
 };
+
+/// Fixed issuance clock (Unix seconds) for the journal entries this suite mints.
+const NOW_UNIX: u64 = 1_700_000_000;
 
 /// A signing backend using a real, fixed P-256 key (RFC 6979 deterministic
 /// ECDSA over SHA-256).
@@ -105,6 +108,8 @@ fn verified(der: &[u8]) -> VerifiedX509 {
 /// Builds a root → org CA → leaf chain through the issuer, returning the CA and
 /// leaf DER (the leaf request is fixed by the caller's expectations below).
 fn issue_chain(backend: &P256Signer, key: &KeyId) -> (Vec<u8>, Vec<u8>) {
+    let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+
     let root = self_signed_ca(
         backend,
         key,
@@ -116,6 +121,8 @@ fn issue_chain(backend: &P256Signer, key: &KeyId) -> (Vec<u8>, Vec<u8>) {
             profile_version: 1,
         },
         &Serial::generate(),
+        &mut journal,
+        NOW_UNIX,
     )
     .unwrap()
     .der;
@@ -132,6 +139,8 @@ fn issue_chain(backend: &P256Signer, key: &KeyId) -> (Vec<u8>, Vec<u8>) {
             profile_version: 2,
         },
         &Serial::generate(),
+        &mut journal,
+        NOW_UNIX,
     )
     .unwrap()
     .der;
@@ -149,9 +158,17 @@ fn issue_chain(backend: &P256Signer, key: &KeyId) -> (Vec<u8>, Vec<u8>) {
         }),
         profile_version: 2,
     };
-    let leaf = issue_leaf(backend, key, &org, &leaf_req, &Serial::generate())
-        .unwrap()
-        .der;
+    let leaf = issue_leaf(
+        backend,
+        key,
+        &org,
+        &leaf_req,
+        &Serial::generate(),
+        &mut journal,
+        NOW_UNIX,
+    )
+    .unwrap()
+    .der;
     (org, leaf)
 }
 

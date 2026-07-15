@@ -59,6 +59,14 @@ origins — serve `dist/` from an actual (even local) HTTP server (e.g.
 `index.html`: browsers apply CORS to `file://` fetches independently of CSP,
 and the WASM binary is loaded via `fetch()`.
 
+**`frame-ancestors` is not in the `<meta>` CSP** — browsers ignore that
+directive (and `sandbox`/report-* ones) when delivered via `<meta>`; only a
+real HTTP response header enforces it. Any hosting of `dist/` (self-hosted
+or the future `issuer.tessera-access.{com,ru}` deploy) MUST set
+`Content-Security-Policy: frame-ancestors 'none'` as an actual header at the
+server/CDN layer — see the comment in `public/index.html` for the concrete
+config line per common setups.
+
 ## Why the bundling shape it is
 
 `wasm-bindgen --target web`'s generated `init()` fetches

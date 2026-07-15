@@ -345,6 +345,58 @@ fn build_leaf_tbs_requires_exactly_one_key_source() {
 }
 
 #[test]
+fn build_leaf_tbs_rejects_short_serial_entropy() {
+    let root = root_cert();
+    let org = org_ca_cert(&root);
+    // 15 bytes: one below the 16-byte floor, so the serial would be short and
+    // guessable — the builder must refuse before assembling the TBS.
+    let input = json!({
+        "parent_b64": b64(&org),
+        "algorithm": "ecdsa-p256",
+        "serial_entropy_b64": b64(&[0x11; 15]),
+        "request": leaf_request_value(),
+    });
+    let out = err(build_leaf_tbs(&input.to_string()));
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap()
+            .contains("serial_entropy_b64"),
+        "{out}"
+    );
+}
+
+#[test]
+fn build_ca_tbs_rejects_short_serial_entropy() {
+    let root = root_cert();
+    let input = json!({
+        "parent_b64": b64(&root),
+        "algorithm": "ecdsa-p256",
+        "serial_entropy_b64": b64(&[0x11; 15]),
+        "request": json!({
+            "subject": "CN=Org CA,O=Org",
+            "spki_b64": b64(&spki_fixture()),
+            "validity": { "not_before": TS, "not_after": NOT_AFTER },
+            "constraints": {
+                "require_tags": [],
+                "allow_roles": ["oper"],
+                "max_level": 4,
+                "max_ttl": 3_600
+            },
+            "profile_version": 1
+        }),
+    });
+    let out = err(build_ca_tbs(&input.to_string()));
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap()
+            .contains("serial_entropy_b64"),
+        "{out}"
+    );
+}
+
+#[test]
 fn build_leaf_tbs_from_valid_csr_succeeds() {
     let root = root_cert();
     let org = org_ca_cert(&root);

@@ -162,26 +162,25 @@ pub fn read_tlv_expect(input: &[u8], tag: u8) -> Result<Tlv<'_>, DerError> {
 ///
 /// Returns a [`DerError`] when the encoding is malformed.
 pub fn oid_to_dotted(content: &[u8]) -> Result<String, DerError> {
-    let (&first, rest_bytes) = content.split_first().ok_or(DerError::EmptyOid)?;
-    let arc1 = u128::from(first / 40);
-    let arc2 = u128::from(first % 40);
+    let mut iter = content.iter();
+    // The first subidentifier packs the first two arcs as `40 * arc1 + arc2` and
+    // is itself a base-128 value — multi-byte once it reaches 128, exactly as
+    // `encode_oid` emits it. Decoding it as a single octet (the earlier
+    // `first / 40`) only happened to work because every project OID keeps that
+    // subidentifier below 128; a general OID codec must read the full value.
+    let first_subid = read_base128_subid(&mut iter)?.ok_or(DerError::EmptyOid)?;
+    // X.690 §8.19.4: arc1 is 0, 1, or 2; only for arc1 == 2 may arc2 exceed 39,
+    // so subidentifiers ≥ 80 all belong to arc1 == 2.
+    let (arc1, arc2) = if first_subid < 80 {
+        (first_subid / 40, first_subid % 40)
+    } else {
+        (2, first_subid - 80)
+    };
     let mut parts: Vec<u128> = Vec::with_capacity(8);
     parts.push(arc1);
     parts.push(arc2);
 
-    let mut iter = rest_bytes.iter();
-    while let Some(&byte) = iter.next() {
-        let mut value = u128::from(byte & 0x7F);
-        let mut more = byte & 0x80 != 0;
-        while more {
-            let &b = iter.next().ok_or(DerError::TruncatedOidArc)?;
-            // Detect overflow before the shift would lose high bits.
-            if value > (u128::MAX >> 7) {
-                return Err(DerError::OidArcOverflow);
-            }
-            value = (value << 7) | u128::from(b & 0x7F);
-            more = b & 0x80 != 0;
-        }
+    while let Some(value) = read_base128_subid(&mut iter)? {
         parts.push(value);
     }
 
@@ -240,6 +239,34 @@ fn parse_arc(arc: Option<&str>) -> Result<u128, DerError> {
     let arc = arc.ok_or_else(|| DerError::InvalidOid("fewer than two arcs".to_owned()))?;
     arc.parse::<u128>()
         .map_err(|_| DerError::InvalidOid(format!("arc {arc:?} is not a u128")))
+}
+
+/// Reads one base-128 subidentifier from `iter`, the inverse of
+/// [`encode_base128`].
+///
+/// Returns `Ok(None)` when the iterator is already exhausted at a clean
+/// subidentifier boundary (the end of the OID). A subidentifier whose
+/// continuation bit is set but whose octets then run out is
+/// [`DerError::TruncatedOidArc`]; one that would exceed [`u128`] is
+/// [`DerError::OidArcOverflow`].
+fn read_base128_subid<'a>(
+    iter: &mut impl Iterator<Item = &'a u8>,
+) -> Result<Option<u128>, DerError> {
+    let Some(&first) = iter.next() else {
+        return Ok(None);
+    };
+    let mut value = u128::from(first & 0x7F);
+    let mut more = first & 0x80 != 0;
+    while more {
+        let &b = iter.next().ok_or(DerError::TruncatedOidArc)?;
+        // Detect overflow before the shift would lose high bits.
+        if value > (u128::MAX >> 7) {
+            return Err(DerError::OidArcOverflow);
+        }
+        value = (value << 7) | u128::from(b & 0x7F);
+        more = b & 0x80 != 0;
+    }
+    Ok(Some(value))
 }
 
 /// Appends `value` to `out` as base-128 subidentifier octets: 7 bits per octet,
@@ -435,6 +462,28 @@ mod tests {
             let content = encode_oid(oid).expect("project OID encodes");
             let decoded = oid_to_dotted(&content).expect("re-decodes");
             assert_eq!(decoded, oid, "round-trip mismatch for {oid}");
+        }
+    }
+
+    #[test]
+    fn decodes_multibyte_first_subidentifier() {
+        // 2.100.3: first subidentifier is 40*2 + 100 = 180, which needs two
+        // base-128 octets (0x81 0x34). Decoding the first octet alone would
+        // mis-split the arcs; the codec must read the whole subidentifier.
+        let encoded = encode_oid("2.100.3").expect("encodes");
+        assert_eq!(encoded, vec![0x81, 0x34, 0x03]);
+        assert_eq!(oid_to_dotted(&encoded).expect("decodes"), "2.100.3");
+    }
+
+    #[test]
+    fn first_subidentifier_round_trips_across_the_multibyte_boundary() {
+        // arc1 == 2 lets arc2 grow without bound, so the first subidentifier
+        // (40*2 + arc2) crosses from one octet into two right at arc2 == 88
+        // (subidentifier 168 > 127); exercise both sides of that boundary.
+        for arc2 in [39_u128, 40, 79, 87, 88, 89, 200, 1_000] {
+            let dotted = format!("2.{arc2}.7");
+            let encoded = encode_oid(&dotted).expect("encodes");
+            assert_eq!(oid_to_dotted(&encoded).expect("decodes"), dotted);
         }
     }
 

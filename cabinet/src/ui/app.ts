@@ -15,6 +15,7 @@ import { parseJournalFile, renderJournalFile, renderJournalStatus } from "../cor
 import { lastCrlNumber, revocationCandidates } from "../core/journalEntries.ts";
 import { pemOrDer } from "../core/pem.ts";
 import { acceptSnapshot, type AcceptedSnapshot } from "../core/snapshot.ts";
+import { startupErrorText } from "../core/startupError.ts";
 import {
   assembleAndVerify,
   buildCaTbs,
@@ -91,9 +92,32 @@ export class App {
     this.#agentSettings = loadAgentSettings(storage);
   }
 
+  /**
+   * Never rejects: a failure to initialise the WASM core (CSP blocking
+   * `WebAssembly.instantiate`, a missing/corrupt `.wasm` artifact, an
+   * unsupported browser) renders a fail-closed error screen instead of
+   * leaving `#app` empty. `main.ts` still wraps the call for defense in
+   * depth against a failure this method itself can't catch (e.g. the
+   * constructor throwing before `this.#locale` exists).
+   */
   async start(): Promise<void> {
-    await ensureWasmReady();
+    try {
+      await ensureWasmReady();
+    } catch (e) {
+      this.renderStartupError(e);
+      return;
+    }
     this.render();
+  }
+
+  private renderStartupError(error: unknown): void {
+    const text = startupErrorText(this.#locale, error);
+    this.#root.replaceChildren(
+      el("div", { class: "startup-error" }, [
+        el("h1", {}, [text.title]),
+        el("p", {}, [text.detail]),
+      ]),
+    );
   }
 
   private setLocale(locale: Locale): void {
@@ -592,7 +616,7 @@ export class App {
       type: "text",
       value: this.#agentSettings?.address ?? "http://127.0.0.1:",
     });
-    const tokenInput = el("input", { type: "text", value: this.#agentSettings?.token ?? "" });
+    const tokenInput = el("input", { type: "password", value: this.#agentSettings?.token ?? "" });
     const keyInput = el("input", { type: "text", value: this.#agentSettings?.keyId ?? "" });
     const statusEl = el("span", { class: "agent-status" }, [this.t("agent_status_unknown")]);
 

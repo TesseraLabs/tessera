@@ -100,9 +100,15 @@ impl VaultSigner {
     ///
     /// # Errors
     ///
-    /// [`VaultSignError::CaBundle`] when [`VaultConfig::ca_bundle_path`] is set
-    /// but the file cannot be read or holds no valid PEM certificate.
+    /// - [`VaultSignError::InsecureAddress`] when [`VaultConfig::address`] is not
+    ///   an `https://` URL: the `X-Vault-Token` header authenticates every
+    ///   request, so an `http://` endpoint would send the bearer token in the
+    ///   clear. Transit signing must always run over TLS — there is no localhost
+    ///   exception.
+    /// - [`VaultSignError::CaBundle`] when [`VaultConfig::ca_bundle_path`] is set
+    ///   but the file cannot be read or holds no valid PEM certificate.
     pub fn new(config: VaultConfig, token: SecretString) -> Result<Self, VaultSignError> {
+        require_https(&config.address)?;
         let agent = build_agent(config.ca_bundle_path.as_deref())?;
         Ok(Self {
             config,
@@ -207,6 +213,24 @@ impl SignatureBackend for VaultSigner {
             algorithm: self.config.algorithm,
             bytes,
         })
+    }
+}
+
+/// Rejects a Vault address that is not an `https://` URL.
+///
+/// The Vault token travels in the `X-Vault-Token` request header, so a plaintext
+/// `http://` endpoint would expose it on the wire. TLS is mandatory for every
+/// contour, including localhost, because Transit signing has no plaintext mode.
+///
+/// The scheme match is ASCII case-insensitive, as URL schemes are.
+pub(crate) fn require_https(address: &str) -> Result<(), VaultSignError> {
+    let scheme_ok = address
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+    if scheme_ok {
+        Ok(())
+    } else {
+        Err(VaultSignError::InsecureAddress(address.to_owned()))
     }
 }
 
@@ -320,6 +344,9 @@ pub enum VaultSignError {
     /// `VAULT_TOKEN` was unset or empty when building from the environment.
     #[error("vault token missing (set VAULT_TOKEN)")]
     MissingToken,
+    /// The Vault address is not `https://`; the token would travel in the clear.
+    #[error("vault address must be https:// (got {0:?})")]
+    InsecureAddress(String),
     /// The algorithm has no Vault Transit representation here (Ed25519 is not
     /// wired up).
     #[error("algorithm not supported by the vault adapter: {0:?}")]
@@ -362,6 +389,31 @@ mod tests {
         let rendered = format!("{signer:?}");
         assert!(!rendered.contains(SECRET_TOKEN), "{rendered}");
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn http_address_is_rejected() {
+        let mut config = config();
+        config.address = "http://vault.example:8200".to_owned();
+        let err = VaultSigner::new(config, SecretString::from(SECRET_TOKEN.to_owned()))
+            .expect_err("an http:// Vault address must fail construction");
+        assert!(matches!(err, VaultSignError::InsecureAddress(_)), "{err:?}");
+    }
+
+    #[test]
+    fn http_localhost_is_rejected_too() {
+        // Transit signing has no plaintext mode, so even localhost must be TLS.
+        assert!(matches!(
+            require_https("http://127.0.0.1:8200"),
+            Err(VaultSignError::InsecureAddress(_))
+        ));
+    }
+
+    #[test]
+    fn https_address_is_accepted() {
+        // Case-insensitive scheme, as URLs are.
+        assert!(require_https("https://vault.example:8200").is_ok());
+        assert!(require_https("HTTPS://vault.example:8200").is_ok());
     }
 
     #[test]

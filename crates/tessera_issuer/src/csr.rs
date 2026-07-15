@@ -37,6 +37,12 @@ const RSA_PKCS1_SHA256_OID: &str = "1.2.840.113549.1.1.11";
 /// PKCS#9 `extensionRequest` attribute — the requested-extensions carrier.
 const EXTENSION_REQUEST_OID: &str = "1.2.840.113549.1.9.14";
 
+/// Minimum accepted RSA modulus size, in bits. 2048 is the floor for a CSR key
+/// the issuer will certify; anything below is refused as proof of possession of
+/// a key too weak to bind a leaf to. ECDSA curves (P-256/P-384) carry their own
+/// strength in the curve choice and are not size-gated here.
+const MIN_RSA_KEY_BITS: u64 = 2048;
+
 /// The ASN.1 `DigestInfo` prefix for SHA-256 (RFC 8017 §9.2): the fixed
 /// `SEQUENCE { SEQUENCE { id-sha256, NULL }, OCTET STRING }` header that
 /// precedes the 32-byte digest in a PKCS#1 v1.5 signature.
@@ -272,9 +278,20 @@ fn verify_rsa_pkcs1_sha256(
 ) -> Result<(), IssueError> {
     use rsa::pkcs1v15::Pkcs1v15Sign;
     use rsa::pkcs8::DecodePublicKey as _;
+    use rsa::traits::PublicKeyParts as _;
 
     let key = rsa::RsaPublicKey::from_public_key_der(spki_der)
         .map_err(|e| IssueError::CsrInvalidKey(e.to_string()))?;
+    // Refuse a modulus below the strength floor before spending a verification:
+    // a weak key must never back an issued leaf, regardless of whether its
+    // self-signature checks out.
+    let bits = key.n().bits() as u64;
+    if bits < MIN_RSA_KEY_BITS {
+        return Err(IssueError::CsrWeakRsaKey {
+            bits,
+            minimum: MIN_RSA_KEY_BITS,
+        });
+    }
     let mut hashed = [0u8; 32];
     hashed.copy_from_slice(&Sha256::digest(message));
     // The digest plus the fixed SHA-256 DigestInfo prefix is the PKCS#1 v1.5

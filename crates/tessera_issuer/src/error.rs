@@ -102,6 +102,15 @@ pub enum IssueError {
     /// declared.
     #[error("invalid CSR public key: {0}")]
     CsrInvalidKey(String),
+    /// A CSR's RSA public key is below the minimum accepted modulus size, so it
+    /// is refused before issuance.
+    #[error("CSR RSA key too weak: {bits}-bit modulus, minimum is {minimum}")]
+    CsrWeakRsaKey {
+        /// The CSR key's modulus size in bits.
+        bits: u64,
+        /// The smallest accepted modulus size in bits.
+        minimum: u64,
+    },
     /// A CSR's self-signature did not verify under its own public key, so
     /// proof of possession failed and no certificate is issued.
     #[error("CSR proof-of-possession failed: self-signature does not verify")]

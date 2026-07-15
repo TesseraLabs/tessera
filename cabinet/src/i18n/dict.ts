@@ -147,6 +147,10 @@ export const en = {
   section_snapshot: "Inventory snapshot",
   section_agent: "Signing agent",
   section_journal: "Issuance journal",
+
+  // Startup failure (fail-closed screen when the WASM core fails to initialise)
+  startup_error_title: "The cabinet failed to start",
+  startup_error_detail: "The issuance core could not be loaded. Technical detail",
 } as const;
 
 export type DictKey = keyof typeof en;
@@ -282,4 +286,7 @@ export const ru: Dict = {
   section_snapshot: "Снапшот инвентаря",
   section_agent: "Агент подписи",
   section_journal: "Журнал выпусков",
+
+  startup_error_title: "Кабинет не смог инициализироваться",
+  startup_error_detail: "Не удалось загрузить ядро выпуска. Техническая информация",
 };

@@ -1,10 +1,13 @@
 // HTTP client for the local `issuer serve` agent (spec `issuer-signing` —
 // "Локальный агент issuer serve"; protocol in
 // `crates/tessera_issuer/src/serve.rs`). This is the cabinet's only network
-// call (spec `issuer-cabinet` — "Никаких внешних обращений"): callers must
-// only ever pass an `http://127.0.0.1:*` or `http://localhost:*` address —
-// the CSP in `public/index.html` enforces that at the browser level, this
-// module does not re-check it.
+// call (spec `issuer-cabinet` — "Никаких внешних обращений"): the CSP in
+// `public/index.html` enforces the loopback restriction at the browser
+// level, but `assertLoopbackAddress` below re-checks it in this module too
+// — an operator-editable address field is one typo away from `connect-src`
+// simply blocking a *different* attempt rather than the intended one, and a
+// clear rejection here is a better failure mode than "request blocked by
+// CSP" with no context about which address was wrong.
 
 import type { AgentAlgorithmTag, AgentInfoResponse, SignatureAlgorithmTag } from "../types.ts";
 
@@ -31,6 +34,39 @@ export function agentAlgorithmToWasmTag(agentTag: AgentAlgorithmTag): SignatureA
   }
 }
 
+/**
+ * Whether `address` parses as `http(s)://<loopback-host>[:port]` — exactly
+ * `127.0.0.1`, `::1` (bracketed, `[::1]`), or `localhost`, case-insensitive.
+ * No path/query/fragment beyond an optional trailing slash, no other host
+ * (including other `127.*` addresses, `0.0.0.0`, or a hostname that merely
+ * resolves to loopback via DNS — matching `issuer serve`'s own bind to
+ * `127.0.0.1` literally, per `crates/tessera_issuer/src/serve.rs`).
+ */
+export function isLoopbackAgentAddress(address: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(address);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  if (url.pathname !== "" && url.pathname !== "/") return false;
+  if (url.search !== "" || url.hash !== "") return false;
+  // The WHATWG URL parser reports an IPv6 host with its brackets intact
+  // (`hostname` is `"[::1]"`, not `"::1"`), unlike an IPv4 literal or a name.
+  const host = url.hostname.toLowerCase();
+  return host === "127.0.0.1" || host === "[::1]" || host === "localhost";
+}
+
+/** Throws {@link AgentError} unless `address` is a loopback agent address (see {@link isLoopbackAgentAddress}). */
+function assertLoopbackAddress(address: string): void {
+  if (!isLoopbackAgentAddress(address)) {
+    throw new AgentError(
+      `agent address must be http(s)://127.0.0.1, ::1, or localhost — refusing to contact "${address}"`,
+    );
+  }
+}
+
 async function parseJsonOrThrow<T>(response: Response): Promise<T> {
   const text = await response.text();
   let body: unknown;
@@ -51,6 +87,7 @@ async function parseJsonOrThrow<T>(response: Response): Promise<T> {
 
 /** `GET /info` — used to confirm the configured agent is reachable and to show its advertised algorithms. */
 export async function agentInfo(address: string, token: string): Promise<AgentInfoResponse> {
+  assertLoopbackAddress(address);
   let response: Response;
   try {
     response = await fetch(`${address.replace(/\/$/, "")}/info`, {
@@ -70,6 +107,7 @@ export async function agentSign(
   keyId: string,
   tbsDerB64: string,
 ): Promise<AgentSignResult> {
+  assertLoopbackAddress(address);
   let response: Response;
   try {
     response = await fetch(`${address.replace(/\/$/, "")}/sign`, {

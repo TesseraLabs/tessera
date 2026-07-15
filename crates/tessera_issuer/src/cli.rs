@@ -524,6 +524,11 @@ fn run_vault(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Result
     let address = args.vault_addr.clone().ok_or_else(|| {
         CliError::Usage("--vault-addr is required for the vault backend".to_owned())
     })?;
+    // The Vault token rides in a request header, so the endpoint must be TLS;
+    // reject a plaintext address here for a clear flag-level error rather than
+    // letting it surface as a generic backend failure. Transit signing has no
+    // plaintext mode, so there is no localhost exception.
+    crate::vault::require_https(&address).map_err(|e| CliError::Usage(e.to_string()))?;
     let config = VaultConfig {
         address,
         mount: args.mount.clone(),
