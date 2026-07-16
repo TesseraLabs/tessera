@@ -67,6 +67,19 @@ export interface SnapshotFile {
   signature_b64: string | null;
 }
 
+/**
+ * Serialise a payload assembled in the cabinet's own inventory constructor
+ * into the same file shape a signed export uses, minus a signature (spec
+ * `issuer-cabinet` — "Сборка инвентаря конструктором": collected inventory is
+ * equivalent to an unsigned/manual snapshot). The result round-trips through
+ * {@link acceptSnapshot} exactly like a hand-authored manual snapshot file —
+ * there is no separate "constructed" code path in the acceptance logic, only
+ * in how the JSON gets produced.
+ */
+export function buildManualSnapshot(payload: SnapshotPayload): SnapshotFile {
+  return { payload_json: JSON.stringify(payload), signature_b64: null };
+}
+
 export type SnapshotOrigin = "signed" | "manual";
 
 export interface AcceptedSnapshot {

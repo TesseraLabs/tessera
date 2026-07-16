@@ -6,23 +6,40 @@
 //! and returns a signature from a [`SignatureBackend`] (in production, the
 //! PKCS#11 adapter).
 //!
-//! Three defences gate every request, and the first two run *before* the
-//! signing backend is ever touched:
+//! Three defences gate every *signing* request, and the first two run *before*
+//! the signing backend is ever touched:
 //!
-//! 1. **Origin allowlist.** A request with no `Origin`, or an `Origin` outside
-//!    the configured allowlist, is refused — the CSRF / DNS-rebinding guard.
-//!    CORS preflight (`OPTIONS`) is answered only for allowlisted origins.
-//! 2. **Paired session token.** The agent mints a random token at startup and
-//!    prints it once for the operator to paste into the cabinet; every request
-//!    must echo it in the [`SESSION_HEADER`] header, compared in constant time.
-//! 3. **Routing.** `POST /sign` and `GET /info` only.
+//! 1. **Paired session token (primary).** The agent mints a random token at
+//!    startup and prints it once for the operator to paste into the cabinet;
+//!    every request must echo it in the [`SESSION_HEADER`] header, compared in
+//!    constant time. A request without the token is refused.
+//! 2. **Origin (secondary).** A *present* `Origin` must be in the allowlist — the
+//!    CSRF / DNS-rebinding guard — but an *absent* `Origin` is not itself a
+//!    refusal, since browsers omit it on same-origin `GET` and the agent's own
+//!    served cabinet must reach `/info`. CORS preflight (`OPTIONS`) is answered
+//!    only for allowlisted origins.
+//! 3. **Routing.** `POST /sign` and `GET /info`.
 //!
 //! The token PIN is entered on the agent side (terminal/pinentry, via the
 //! backend's own PIN source). The HTTP surface has **no PIN field**: the sign
 //! request carries only a key id and the base64 TBS, so a PIN can neither be
 //! sent to nor leaked by the agent.
+//!
+//! # Serving the cabinet
+//!
+//! The agent may *also* serve the cabinet SPA (its `index.html`, script, styles
+//! and WASM) on the same loopback origin as `/sign`, from either assets embedded
+//! into the binary (feature `embed-cabinet`) or an external `dist/` directory
+//! (see [`CabinetSource`]). Static serving answers browser navigations and
+//! subresource fetches — which carry neither an `Origin` nor the session token —
+//! so it runs *ahead* of the gates above, but only for a fixed set of asset
+//! paths: nothing outside that set is ever read from the filesystem, and the
+//! `/sign` gate is never weakened. When it serves `index.html` the agent injects
+//! the current session token and key label as `<meta>` tags so the operator need
+//! not retype them.
 
 use std::io::Read as _;
+use std::path::Path;
 
 use secrecy::{ExposeSecret, SecretString};
 use subtle::ConstantTimeEq as _;
@@ -42,6 +59,61 @@ pub const SESSION_HEADER: &str = "X-Tessera-Session";
 /// few KiB; this is a generous ceiling that bounds memory per request).
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
+/// The cabinet's embedded assets (`cabinet/dist/`), compiled into the binary.
+///
+/// The path is resolved relative to this crate (`crates/tessera_issuer/`), so
+/// `../../cabinet/dist` reaches the repository's `cabinet/dist/`. The directory
+/// must exist at build time (produced by `cabinet/build.sh`).
+#[cfg(feature = "embed-cabinet")]
+static EMBEDDED_CABINET: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../cabinet/dist");
+
+/// The document served for `GET /` (and `GET /index.html`).
+const INDEX_FILE: &str = "index.html";
+
+/// Content type for the cabinet document.
+const INDEX_CONTENT_TYPE: &str = "text/html; charset=utf-8";
+
+/// The fixed set of non-document cabinet assets, each with its content type.
+///
+/// A request path must match one of these names exactly (leading `/` stripped):
+/// nothing else is ever read, which — together with the exact-match lookup —
+/// keeps path-traversal (`..`, absolute paths, subdirectories) off the table.
+/// The source map (`main.js.map`) is deliberately absent: it is a debugging
+/// artifact with no place in a shipped agent.
+const CABINET_ASSETS: &[(&str, &str)] = &[
+    ("main.js", "text/javascript"),
+    ("styles.css", "text/css"),
+    ("tessera_issuer_wasm_bg.wasm", "application/wasm"),
+];
+
+/// The Content-Security-Policy the agent sends as a real header when it serves
+/// the cabinet. It mirrors the cabinet's own `<meta>` CSP and adds
+/// `frame-ancestors 'none'`, which a `<meta>` CSP cannot enforce — only an HTTP
+/// header can, so hosting the cabinet from the agent is what finally applies it.
+const CABINET_CSP: &str = "default-src 'self'; connect-src 'self' \
+     http://127.0.0.1:* http://localhost:*; img-src 'self' data:; \
+     style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; \
+     base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// Where the agent gets the cabinet's static assets, if it serves them at all.
+///
+/// Default is [`CabinetSource::Disabled`] — a pure signing bridge, unchanged
+/// from the agent's original behaviour. An external directory overrides embedded
+/// assets when both are available.
+#[derive(Debug, Clone, Default)]
+pub enum CabinetSource {
+    /// Do not serve the cabinet; act only as the `/sign` + `/info` bridge.
+    #[default]
+    Disabled,
+    /// Serve assets from an external `dist/` directory. The directory is
+    /// canonicalized and every resolved file is verified to stay inside it.
+    Directory(std::path::PathBuf),
+    /// Serve the assets embedded into the binary at build time.
+    #[cfg(feature = "embed-cabinet")]
+    Embedded,
+}
+
 /// Configuration for the local signing agent.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -53,21 +125,15 @@ pub struct AgentConfig {
     pub allowed_origins: Vec<String>,
     /// Algorithms advertised by `GET /info`.
     pub advertised_algorithms: Vec<SignatureAlgorithm>,
-    /// How the pairing token is delivered at startup.
-    pub token_delivery: TokenDelivery,
+    /// Source of the cabinet's static assets, or [`CabinetSource::Disabled`] to
+    /// run as a pure bridge.
+    pub cabinet: CabinetSource,
+    /// The CA key label the agent signs with, injected into the served
+    /// `index.html` as `<meta name="tessera-agent-key">` so the operator need
+    /// not retype it.
+    pub key_label: String,
     /// The locale for the agent's operator messages.
     pub locale: Locale,
-}
-
-/// Where the startup pairing token is delivered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TokenDelivery {
-    /// Print the token to stdout (interactive operator copies it).
-    #[default]
-    Stdout,
-    /// Write the token to a private per-user runtime file (background/daemon
-    /// use); the file path is printed instead of the token.
-    RuntimeFile,
 }
 
 /// The signing agent: a backend, an operator-confirmation channel, and the
@@ -77,6 +143,8 @@ pub struct Agent<B: SignatureBackend, C: Confirmer> {
     confirmer: C,
     allowed_origins: Vec<String>,
     advertised_algorithms: Vec<SignatureAlgorithm>,
+    cabinet: CabinetSource,
+    key_label: String,
     session_token: SecretString,
     locale: Locale,
 }
@@ -110,22 +178,31 @@ struct HttpInput<'a> {
     body: &'a [u8],
 }
 
-/// What to send back: a status, a JSON body (or empty), and whether the allowed
-/// origin should be echoed in an `Access-Control-Allow-Origin` header.
+/// What to send back: a status, a body, its content type, and whether the
+/// allowed origin should be echoed in an `Access-Control-Allow-Origin` header.
 struct HttpOutput {
     status: u16,
-    body: String,
+    body: Vec<u8>,
+    /// The `Content-Type` to send, or `None` for an empty-body response.
+    content_type: Option<&'static str>,
     cors_origin: Option<String>,
     preflight: bool,
+    /// Whether to attach the cabinet [`CABINET_CSP`] header (static serving).
+    csp: bool,
 }
 
 impl HttpOutput {
-    fn json(status: u16, body: String, origin: &str) -> Self {
+    /// A JSON response. `origin` is echoed in `Access-Control-Allow-Origin` when
+    /// present (a cross-origin cabinet request); a same-origin request carries no
+    /// `Origin`, so no CORS header is emitted.
+    fn json(status: u16, body: String, origin: Option<&str>) -> Self {
         Self {
             status,
-            body,
-            cors_origin: Some(origin.to_owned()),
+            body: body.into_bytes(),
+            content_type: Some("application/json"),
+            cors_origin: origin.map(str::to_owned),
             preflight: false,
+            csp: false,
         }
     }
 
@@ -134,9 +211,37 @@ impl HttpOutput {
     fn refused(status: u16) -> Self {
         Self {
             status,
-            body: String::new(),
+            body: Vec::new(),
+            content_type: None,
             cors_origin: None,
             preflight: false,
+            csp: false,
+        }
+    }
+
+    /// A served cabinet asset: its own content type, no CORS header (the SPA is
+    /// same-origin), and the cabinet CSP header attached.
+    fn asset(status: u16, body: Vec<u8>, content_type: &'static str) -> Self {
+        Self {
+            status,
+            body,
+            content_type: Some(content_type),
+            cors_origin: None,
+            preflight: false,
+            csp: true,
+        }
+    }
+
+    /// A 404 within the cabinet route set (asset missing on disk): carries the
+    /// CSP header but no body, and never touches the filesystem beyond the set.
+    fn asset_not_found() -> Self {
+        Self {
+            status: 404,
+            body: Vec::new(),
+            content_type: None,
+            cors_origin: None,
+            preflight: false,
+            csp: true,
         }
     }
 }
@@ -151,6 +256,8 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
             confirmer,
             allowed_origins: config.allowed_origins,
             advertised_algorithms: config.advertised_algorithms,
+            cabinet: config.cabinet,
+            key_label: config.key_label,
             session_token,
             locale: config.locale,
         }
@@ -175,25 +282,47 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         presented.ct_eq(expected).into()
     }
 
-    /// Apply the full policy to a decomposed request. Origin and token are
-    /// checked before any backend call.
+    /// Apply the full policy to a decomposed request.
+    ///
+    /// The paired token is the primary gate and is always required. Origin is a
+    /// secondary check: a *present* `Origin` must be allowlisted, but an *absent*
+    /// one is not itself a refusal — browsers omit `Origin` on same-origin `GET`,
+    /// so the agent's own served cabinet must be able to reach `/info`. A
+    /// cross-origin page cannot read the injected token, nor set the session
+    /// header on a cross-origin request without a preflight the allowlist blocks,
+    /// and DNS-rebinding carries the attacker's own `Origin` — caught here.
     fn handle(&self, input: &HttpInput<'_>) -> HttpOutput {
-        // 1. Origin allowlist — refuse foreign/absent origins outright.
-        let Some(origin) = input.origin.filter(|o| self.origin_allowed(o)) else {
-            return HttpOutput::refused(403);
+        // Static cabinet serving (opt-in) answers browser navigations and asset
+        // fetches, which carry neither an Origin nor the session token. It runs
+        // ahead of the gates below but only for the fixed cabinet asset set, and
+        // never for `/sign` or `/info`, which stay gated.
+        if input.method == ReqMethod::Get {
+            if let Some(response) = self.try_serve_cabinet(input.path) {
+                return response;
+            }
+        }
+
+        // 1. Origin — a present Origin must be allowlisted; an absent one falls
+        //    through to the token gate (same-origin requests omit it).
+        let origin = match input.origin {
+            Some(o) if self.origin_allowed(o) => Some(o),
+            Some(_) => return HttpOutput::refused(403),
+            None => None,
         };
 
         // 2. Preflight for an allowlisted origin.
         if input.method == ReqMethod::Options {
             return HttpOutput {
                 status: 204,
-                body: String::new(),
-                cors_origin: Some(origin.to_owned()),
+                body: Vec::new(),
+                content_type: None,
+                cors_origin: origin.map(str::to_owned),
                 preflight: true,
+                csp: false,
             };
         }
 
-        // 3. Paired session token — refuse before touching the backend.
+        // 3. Paired session token — the primary gate, refused before the backend.
         if !self.token_ok(input.session_token) {
             return HttpOutput::json(403, error_json("invalid or missing session token"), origin);
         }
@@ -206,7 +335,7 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         }
     }
 
-    fn handle_sign(&self, origin: &str, body: &[u8]) -> HttpOutput {
+    fn handle_sign(&self, origin: Option<&str>, body: &[u8]) -> HttpOutput {
         let Ok(request) = serde_json::from_slice::<SignRequest>(body) else {
             return HttpOutput::json(400, error_json("malformed sign request"), origin);
         };
@@ -269,7 +398,7 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         }
     }
 
-    fn handle_info(&self, origin: &str) -> HttpOutput {
+    fn handle_info(&self, origin: Option<&str>) -> HttpOutput {
         let algorithms: Vec<&str> = self
             .advertised_algorithms
             .iter()
@@ -282,6 +411,147 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         .to_string();
         HttpOutput::json(200, body, origin)
     }
+
+    /// Serve a cabinet asset for `path`, or `None` to fall through to the gated
+    /// routes (`/info`, `/sign`, and any non-cabinet path).
+    ///
+    /// Returns `None` when cabinet serving is disabled or when `path` is not one
+    /// of the fixed cabinet asset paths, so `/info` stays gated and no path
+    /// outside the asset set is ever read from the filesystem.
+    fn try_serve_cabinet(&self, path: &str) -> Option<HttpOutput> {
+        if matches!(self.cabinet, CabinetSource::Disabled) {
+            return None;
+        }
+        let asset = resolve_asset(path)?;
+        let Some(bytes) = self.load_asset(asset.file) else {
+            return Some(HttpOutput::asset_not_found());
+        };
+        if asset.is_index {
+            let html = String::from_utf8_lossy(&bytes);
+            let injected =
+                inject_agent_meta(&html, self.session_token.expose_secret(), &self.key_label);
+            Some(HttpOutput::asset(
+                200,
+                injected.into_bytes(),
+                INDEX_CONTENT_TYPE,
+            ))
+        } else {
+            Some(HttpOutput::asset(200, bytes, asset.content_type))
+        }
+    }
+
+    /// Load a fixed cabinet asset's bytes from the configured source.
+    ///
+    /// `file` is always one of the fixed asset names (no path separators); the
+    /// directory source additionally canonicalizes and verifies containment.
+    fn load_asset(&self, file: &str) -> Option<Vec<u8>> {
+        match &self.cabinet {
+            CabinetSource::Disabled => None,
+            CabinetSource::Directory(root) => read_asset_from_dir(root, file),
+            #[cfg(feature = "embed-cabinet")]
+            CabinetSource::Embedded => EMBEDDED_CABINET
+                .get_file(file)
+                .map(|f| f.contents().to_vec()),
+        }
+    }
+}
+
+/// A resolved cabinet asset: which file to load and how to label it.
+struct ResolvedAsset {
+    file: &'static str,
+    content_type: &'static str,
+    is_index: bool,
+}
+
+/// Map a request path to a fixed cabinet asset, or `None` if it is not one.
+///
+/// Only `/`, `/index.html`, and the exact [`CABINET_ASSETS`] names match; a
+/// path with separators, `..`, or any other name yields `None`.
+fn resolve_asset(path: &str) -> Option<ResolvedAsset> {
+    if path == "/" || path == "/index.html" {
+        return Some(ResolvedAsset {
+            file: INDEX_FILE,
+            content_type: INDEX_CONTENT_TYPE,
+            is_index: true,
+        });
+    }
+    let name = path.strip_prefix('/')?;
+    CABINET_ASSETS
+        .iter()
+        .find(|(asset, _)| *asset == name)
+        .map(|(asset, content_type)| ResolvedAsset {
+            file: asset,
+            content_type,
+            is_index: false,
+        })
+}
+
+/// Read a fixed asset from an external directory, refusing anything that
+/// escapes it.
+///
+/// `file` is already one of the fixed asset names, but the directory root and
+/// the resolved file are both canonicalized and containment is checked, so a
+/// symlink pointing outside the directory is refused too.
+fn read_asset_from_dir(root: &Path, file: &str) -> Option<Vec<u8>> {
+    let root = root.canonicalize().ok()?;
+    let candidate = root.join(file).canonicalize().ok()?;
+    if !candidate.starts_with(&root) {
+        return None;
+    }
+    std::fs::read(&candidate).ok()
+}
+
+/// Inject the session token and key label into the cabinet's `index.html` as
+/// `<meta>` tags, right after the opening `<head>` tag.
+///
+/// Only `<meta>` tags are added — no inline script — so the cabinet's
+/// `script-src` CSP is untouched. Both values are HTML-attribute-escaped. If no
+/// `<head>` is found (not the case for the project's own asset), the HTML is
+/// returned unchanged.
+fn inject_agent_meta(html: &str, token: &str, key_label: &str) -> String {
+    let Some(insert_at) = head_insert_index(html) else {
+        // Fail-safe: the cabinet still loads and falls back to manual entry. But
+        // a silent skip would hide a future index.html restructure that quietly
+        // disables pairing, so make it visible on the agent's console.
+        eprintln!(
+            "issuer serve: warning — cabinet index.html has no <head>; \
+             session token and key were not injected (manual entry required)"
+        );
+        return html.to_owned();
+    };
+    let meta = format!(
+        "\n    <meta name=\"tessera-agent-token\" content=\"{}\" />\
+         \n    <meta name=\"tessera-agent-key\" content=\"{}\" />",
+        escape_attr(token),
+        escape_attr(key_label),
+    );
+    let mut out = String::with_capacity(html.len() + meta.len());
+    out.push_str(&html[..insert_at]);
+    out.push_str(&meta);
+    out.push_str(&html[insert_at..]);
+    out
+}
+
+/// The byte offset just past the first `<head …>` opening tag, or `None`.
+fn head_insert_index(html: &str) -> Option<usize> {
+    let start = html.find("<head")?;
+    let close = html[start..].find('>')?;
+    Some(start + close + 1)
+}
+
+/// Escape a string for use inside a double-quoted HTML attribute.
+fn escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Run the agent: bind `127.0.0.1:<port>`, print the ephemeral address and a
@@ -294,7 +564,7 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
 pub fn serve<B: SignatureBackend, C: Confirmer>(
     backend: B,
     confirmer: C,
-    config: AgentConfig,
+    mut config: AgentConfig,
 ) -> Result<(), ServeError> {
     let hex = random_session_token();
     let server = Server::http(("127.0.0.1", config.bind_port))
@@ -304,26 +574,34 @@ pub fn serve<B: SignatureBackend, C: Confirmer>(
         .to_ip()
         .map_or_else(|| "127.0.0.1".to_owned(), |a| a.to_string());
     println!("{} http://{bound}", Msg::ServeListening.text(config.locale));
-    // Deliver the pairing token: printed for an interactive operator, or written
-    // to a private per-user runtime file for a background/daemon agent.
-    match config.token_delivery {
-        TokenDelivery::Stdout => {
-            println!("{} {hex}", Msg::ServeSessionToken.text(config.locale));
-        }
-        TokenDelivery::RuntimeFile => {
-            let path = write_token_file(&hex)?;
-            println!(
-                "{} {}",
-                Msg::ServeTokenWritten.text(config.locale),
-                path.display()
-            );
-        }
+    // When the agent serves the cabinet, the served page's same-origin `POST`
+    // carries the agent's own loopback origin — known only now that the port is
+    // bound (important under `--port 0`). Add it so that gate passes without the
+    // operator supplying `--allow-origin`.
+    if !matches!(config.cabinet, CabinetSource::Disabled) {
+        config.allowed_origins.extend(self_origins(&bound));
     }
+    // The pairing token is printed for the operator to paste into the cabinet;
+    // when the agent also serves the cabinet, it is injected into the served
+    // page so no manual entry is needed.
+    println!("{} {hex}", Msg::ServeSessionToken.text(config.locale));
     let agent = Agent::new(backend, confirmer, config, SecretString::from(hex));
     for request in server.incoming_requests() {
         agent.serve_one(request);
     }
     Ok(())
+}
+
+/// The agent's own loopback origins for a bound `host:port`, in both the
+/// `127.0.0.1` and `localhost` spellings (matching the cabinet CSP's
+/// `connect-src`), so a same-origin cabinet `POST` is accepted however the
+/// operator opened the page.
+fn self_origins(bound_addr: &str) -> Vec<String> {
+    let mut origins = vec![format!("http://{bound_addr}")];
+    if let Some(port) = bound_addr.rsplit(':').next() {
+        origins.push(format!("http://localhost:{port}"));
+    }
+    origins
 }
 
 impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
@@ -345,11 +623,9 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
                 session_token: token.as_deref(),
                 body: &body,
             }),
-            Err(()) => HttpOutput::json(
-                413,
-                error_json("request body too large"),
-                origin.as_deref().unwrap_or(""),
-            ),
+            Err(()) => {
+                HttpOutput::json(413, error_json("request body too large"), origin.as_deref())
+            }
         };
 
         if request.respond(build_response(&output)).is_err() {
@@ -391,9 +667,14 @@ fn header_value(request: &Request, name: &'static str) -> Option<String> {
 
 /// Turn an [`HttpOutput`] into a `tiny_http` response with the right headers.
 fn build_response(output: &HttpOutput) -> Response<std::io::Cursor<Vec<u8>>> {
-    let mut response = Response::from_string(output.body.clone()).with_status_code(output.status);
-    if !output.body.is_empty() {
-        if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
+    let mut response = Response::from_data(output.body.clone()).with_status_code(output.status);
+    if let Some(content_type) = output.content_type {
+        if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
+            response = response.with_header(h);
+        }
+    }
+    if output.csp {
+        if let Ok(h) = Header::from_bytes(&b"Content-Security-Policy"[..], CABINET_CSP.as_bytes()) {
             response = response.with_header(h);
         }
     }
@@ -459,81 +740,6 @@ fn random_session_token() -> String {
     out
 }
 
-/// Resolve the per-user runtime directory for the token file, by platform.
-///
-/// Linux: `$XDG_RUNTIME_DIR/tessera-issuer`; macOS:
-/// `~/Library/Application Support/tessera-issuer`; Windows:
-/// `%LOCALAPPDATA%\tessera-issuer`.
-fn runtime_dir() -> Result<std::path::PathBuf, ServeError> {
-    #[cfg(target_os = "linux")]
-    {
-        let base = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
-            ServeError::NoRuntimeDir(
-                "XDG_RUNTIME_DIR is not set; start the agent inside a user session \
-                 (e.g. systemd --user) or export XDG_RUNTIME_DIR=/run/user/$(id -u)"
-                    .to_owned(),
-            )
-        })?;
-        Ok(std::path::PathBuf::from(base).join("tessera-issuer"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| ServeError::NoRuntimeDir("HOME is not set".to_owned()))?;
-        Ok(std::path::PathBuf::from(home).join("Library/Application Support/tessera-issuer"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .ok_or_else(|| ServeError::NoRuntimeDir("LOCALAPPDATA is not set".to_owned()))?;
-        Ok(std::path::PathBuf::from(base).join("tessera-issuer"))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        Err(ServeError::NoRuntimeDir(
-            "no known per-user runtime directory on this platform".to_owned(),
-        ))
-    }
-}
-
-/// Write the pairing token to the platform runtime directory.
-fn write_token_file(token: &str) -> Result<std::path::PathBuf, ServeError> {
-    write_token_at(&runtime_dir()?, token)
-}
-
-/// Write the pairing token into `dir`, creating it if needed.
-///
-/// On Unix the directory is `0700` and the file `0600`; on Windows the file
-/// inherits the user profile's ACLs (the directory is not shared). A restart
-/// overwrites (truncates) any existing token file.
-fn write_token_at(dir: &std::path::Path, token: &str) -> Result<std::path::PathBuf, ServeError> {
-    use std::io::Write as _;
-
-    std::fs::create_dir_all(dir)
-        .map_err(|e| ServeError::TokenFile(format!("{}: {e}", dir.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| ServeError::TokenFile(format!("{}: {e}", dir.display())))?;
-    }
-
-    let path = dir.join("token");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&path)
-        .map_err(|e| ServeError::TokenFile(format!("{}: {e}", path.display())))?;
-    file.write_all(token.as_bytes())
-        .map_err(|e| ServeError::TokenFile(format!("{}: {e}", path.display())))?;
-    Ok(path)
-}
-
 /// Errors from starting the agent.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -541,12 +747,6 @@ pub enum ServeError {
     /// The loopback socket could not be bound.
     #[error("failed to bind 127.0.0.1 agent socket: {0}")]
     Bind(String),
-    /// No per-user runtime directory is available for the token file.
-    #[error("no runtime directory for the token file: {0}")]
-    NoRuntimeDir(String),
-    /// The token file could not be written.
-    #[error("failed to write the token file: {0}")]
-    TokenFile(String),
 }
 
 #[cfg(test)]
@@ -625,12 +825,19 @@ mod tests {
         }
     }
 
+    const KEY_LABEL: &str = "ca-key";
+
     fn config() -> AgentConfig {
+        config_with_cabinet(CabinetSource::Disabled)
+    }
+
+    fn config_with_cabinet(cabinet: CabinetSource) -> AgentConfig {
         AgentConfig {
             bind_port: 0,
             allowed_origins: vec![ORIGIN.to_owned()],
             advertised_algorithms: vec![SignatureAlgorithm::EcdsaWithSha256],
-            token_delivery: TokenDelivery::Stdout,
+            cabinet,
+            key_label: KEY_LABEL.to_owned(),
             locale: Locale::En,
         }
     }
@@ -640,6 +847,18 @@ mod tests {
             backend,
             auto_confirm as ConfirmFn,
             config(),
+            SecretString::from(TOKEN.to_owned()),
+        )
+    }
+
+    fn agent_serving(
+        backend: RecordingSigner,
+        cabinet: CabinetSource,
+    ) -> Agent<RecordingSigner, ConfirmFn> {
+        Agent::new(
+            backend,
+            auto_confirm as ConfirmFn,
+            config_with_cabinet(cabinet),
             SecretString::from(TOKEN.to_owned()),
         )
     }
@@ -754,7 +973,9 @@ mod tests {
     }
 
     #[test]
-    fn absent_origin_is_refused_before_signing() {
+    fn absent_origin_with_valid_token_is_served() {
+        // A same-origin `POST` from the served cabinet carries the token but the
+        // browser may omit `Origin`; the token is the gate, so it is honoured.
         let a = agent(RecordingSigner::new());
         let body = sign_body();
         let out = a.handle(&HttpInput {
@@ -764,8 +985,33 @@ mod tests {
             session_token: Some(TOKEN),
             body: body.as_bytes(),
         });
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        assert!(a.backend.signed.get(), "backend must sign");
+        assert!(
+            out.cors_origin.is_none(),
+            "no CORS header when the request had no Origin"
+        );
+    }
+
+    #[test]
+    fn absent_origin_without_token_is_refused() {
+        // Absent Origin is not a free pass: the token still gates.
+        let a = agent(RecordingSigner::new());
+        let body = sign_body();
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign",
+            origin: None,
+            session_token: None,
+            body: body.as_bytes(),
+        });
         assert_eq!(out.status, 403);
-        assert!(!a.backend.signed.get());
+        assert!(!a.backend.signed.get(), "backend must not be reached");
     }
 
     #[test]
@@ -810,10 +1056,15 @@ mod tests {
             session_token: Some(TOKEN),
             body: body.as_bytes(),
         });
-        assert_eq!(out.status, 200, "body: {}", out.body);
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
         assert!(a.backend.signed.get(), "backend must be reached");
         assert_eq!(out.cors_origin.as_deref(), Some(ORIGIN));
-        let value: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
         assert!(value.get("signature_b64").is_some());
         assert_eq!(value["algorithm"], "ecdsa-with-sha256");
     }
@@ -837,7 +1088,7 @@ mod tests {
         });
         assert_eq!(out.status, 200);
         assert!(
-            !out.body.contains("1234-secret-pin"),
+            !String::from_utf8_lossy(&out.body).contains("1234-secret-pin"),
             "pin must not surface"
         );
     }
@@ -860,7 +1111,12 @@ mod tests {
             session_token: Some(TOKEN),
             body: body.as_bytes(),
         });
-        assert_eq!(out.status, 403, "body: {}", out.body);
+        assert_eq!(
+            out.status,
+            403,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
         assert!(a.confirmer.called.get(), "confirmer must have been asked");
         assert!(
             !a.backend.signed.get(),
@@ -892,7 +1148,12 @@ mod tests {
             session_token: Some(TOKEN),
             body: body.as_bytes(),
         });
-        assert_eq!(out.status, 400, "body: {}", out.body);
+        assert_eq!(
+            out.status,
+            400,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
         assert!(
             !a.confirmer.called.get(),
             "confirmer must not run on garbage TBS"
@@ -916,7 +1177,12 @@ mod tests {
             session_token: Some(TOKEN),
             body: sign_body().as_bytes(),
         });
-        assert_eq!(out.status, 200, "body: {}", out.body);
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
         assert!(a.confirmer.called.get());
         assert!(a.backend.signed.get());
     }
@@ -962,7 +1228,7 @@ mod tests {
             body: &[],
         });
         assert_eq!(out.status, 200);
-        let value: serde_json::Value = serde_json::from_str(&out.body).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(value["algorithms"][0], "ecdsa-with-sha256");
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     }
@@ -1057,7 +1323,7 @@ mod tests {
         );
     }
 
-    // --- Token file (daemon mode) ---
+    // --- Cabinet static serving ---
 
     /// A throwaway directory under the system temp dir, removed on drop.
     struct TempDir(std::path::PathBuf);
@@ -1068,7 +1334,12 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos());
             let dir = std::env::temp_dir().join(format!("tessera-issuer-{tag}-{nanos}"));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
             Self(dir)
+        }
+
+        fn write(&self, name: &str, contents: &[u8]) {
+            std::fs::write(self.0.join(name), contents).expect("write asset");
         }
     }
 
@@ -1080,26 +1351,248 @@ mod tests {
         }
     }
 
+    /// A cabinet `dist/` with a minimal `index.html` (carrying a `<head>`) and
+    /// the fixed asset set, served from a temporary directory.
+    fn cabinet_dir() -> TempDir {
+        let dir = TempDir::new("cabinet");
+        dir.write(
+            "index.html",
+            b"<!doctype html>\n<html>\n  <head>\n    <title>Cabinet</title>\n  </head>\n  <body></body>\n</html>\n",
+        );
+        dir.write("main.js", b"export const x = 1;\n");
+        dir.write("main.js.map", b"{\"version\":3}\n");
+        dir.write("styles.css", b"body{}\n");
+        dir.write("tessera_issuer_wasm_bg.wasm", b"\0asm\x01\0\0\0");
+        dir
+    }
+
+    fn source(dir: &TempDir) -> CabinetSource {
+        CabinetSource::Directory(dir.0.clone())
+    }
+
+    fn get(agent: &Agent<RecordingSigner, ConfirmFn>, path: &str) -> HttpOutput {
+        // A browser navigation / subresource GET carries no Origin and no token.
+        agent.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path,
+            origin: None,
+            session_token: None,
+            body: &[],
+        })
+    }
+
     #[test]
-    fn token_file_has_private_permissions_and_overwrites() {
-        let temp = TempDir::new("tokfile");
-        let dir = temp.0.join("tessera-issuer");
+    fn index_is_served_with_html_content_type_and_injected_meta() {
+        let dir = cabinet_dir();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        let out = get(&a, "/");
+        assert_eq!(out.status, 200);
+        assert_eq!(out.content_type, Some(INDEX_CONTENT_TYPE));
+        let html = String::from_utf8(out.body).unwrap();
+        assert!(
+            html.contains(&format!(
+                "<meta name=\"tessera-agent-token\" content=\"{TOKEN}\" />"
+            )),
+            "index must carry the session token meta: {html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "<meta name=\"tessera-agent-key\" content=\"{KEY_LABEL}\" />"
+            )),
+            "index must carry the key label meta: {html}"
+        );
+        assert!(out.csp, "served document must carry the CSP header");
+    }
 
-        let path = write_token_at(&dir, "first-token").expect("write token");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first-token");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(file_mode, 0o600, "token file must be 0600");
-            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(dir_mode, 0o700, "token directory must be 0700");
+    #[test]
+    fn each_asset_is_served_with_its_content_type() {
+        let dir = cabinet_dir();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        for (path, expected) in [
+            ("/main.js", "text/javascript"),
+            ("/styles.css", "text/css"),
+            ("/tessera_issuer_wasm_bg.wasm", "application/wasm"),
+        ] {
+            let out = get(&a, path);
+            assert_eq!(out.status, 200, "{path}");
+            assert_eq!(out.content_type, Some(expected), "{path}");
+            assert!(!out.body.is_empty(), "{path}");
         }
+    }
 
-        // A restart overwrites (truncates) the previous token.
-        let path2 = write_token_at(&dir, "second").expect("rewrite token");
-        assert_eq!(path2, path);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+    #[test]
+    fn source_map_is_not_served() {
+        // The source map exists on disk but is not in the shipped asset set, so
+        // it falls through to the gated routes and is not returned as a file.
+        let dir = cabinet_dir();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/main.js.map",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(out.status, 404);
+    }
+
+    #[test]
+    fn path_outside_the_asset_set_is_not_served() {
+        let dir = cabinet_dir();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        // Not in the fixed set: falls through to the gated routes, which — with a
+        // valid origin and token — 404 rather than reading anything from disk.
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/secret.txt",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(out.status, 404);
+    }
+
+    #[test]
+    fn path_traversal_is_refused() {
+        let dir = cabinet_dir();
+        // Plant a file next to (outside) the dist directory.
+        std::fs::write(dir.0.join("..").join("outside.txt"), b"secret").ok();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        for path in ["/../outside.txt", "/../../Cargo.toml", "/..%2fCargo.toml"] {
+            let out = a.handle(&HttpInput {
+                method: ReqMethod::Get,
+                path,
+                origin: Some(ORIGIN),
+                session_token: Some(TOKEN),
+                body: &[],
+            });
+            assert_ne!(out.status, 200, "{path} must not serve a file");
+            assert!(
+                !out.body.windows(6).any(|w| w == b"secret"),
+                "{path} must not leak file contents"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_without_token_is_still_refused_while_serving_cabinet() {
+        let dir = cabinet_dir();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign",
+            origin: Some(ORIGIN),
+            session_token: None,
+            body: sign_body().as_bytes(),
+        });
+        assert_eq!(out.status, 403);
+        assert!(!a.backend.signed.get(), "backend must not be reached");
+    }
+
+    #[test]
+    fn without_cabinet_root_is_not_served() {
+        // Bridge mode: `GET /` with a valid origin and token is a 404, never a
+        // document.
+        let a = agent(RecordingSigner::new());
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(out.status, 404);
+        assert!(!out.csp, "bridge mode sends no cabinet CSP");
+    }
+
+    #[test]
+    fn missing_asset_is_a_cabinet_404_not_a_filesystem_probe() {
+        let dir = TempDir::new("empty-cabinet");
+        // No index.html on disk, but serving is enabled.
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        let out = get(&a, "/");
+        assert_eq!(out.status, 404);
+        assert!(out.csp);
+        assert!(out.body.is_empty());
+    }
+
+    #[test]
+    fn info_stays_gated_while_serving_cabinet() {
+        let dir = cabinet_dir();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        // No token: `/info` is not a cabinet asset, so it falls through and the
+        // token gate refuses it.
+        let refused = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/info",
+            origin: Some(ORIGIN),
+            session_token: None,
+            body: &[],
+        });
+        assert_eq!(refused.status, 403);
+        // With a token, `/info` answers as usual.
+        let ok = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/info",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(ok.status, 200);
+    }
+
+    #[test]
+    fn attribute_escaping_neutralizes_a_hostile_key_label() {
+        let escaped = escape_attr("evil\"><script>alert(1)</script>");
+        assert!(!escaped.contains('<'), "{escaped}");
+        assert!(!escaped.contains('"'), "{escaped}");
+        assert!(
+            escaped.contains("&quot;") && escaped.contains("&lt;"),
+            "{escaped}"
+        );
+    }
+
+    #[test]
+    fn self_origins_cover_both_loopback_spellings() {
+        let origins = self_origins("127.0.0.1:53421");
+        assert!(
+            origins.contains(&"http://127.0.0.1:53421".to_owned()),
+            "{origins:?}"
+        );
+        assert!(
+            origins.contains(&"http://localhost:53421".to_owned()),
+            "{origins:?}"
+        );
+    }
+
+    #[test]
+    fn same_origin_post_from_served_cabinet_is_accepted() {
+        // Mirror what `serve` does after bind: add the bound loopback origin to
+        // the allowlist, then a `POST /sign` carrying that Origin passes.
+        let bound = "127.0.0.1:53999";
+        let self_origin = format!("http://{bound}");
+        let mut cfg = config_with_cabinet(CabinetSource::Disabled);
+        cfg.allowed_origins.extend(self_origins(bound));
+        let a = Agent::new(
+            RecordingSigner::new(),
+            auto_confirm as ConfirmFn,
+            cfg,
+            SecretString::from(TOKEN.to_owned()),
+        );
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign",
+            origin: Some(&self_origin),
+            session_token: Some(TOKEN),
+            body: sign_body().as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        assert!(a.backend.signed.get());
+        assert_eq!(out.cors_origin.as_deref(), Some(self_origin.as_str()));
     }
 }

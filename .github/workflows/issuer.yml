@@ -168,10 +168,11 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # Сборка статики кабинета отдельным артефактом. КОНТРАКТ: cabinet/build.sh без
-  # аргументов кладёт статику в cabinet/dist/ вместе с SHA256SUMS. Артефакт
-  # `tessera-cabinet` в deb агента не входит (deb собирает build.yml, кабинет он
-  # не трогает).
+  # Верификация кабинета. КОНТРАКТ: cabinet/build.sh без аргументов кладёт статику
+  # в cabinet/dist/ вместе с SHA256SUMS; затем бинарь issuer собирается с фичей
+  # embed-cabinet — ловим и поломку сборки SPA, и поломку встраивания. Наружу
+  # ничего не публикуется: кабинет едет встроенным в бинарь агента (deb собирает
+  # build.yml), отдельного хостинга нет.
   cabinet:
     needs: detect-cabinet
     if: needs.detect-cabinet.outputs.present == 'true'
@@ -202,13 +203,12 @@ jobs:
       - name: Build cabinet
         run: bash cabinet/build.sh
 
-      - name: Upload cabinet artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: tessera-cabinet
-          path: cabinet/dist/**
-          if-no-files-found: error
-          retention-days: 30
+      # Guard: релизный бинарь встраивает cabinet/dist через `include_dir!` за
+      # фичей `embed-cabinet` (кабинет раздаётся `issuer serve` по умолчанию).
+      # Собираем сразу после build.sh — поломка пути include_dir/встраивания
+      # падает здесь, а не при выпуске бинаря.
+      - name: Verify issuer embeds the cabinet
+        run: cargo build -p tessera_issuer --features embed-cabinet,serve,pkcs11
 
   # mac-gated сюиты tessera_core (в т.ч. issuer_contract — «что выпустил issuer,
   # то принял разбор Engine»). Без фичи mac-tests эти тесты не компилируются и в

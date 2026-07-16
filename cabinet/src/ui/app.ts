@@ -7,6 +7,7 @@
 // parts already live in `core/*` and `ui/forms.ts`/`ui/widgets.ts`.
 
 import { agentInfo, agentSign, AgentError } from "../core/agentClient.ts";
+import { readAgentInjection } from "../core/agentInjection.ts";
 import { computeLeafPrefill } from "../core/csrPrefill.ts";
 import { parseApiError, renderApiError } from "../core/errorLabels.ts";
 import { validateChildEnvelope, validateLeafSelection } from "../core/envelope.ts";
@@ -14,7 +15,12 @@ import { sha256HexOfDer } from "../core/fingerprint.ts";
 import { parseJournalFile, renderJournalFile, renderJournalStatus } from "../core/journal.ts";
 import { lastCrlNumber, revocationCandidates } from "../core/journalEntries.ts";
 import { pemOrDer } from "../core/pem.ts";
-import { acceptSnapshot, type AcceptedSnapshot } from "../core/snapshot.ts";
+import {
+  acceptSnapshot,
+  buildManualSnapshot,
+  type AcceptedSnapshot,
+  type SnapshotPayload,
+} from "../core/snapshot.ts";
 import { startupErrorText } from "../core/startupError.ts";
 import {
   assembleAndVerify,
@@ -53,8 +59,27 @@ import {
   type CrlFormHandle,
   type LeafFormHandle,
 } from "./forms.ts";
+import { openModal } from "./modal.ts";
+import { hostListInput, stringListInput, tagListInput } from "./widgets.ts";
 
 const ALGORITHMS: SignatureAlgorithmTag[] = ["ecdsa-p256", "ecdsa-p384", "rsa-sha256", "ed25519"];
+
+/** Literal CLI example for the agent help modal (design §3) — technical, not localized, mirrors `docs/{ru,en}/issuer.md` §"Агент issuer serve". */
+const AGENT_SERVE_EXAMPLE = `issuer serve \\
+    --allow-origin https://cabinet.example \\
+    --module /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so \\
+    --key tessera-ca --algorithm ecdsa-p256 \\
+    --port 0`;
+
+type Tab = "issue" | "journal";
+type SnapshotMode = "manual" | "file";
+/**
+ * The signing agent's reachability, tracked separately from a per-check
+ * result so the indicator survives a re-render/tab switch (design §4):
+ * `"unknown"` — never checked (or the settings changed since); `"connecting"`
+ * — a check is in flight; `"connected"`/`"error"` — the last check's outcome.
+ */
+type AgentStatus = "unknown" | "connecting" | "connected" | "error";
 
 interface PendingOperation {
   kind: "org_ca" | "shift_leaf" | "crl";
@@ -76,12 +101,30 @@ export class App {
   #parentFingerprintHex?: string;
   #parentInfo?: InspectParentResponse;
   #snapshot?: AcceptedSnapshot;
+  #snapshotMode: SnapshotMode = "manual";
   #agentSettings?: AgentSettings;
+  /**
+   * Set once, in the constructor, from whether {@link readAgentInjection}
+   * returned a settled value — i.e. this page was served by the local agent
+   * itself (design `issuer-local-cabinet` §2), not hosted externally. Drives
+   * the compact agent section (status only, no editable fields) and the
+   * automatic connectivity check on startup.
+   */
+  #agentInjected: boolean;
+  #agentStatus: AgentStatus = "unknown";
   #journalLines: string[] = [];
   #pending?: PendingOperation;
   #error?: string;
+  #activeTab: Tab = "issue";
 
-  constructor(root: HTMLElement, storage: Storage, hostname: string, browserLanguage: string | undefined) {
+  constructor(
+    root: HTMLElement,
+    storage: Storage,
+    hostname: string,
+    browserLanguage: string | undefined,
+    agentMetaLookup: (name: string) => string | null,
+    origin: string,
+  ) {
     this.#root = root;
     this.#storage = storage;
     this.#locale = resolveLocale({
@@ -89,7 +132,14 @@ export class App {
       hostname,
       browserLanguage,
     });
-    this.#agentSettings = loadAgentSettings(storage);
+    // The agent-served injection (design `issuer-local-cabinet` §2) is the
+    // source of truth for *this* run when present — it means the page was
+    // just served by the agent itself — and overrides whatever was saved
+    // from a previous session. When there is no injection (external
+    // hosting/dev), previously saved settings are left untouched.
+    const injected = readAgentInjection(agentMetaLookup, origin);
+    this.#agentInjected = injected !== undefined;
+    this.#agentSettings = injected ?? loadAgentSettings(storage);
   }
 
   /**
@@ -106,6 +156,28 @@ export class App {
     } catch (e) {
       this.renderStartupError(e);
       return;
+    }
+    this.render();
+    // Injected settings are known-good by construction (the agent just
+    // served this page with them) — the compact agent section has no
+    // "Подключить" button to trigger a check, so it happens once here
+    // instead. The compact view has no editable fields to lose, so a full
+    // re-render on completion is safe (unlike the manual-entry flow's
+    // in-place indicator update, which guards against clobbering unsaved
+    // input elsewhere in that section).
+    if (this.#agentInjected && this.#agentSettings) {
+      void this.autoCheckAgentConnection(this.#agentSettings);
+    }
+  }
+
+  private async autoCheckAgentConnection(settings: AgentSettings): Promise<void> {
+    this.#agentStatus = "connecting";
+    this.render();
+    try {
+      await agentInfo(settings.address, settings.token);
+      this.#agentStatus = "connected";
+    } catch {
+      this.#agentStatus = "error";
     }
     this.render();
   }
@@ -134,16 +206,50 @@ export class App {
   // --- render -----------------------------------------------------------
 
   render(): void {
-    this.#root.replaceChildren(
-      this.renderHeader(),
-      this.#error ? el("div", { class: "banner banner-error" }, [this.#error]) : "",
+    const issueTabNodes = [
       this.renderParentSection(),
       this.#parentInfo ? this.renderOperationSection() : "",
       this.renderSnapshotSection(),
       this.renderAgentSection(),
       this.#pending ? this.renderSummarySection() : "",
-      this.renderJournalSection(),
+    ];
+    this.#root.replaceChildren(
+      this.renderHeader(),
+      this.renderTabBar(),
+      this.#error ? el("div", { class: "banner banner-error" }, [this.#error]) : "",
+      ...(this.#activeTab === "issue" ? issueTabNodes : [this.renderJournalSection()]),
     );
+  }
+
+  private setActiveTab(tab: Tab): void {
+    this.#activeTab = tab;
+    this.render();
+  }
+
+  private renderTabBar(): HTMLElement {
+    const issueBtn = el(
+      "button",
+      { type: "button", class: this.#activeTab === "issue" ? "active" : "" },
+      [this.t("tab_issue")],
+    );
+    const journalBtn = el(
+      "button",
+      { type: "button", class: this.#activeTab === "journal" ? "active" : "" },
+      [this.t("tab_journal")],
+    );
+    issueBtn.addEventListener("click", () => this.setActiveTab("issue"));
+    journalBtn.addEventListener("click", () => this.setActiveTab("journal"));
+    return el("nav", { class: "tab-bar" }, [issueBtn, journalBtn]);
+  }
+
+  private helpButton(titleKey: "help_parent_title" | "help_agent_title", body: (Node | string)[]): HTMLElement {
+    const btn = el("button", { type: "button", class: "btn-help", "aria-label": this.t("help_button_label") }, [
+      "?",
+    ]);
+    btn.addEventListener("click", () => {
+      openModal(this.t(titleKey), body, this.t("action_close"));
+    });
+    return btn;
   }
 
   private t(key: Parameters<typeof t>[1]): string {
@@ -177,8 +283,15 @@ export class App {
       ? this.renderParentStatus(this.#parentInfo)
       : el("p", { class: "hint" }, [this.t("parent_no_parent")]);
 
+    const helpBtn = this.helpButton("help_parent_title", [
+      el("p", {}, [this.t("help_parent_p1")]),
+      el("p", {}, [this.t("help_parent_p2")]),
+      el("p", {}, [this.t("help_parent_p3")]),
+      el("p", { class: "hint" }, [`${this.t("help_docs_more")}: docs/issuer.md`]),
+    ]);
+
     return el("section", { class: "section section-parent" }, [
-      el("h2", {}, [this.t("parent_file_label")]),
+      el("h2", { class: "section-heading" }, [this.t("parent_file_label"), helpBtn]),
       el("p", { class: "hint" }, [this.t("parent_file_hint")]),
       fileInput,
       status,
@@ -269,7 +382,7 @@ export class App {
   }
 
   private renderCaOperation(envelope: EnvelopeJson): HTMLElement {
-    const form: CaFormHandle = buildCaForm(this.#locale, envelope);
+    const form: CaFormHandle = buildCaForm(this.#locale, envelope, this.#snapshot?.payload);
     const algorithmSelect = algorithmSelectWidget();
     const buildBtn = el("button", { type: "button", class: "btn-primary" }, [
       this.t("action_build_summary"),
@@ -338,7 +451,7 @@ export class App {
   }
 
   private renderLeafOperation(envelope: EnvelopeJson): HTMLElement {
-    const form: LeafFormHandle = buildLeafForm(this.#locale, envelope);
+    const form: LeafFormHandle = buildLeafForm(this.#locale, envelope, this.#snapshot?.payload);
     const algorithmSelect = algorithmSelectWidget();
     const csrStatus = el("div", { class: "csr-status" });
 
@@ -550,6 +663,57 @@ export class App {
   // --- snapshot ---------------------------------------------------------
 
   private renderSnapshotSection(): HTMLElement {
+    const manualRadio = el("input", {
+      type: "radio",
+      name: "snapshot-mode",
+      value: "manual",
+      checked: this.#snapshotMode === "manual" ? "checked" : undefined,
+    });
+    const fileRadio = el("input", {
+      type: "radio",
+      name: "snapshot-mode",
+      value: "file",
+      checked: this.#snapshotMode === "file" ? "checked" : undefined,
+    });
+    manualRadio.addEventListener("change", () => {
+      this.#snapshotMode = "manual";
+      this.render();
+    });
+    fileRadio.addEventListener("change", () => {
+      this.#snapshotMode = "file";
+      this.render();
+    });
+    const modeRow = el("div", { class: "snapshot-mode-picker" }, [
+      el("label", {}, [manualRadio, this.t("snapshot_mode_manual")]),
+      el("label", {}, [fileRadio, this.t("snapshot_mode_file")]),
+    ]);
+
+    const modeBody =
+      this.#snapshotMode === "manual" ? this.renderSnapshotConstructor() : this.renderSnapshotFilePicker();
+
+    const status = this.#snapshot
+      ? el("p", {}, [
+          `${this.#snapshot.origin === "signed" ? this.t("snapshot_origin_signed") : this.t("snapshot_origin_manual")} — ${this.t("snapshot_age")}: ${formatAge(this.#snapshot.ageSeconds)}`,
+        ])
+      : el("p", { class: "hint" }, [this.t("snapshot_none")]);
+
+    return el("section", { class: "section section-snapshot" }, [
+      el("h2", {}, [this.t("section_snapshot")]),
+      el("p", { class: "hint" }, [this.t("snapshot_file_hint")]),
+      modeRow,
+      modeBody,
+      status,
+    ]);
+  }
+
+  /**
+   * The file-upload path (signed export or a hand-authored manual file).
+   * The verify-key field lives here, not in the constructor (`renderSnapshotConstructor`):
+   * it only matters for checking a *loaded* file's signature — a snapshot
+   * assembled in the constructor is unsigned by construction, so showing a
+   * signature-verification key next to it would just be confusing.
+   */
+  private renderSnapshotFilePicker(): HTMLElement {
     const fileInput = el("input", { type: "file", accept: ".json" });
     fileInput.addEventListener("change", () => {
       void this.onSnapshotFileChosen(fileInput);
@@ -569,20 +733,73 @@ export class App {
       }
     });
 
-    const status = this.#snapshot
-      ? el("p", {}, [
-          `${this.#snapshot.origin === "signed" ? this.t("snapshot_origin_signed") : this.t("snapshot_origin_manual")} — ${this.t("snapshot_age")}: ${formatAge(this.#snapshot.ageSeconds)}`,
-        ])
-      : el("p", { class: "hint" }, [this.t("snapshot_none")]);
-
-    return el("section", { class: "section section-snapshot" }, [
-      el("h2", {}, [this.t("section_snapshot")]),
-      el("p", { class: "hint" }, [this.t("snapshot_file_hint")]),
+    return el("div", { class: "snapshot-file-picker" }, [
       fileInput,
-      status,
       field(this.t("snapshot_verify_key_label"), keyTextarea),
       el("p", { class: "hint" }, [this.t("snapshot_verify_key_hint")]),
       saveKeyBtn,
+    ]);
+  }
+
+  /**
+   * The inventory constructor (spec `issuer-cabinet` — "Сборка инвентаря
+   * конструктором"): device/user/role/tag editors and a "build" button that
+   * assembles a {@link SnapshotPayload}, runs it through
+   * {@link buildManualSnapshot} + {@link acceptSnapshot} — the exact same
+   * acceptance path a manual snapshot *file* goes through, so there is only
+   * one code path that decides what counts as a valid manual inventory — and
+   * a "download" button once one has been built, for reuse in a later
+   * session.
+   */
+  private renderSnapshotConstructor(): HTMLElement {
+    const hosts = hostListInput(
+      this.t("field_add"),
+      this.t("field_remove"),
+      this.t("snapshot_host_id_placeholder"),
+      this.t("snapshot_host_label_placeholder"),
+    );
+    const users = stringListInput(this.t("field_add"), this.t("field_remove"));
+    const roles = stringListInput(this.t("field_add"), this.t("field_remove"));
+    const tags = tagListInput(this.t("field_add"), this.t("field_remove"), []);
+
+    const buildBtn = el("button", { type: "button", class: "btn-primary" }, [
+      this.t("snapshot_build_action"),
+    ]);
+    const downloadBtn = el("button", { type: "button" }, [this.t("snapshot_download_action")]);
+    if (this.#snapshot?.origin !== "manual") downloadBtn.classList.add("hidden");
+    downloadBtn.addEventListener("click", () => {
+      if (!this.#snapshot || this.#snapshot.origin !== "manual") return;
+      const file = buildManualSnapshot(this.#snapshot.payload);
+      downloadText("inventory-snapshot.json", JSON.stringify(file), "application/json");
+    });
+
+    buildBtn.addEventListener("click", () => {
+      void (async () => {
+        const payload: SnapshotPayload = {
+          generated_at: Math.floor(Date.now() / 1000),
+          hosts: hosts.getValue(),
+          users: users.getValue(),
+          roles: roles.getValue(),
+          tags: tags.getValue().map(([key, value]) => ({ key, value })),
+        };
+        const file = buildManualSnapshot(payload);
+        const result = await acceptSnapshot(JSON.stringify(file), undefined, Math.floor(Date.now() / 1000));
+        if (!result.ok) {
+          this.setError(result.rejection.kind === "malformed" ? result.rejection.message : "invalid inventory");
+          return;
+        }
+        this.#snapshot = result.snapshot;
+        this.#error = undefined;
+        this.render();
+      })();
+    });
+
+    return el("div", { class: "snapshot-constructor" }, [
+      field(this.t("snapshot_hosts_label"), hosts.root),
+      field(this.t("snapshot_users_label"), users.root),
+      field(this.t("snapshot_roles_label"), roles.root),
+      field(this.t("snapshot_tags_label"), tags.root),
+      el("div", { class: "snapshot-constructor-actions" }, [buildBtn, downloadBtn]),
     ]);
   }
 
@@ -611,14 +828,70 @@ export class App {
 
   // --- agent --------------------------------------------------------------
 
+  private agentStatusLabel(status: AgentStatus): string {
+    switch (status) {
+      case "unknown":
+        return this.t("agent_status_unknown");
+      case "connecting":
+        return this.t("agent_status_connecting");
+      case "connected":
+        return this.t("agent_status_connected");
+      case "error":
+        return this.t("agent_status_disconnected");
+    }
+  }
+
+  /** Update the status indicator element in place, without a full `render()` — a full re-render would drop whatever the operator has typed into an unfinished operation form (design §4). */
+  private setAgentStatusIndicator(indicator: HTMLElement, status: AgentStatus): void {
+    this.#agentStatus = status;
+    indicator.textContent = this.agentStatusLabel(status);
+    indicator.className = `agent-status agent-status-${status}`;
+  }
+
+  /**
+   * The injected settings were handed to us by the same agent that served
+   * this page — asking the operator to re-enter (or even see) address/token/
+   * key would just be noise. Only the connectivity indicator matters here;
+   * {@link autoCheckAgentConnection} keeps it current without a click.
+   */
+  private renderAgentSectionInjected(): HTMLElement {
+    const statusEl = el("span", { class: `agent-status agent-status-${this.#agentStatus}` }, [
+      this.agentStatusLabel(this.#agentStatus),
+    ]);
+    return el("section", { class: "section section-agent section-agent-compact" }, [
+      el("h2", { class: "section-heading" }, [this.t("section_agent")]),
+      el("div", { class: "agent-actions" }, [statusEl]),
+    ]);
+  }
+
   private renderAgentSection(): HTMLElement {
+    if (this.#agentInjected) return this.renderAgentSectionInjected();
+
     const addressInput = el("input", {
       type: "text",
       value: this.#agentSettings?.address ?? "http://127.0.0.1:",
     });
     const tokenInput = el("input", { type: "password", value: this.#agentSettings?.token ?? "" });
     const keyInput = el("input", { type: "text", value: this.#agentSettings?.keyId ?? "" });
-    const statusEl = el("span", { class: "agent-status" }, [this.t("agent_status_unknown")]);
+    const statusEl = el("span", { class: `agent-status agent-status-${this.#agentStatus}` }, [
+      this.agentStatusLabel(this.#agentStatus),
+    ]);
+
+    // Guards against the "Подключить" race (L2): editing a field while a
+    // `GET /info` check is in flight must not let that check's result
+    // clobber the indicator once it resolves — the fields it checked are no
+    // longer what's on screen. Every field edit *and* every "Подключить"
+    // click bumps this generation counter; a check applies its result only
+    // if the generation is still the one it was issued under.
+    let connectGeneration = 0;
+
+    const markUnknown = (): void => {
+      connectGeneration += 1;
+      if (this.#agentStatus !== "unknown") this.setAgentStatusIndicator(statusEl, "unknown");
+    };
+    addressInput.addEventListener("input", markUnknown);
+    tokenInput.addEventListener("input", markUnknown);
+    keyInput.addEventListener("input", markUnknown);
 
     const saveBtn = el("button", { type: "button" }, [this.t("agent_save")]);
     saveBtn.addEventListener("click", () => {
@@ -630,28 +903,48 @@ export class App {
       saveAgentSettings(this.#storage, this.#agentSettings);
     });
 
-    const checkBtn = el("button", { type: "button" }, [this.t("agent_check")]);
-    checkBtn.addEventListener("click", () => {
+    const connectBtn = el("button", { type: "button" }, [this.t("agent_connect")]);
+    connectBtn.addEventListener("click", () => {
+      const myGeneration = (connectGeneration += 1);
       void (async () => {
-        statusEl.textContent = t(this.#locale, "status_loading");
+        this.#agentSettings = {
+          address: addressInput.value.trim(),
+          token: tokenInput.value.trim(),
+          keyId: keyInput.value.trim(),
+        };
+        saveAgentSettings(this.#storage, this.#agentSettings);
+        this.setAgentStatusIndicator(statusEl, "connecting");
+        let outcome: "connected" | "error";
         try {
           await agentInfo(addressInput.value.trim(), tokenInput.value.trim());
-          statusEl.textContent = this.t("agent_status_ok");
+          outcome = "connected";
         } catch {
-          statusEl.textContent = this.t("agent_status_error");
+          outcome = "error";
         }
+        if (myGeneration !== connectGeneration) return; // stale: fields changed since this check started
+        this.setAgentStatusIndicator(statusEl, outcome);
       })();
     });
 
+    const helpBtn = this.helpButton("help_agent_title", [
+      el("p", {}, [this.t("help_agent_p1")]),
+      el("p", {}, [this.t("help_agent_p2")]),
+      el("pre", {}, [AGENT_SERVE_EXAMPLE]),
+      el("p", {}, [this.t("help_agent_p3")]),
+      el("p", {}, [this.t("help_agent_p4")]),
+      el("p", {}, [this.t("help_agent_p5")]),
+      el("p", { class: "hint" }, [`${this.t("help_docs_more")}: docs/issuer.md`]),
+    ]);
+
     return el("section", { class: "section section-agent" }, [
-      el("h2", {}, [this.t("section_agent")]),
+      el("h2", { class: "section-heading" }, [this.t("section_agent"), helpBtn]),
       field(this.t("agent_address_label"), addressInput),
       el("p", { class: "hint" }, [this.t("agent_address_hint")]),
       field(this.t("agent_token_label"), tokenInput),
       el("p", { class: "hint" }, [this.t("agent_token_hint")]),
       field(this.t("agent_key_label"), keyInput),
       el("p", { class: "hint" }, [this.t("agent_key_hint")]),
-      el("div", { class: "agent-actions" }, [saveBtn, checkBtn, statusEl]),
+      el("div", { class: "agent-actions" }, [saveBtn, connectBtn, statusEl]),
     ]);
   }
 
