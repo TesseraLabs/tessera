@@ -5,9 +5,10 @@
 // `core/envelope.ts`'s `validate*` functions are still run on submit as the
 // last client-side gate before the WASM core's own (authoritative) check.
 
-import { maxSelectableLevel, maxSelectableTtl, selectableRoles } from "../core/envelope.ts";
+import { maxSelectableLevel, maxSelectableTtl, rolesForSelection, selectableRoles } from "../core/envelope.ts";
 import type { LeafPrefill } from "../core/csrPrefill.ts";
 import type { IssuedEntry } from "../core/journalEntries.ts";
+import type { SnapshotPayload } from "../core/snapshot.ts";
 import type { Locale } from "../i18n/locale.ts";
 import { t } from "../i18n/locale.ts";
 import type { CaRequestJson, EnvelopeJson, LeafRequestJson } from "../types.ts";
@@ -16,6 +17,7 @@ import {
   datetimeLocalToUnix,
   roleCheckboxGroup,
   stringListInput,
+  suggestingStringListInput,
   tagListInput,
   unixToDatetimeLocal,
 } from "./widgets.ts";
@@ -33,8 +35,13 @@ export interface CaFormHandle {
   getValue: () => CaFormResult;
 }
 
-/** Build the "issue organisation CA" form, scoped to `parent`. */
-export function buildCaForm(locale: Locale, parent: EnvelopeJson): CaFormHandle {
+/**
+ * Build the "issue organisation CA" form, scoped to `parent`. `inventory`,
+ * when present, only feeds a `require_tags` completion aid — envelope fields
+ * (roles/level/ttl) on a CA form are unaffected by the inventory, that
+ * narrowing applies to the leaf form (see {@link buildLeafForm}).
+ */
+export function buildCaForm(locale: Locale, parent: EnvelopeJson, inventory?: SnapshotPayload): CaFormHandle {
   const subjectInput = el("input", { type: "text", placeholder: "CN=Org North CA,O=Org" });
   const spkiInput = el("input", { type: "file" });
   const notBefore = el("input", { type: "datetime-local" });
@@ -56,6 +63,9 @@ export function buildCaForm(locale: Locale, parent: EnvelopeJson): CaFormHandle 
     t(locale, "field_add"),
     t(locale, "field_remove"),
     parent.require_tags,
+    [],
+    inventory ? [...new Set(inventory.tags.map((tag) => tag.key))] : [],
+    inventory ? [...new Set(inventory.tags.map((tag) => tag.value))] : [],
   );
 
   const root = el("div", { class: "form form-ca" }, [
@@ -123,8 +133,14 @@ export interface LeafFormHandle {
   applyCsrPrefill: (prefill: LeafPrefill) => void;
 }
 
-/** Build the "issue shift leaf" form, scoped to `parent`. */
-export function buildLeafForm(locale: Locale, parent: EnvelopeJson): LeafFormHandle {
+/**
+ * Build the "issue shift leaf" form, scoped to `parent`. `inventory`, when
+ * present, feeds `host_binding`/`user_binding` suggestions (free text is
+ * still accepted) and narrows the offered role list to the intersection with
+ * `parent`'s envelope (spec `issuer-cabinet` — "Инвентарь для форм": the
+ * envelope stays the ceiling, the inventory only narrows and suggests).
+ */
+export function buildLeafForm(locale: Locale, parent: EnvelopeJson, inventory?: SnapshotPayload): LeafFormHandle {
   const spkiRadio = el("input", { type: "radio", name: "leaf-key-source", value: "spki", checked: "checked" });
   const csrRadio = el("input", { type: "radio", name: "leaf-key-source", value: "csr" });
   const keySourceRow = el("div", { class: "key-source-picker" }, [
@@ -155,9 +171,27 @@ export function buildLeafForm(locale: Locale, parent: EnvelopeJson): LeafFormHan
 
   const notBefore = el("input", { type: "datetime-local" });
   const notAfter = el("input", { type: "datetime-local" });
-  const hostBinding = stringListInput(t(locale, "field_add"), t(locale, "field_remove"));
-  const userBinding = stringListInput(t(locale, "field_add"), t(locale, "field_remove"));
-  const roles = roleCheckboxGroup(selectableRoles(parent));
+  const hostBinding = suggestingStringListInput(
+    t(locale, "field_add"),
+    t(locale, "field_remove"),
+    inventory ? inventory.hosts.map((h) => h.id) : [],
+  );
+  const userBinding = suggestingStringListInput(
+    t(locale, "field_add"),
+    t(locale, "field_remove"),
+    inventory ? inventory.users : [],
+  );
+  const envelopeRoles = selectableRoles(parent);
+  const offeredRoles = rolesForSelection(envelopeRoles, inventory?.roles);
+  const roles = roleCheckboxGroup(offeredRoles);
+  // `rolesForSelection` itself treats an inventory that lists no roles as "no
+  // opinion" and returns the full envelope (core/envelope.ts) — so this length
+  // comparison is already false whenever the inventory didn't actually narrow
+  // anything, without needing to special-case an empty `inventory.roles` here.
+  const rolesNarrowed = inventory !== undefined && offeredRoles.length < envelopeRoles.length;
+  const rolesNarrowedNote = rolesNarrowed
+    ? el("p", { class: "hint roles-narrowed-note" }, [t(locale, "leaf_roles_narrowed_by_inventory")])
+    : "";
   const maxLevel = el("input", {
     type: "number",
     max: String(maxSelectableLevel(parent)),
@@ -184,6 +218,7 @@ export function buildLeafForm(locale: Locale, parent: EnvelopeJson): LeafFormHan
     fieldWithMarker(t(locale, "field_host_binding"), hostBinding.root, hostMarker),
     fieldWithMarker(t(locale, "field_user_binding"), userBinding.root, userMarker),
     fieldWithMarker(t(locale, "field_allowed_roles"), roles.root, rolesMarker),
+    rolesNarrowedNote,
     fieldWithMarker(t(locale, "field_max_integrity_level"), maxLevel, integrityMarker),
     field(t(locale, "field_max_integrity_categories"), maxCategories),
     fieldWithMarker(t(locale, "field_profile_version"), profileVersion, profileMarker),

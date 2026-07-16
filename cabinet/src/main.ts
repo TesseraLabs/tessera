@@ -13,7 +13,14 @@ if (!root) {
 // through unnoticed. It cannot assume a locale, so the message is bilingual
 // plain text rather than going through the RU/EN dictionary.
 try {
-  const app = new App(root, window.sessionStorage, window.location.hostname, navigator.language);
+  const app = new App(
+    root,
+    window.sessionStorage,
+    window.location.hostname,
+    navigator.language,
+    (name) => document.querySelector(`meta[name="${name}"]`)?.getAttribute("content") ?? null,
+    window.location.origin,
+  );
   app.start().catch((e: unknown) => {
     renderFatalError(root, e);
   });

@@ -184,8 +184,6 @@ pub(crate) enum Msg {
     ServeListening,
     /// `issuer serve`: the session token follows.
     ServeSessionToken,
-    /// `issuer serve`: the runtime token-file path follows.
-    ServeTokenWritten,
     /// `issuer serve`: a TBS that could not be shown was refused (full line).
     ServeUnreadableTbs,
     /// `issuer serve`: the operator declined (a kind and subject follow).
@@ -241,7 +239,6 @@ impl Msg {
         match self {
             Msg::ServeListening => "issuer serve: listening on",
             Msg::ServeSessionToken => "issuer serve: session token:",
-            Msg::ServeTokenWritten => "issuer serve: session token written to",
             Msg::ServeUnreadableTbs => {
                 "issuer serve: rejected sign — TBS is not a readable issuance operation"
             }
@@ -273,7 +270,6 @@ impl Msg {
         match self {
             Msg::ServeListening => "issuer serve: приём на",
             Msg::ServeSessionToken => "issuer serve: токен сессии:",
-            Msg::ServeTokenWritten => "issuer serve: токен сессии записан в",
             Msg::ServeUnreadableTbs => {
                 "issuer serve: подпись отклонена — TBS не читается как операция выпуска"
             }

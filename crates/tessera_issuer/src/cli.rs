@@ -358,10 +358,15 @@ struct ServeArgs {
     /// Signing algorithm: `ecdsa-p256`, `ecdsa-p384`, or `rsa-sha256`.
     #[arg(long, default_value = "ecdsa-p256")]
     algorithm: String,
-    /// Write the pairing token to a private per-user runtime file instead of
-    /// printing it (background/daemon use).
+    /// Run as a pure signing bridge without serving the cabinet SPA (the cabinet
+    /// is served by default when this binary carries it or `--cabinet-dir` is
+    /// given).
     #[arg(long)]
-    daemon_token_file: bool,
+    no_cabinet: bool,
+    /// Serve the cabinet SPA from an external `dist/` directory instead of the
+    /// assets embedded in this binary (overridden by `--no-cabinet`).
+    #[arg(long)]
+    cabinet_dir: Option<PathBuf>,
     /// Path to a pinentry program for the operator-confirmation dialog.
     #[arg(long)]
     pinentry: Option<PathBuf>,
@@ -1207,7 +1212,7 @@ fn run_serve(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
 
     use crate::confirm::DefaultConfirmer;
     use crate::pkcs11::{Pkcs11Config, Pkcs11SignError, Pkcs11Signer};
-    use crate::serve::{serve, AgentConfig, TokenDelivery};
+    use crate::serve::{serve, AgentConfig};
 
     let module_path = args
         .module
@@ -1215,11 +1220,20 @@ fn run_serve(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
     let key = args
         .key
         .ok_or_else(|| CliError::Usage("issuer serve: --key is required".to_owned()))?;
-    if args.allow_origins.is_empty() {
+    let cabinet = resolve_cabinet_source(args.cabinet_dir, args.no_cabinet);
+    // Serving the cabinet supplies the allowlist entry itself (the bound
+    // loopback origin, added after bind), so `--allow-origin` is optional then;
+    // a pure bridge still needs at least one.
+    let serving_cabinet = !matches!(cabinet, crate::serve::CabinetSource::Disabled);
+    if args.allow_origins.is_empty() && !serving_cabinet {
         return Err(CliError::Usage(
-            "issuer serve: at least one --allow-origin is required".to_owned(),
+            "issuer serve: at least one --allow-origin is required in bridge mode (drop \
+             --no-cabinet — serving the cabinet is the default and allowlists the agent's \
+             own origin)"
+                .to_owned(),
         ));
     }
+    let key_label = key.clone();
     let algorithm = parse_algorithm(&args.algorithm)?;
     let config = Pkcs11Config {
         module_path,
@@ -1242,15 +1256,42 @@ fn run_serve(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
         bind_port: args.port,
         allowed_origins: args.allow_origins,
         advertised_algorithms: vec![algorithm],
-        token_delivery: if args.daemon_token_file {
-            TokenDelivery::RuntimeFile
-        } else {
-            TokenDelivery::Stdout
-        },
+        cabinet,
+        key_label,
         locale,
     };
     let confirmer = DefaultConfirmer::new(args.pinentry, locale);
     serve(signer, confirmer, agent_config).map_err(|e| CliError::Backend(e.to_string()))
+}
+
+/// Resolve the cabinet source: serving is the default when the cabinet is
+/// available, and `--no-cabinet` opts out.
+///
+/// `--no-cabinet` forces a pure bridge; otherwise an explicit `--cabinet-dir`
+/// wins, else the assets embedded in this binary are used, and if the binary
+/// carries none the agent falls back to a bridge (no error — a build without the
+/// `embed-cabinet` feature simply has nothing to serve).
+#[cfg(all(feature = "serve", feature = "pkcs11"))]
+fn resolve_cabinet_source(
+    cabinet_dir: Option<PathBuf>,
+    no_cabinet: bool,
+) -> crate::serve::CabinetSource {
+    use crate::serve::CabinetSource;
+
+    if no_cabinet {
+        return CabinetSource::Disabled;
+    }
+    if let Some(dir) = cabinet_dir {
+        return CabinetSource::Directory(dir);
+    }
+    #[cfg(feature = "embed-cabinet")]
+    {
+        CabinetSource::Embedded
+    }
+    #[cfg(not(feature = "embed-cabinet"))]
+    {
+        CabinetSource::Disabled
+    }
 }
 
 /// Fallback when `serve` is enabled without the `pkcs11` backend.
@@ -1514,5 +1555,47 @@ mod tests {
         let pem = encode_pem("CERTIFICATE", &der);
         assert_eq!(decode_pem_or_der(&der).unwrap(), der);
         assert_eq!(decode_pem_or_der(pem.as_bytes()).unwrap(), der);
+    }
+
+    #[cfg(all(feature = "serve", feature = "pkcs11"))]
+    #[test]
+    fn no_cabinet_flag_forces_bridge() {
+        use crate::serve::CabinetSource;
+        assert!(matches!(
+            resolve_cabinet_source(Some(std::path::PathBuf::from("/some/dist")), true),
+            CabinetSource::Disabled
+        ));
+    }
+
+    #[cfg(all(feature = "serve", feature = "pkcs11"))]
+    #[test]
+    fn explicit_cabinet_dir_selects_directory() {
+        use crate::serve::CabinetSource;
+        assert!(matches!(
+            resolve_cabinet_source(Some(std::path::PathBuf::from("/some/dist")), false),
+            CabinetSource::Directory(_)
+        ));
+    }
+
+    #[cfg(all(feature = "serve", feature = "pkcs11", feature = "embed-cabinet"))]
+    #[test]
+    fn default_serves_embedded_cabinet() {
+        use crate::serve::CabinetSource;
+        // No flag and a binary carrying the cabinet → serve it (the default).
+        assert!(matches!(
+            resolve_cabinet_source(None, false),
+            CabinetSource::Embedded
+        ));
+    }
+
+    #[cfg(all(feature = "serve", feature = "pkcs11", not(feature = "embed-cabinet")))]
+    #[test]
+    fn default_falls_back_to_bridge_without_embedded_cabinet() {
+        use crate::serve::CabinetSource;
+        // No flag and no embedded assets → bridge, no error.
+        assert!(matches!(
+            resolve_cabinet_source(None, false),
+            CabinetSource::Disabled
+        ));
     }
 }

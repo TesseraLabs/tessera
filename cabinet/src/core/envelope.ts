@@ -31,6 +31,29 @@ export function selectableRoles(parent: EnvelopeJson): string[] {
   return [...parent.allow_roles];
 }
 
+/**
+ * The roles a leaf form actually offers when an inventory is on hand (spec
+ * `issuer-cabinet` — "Инвентарь для форм"): the intersection of the parent
+ * envelope's roles with the inventory's roles, in the envelope's order — the
+ * envelope stays the ceiling, the inventory only narrows and suggests. A role
+ * present in the inventory but outside the envelope is silently dropped (it
+ * was never selectable in the first place).
+ *
+ * An inventory that doesn't list any roles at all — `snapshotRoles`
+ * `undefined` *or* an empty array — does not narrow anything: it's read as
+ * "this inventory has no opinion on roles" (an operator who built an
+ * inventory purely for the host/user suggestions, without filling in roles,
+ * must not end up with zero roles offered — a snapshot with no roles is not
+ * the same claim as a snapshot that positively lists none). Narrowing, and
+ * the form's "narrowed by inventory" note, only kick in once the inventory
+ * actually names at least one role.
+ */
+export function rolesForSelection(envelopeRoles: string[], snapshotRoles?: string[]): string[] {
+  if (snapshotRoles === undefined || snapshotRoles.length === 0) return [...envelopeRoles];
+  const inInventory = new Set(snapshotRoles);
+  return envelopeRoles.filter((role) => inInventory.has(role));
+}
+
 /** The largest integrity level a form may offer under `parent`. */
 export function maxSelectableLevel(parent: EnvelopeJson): number {
   return parent.max_level;

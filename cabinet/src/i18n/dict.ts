@@ -88,9 +88,10 @@ export const en = {
   agent_key_label: "CA key label",
   agent_key_hint: "must match the agent's --key flag exactly",
   agent_status_unknown: "not checked",
-  agent_status_ok: "reachable",
-  agent_status_error: "unreachable",
-  agent_check: "Check",
+  agent_status_connecting: "connecting…",
+  agent_status_connected: "connected",
+  agent_status_disconnected: "not connected",
+  agent_connect: "Connect",
   agent_save: "Save",
 
   // Summary / signing flow
@@ -151,6 +152,51 @@ export const en = {
   // Startup failure (fail-closed screen when the WASM core fails to initialise)
   startup_error_title: "The cabinet failed to start",
   startup_error_detail: "The issuance core could not be loaded. Technical detail",
+
+  // Tabs
+  tab_issue: "Issue",
+  tab_journal: "Journal",
+
+  // Help modals (design §3): a "?" button next to the parent and agent
+  // section headings opens a local, CSP-safe modal with the same content as
+  // docs/issuer.md's corresponding sections — no new claims, just surfaced
+  // in-app.
+  help_button_label: "Help",
+  help_docs_more: "More detail",
+
+  help_parent_title: "Parent certificate",
+  help_parent_p1:
+    "The cabinet's parent is either the fleet root (created by the PKI owner, outside day-to-day issuance) or an organisation CA (issued under the root with `issuer issue-ca`). Which one you load decides what the cabinet offers: a root issues organisation CAs and assigns their envelopes; an organisation CA issues shift leaves within its own envelope.",
+  help_parent_p2:
+    "The operator receives the parent file from the level above — it is not something the cabinet creates for you.",
+  help_parent_p3: "Accepted formats: PEM or DER; the format is detected from the file's content.",
+
+  help_agent_title: "The issuer serve agent",
+  help_agent_p1:
+    "issuer serve is a local HTTP bridge on 127.0.0.1 between the browser cabinet — which cannot reach a PKCS#11 token or HSM directly — and the signing key. It receives a built TBS from the cabinet and returns a signature; it never receives or stores a private key.",
+  help_agent_p2: "Basic run, for the duration of a session:",
+  help_agent_p3:
+    "For a standing workstation, ready-made autostart examples ship in crates/tessera_issuer/examples/: systemd --user on Linux (issuer-serve.service), a launchd LaunchAgent on macOS (com.tesseralabs.issuer-serve.plist), and a logon-triggered Task Scheduler task on Windows (issuer-serve-task.xml).",
+  help_agent_p4:
+    "The agent prints a paired session token at startup (or writes it to a file with --daemon-token-file); the cabinet sends it back on every request in the X-Tessera-Session header.",
+  help_agent_p5:
+    "--allow-origin is required and repeatable: a request with no Origin header, or an Origin outside the allowlist, is rejected before the signing module is ever touched.",
+
+  // Inventory constructor (design §1: build inventory in the cabinet instead
+  // of loading a signed export file)
+  snapshot_mode_manual: "Build",
+  snapshot_mode_file: "Load file",
+  snapshot_hosts_label: "Devices",
+  snapshot_host_id_placeholder: "id (e.g. sha256:…)",
+  snapshot_host_label_placeholder: "label (optional)",
+  snapshot_users_label: "Users",
+  snapshot_roles_label: "Roles",
+  snapshot_tags_label: "Tags (key=value)",
+  snapshot_build_action: "Build inventory",
+  snapshot_download_action: "Download snapshot",
+
+  // Leaf form: role list narrowed by the loaded inventory (spec issuer-cabinet)
+  leaf_roles_narrowed_by_inventory: "Narrowed by the loaded inventory, relative to the parent's envelope.",
 } as const;
 
 export type DictKey = keyof typeof en;
@@ -232,9 +278,10 @@ export const ru: Dict = {
   agent_key_label: "Метка ключа CA",
   agent_key_hint: "должна точно совпадать с флагом --key агента",
   agent_status_unknown: "не проверялся",
-  agent_status_ok: "доступен",
-  agent_status_error: "недоступен",
-  agent_check: "Проверить",
+  agent_status_connecting: "подключение…",
+  agent_status_connected: "подключён",
+  agent_status_disconnected: "не подключён",
+  agent_connect: "Подключить",
   agent_save: "Сохранить",
 
   summary_title: "Сводка операции",
@@ -289,4 +336,41 @@ export const ru: Dict = {
 
   startup_error_title: "Кабинет не смог инициализироваться",
   startup_error_detail: "Не удалось загрузить ядро выпуска. Техническая информация",
+
+  tab_issue: "Выпуск",
+  tab_journal: "Журнал",
+
+  help_button_label: "Справка",
+  help_docs_more: "Подробнее",
+
+  help_parent_title: "Родительский сертификат",
+  help_parent_p1:
+    "Родитель кабинета — либо корень парка (создаётся владельцем PKI, вне ежедневного выпуска), либо CA организации (выдаётся под корнем командой `issuer issue-ca`). От того, что загружено, зависит набор доступных операций: корень выпускает CA организаций и назначает их рамки делегирования; CA организации выпускает листы смен строго в своих рамках.",
+  help_parent_p2:
+    "Оператор получает файл родителя от уровня выше — кабинет его не создаёт.",
+  help_parent_p3: "Принимаемые форматы: PEM или DER; формат определяется по содержимому файла.",
+
+  help_agent_title: "Агент issuer serve",
+  help_agent_p1:
+    "issuer serve — локальный HTTP-мост на 127.0.0.1 между браузерным кабинетом (который не может обратиться к PKCS#11-токену или HSM напрямую) и ключом подписи. Он принимает от кабинета готовый TBS и возвращает подпись; приватный ключ через него не проходит.",
+  help_agent_p2: "Базовый запуск на время сессии:",
+  help_agent_p3:
+    "Для постоянного рабочего места готовые примеры автостарта лежат в crates/tessera_issuer/examples/: systemd --user на Linux (issuer-serve.service), launchd LaunchAgent на macOS (com.tesseralabs.issuer-serve.plist), задача Task Scheduler с логон-триггером на Windows (issuer-serve-task.xml).",
+  help_agent_p4:
+    "Агент печатает парный токен сессии при старте (либо пишет в файл с --daemon-token-file); кабинет передаёт его в заголовке X-Tessera-Session с каждым запросом.",
+  help_agent_p5:
+    "--allow-origin обязателен и повторяем: запрос без заголовка Origin или с Origin вне allowlist отвергается до обращения к модулю подписи.",
+
+  snapshot_mode_manual: "Собрать",
+  snapshot_mode_file: "Загрузить файл",
+  snapshot_hosts_label: "Устройства",
+  snapshot_host_id_placeholder: "id (например, sha256:…)",
+  snapshot_host_label_placeholder: "метка (необязательно)",
+  snapshot_users_label: "Пользователи",
+  snapshot_roles_label: "Роли",
+  snapshot_tags_label: "Метки (ключ=значение)",
+  snapshot_build_action: "Собрать инвентарь",
+  snapshot_download_action: "Скачать снапшот",
+
+  leaf_roles_narrowed_by_inventory: "Список сужен загруженным инвентарём относительно рамок родителя.",
 };

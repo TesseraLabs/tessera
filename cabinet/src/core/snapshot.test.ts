@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { acceptSnapshot } from "./snapshot.ts";
+import { acceptSnapshot, buildManualSnapshot } from "./snapshot.ts";
+import type { SnapshotPayload } from "./snapshot.ts";
 
 const payload = {
   generated_at: 1_750_000_000,
@@ -106,4 +107,24 @@ test("malformed snapshot files are rejected", async () => {
     0,
   );
   assert.equal(badPayload.ok, false);
+});
+
+test("buildManualSnapshot round-trips through acceptSnapshot as a manual snapshot", async () => {
+  const constructed: SnapshotPayload = {
+    generated_at: 1_750_000_000,
+    hosts: [{ id: "sha256:bbbb", label: "south-02" }],
+    users: ["petrov"],
+    roles: ["oper", "serv"],
+    tags: [{ key: "region", value: "south" }],
+  };
+  const file = buildManualSnapshot(constructed);
+  assert.equal(file.signature_b64, null);
+
+  const result = await acceptSnapshot(JSON.stringify(file), undefined, 1_750_000_900);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.snapshot.origin, "manual");
+    assert.equal(result.snapshot.ageSeconds, 900);
+    assert.deepEqual(result.snapshot.payload, constructed);
+  }
 });

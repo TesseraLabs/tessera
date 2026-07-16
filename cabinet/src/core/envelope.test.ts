@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   maxSelectableLevel,
   maxSelectableTtl,
+  rolesForSelection,
   selectableRoles,
   validateChildEnvelope,
   validateLeafSelection,
@@ -85,4 +86,20 @@ test("validateChildEnvelope rejects a dropped or altered required tag", () => {
 
 test("validateChildEnvelope accepts equality (same envelope, not narrowed further)", () => {
   assert.deepEqual(validateChildEnvelope(parent, { ...parent }), []);
+});
+
+test("rolesForSelection without an inventory returns the envelope's roles as-is, in order", () => {
+  assert.deepEqual(rolesForSelection(selectableRoles(parent)), ["oper", "serv"]);
+});
+
+test("rolesForSelection with an inventory returns the intersection, ordered by the envelope", () => {
+  assert.deepEqual(rolesForSelection(["oper", "serv"], ["serv", "oper"]), ["oper", "serv"]);
+});
+
+test("rolesForSelection drops an inventory role outside the envelope", () => {
+  assert.deepEqual(rolesForSelection(["oper", "serv"], ["oper", "admin"]), ["oper"]);
+});
+
+test("rolesForSelection with an inventory that lists no roles does not narrow — full envelope offered", () => {
+  assert.deepEqual(rolesForSelection(["oper", "serv"], []), ["oper", "serv"]);
 });
