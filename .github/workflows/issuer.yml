@@ -80,12 +80,14 @@ jobs:
       - name: Test (default features)
         run: cargo test -p tessera_issuer -p tessera_ext
 
-      # На Linux — весь набор фич. pkcs11-tests/vault-tests компилируются, но
-      # без внешней зависимости (SoftHSM-модуль, бинарь vault) в рантайме
-      # печатают `skipped:` и возвращают Ok — железо в CI не требуется.
-      - name: Test (all features, Linux)
+      # На Linux — весь набор фич, КРОМЕ embed-cabinet: она через `include_dir!`
+      # встраивает cabinet/dist, которого в этом job'е нет (кабинет собирается
+      # отдельным cabinet-job'ом, там же и тестируется embed). pkcs11-tests/
+      # vault-tests компилируются, но без внешней зависимости (SoftHSM-модуль,
+      # бинарь vault) в рантайме печатают `skipped:` и возвращают Ok.
+      - name: Test (Linux, all features except embed-cabinet)
         if: runner.os == 'Linux'
-        run: cargo test -p tessera_issuer --all-features
+        run: cargo test -p tessera_issuer --features cli,pkcs11,vault,serve,test-support
 
       # macOS/Windows: адаптеры собираются и тестируются с фичами, но без
       # железозависимых -tests-фич (нечего к ним подключать на раннере).
@@ -115,6 +117,14 @@ jobs:
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           shared-key: issuer-clippy
+
+      # embed-cabinet (в --all-features) через `include_dir!` требует
+      # cabinet/dist на этапе компиляции. Для линта содержимое не нужно —
+      # достаточно существования каталога (clippy не исполняет serving-тесты),
+      # поэтому кладём пустой placeholder; реальный embed собирается и тестируется
+      # в cabinet-job'е, где build.sh уже наполнил dist.
+      - name: Placeholder cabinet/dist for embed-cabinet lint
+        run: mkdir -p cabinet/dist
 
       - name: cargo clippy (issuer crates, all features, -D warnings)
         run: >
@@ -205,10 +215,11 @@ jobs:
 
       # Guard: релизный бинарь встраивает cabinet/dist через `include_dir!` за
       # фичей `embed-cabinet` (кабинет раздаётся `issuer serve` по умолчанию).
-      # Собираем сразу после build.sh — поломка пути include_dir/встраивания
-      # падает здесь, а не при выпуске бинаря.
-      - name: Verify issuer embeds the cabinet
-        run: cargo build -p tessera_issuer --features embed-cabinet,serve,pkcs11
+      # build.sh уже наполнил dist настоящим кабинетом — тестируем embed здесь
+      # (единственный job с реальным dist): поломка пути include_dir/встраивания
+      # и embed-serving-тесты падают здесь, а не при выпуске бинаря.
+      - name: Test issuer with the embedded cabinet
+        run: cargo test -p tessera_issuer --features embed-cabinet,serve,pkcs11,test-support
 
   # mac-gated сюиты tessera_core (в т.ч. issuer_contract — «что выпустил issuer,
   # то принял разбор Engine»). Без фичи mac-tests эти тесты не компилируются и в
