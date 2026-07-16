@@ -1,0 +1,191 @@
+name: release-issuer
+
+# Публикует бинарь `issuer` с ВСТРОЕННЫМ веб-кабинетом выпуска (фича
+# `embed-cabinet`) под Linux/macOS/Windows в тот же draft GitHub Release, что и
+# `.deb` агента (build.yml). Кабинет собирается один раз (cabinet-dist) и
+# встраивается на каждой платформе — так astra-контейнеру и раннерам не нужен
+# Node. Linux собирается в astra-builder (самый старый glibc среди целей →
+# бинарь работает на Astra, Ubuntu и Debian по обратной совместимости glibc).
+#
+# Спека: openspec/specs/build-release (требование «Release job»).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза для повторной публикации бинарей (например v0.5.0)'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  ISSUER_FEATURES: cli,pkcs11,vault,serve,embed-cabinet
+
+jobs:
+  # Кабинет — npm/esbuild/TypeScript SPA поверх wasm-ядра; build.sh нужны Node и
+  # Rust+wasm32. Собираем один раз, dist раздаём артефактом для embed.
+  cabinet-dist:
+    if: github.repository == 'TesseraLabs/tessera'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: release-issuer-cabinet
+
+      - name: Build cabinet
+        run: bash cabinet/build.sh
+
+      - name: Upload cabinet dist
+        uses: actions/upload-artifact@v7
+        with:
+          name: cabinet-dist
+          path: cabinet/dist/**
+          if-no-files-found: error
+          retention-days: 7
+
+  # Linux: в astra-builder (тот же контейнер, что собирает .deb). Старый glibc →
+  # бинарь работает на Astra и новее (Ubuntu/Debian). Rust и openssl (vault
+  # native-tls) в образе уже есть — им же собирается tessera_core.
+  build-issuer-linux:
+    needs: cabinet-dist
+    if: github.repository == 'TesseraLabs/tessera'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/tesseralabs/tessera-astra-builder:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Download cabinet dist
+        uses: actions/download-artifact@v8
+        with:
+          name: cabinet-dist
+          path: cabinet/dist
+
+      - name: Build issuer (release, embedded cabinet)
+        run: cargo build --release -p tessera_issuer --features "$ISSUER_FEATURES"
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp target/release/issuer out/issuer-linux-x86_64
+
+      - name: Upload issuer binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: issuer-linux-x86_64
+          path: out/*
+          if-no-files-found: error
+
+  # macOS/Windows: нативные раннеры (контейнеры на них не поддерживаются).
+  # native-tls (vault) использует системный TLS (Secure Transport / SChannel) —
+  # openssl не нужен. Rust предустановлен; rustup show ставит версию из
+  # rust-toolchain.toml.
+  build-issuer-desktop:
+    needs: cabinet-dist
+    if: github.repository == 'TesseraLabs/tessera'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: macos-arm64
+            ext: ''
+          - os: windows-latest
+            target: windows-x86_64
+            ext: '.exe'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Download cabinet dist
+        uses: actions/download-artifact@v8
+        with:
+          name: cabinet-dist
+          path: cabinet/dist
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: release-issuer-${{ matrix.target }}
+
+      - name: Build issuer (release, embedded cabinet)
+        run: cargo build --release -p tessera_issuer --features "$ISSUER_FEATURES"
+        shell: bash
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp "target/release/issuer${{ matrix.ext }}" "out/issuer-${{ matrix.target }}${{ matrix.ext }}"
+
+      - name: Upload issuer binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: issuer-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  # Собираем все бинари, считаем SHA256SUMS, доливаем в draft-релиз тега (как
+  # .deb в build.yml — владелец промоутит вручную).
+  release-issuer:
+    needs: [build-issuer-linux, build-issuer-desktop]
+    if: >-
+      github.repository == 'TesseraLabs/tessera' &&
+      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all issuer binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: issuer-*
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum issuer-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish issuer binaries to the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
+          files: |
+            dist/issuer-*
+            dist/SHA256SUMS
