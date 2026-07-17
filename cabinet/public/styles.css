@@ -226,6 +226,23 @@ dd {
   gap: 1rem;
 }
 
+.operation-choice-picker {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.operation-choice-picker label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.operation-choice-label {
+  font-weight: 600;
+}
+
 .csr-prefill-marker {
   color: var(--accent);
   font-weight: 400;

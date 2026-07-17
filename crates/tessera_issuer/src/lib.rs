@@ -93,6 +93,8 @@ pub mod cli;
 // (built with `--no-default-features`) pulls none of them.
 #[cfg(feature = "serve")]
 pub mod confirm;
+#[cfg(feature = "file")]
+pub mod file;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 #[cfg(feature = "serve")]

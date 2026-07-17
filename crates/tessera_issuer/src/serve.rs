@@ -1595,4 +1595,226 @@ mod tests {
         assert!(a.backend.signed.get());
         assert_eq!(out.cors_origin.as_deref(), Some(self_origin.as_str()));
     }
+
+    // --- Agent over real backends (file, and gated Vault) --------------------
+
+    /// The agent's `/info` + `/sign` cycle backed by a real on-disk file key,
+    /// standing in for the mock: a genuine P-256 signature comes back and
+    /// verifies against the CA public key.
+    #[cfg(feature = "file")]
+    #[test]
+    fn agent_over_file_backend_serves_info_and_signs() {
+        use std::io::Write as _;
+
+        use p256::ecdsa::signature::Verifier as _;
+        use p256::pkcs8::{EncodePrivateKey as _, LineEnding};
+
+        use crate::file::{FileConfig, FileSignError, FileSigner};
+
+        // A plaintext P-256 CA key on disk (0600), key id matching `config()`.
+        let secret = p256::SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let verifying = *p256::ecdsa::SigningKey::from(secret.clone()).verifying_key();
+        let pem = secret.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file.write_all(pem.as_bytes()).unwrap();
+        key_file.flush().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(key_file.path(), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        // The passphrase source must never be consulted for a plaintext key.
+        let passphrase = || Err(FileSignError::PassphraseUnavailable("n/a".to_owned()));
+        let signer = FileSigner::open(
+            FileConfig {
+                path: key_file.path().to_path_buf(),
+                key_id: KeyId::new(KEY_LABEL),
+                requested_algorithm: None,
+            },
+            &passphrase,
+        )
+        .unwrap();
+
+        let agent = Agent::new(
+            signer,
+            auto_confirm as ConfirmFn,
+            config(),
+            SecretString::from(TOKEN.to_owned()),
+        );
+
+        // GET /info reports the advertised algorithm.
+        let info = agent.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/info",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(info.status, 200);
+        let info_json: serde_json::Value = serde_json::from_slice(&info.body).unwrap();
+        assert_eq!(info_json["algorithms"][0], "ecdsa-with-sha256");
+
+        // POST /sign returns a real signature over the submitted TBS.
+        let tbs_b64 = leaf_tbs_b64();
+        let body = serde_json::json!({ "key_id": KEY_LABEL, "tbs_der_b64": tbs_b64 }).to_string();
+        let out = agent.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: body.as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(value["algorithm"], "ecdsa-with-sha256");
+        let sig_b64 = value["signature_b64"].as_str().expect("signature present");
+
+        // The returned signature verifies under the file key's public half.
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let tbs = base64::Engine::decode(&b64, tbs_b64).unwrap();
+        let sig_der = base64::Engine::decode(&b64, sig_b64).unwrap();
+        let signature = p256::ecdsa::Signature::from_der(&sig_der).unwrap();
+        verifying
+            .verify(&tbs, &signature)
+            .expect("agent's file-backed signature must verify");
+    }
+
+    /// The agent's `/info` + `/sign` cycle backed by a live Vault Transit key.
+    ///
+    /// Gated by `vault-tests` and a runtime check for the `vault` binary; when it
+    /// is absent the test prints `skipped:` and returns, mirroring
+    /// `tests/vault_sign.rs`.
+    #[cfg(feature = "vault-tests")]
+    #[test]
+    fn agent_over_vault_backend_serves_info_and_signs() {
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        use crate::vault::{VaultConfig, VaultSigner};
+
+        const VAULT_ADDR: &str = "http://127.0.0.1:8210";
+        const ROOT_TOKEN: &str = "tessera-dev-root-token";
+
+        /// A dev-server killed when the guard drops.
+        struct VaultGuard(Child);
+        impl Drop for VaultGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn vault_available() -> bool {
+            Command::new("vault")
+                .arg("-version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+
+        fn vault_cmd(args: &[&str]) {
+            let status = Command::new("vault")
+                .args(args)
+                .env("VAULT_ADDR", VAULT_ADDR)
+                .env("VAULT_TOKEN", ROOT_TOKEN)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("run vault command");
+            assert!(status.success(), "vault {args:?} failed");
+        }
+
+        if !vault_available() {
+            println!("skipped: `vault` binary not found on PATH");
+            return;
+        }
+
+        let child = Command::new("vault")
+            .args([
+                "server",
+                "-dev",
+                "-dev-root-token-id",
+                ROOT_TOKEN,
+                "-dev-listen-address",
+                "127.0.0.1:8210",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vault dev server");
+        let _guard = VaultGuard(child);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if ureq::get(&format!("{VAULT_ADDR}/v1/sys/health"))
+                .call()
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "vault dev-server did not come up"
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+
+        vault_cmd(&["secrets", "enable", "transit"]);
+        vault_cmd(&["write", "-f", "transit/keys/ca-key", "type=ecdsa-p256"]);
+
+        let signer = VaultSigner::new(
+            VaultConfig {
+                address: VAULT_ADDR.to_owned(),
+                mount: "transit".to_owned(),
+                key_name: "ca-key".to_owned(),
+                key_id: KeyId::new(KEY_LABEL),
+                algorithm: SignatureAlgorithm::EcdsaWithSha256,
+                prehashed: false,
+                ca_bundle_path: None,
+            },
+            SecretString::from(ROOT_TOKEN.to_owned()),
+        )
+        .expect("build vault signer");
+
+        let agent = Agent::new(
+            signer,
+            auto_confirm as ConfirmFn,
+            config(),
+            SecretString::from(TOKEN.to_owned()),
+        );
+
+        let info = agent.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/info",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(info.status, 200);
+
+        let body = sign_body();
+        let out = agent.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: body.as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(value["algorithm"], "ecdsa-with-sha256");
+        assert!(value.get("signature_b64").is_some());
+    }
 }

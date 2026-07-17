@@ -222,6 +222,9 @@ pub(crate) enum Msg {
     CliBackendError,
     /// CLI: an I/O error (a detail follows).
     CliIoError,
+    /// File backend: the CA key file is unencrypted (full-line warning printed
+    /// once at startup, to stderr).
+    FilePlaintextKeyWarning,
 }
 
 #[cfg(any(feature = "cli", feature = "serve"))]
@@ -262,6 +265,10 @@ impl Msg {
             Msg::CliUsage => "usage error:",
             Msg::CliBackendError => "backend error:",
             Msg::CliIoError => "I/O error:",
+            Msg::FilePlaintextKeyWarning => {
+                "warning: the CA key file is unencrypted; encrypt it \
+                 (openssl pkcs8 -topk8) or use a PKCS#11/Vault backend in production"
+            }
         }
     }
 
@@ -293,6 +300,10 @@ impl Msg {
             Msg::CliUsage => "ошибка вызова:",
             Msg::CliBackendError => "ошибка бэкенда:",
             Msg::CliIoError => "ошибка ввода-вывода:",
+            Msg::FilePlaintextKeyWarning => {
+                "предупреждение: файл ключа УЦ не зашифрован; зашифруйте его \
+                 (openssl pkcs8 -topk8) или используйте бэкенд PKCS#11/Vault в проде"
+            }
         }
     }
 }
