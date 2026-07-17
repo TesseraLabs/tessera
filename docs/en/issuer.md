@@ -5,9 +5,12 @@
 Tessera verifies certificates on the device, but something has to issue them.
 The issuer tooling covers that side: a single Rust core assembles a
 `TBSCertificate` with the Tessera extensions, checks the monotonic narrowing of
-the delegation envelope **before** signing, and signs the result with a key that
-never leaves the token/HSM/Vault. The tool is **not a custodian**: no private key
-material passes through the issuing code.
+the delegation envelope **before** signing, and signs the result with the key of
+the selected backend — a token/HSM (PKCS#11), Vault Transit, or a local PKCS#8
+file. With the PKCS#11 and Vault backends the tool is **not a custodian**: no
+private key material passes through the issuing code; the file backend is a
+deliberate trade-off with the key resident in the issuance process memory (see
+[threat-model.md §11](threat-model.md)).
 
 Components:
 
