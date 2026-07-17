@@ -84,6 +84,8 @@ enum BackendKind {
     Pkcs11,
     /// A Vault / `OpenBao` Transit key.
     Vault,
+    /// An on-disk PKCS#8 CA key file.
+    File,
     /// A deterministic in-crate signer for tests (no real cryptography).
     #[value(hide = true)]
     Mock,
@@ -96,19 +98,27 @@ struct BackendArgs {
     /// Signing backend.
     #[arg(long, value_enum, default_value_t = BackendKind::Pkcs11)]
     backend: BackendKind,
-    /// CA key identifier: the PKCS#11 `CKA_LABEL`, or the Vault key id.
+    /// CA key identifier: the PKCS#11 `CKA_LABEL`, or the Vault key id. Required
+    /// for pkcs11/vault; optional for the file backend, where it defaults to the
+    /// key file's basename without extension.
     #[arg(long)]
-    key: String,
-    /// Signing algorithm: `ecdsa-p256`, `ecdsa-p384`, or `rsa-sha256`.
-    #[arg(long, default_value = "ecdsa-p256")]
-    algorithm: String,
+    key: Option<String>,
+    /// Signing algorithm: `ecdsa-p256`, `ecdsa-p384`, or `rsa-sha256`. Defaults
+    /// to `ecdsa-p256` for pkcs11/vault; for the file backend the algorithm is
+    /// derived from the key and this flag is only a cross-check.
+    #[arg(long)]
+    algorithm: Option<String>,
     /// PKCS#11 module path (pkcs11 backend).
     #[arg(long)]
     module: Option<PathBuf>,
     /// PKCS#11 token label to select (pkcs11 backend).
     #[arg(long)]
     token_label: Option<String>,
-    /// pinentry program for the PIN prompt (pkcs11 backend).
+    /// PKCS#8 CA key file, PEM or DER (file backend).
+    #[arg(long)]
+    key_file: Option<PathBuf>,
+    /// pinentry program for the PIN prompt (pkcs11 backend) or the key
+    /// passphrase prompt (file backend).
     #[arg(long)]
     pinentry: Option<PathBuf>,
     /// Vault base address, e.g. `https://vault.example:8200` (vault backend).
@@ -346,18 +356,45 @@ struct ServeArgs {
     /// Allowed cabinet `Origin` (repeat for several).
     #[arg(long = "allow-origin")]
     allow_origins: Vec<String>,
-    /// Path to the PKCS#11 module the CA key lives in.
-    #[arg(long)]
-    module: Option<PathBuf>,
-    /// Token label to select (defaults to the first present token).
-    #[arg(long)]
-    token_label: Option<String>,
-    /// CA key label — also the key id the cabinet references.
+    /// Signing backend (default `pkcs11`; the same set as the issuing
+    /// subcommands).
+    #[arg(long, value_enum, default_value_t = BackendKind::Pkcs11)]
+    backend: BackendKind,
+    /// CA key label — also the key id the cabinet references. Required for
+    /// pkcs11/vault; optional for the file backend, where it defaults to the key
+    /// file's basename without extension.
     #[arg(long)]
     key: Option<String>,
-    /// Signing algorithm: `ecdsa-p256`, `ecdsa-p384`, or `rsa-sha256`.
-    #[arg(long, default_value = "ecdsa-p256")]
-    algorithm: String,
+    /// Signing algorithm: `ecdsa-p256`, `ecdsa-p384`, or `rsa-sha256`. Defaults
+    /// to `ecdsa-p256` for pkcs11/vault; for the file backend the algorithm is
+    /// derived from the key and this flag is only a cross-check.
+    #[arg(long)]
+    algorithm: Option<String>,
+    /// Path to the PKCS#11 module the CA key lives in (pkcs11 backend).
+    #[arg(long)]
+    module: Option<PathBuf>,
+    /// PKCS#11 token label to select (pkcs11 backend; defaults to the first
+    /// present token).
+    #[arg(long)]
+    token_label: Option<String>,
+    /// PKCS#8 CA key file, PEM or DER (file backend).
+    #[arg(long)]
+    key_file: Option<PathBuf>,
+    /// Vault base address, e.g. `https://vault.example:8200` (vault backend).
+    #[arg(long)]
+    vault_addr: Option<String>,
+    /// Vault Transit mount path (vault backend).
+    #[arg(long, default_value = "transit")]
+    mount: String,
+    /// Vault Transit key name; defaults to `--key` (vault backend).
+    #[arg(long)]
+    vault_key: Option<String>,
+    /// PEM CA bundle to trust instead of the platform store (vault backend).
+    #[arg(long)]
+    ca_bundle: Option<PathBuf>,
+    /// Send a locally computed digest with `prehashed=true` (vault backend).
+    #[arg(long)]
+    prehashed: bool,
     /// Run as a pure signing bridge without serving the cabinet SPA (the cabinet
     /// is served by default when this binary carries it or `--cabinet-dir` is
     /// given).
@@ -367,7 +404,8 @@ struct ServeArgs {
     /// assets embedded in this binary (overridden by `--no-cabinet`).
     #[arg(long)]
     cabinet_dir: Option<PathBuf>,
-    /// Path to a pinentry program for the operator-confirmation dialog.
+    /// Path to a pinentry program for the operator-confirmation dialog and the
+    /// file-backend key passphrase.
     #[arg(long)]
     pinentry: Option<PathBuf>,
 }
@@ -479,13 +517,47 @@ fn dispatch_with_backend(
         BackendKind::Mock => run_mock(args, locale, job),
         BackendKind::Pkcs11 => run_pkcs11(args, locale, job),
         BackendKind::Vault => run_vault(args, locale, job),
+        BackendKind::File => run_file(args, locale, job),
     }
+}
+
+/// Resolve the key identifier the backend and the job both use.
+///
+/// `--key` names it directly. It is required for every backend except the file
+/// backend, which defaults it to the key file's basename (there is no key
+/// namespace in a file). Keeping this in one place guarantees the signer and the
+/// issuance job agree on the id passed through [`SignatureBackend`].
+fn effective_key_id(args: &BackendArgs) -> Result<KeyId, CliError> {
+    if let Some(key) = args.key.as_deref().filter(|k| !k.is_empty()) {
+        return Ok(KeyId::new(key));
+    }
+    if args.backend == BackendKind::File {
+        if let Some(id) = args.key_file.as_deref().and_then(key_id_from_path) {
+            return Ok(KeyId::new(id));
+        }
+    }
+    Err(CliError::Usage("--key is required".to_owned()))
+}
+
+/// The key file's basename without extension, used as the default file-backend
+/// key id.
+fn key_id_from_path(path: &Path) -> Option<String> {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+}
+
+/// Resolve the signing algorithm for backends that take it as configuration
+/// (pkcs11/vault/mock), defaulting to `ecdsa-p256`. The file backend derives its
+/// algorithm from the key instead, so it does not use this.
+#[cfg(any(test, feature = "test-support", feature = "pkcs11", feature = "vault"))]
+fn resolved_algorithm(args: &BackendArgs) -> Result<SignatureAlgorithm, CliError> {
+    parse_algorithm(args.algorithm.as_deref().unwrap_or("ecdsa-p256"))
 }
 
 #[cfg(any(test, feature = "test-support"))]
 fn run_mock(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Result<(), CliError> {
-    let signer =
-        crate::sign::MockSigner::new(KeyId::new(&args.key), parse_algorithm(&args.algorithm)?);
+    let signer = crate::sign::MockSigner::new(effective_key_id(args)?, resolved_algorithm(args)?);
     job.run(&signer, locale)
 }
 
@@ -507,8 +579,8 @@ fn run_pkcs11(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Resul
     let config = Pkcs11Config {
         module_path,
         token_label: args.token_label.clone(),
-        key_id: KeyId::new(&args.key),
-        algorithm: parse_algorithm(&args.algorithm)?,
+        key_id: effective_key_id(args)?,
+        algorithm: resolved_algorithm(args)?,
     };
     let signer = Pkcs11Signer::open(config, pin::CliPinSource::new(args.pinentry.clone()))
         .map_err(|e| CliError::Backend(e.to_string()))?;
@@ -534,12 +606,16 @@ fn run_vault(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Result
     // letting it surface as a generic backend failure. Transit signing has no
     // plaintext mode, so there is no localhost exception.
     crate::vault::require_https(&address).map_err(|e| CliError::Usage(e.to_string()))?;
+    let key_id = effective_key_id(args)?;
     let config = VaultConfig {
         address,
         mount: args.mount.clone(),
-        key_name: args.vault_key.clone().unwrap_or_else(|| args.key.clone()),
-        key_id: KeyId::new(&args.key),
-        algorithm: parse_algorithm(&args.algorithm)?,
+        key_name: args
+            .vault_key
+            .clone()
+            .unwrap_or_else(|| key_id.as_str().to_owned()),
+        key_id,
+        algorithm: resolved_algorithm(args)?,
         prehashed: args.prehashed,
         ca_bundle_path: args.ca_bundle.clone(),
     };
@@ -554,6 +630,43 @@ fn run_vault(_args: &BackendArgs, _locale: Locale, _job: impl BackendJob) -> Res
     ))
 }
 
+#[cfg(feature = "file")]
+fn run_file(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Result<(), CliError> {
+    use crate::file::{FileConfig, FileSigner};
+
+    let path = args
+        .key_file
+        .clone()
+        .ok_or_else(|| CliError::Usage("--key-file is required for the file backend".to_owned()))?;
+    // The file backend derives the algorithm from the key; an explicit
+    // `--algorithm` is only a cross-check, so pass it through as-is (None means
+    // "no cross-check") rather than substituting a default.
+    let requested_algorithm = args.algorithm.as_deref().map(parse_algorithm).transpose()?;
+    let key_id = effective_key_id(args)?;
+    let passphrase = keypass::FilePassphraseSource::new(args.pinentry.clone());
+    let signer = FileSigner::open(
+        FileConfig {
+            path,
+            key_id,
+            requested_algorithm,
+        },
+        &passphrase,
+    )
+    .map_err(|e| CliError::Backend(e.to_string()))?;
+    // A plaintext CA key is accepted but flagged on every start.
+    if !signer.key_is_encrypted() {
+        eprintln!("{}", Msg::FilePlaintextKeyWarning.text(locale));
+    }
+    job.run(&signer, locale)
+}
+
+#[cfg(not(feature = "file"))]
+fn run_file(_args: &BackendArgs, _locale: Locale, _job: impl BackendJob) -> Result<(), CliError> {
+    Err(CliError::Usage(
+        "this build has no file backend (rebuild with the `file` feature)".to_owned(),
+    ))
+}
+
 // --- Jobs -------------------------------------------------------------------
 
 /// `issue-root`.
@@ -564,7 +677,7 @@ struct IssueRootJob<'a> {
 impl BackendJob for IssueRootJob<'_> {
     fn run<B: SignatureBackend>(self, backend: &B, locale: Locale) -> Result<(), CliError> {
         let a = self.args;
-        let key = KeyId::new(&a.backend.key);
+        let key = effective_key_id(&a.backend)?;
         let spki = decode_pem_or_der(&read_file(&a.spki)?)?;
         let req = RootRequest {
             subject: a.subject.clone(),
@@ -598,7 +711,7 @@ struct IssueCaJob<'a> {
 impl BackendJob for IssueCaJob<'_> {
     fn run<B: SignatureBackend>(self, backend: &B, locale: Locale) -> Result<(), CliError> {
         let a = self.args;
-        let key = KeyId::new(&a.backend.key);
+        let key = effective_key_id(&a.backend)?;
         let parent = decode_pem_or_der(&read_file(&a.parent)?)?;
         let spki = decode_pem_or_der(&read_file(&a.spki)?)?;
         let req = CaRequest {
@@ -641,7 +754,7 @@ struct IssueLeafJob<'a> {
 impl BackendJob for IssueLeafJob<'_> {
     fn run<B: SignatureBackend>(self, backend: &B, locale: Locale) -> Result<(), CliError> {
         let a = self.args;
-        let key = KeyId::new(&a.backend.key);
+        let key = effective_key_id(&a.backend)?;
         let parent = decode_pem_or_der(&read_file(&a.parent)?)?;
         let source = build_key_source(a.spki.as_deref(), a.csr.as_deref())?;
         let scope = leaf_scope(a);
@@ -686,7 +799,7 @@ struct IssueCrlJob<'a> {
 impl BackendJob for IssueCrlJob<'_> {
     fn run<B: SignatureBackend>(self, backend: &B, locale: Locale) -> Result<(), CliError> {
         let a = self.args;
-        let key = KeyId::new(&a.backend.key);
+        let key = effective_key_id(&a.backend)?;
         let issuer = decode_pem_or_der(&read_file(&a.issuer)?)?;
         let mut revoked = Vec::with_capacity(a.revoked.len());
         for spec in &a.revoked {
@@ -722,7 +835,7 @@ struct CsrJob<'a> {
 impl BackendJob for CsrJob<'_> {
     fn run<B: SignatureBackend>(self, backend: &B, locale: Locale) -> Result<(), CliError> {
         let a = self.args;
-        let key = KeyId::new(&a.backend.key);
+        let key = effective_key_id(&a.backend)?;
         let spki = decode_pem_or_der(&read_file(&a.spki)?)?;
         let der = build_csr_der(backend, &key, &a.subject, &spki)?;
         write_artifact(&a.out, &der, "CERTIFICATE REQUEST", a.der)?;
@@ -1051,19 +1164,19 @@ fn encode_pem(label: &str, der: &[u8]) -> String {
     out
 }
 
-// --- PKCS#11 PIN source -----------------------------------------------------
+// --- Secret prompting (pinentry) --------------------------------------------
 
-/// The PIN provider for the CLI's PKCS#11 backend: an interactive pinentry
-/// prompt, falling back to the `TESSERA_ISSUER_PIN` environment variable.
-#[cfg(feature = "pkcs11")]
-mod pin {
+/// Shared pinentry prompting for the interactive backend secrets: the PKCS#11
+/// token PIN and the file-backend key passphrase. The Assuan exchange is the
+/// same; only the prompt caption and the environment fallback differ, so the
+/// exchange lives here and each backend's secret source wraps it.
+#[cfg(any(feature = "pkcs11", feature = "file"))]
+mod prompt {
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
 
     use secrecy::SecretString;
-
-    use crate::pkcs11::{PinSource, Pkcs11SignError};
 
     /// pinentry program names probed on `PATH`, in preference order.
     const PINENTRY_NAMES: &[&str] = &[
@@ -1074,36 +1187,14 @@ mod pin {
         "pinentry-curses",
     ];
 
-    /// A [`PinSource`] that prompts via pinentry, then falls back to the
-    /// `TESSERA_ISSUER_PIN` environment variable for non-interactive use.
-    pub(super) struct CliPinSource {
-        explicit_pinentry: Option<PathBuf>,
-    }
-
-    impl CliPinSource {
-        /// A PIN source preferring `explicit_pinentry`, then a discovered one.
-        pub(super) fn new(explicit_pinentry: Option<PathBuf>) -> Self {
-            Self { explicit_pinentry }
-        }
-    }
-
-    impl PinSource for CliPinSource {
-        fn pin(&self) -> Result<SecretString, Pkcs11SignError> {
-            if let Some(program) = discover(self.explicit_pinentry.clone()) {
-                if let Some(secret) = pinentry_get_pin(&program) {
-                    return Ok(secret);
-                }
-            }
-            std::env::var("TESSERA_ISSUER_PIN")
-                .ok()
-                .filter(|p| !p.is_empty())
-                .map(SecretString::from)
-                .ok_or_else(|| {
-                    Pkcs11SignError::PinUnavailable(
-                        "no pinentry available; set TESSERA_ISSUER_PIN".to_owned(),
-                    )
-                })
-        }
+    /// Prompt for a secret via pinentry, or `None` if none is available or the
+    /// prompt is cancelled (the caller then falls back to the environment).
+    ///
+    /// `prompt` is the caption shown in the dialog (e.g. the token PIN or the
+    /// key passphrase).
+    pub(super) fn prompt_secret(explicit: Option<PathBuf>, prompt: &str) -> Option<SecretString> {
+        let program = discover(explicit)?;
+        pinentry_get_secret(&program, prompt)
     }
 
     /// Locate a pinentry program: an explicit path if present, else the first
@@ -1126,11 +1217,11 @@ mod pin {
         None
     }
 
-    /// Run one Assuan `GETPIN` exchange, returning the entered PIN.
+    /// Run one Assuan `GETPIN` exchange under `prompt`, returning the entry.
     ///
     /// Returns `None` on any channel or protocol failure so the caller can fall
     /// back; a cancelled prompt is also `None`.
-    fn pinentry_get_pin(program: &PathBuf) -> Option<SecretString> {
+    fn pinentry_get_secret(program: &PathBuf, prompt: &str) -> Option<SecretString> {
         let mut child = Command::new(program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1143,7 +1234,7 @@ mod pin {
 
         let secret = (|| {
             read_until_ok(&mut reader)?; // greeting
-            send(&mut stdin, "SETPROMPT Tessera token PIN")?;
+            send(&mut stdin, &format!("SETPROMPT {prompt}"))?;
             read_until_ok(&mut reader)?;
             send(&mut stdin, "GETPIN")?;
             read_pin(&mut reader)
@@ -1183,9 +1274,9 @@ mod pin {
         }
     }
 
-    /// Read the `D <pin>` data line of a `GETPIN` reply, then its `OK`.
+    /// Read the `D <secret>` data line of a `GETPIN` reply, then its `OK`.
     fn read_pin(reader: &mut impl BufRead) -> Option<SecretString> {
-        let mut pin: Option<SecretString> = None;
+        let mut secret: Option<SecretString> = None;
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).ok()? == 0 {
@@ -1193,9 +1284,9 @@ mod pin {
             }
             let trimmed = line.trim_end();
             if let Some(value) = trimmed.strip_prefix("D ") {
-                pin = Some(SecretString::from(value.to_owned()));
+                secret = Some(SecretString::from(value.to_owned()));
             } else if trimmed == "OK" || trimmed.starts_with("OK ") {
-                return pin;
+                return secret;
             } else if trimmed.starts_with("ERR") {
                 return None;
             }
@@ -1203,28 +1294,148 @@ mod pin {
     }
 }
 
-// --- serve ------------------------------------------------------------------
+/// The PIN provider for the CLI's PKCS#11 backend: an interactive pinentry
+/// prompt, falling back to the `TESSERA_ISSUER_PIN` environment variable.
+#[cfg(feature = "pkcs11")]
+mod pin {
+    use std::path::PathBuf;
 
-/// Run the local signing agent when the required features are compiled in.
-#[cfg(all(feature = "serve", feature = "pkcs11"))]
-fn run_serve(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
     use secrecy::SecretString;
 
-    use crate::confirm::DefaultConfirmer;
-    use crate::pkcs11::{Pkcs11Config, Pkcs11SignError, Pkcs11Signer};
-    use crate::serve::{serve, AgentConfig};
+    use crate::pkcs11::{PinSource, Pkcs11SignError};
 
-    let module_path = args
-        .module
-        .ok_or_else(|| CliError::Usage("issuer serve: --module is required".to_owned()))?;
-    let key = args
-        .key
-        .ok_or_else(|| CliError::Usage("issuer serve: --key is required".to_owned()))?;
+    /// A [`PinSource`] that prompts via pinentry, then falls back to the
+    /// `TESSERA_ISSUER_PIN` environment variable for non-interactive use.
+    pub(super) struct CliPinSource {
+        explicit_pinentry: Option<PathBuf>,
+    }
+
+    impl CliPinSource {
+        /// A PIN source preferring `explicit_pinentry`, then a discovered one.
+        pub(super) fn new(explicit_pinentry: Option<PathBuf>) -> Self {
+            Self { explicit_pinentry }
+        }
+    }
+
+    impl PinSource for CliPinSource {
+        fn pin(&self) -> Result<SecretString, Pkcs11SignError> {
+            if let Some(secret) =
+                super::prompt::prompt_secret(self.explicit_pinentry.clone(), "Tessera token PIN")
+            {
+                return Ok(secret);
+            }
+            std::env::var("TESSERA_ISSUER_PIN")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(SecretString::from)
+                .ok_or_else(|| {
+                    Pkcs11SignError::PinUnavailable(
+                        "no pinentry available; set TESSERA_ISSUER_PIN".to_owned(),
+                    )
+                })
+        }
+    }
+}
+
+/// The passphrase provider for the CLI's file backend: an interactive pinentry
+/// prompt, falling back to the `TESSERA_ISSUER_KEY_PASSPHRASE` environment
+/// variable.
+#[cfg(feature = "file")]
+mod keypass {
+    use std::path::PathBuf;
+
+    use secrecy::SecretString;
+
+    use crate::file::{FileSignError, PassphraseSource};
+
+    /// A [`PassphraseSource`] that prompts via pinentry, then falls back to the
+    /// `TESSERA_ISSUER_KEY_PASSPHRASE` environment variable.
+    pub(super) struct FilePassphraseSource {
+        explicit_pinentry: Option<PathBuf>,
+    }
+
+    impl FilePassphraseSource {
+        /// A passphrase source preferring `explicit_pinentry`, then a discovered
+        /// pinentry program.
+        pub(super) fn new(explicit_pinentry: Option<PathBuf>) -> Self {
+            Self { explicit_pinentry }
+        }
+    }
+
+    impl PassphraseSource for FilePassphraseSource {
+        fn passphrase(&self) -> Result<SecretString, FileSignError> {
+            if let Some(secret) = super::prompt::prompt_secret(
+                self.explicit_pinentry.clone(),
+                "Tessera CA key passphrase",
+            ) {
+                return Ok(secret);
+            }
+            std::env::var("TESSERA_ISSUER_KEY_PASSPHRASE")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(SecretString::from)
+                .ok_or_else(|| {
+                    FileSignError::PassphraseUnavailable(
+                        "no pinentry available; set TESSERA_ISSUER_KEY_PASSPHRASE".to_owned(),
+                    )
+                })
+        }
+    }
+}
+
+// --- serve ------------------------------------------------------------------
+
+/// Run the local signing agent, dispatching on the selected backend.
+///
+/// The backend only supplies the signature; the agent's gates (loopback bind,
+/// pairing token, Origin allowlist, operator confirmation) are identical for
+/// every backend, so they live in the shared [`finish_serve`].
+#[cfg(feature = "serve")]
+fn run_serve(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
+    match args.backend {
+        BackendKind::Pkcs11 => run_serve_pkcs11(args, locale),
+        BackendKind::Vault => run_serve_vault(args, locale),
+        BackendKind::File => run_serve_file(args, locale),
+        BackendKind::Mock => Err(CliError::Usage(
+            "issuer serve: the mock backend cannot serve (choose pkcs11, vault, or file)"
+                .to_owned(),
+        )),
+    }
+}
+
+/// The algorithm a pkcs11/vault agent advertises, defaulting to `ecdsa-p256`.
+/// The file backend derives its algorithm from the key instead.
+#[cfg(all(feature = "serve", any(feature = "pkcs11", feature = "vault")))]
+fn serve_algorithm(args: &ServeArgs) -> Result<SignatureAlgorithm, CliError> {
+    parse_algorithm(args.algorithm.as_deref().unwrap_or("ecdsa-p256"))
+}
+
+/// Assemble the agent config and confirmer, then run the generic agent with
+/// `signer`.
+///
+/// This is the single place the request-gating policy and cabinet handling are
+/// wired, so switching backends changes only which signer is passed in — never a
+/// gate. `advertised` is the algorithm `GET /info` reports; `key_label` is the
+/// key id the served page carries and the cabinet references.
+#[cfg(all(
+    feature = "serve",
+    any(feature = "pkcs11", feature = "vault", feature = "file")
+))]
+fn finish_serve<B: SignatureBackend>(
+    args: ServeArgs,
+    locale: Locale,
+    signer: B,
+    advertised: SignatureAlgorithm,
+    key_label: String,
+) -> Result<(), CliError> {
+    use crate::confirm::DefaultConfirmer;
+    use crate::serve::{serve, AgentConfig, CabinetSource};
+
     let cabinet = resolve_cabinet_source(args.cabinet_dir, args.no_cabinet);
     // Serving the cabinet supplies the allowlist entry itself (the bound
     // loopback origin, added after bind), so `--allow-origin` is optional then;
     // a pure bridge still needs at least one.
-    let serving_cabinet = !matches!(cabinet, crate::serve::CabinetSource::Disabled);
+    let serving_cabinet = !matches!(cabinet, CabinetSource::Disabled);
     if args.allow_origins.is_empty() && !serving_cabinet {
         return Err(CliError::Usage(
             "issuer serve: at least one --allow-origin is required in bridge mode (drop \
@@ -1233,12 +1444,34 @@ fn run_serve(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
                 .to_owned(),
         ));
     }
-    let key_label = key.clone();
-    let algorithm = parse_algorithm(&args.algorithm)?;
+    let agent_config = AgentConfig {
+        bind_port: args.port,
+        allowed_origins: args.allow_origins,
+        advertised_algorithms: vec![advertised],
+        cabinet,
+        key_label,
+        locale,
+    };
+    let confirmer = DefaultConfirmer::new(args.pinentry, locale);
+    serve(signer, confirmer, agent_config).map_err(|e| CliError::Backend(e.to_string()))
+}
+
+/// Build the PKCS#11 agent backend and serve.
+#[cfg(all(feature = "serve", feature = "pkcs11"))]
+fn run_serve_pkcs11(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
+    use secrecy::SecretString;
+
+    use crate::pkcs11::{Pkcs11Config, Pkcs11SignError, Pkcs11Signer};
+
+    let module_path = args.module.clone().ok_or_else(|| {
+        CliError::Usage("issuer serve: --module is required for the pkcs11 backend".to_owned())
+    })?;
+    let key = serve_required_key(&args, "pkcs11")?;
+    let algorithm = serve_algorithm(&args)?;
     let config = Pkcs11Config {
         module_path,
-        token_label: args.token_label,
-        key_id: KeyId::new(key),
+        token_label: args.token_label.clone(),
+        key_id: KeyId::new(&key),
         algorithm,
     };
     // Agent-side PIN source: read from the environment for the duration of a
@@ -1252,16 +1485,114 @@ fn run_serve(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
     };
     let signer =
         Pkcs11Signer::open(config, pin_source).map_err(|e| CliError::Backend(e.to_string()))?;
-    let agent_config = AgentConfig {
-        bind_port: args.port,
-        allowed_origins: args.allow_origins,
-        advertised_algorithms: vec![algorithm],
-        cabinet,
-        key_label,
-        locale,
+    finish_serve(args, locale, signer, algorithm, key)
+}
+
+/// Fallback when `serve` is built without the `pkcs11` backend.
+#[cfg(all(feature = "serve", not(feature = "pkcs11")))]
+fn run_serve_pkcs11(_args: ServeArgs, _locale: Locale) -> Result<(), CliError> {
+    Err(CliError::Usage(
+        "issuer serve: this build has no pkcs11 backend (rebuild with the `pkcs11` feature)"
+            .to_owned(),
+    ))
+}
+
+/// Build the Vault Transit agent backend and serve.
+#[cfg(all(feature = "serve", feature = "vault"))]
+fn run_serve_vault(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
+    use crate::vault::{VaultConfig, VaultSigner};
+
+    let address = args.vault_addr.clone().ok_or_else(|| {
+        CliError::Usage("issuer serve: --vault-addr is required for the vault backend".to_owned())
+    })?;
+    crate::vault::require_https(&address).map_err(|e| CliError::Usage(e.to_string()))?;
+    let key = serve_required_key(&args, "vault")?;
+    let algorithm = serve_algorithm(&args)?;
+    let config = VaultConfig {
+        address,
+        mount: args.mount.clone(),
+        key_name: args.vault_key.clone().unwrap_or_else(|| key.clone()),
+        key_id: KeyId::new(&key),
+        algorithm,
+        prehashed: args.prehashed,
+        ca_bundle_path: args.ca_bundle.clone(),
     };
-    let confirmer = DefaultConfirmer::new(args.pinentry, locale);
-    serve(signer, confirmer, agent_config).map_err(|e| CliError::Backend(e.to_string()))
+    // Reads VAULT_TOKEN from the agent's environment, never from an HTTP request.
+    let signer = VaultSigner::from_env(config).map_err(|e| CliError::Backend(e.to_string()))?;
+    finish_serve(args, locale, signer, algorithm, key)
+}
+
+/// Fallback when `serve` is built without the `vault` backend.
+#[cfg(all(feature = "serve", not(feature = "vault")))]
+fn run_serve_vault(_args: ServeArgs, _locale: Locale) -> Result<(), CliError> {
+    Err(CliError::Usage(
+        "issuer serve: this build has no vault backend (rebuild with the `vault` feature)"
+            .to_owned(),
+    ))
+}
+
+/// Build the file agent backend and serve.
+#[cfg(all(feature = "serve", feature = "file"))]
+fn run_serve_file(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
+    use crate::file::{FileConfig, FileSigner};
+
+    let path = args.key_file.clone().ok_or_else(|| {
+        CliError::Usage("issuer serve: --key-file is required for the file backend".to_owned())
+    })?;
+    // The file backend derives the algorithm from the key; `--algorithm` is only
+    // a cross-check, so pass `None` when it is unset rather than a default.
+    let requested_algorithm = args.algorithm.as_deref().map(parse_algorithm).transpose()?;
+    // `--key` is optional for the file backend; default to the key file basename.
+    let key_id = args
+        .key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .map(KeyId::new)
+        .or_else(|| key_id_from_path(&path).map(KeyId::new))
+        .ok_or_else(|| {
+            CliError::Usage("issuer serve: --key is required for the file backend".to_owned())
+        })?;
+    let passphrase = keypass::FilePassphraseSource::new(args.pinentry.clone());
+    let signer = FileSigner::open(
+        FileConfig {
+            path,
+            key_id: key_id.clone(),
+            requested_algorithm,
+        },
+        &passphrase,
+    )
+    .map_err(|e| CliError::Backend(e.to_string()))?;
+    if !signer.key_is_encrypted() {
+        eprintln!("{}", Msg::FilePlaintextKeyWarning.text(locale));
+    }
+    let advertised = signer
+        .algorithm(&key_id)
+        .map_err(|e| CliError::Backend(e.to_string()))?;
+    let key_label = key_id.as_str().to_owned();
+    finish_serve(args, locale, signer, advertised, key_label)
+}
+
+/// Fallback when `serve` is built without the `file` backend.
+#[cfg(all(feature = "serve", not(feature = "file")))]
+fn run_serve_file(_args: ServeArgs, _locale: Locale) -> Result<(), CliError> {
+    Err(CliError::Usage(
+        "issuer serve: this build has no file backend (rebuild with the `file` feature)".to_owned(),
+    ))
+}
+
+/// The mandatory `--key` for the pkcs11/vault agent backends (`backend` names it
+/// for the error text).
+#[cfg(all(feature = "serve", any(feature = "pkcs11", feature = "vault")))]
+fn serve_required_key(args: &ServeArgs, backend: &str) -> Result<String, CliError> {
+    args.key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "issuer serve: --key is required for the {backend} backend"
+            ))
+        })
 }
 
 /// Resolve the cabinet source: serving is the default when the cabinet is
@@ -1271,7 +1602,10 @@ fn run_serve(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
 /// wins, else the assets embedded in this binary are used, and if the binary
 /// carries none the agent falls back to a bridge (no error — a build without the
 /// `embed-cabinet` feature simply has nothing to serve).
-#[cfg(all(feature = "serve", feature = "pkcs11"))]
+#[cfg(all(
+    feature = "serve",
+    any(feature = "pkcs11", feature = "vault", feature = "file")
+))]
 fn resolve_cabinet_source(
     cabinet_dir: Option<PathBuf>,
     no_cabinet: bool,
@@ -1292,14 +1626,6 @@ fn resolve_cabinet_source(
     {
         CabinetSource::Disabled
     }
-}
-
-/// Fallback when `serve` is enabled without the `pkcs11` backend.
-#[cfg(all(feature = "serve", not(feature = "pkcs11")))]
-fn run_serve(_args: ServeArgs, _locale: Locale) -> Result<(), CliError> {
-    Err(CliError::Usage(
-        "issuer serve requires the `pkcs11` feature".to_owned(),
-    ))
 }
 
 #[cfg(test)]
@@ -1597,5 +1923,117 @@ mod tests {
             resolve_cabinet_source(None, false),
             CabinetSource::Disabled
         ));
+    }
+
+    // --- serve backend selection ---------------------------------------------
+
+    /// A `ServeArgs` with the given backend and otherwise-minimal fields.
+    #[cfg(feature = "serve")]
+    fn serve_args(backend: BackendKind) -> ServeArgs {
+        ServeArgs {
+            port: 0,
+            allow_origins: vec!["https://cabinet.example".to_owned()],
+            backend,
+            key: None,
+            algorithm: None,
+            module: None,
+            token_label: None,
+            key_file: None,
+            vault_addr: None,
+            mount: "transit".to_owned(),
+            vault_key: None,
+            ca_bundle: None,
+            prehashed: false,
+            no_cabinet: true,
+            cabinet_dir: None,
+            pinentry: None,
+        }
+    }
+
+    /// The old command form (`--module … --key …`, no `--backend`) resolves to
+    /// the PKCS#11 backend — the pre-`--backend` behaviour is unchanged.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_without_backend_flag_defaults_to_pkcs11() {
+        let cli = Cli::try_parse_from(["issuer", "serve", "--module", "/tmp/x.so", "--key", "ca"])
+            .expect("old serve form must parse");
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.backend, BackendKind::Pkcs11);
+                assert_eq!(
+                    args.module.as_deref(),
+                    Some(std::path::Path::new("/tmp/x.so"))
+                );
+                assert_eq!(args.key.as_deref(), Some("ca"));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    /// `--backend file --key-file …` parses to the file backend.
+    #[cfg(all(feature = "serve", feature = "file"))]
+    #[test]
+    fn serve_parses_backend_file_with_key_file() {
+        let cli = Cli::try_parse_from([
+            "issuer",
+            "serve",
+            "--backend",
+            "file",
+            "--key-file",
+            "/tmp/ca.p8",
+        ])
+        .expect("file serve form must parse");
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.backend, BackendKind::File);
+                assert_eq!(
+                    args.key_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/ca.p8"))
+                );
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "serve", feature = "pkcs11"))]
+    #[test]
+    fn serve_pkcs11_without_module_is_a_usage_error() {
+        let mut args = serve_args(BackendKind::Pkcs11);
+        args.key = Some("ca".to_owned());
+        match run_serve(args, Locale::En).unwrap_err() {
+            CliError::Usage(msg) => assert!(msg.contains("--module"), "{msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "serve", feature = "vault"))]
+    #[test]
+    fn serve_vault_without_address_is_a_usage_error() {
+        let mut args = serve_args(BackendKind::Vault);
+        args.key = Some("ca".to_owned());
+        match run_serve(args, Locale::En).unwrap_err() {
+            CliError::Usage(msg) => assert!(msg.contains("--vault-addr"), "{msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "serve", feature = "file"))]
+    #[test]
+    fn serve_file_without_key_file_is_a_usage_error() {
+        let args = serve_args(BackendKind::File);
+        match run_serve(args, Locale::En).unwrap_err() {
+            CliError::Usage(msg) => assert!(msg.contains("--key-file"), "{msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_mock_backend_is_rejected() {
+        let args = serve_args(BackendKind::Mock);
+        match run_serve(args, Locale::En).unwrap_err() {
+            CliError::Usage(msg) => assert!(msg.contains("mock"), "{msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 }

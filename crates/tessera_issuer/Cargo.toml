@@ -37,6 +37,17 @@ vault = [
     "dep:secrecy",
     "dep:zeroize",
 ]
+# On-disk PKCS#8 CA key signing adapter. Native-only. p256/rsa/sha2 are core
+# dependencies (CSR verification); this feature adds p384 (P-384 signing) and
+# direct pkcs8 access (PrivateKeyInfo parsing + EncryptedPrivateKeyInfo/PBES2
+# decryption), plus the secret-handling crates.
+file = [
+    "native",
+    "dep:p384",
+    "dep:pkcs8",
+    "dep:secrecy",
+    "dep:zeroize",
+]
 # The browser-bridging local signing agent `issuer serve`. Native-only; the
 # `issuer` binary drives it, hence `cli`.
 serve = [
@@ -68,6 +79,8 @@ thiserror = { workspace = true }
 # sha2 chains the issuance journal and hashes CSR contents; serde/serde_json
 # render and parse the NDJSON journal; base64 encodes head signatures.
 p256 = { workspace = true }
+p384 = { workspace = true, optional = true }
+pkcs8 = { workspace = true, optional = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
@@ -92,6 +105,9 @@ getrandom = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
 p256 = { workspace = true, features = ["pem"] }
+# The file-backend tests write key fixtures to disk with restricted permissions;
+# tempfile gives a self-cleaning path. Native-only test aid.
+tempfile = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"

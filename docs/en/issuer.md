@@ -43,8 +43,10 @@ covered in [threat-model.md §11](threat-model.md) and is not duplicated here.
 ## CLI quick start
 
 Every issuing subcommand selects a signing backend with `--backend` (`pkcs11` is
-the default, `vault`), `--key` (the CA key label) and `--algorithm`
-(`ecdsa-p256` is the default, `ecdsa-p384`, `rsa-sha256`). Times
+the default, `vault`, `file`), `--key` (the CA key label; optional for `file`,
+defaulting to the key file's name) and `--algorithm` (`ecdsa-p256` is the
+default, `ecdsa-p384`, `rsa-sha256`; for `file` the algorithm is derived from
+the key itself and the flag acts as a cross-check). Times
 (`--not-before`, `--not-after`, `--this-update`, …) are Unix seconds. Inputs
 (`--parent`, `--spki`, `--csr`, `--issuer`) are accepted as PEM or DER (the
 format is detected from the content). Output is PEM, or DER with `--der`.
@@ -203,16 +205,34 @@ cabinet lives in a single signed binary — no separate hosting is needed. The
 `--no-cabinet` flag disables serving (pure bridge mode, when the SPA is served
 externally).
 
+The agent supports the same signing backends as the issuing subcommands —
+`--backend pkcs11|vault|file` (the default is `pkcs11`, so the old command form
+without `--backend` works as before):
+
 ```sh
+# Hardware token or HSM (the default)
 issuer serve \
     --module /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so \
     --key tessera-ca --algorithm ecdsa-p256 \
     --port 0
+
+# Vault / OpenBao Transit (the Vault token comes from VAULT_TOKEN)
+issuer serve --backend vault \
+    --vault-addr https://vault.example:8200 \
+    --key tessera-ca
+
+# Key in a local file (PKCS#8; the passphrase comes from pinentry
+# or TESSERA_ISSUER_KEY_PASSPHRASE)
+issuer serve --backend file --key-file ca-key.p8
 ```
 
-`--module` and `--key` are required; `--token-label` selects a token when there
-are several; `--pinentry` names the pinentry program explicitly. `--port 0` (the
-default) picks an ephemeral port — the actual address is printed at startup and
+For `pkcs11`, `--module` and `--key` are required; `--token-label` selects a
+token when there are several; `--pinentry` names the pinentry program
+explicitly. For `vault`, `--vault-addr`, `--key` and a `VAULT_TOKEN` in the
+environment are required. For `file`, `--key-file` is required; the key-file
+rules are in ["Key in a file"](#key-in-a-file). The agent's gates (loopback,
+paired token, Origin, operator confirmation) are identical across backends.
+`--port 0` (the default) picks an ephemeral port — the actual address is printed at startup and
 is the one to open in the browser. When serving the cabinet (by default, or
 `--cabinet-dir <dist>`) `--allow-origin` is not required: the agent is in its own
 allowlist. For the pure bridge mode (`--no-cabinet`, or when there is no embedded
@@ -335,6 +355,45 @@ adapter requests `marshaling_algorithm=asn1` (Vault returns a DER signature).
 Transit does not check **what** it signs — all issuance checks run before
 signing, in the core, on the client; who may call `sign` is constrained by Vault
 policy.
+
+### Key in a file
+
+The `file` backend signs with a CA key from a local file: `--key-file <path>`.
+The format is PKCS#8 (PEM or DER), including encrypted (`ENCRYPTED PRIVATE
+KEY`, PBES2); the key types are ECDSA P-256/P-384 and RSA. GOST keys are not
+supported by the file backend — for GOST, PKCS#11 remains the path. Other
+formats convert with stock tooling:
+
+```sh
+# a new encrypted P-256 key
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+    | openssl pkcs8 -topk8 -v2 aes-256-cbc -out ca-key.p8
+chmod 600 ca-key.p8
+
+# converting an existing key (SEC1/PKCS#1 → PKCS#8)
+openssl pkcs8 -topk8 -v2 aes-256-cbc -in old-key.pem -out ca-key.p8
+```
+
+The backend's rules:
+
+- The key file must not be accessible to the group or to others (`chmod 600`) —
+  otherwise the backend refuses before reading the contents. File ownership and
+  directory permissions are not checked — keep the key in your own directory
+  with `700` permissions.
+- The passphrase of an encrypted key is prompted through pinentry, falling back
+  to `TESSERA_ISSUER_KEY_PASSPHRASE`; the passphrase never appears in
+  command-line arguments or logs, and memory is zeroized.
+- An unencrypted key is accepted, but with a warning on every start; the
+  recommendation is encrypted PKCS#8.
+- The signing algorithm is derived from the key itself; an `--algorithm` that
+  does not match the key is an error. `--key` is optional (defaulting to the
+  file name) and serves as the key identifier in `/info`, the confirmation
+  summary and the journal.
+
+A key in a file is a deliberate trade-off for test benches, CI and small
+installations: on host compromise it is extractable, unlike a token/HSM/Vault
+key. For production, PKCS#11 or Vault Transit are recommended (see
+[threat-model.md §11](threat-model.md)).
 
 ## The issuance journal
 
