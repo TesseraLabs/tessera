@@ -1685,45 +1685,48 @@ mod tests {
             .expect("agent's file-backed signature must verify");
     }
 
-    /// The agent's `/info` + `/sign` cycle backed by a live Vault Transit key.
-    ///
-    /// Gated by `vault-tests` and a runtime check for the `vault` binary; when it
-    /// is absent the test prints `skipped:` and returns, mirroring
-    /// `tests/vault_sign.rs`.
+    /// The dev-server address and root token the Vault agent test uses.
     #[cfg(feature = "vault-tests")]
-    #[test]
-    fn agent_over_vault_backend_serves_info_and_signs() {
-        use std::process::{Child, Command, Stdio};
+    const VAULT_DEV_ADDR: &str = "http://127.0.0.1:8210";
+    #[cfg(feature = "vault-tests")]
+    const VAULT_DEV_TOKEN: &str = "tessera-dev-root-token";
+
+    /// A Vault dev-server killed when the guard drops.
+    #[cfg(feature = "vault-tests")]
+    struct VaultGuard(std::process::Child);
+
+    #[cfg(feature = "vault-tests")]
+    impl Drop for VaultGuard {
+        fn drop(&mut self) {
+            // Best-effort teardown; `drop` consumes the must-use results.
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+
+    /// Whether the `vault` binary is on `PATH`.
+    #[cfg(feature = "vault-tests")]
+    fn vault_available() -> bool {
+        std::process::Command::new("vault")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Start a throwaway Vault dev-server with a P-256 Transit key `ca-key`,
+    /// returning a guard that tears it down on drop.
+    #[cfg(feature = "vault-tests")]
+    fn start_vault_dev_server() -> VaultGuard {
+        use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
-
-        use crate::vault::{VaultConfig, VaultSigner};
-
-        const VAULT_ADDR: &str = "http://127.0.0.1:8210";
-        const ROOT_TOKEN: &str = "tessera-dev-root-token";
-
-        /// A dev-server killed when the guard drops.
-        struct VaultGuard(Child);
-        impl Drop for VaultGuard {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-
-        fn vault_available() -> bool {
-            Command::new("vault")
-                .arg("-version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        }
 
         fn vault_cmd(args: &[&str]) {
             let status = Command::new("vault")
                 .args(args)
-                .env("VAULT_ADDR", VAULT_ADDR)
-                .env("VAULT_TOKEN", ROOT_TOKEN)
+                .env("VAULT_ADDR", VAULT_DEV_ADDR)
+                .env("VAULT_TOKEN", VAULT_DEV_TOKEN)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -1731,17 +1734,12 @@ mod tests {
             assert!(status.success(), "vault {args:?} failed");
         }
 
-        if !vault_available() {
-            println!("skipped: `vault` binary not found on PATH");
-            return;
-        }
-
         let child = Command::new("vault")
             .args([
                 "server",
                 "-dev",
                 "-dev-root-token-id",
-                ROOT_TOKEN,
+                VAULT_DEV_TOKEN,
                 "-dev-listen-address",
                 "127.0.0.1:8210",
             ])
@@ -1749,11 +1747,11 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn vault dev server");
-        let _guard = VaultGuard(child);
+        let guard = VaultGuard(child);
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if ureq::get(&format!("{VAULT_ADDR}/v1/sys/health"))
+            if ureq::get(&format!("{VAULT_DEV_ADDR}/v1/sys/health"))
                 .call()
                 .is_ok()
             {
@@ -1765,13 +1763,18 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(150));
         }
-
         vault_cmd(&["secrets", "enable", "transit"]);
         vault_cmd(&["write", "-f", "transit/keys/ca-key", "type=ecdsa-p256"]);
+        guard
+    }
 
-        let signer = VaultSigner::new(
-            VaultConfig {
-                address: VAULT_ADDR.to_owned(),
+    /// A [`VaultSigner`](crate::vault::VaultSigner) bound to the dev-server's
+    /// `ca-key` Transit key.
+    #[cfg(feature = "vault-tests")]
+    fn vault_dev_signer() -> crate::vault::VaultSigner {
+        crate::vault::VaultSigner::new(
+            crate::vault::VaultConfig {
+                address: VAULT_DEV_ADDR.to_owned(),
                 mount: "transit".to_owned(),
                 key_name: "ca-key".to_owned(),
                 key_id: KeyId::new(KEY_LABEL),
@@ -1779,12 +1782,27 @@ mod tests {
                 prehashed: false,
                 ca_bundle_path: None,
             },
-            SecretString::from(ROOT_TOKEN.to_owned()),
+            SecretString::from(VAULT_DEV_TOKEN.to_owned()),
         )
-        .expect("build vault signer");
+        .expect("build vault signer")
+    }
+
+    /// The agent's `/info` + `/sign` cycle backed by a live Vault Transit key.
+    ///
+    /// Gated by `vault-tests` and a runtime check for the `vault` binary; when it
+    /// is absent the test prints `skipped:` and returns, mirroring
+    /// `tests/vault_sign.rs`.
+    #[cfg(feature = "vault-tests")]
+    #[test]
+    fn agent_over_vault_backend_serves_info_and_signs() {
+        if !vault_available() {
+            println!("skipped: `vault` binary not found on PATH");
+            return;
+        }
+        let _guard = start_vault_dev_server();
 
         let agent = Agent::new(
-            signer,
+            vault_dev_signer(),
             auto_confirm as ConfirmFn,
             config(),
             SecretString::from(TOKEN.to_owned()),
@@ -1799,13 +1817,12 @@ mod tests {
         });
         assert_eq!(info.status, 200);
 
-        let body = sign_body();
         let out = agent.handle(&HttpInput {
             method: ReqMethod::Post,
             path: "/sign",
             origin: Some(ORIGIN),
             session_token: Some(TOKEN),
-            body: body.as_bytes(),
+            body: sign_body().as_bytes(),
         });
         assert_eq!(
             out.status,
