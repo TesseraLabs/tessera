@@ -28,10 +28,11 @@ Components:
   or by separate static hosting in an air-gapped environment (see the
   "Web cabinet" section below).
 
-The role model comes from the parent certificate presented: the fleet root
-issues organisation CAs, and organisation CAs issue engineers' shift-leaves
-strictly inside their delegation envelope. There is no separate "mode by job
-title".
+The role model comes from the parent certificate presented: any CA with a
+delegation envelope (the fleet root or an organisation CA) issues both
+subordinate organisation CAs and engineers' shift-leaves — strictly inside its
+delegation envelope, which can only narrow at every step. There is no separate
+"mode by job title".
 
 The semantics of the extensions themselves (`host_binding`, `user_binding`,
 `allowed_roles`, `max_integrity`, `profile_version`, `delegation_constraints`)
@@ -367,10 +368,11 @@ call is to the local `issuer serve` agent on `127.0.0.1`. Issuance data is not
 sent to any external address.
 
 There is one cabinet for all issuing roles: the available operations are derived
-from the parent certificate presented (root → issue organisation CAs with an
-assigned envelope; organisation CA → issue shift-leaves within that envelope; a
-leaf/unsuitable certificate → operations unavailable, with an explanation).
-There are no separate "by job title" builds.
+from the parent certificate presented. Any CA with a delegation envelope (the
+root or an organisation CA) issues both subordinate organisation CAs with a
+narrowed assigned envelope and shift-leaves within its own envelope — the
+operation is chosen with a switch; a leaf/unsuitable certificate → operations
+unavailable, with an explanation. There are no separate "by job title" builds.
 
 The cabinet is part of the signed `issuer` binary: `issuer serve` by default
 serves it from `127.0.0.1`, with no separate hosting. The
@@ -395,10 +397,12 @@ the agent with `--cabinet-dir <dist>`; the cabinet has no server side.
    agent"](#the-issuer-serve-agent)). The agent preconfigures the connection
    itself — the agent block in the cabinet shows only a "connected" status.
 2. Present the parent certificate — the available
-   operations are derived from it: root → issue organisation CAs with an
-   assigned envelope; organisation CA → issue shift-leaves within that
-   envelope; a leaf or an unsuitable certificate → operations unavailable,
-   with an explanation.
+   operations are derived from it: a CA with a delegation envelope (the
+   root or an organisation CA) → issue subordinate organisation CAs with
+   a narrowed assigned envelope, or shift-leaves within its own envelope;
+   the operation is chosen with a switch (defaults: root — organisation
+   CA, organisation CA — shift-leaf); a leaf or an unsuitable certificate
+   → operations unavailable, with an explanation.
 3. Device inventory: build it right in the cabinet (a constructor —
    devices, users, roles, tags; the result is a "manual" snapshot that
    downloads as a file) or load a ready snapshot file. A signed snapshot

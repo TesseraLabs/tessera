@@ -13,9 +13,9 @@ export const en = {
   parent_file_label: "Parent certificate",
   parent_file_hint: "PEM or DER — the certificate that authorises this issuance",
   parent_kind_root: "Fleet root",
-  parent_kind_root_desc: "Issues organisation CAs and assigns their envelopes.",
+  parent_kind_root_desc: "Issues organisation CAs and shift leaves, and assigns delegation envelopes.",
   parent_kind_org_ca: "Organisation CA",
-  parent_kind_org_ca_desc: "Issues shift leaves within its delegation envelope.",
+  parent_kind_org_ca_desc: "Issues shift leaves and subordinate organisation CAs, strictly within its own delegation envelope.",
   parent_kind_leaf: "Leaf certificate",
   parent_kind_leaf_desc: "Not a CA — cannot issue anything.",
   parent_kind_unusable: "Not usable as an issuer",
@@ -138,6 +138,13 @@ export const en = {
   crl_candidates_none: "No issuances by this CA found in the loaded journal",
   crl_action_issue: "Build CRL summary",
 
+  // Operation switch (design `cabinet-operation-choice`): both a root and an
+  // organisation CA with a delegation envelope can issue either an
+  // organisation CA or a shift leaf.
+  operation_choice_label: "Operation",
+  operation_choice_ca: "Organisation CA",
+  operation_choice_leaf: "Shift leaf",
+
   // Generic actions / statuses
   action_choose_file: "Choose file",
   action_build_summary: "Build summary",
@@ -166,7 +173,7 @@ export const en = {
 
   help_parent_title: "Parent certificate",
   help_parent_p1:
-    "The cabinet's parent is either the fleet root (created by the PKI owner, outside day-to-day issuance) or an organisation CA (issued under the root with `issuer issue-ca`). Which one you load decides what the cabinet offers: a root issues organisation CAs and assigns their envelopes; an organisation CA issues shift leaves within its own envelope.",
+    "The cabinet's parent is either the fleet root (created by the PKI owner, outside day-to-day issuance) or an organisation CA (issued under the root with `issuer issue-ca`). Either kind, when it carries a delegation envelope, can issue both a subordinate organisation CA and a shift leaf — the operation switch below the parent status lets you pick which; both are always bound by that parent's own envelope.",
   help_parent_p2:
     "The operator receives the parent file from the level above — it is not something the cabinet creates for you.",
   help_parent_p3: "Accepted formats: PEM or DER; the format is detected from the file's content.",
@@ -210,9 +217,9 @@ export const ru: Dict = {
   parent_file_label: "Родительский сертификат",
   parent_file_hint: "PEM или DER — сертификат, из которого выводятся права на выпуск",
   parent_kind_root: "Корень парка",
-  parent_kind_root_desc: "Выпускает CA организаций и назначает их рамки делегирования.",
+  parent_kind_root_desc: "Выпускает CA организаций и листы смен, назначает рамки делегирования.",
   parent_kind_org_ca: "CA организации",
-  parent_kind_org_ca_desc: "Выпускает листы смен строго в своих рамках делегирования.",
+  parent_kind_org_ca_desc: "Выпускает листы смен и подчинённые CA организации строго в своих рамках делегирования.",
   parent_kind_leaf: "Лист",
   parent_kind_leaf_desc: "Не CA — не может ничего выпускать.",
   parent_kind_unusable: "Непригоден как эмитент",
@@ -324,6 +331,10 @@ export const ru: Dict = {
   crl_candidates_none: "В загруженном журнале нет выпусков этого CA",
   crl_action_issue: "Сформировать сводку CRL",
 
+  operation_choice_label: "Операция",
+  operation_choice_ca: "CA организации",
+  operation_choice_leaf: "Лист смены",
+
   action_choose_file: "Выбрать файл",
   action_build_summary: "Сформировать сводку",
   action_close: "Закрыть",
@@ -345,7 +356,7 @@ export const ru: Dict = {
 
   help_parent_title: "Родительский сертификат",
   help_parent_p1:
-    "Родитель кабинета — либо корень парка (создаётся владельцем PKI, вне ежедневного выпуска), либо CA организации (выдаётся под корнем командой `issuer issue-ca`). От того, что загружено, зависит набор доступных операций: корень выпускает CA организаций и назначает их рамки делегирования; CA организации выпускает листы смен строго в своих рамках.",
+    "Родитель кабинета — либо корень парка (создаётся владельцем PKI, вне ежедневного выпуска), либо CA организации (выдаётся под корнем командой `issuer issue-ca`). Любой из них, если несёт рамки делегирования, может выпустить и подчинённый CA организации, и лист смены — какую операцию выполнить, выбирает переключатель под статусом родителя; обе всегда ограничены рамками делегирования этого родителя.",
   help_parent_p2:
     "Оператор получает файл родителя от уровня выше — кабинет его не создаёт.",
   help_parent_p3: "Принимаемые форматы: PEM или DER; формат определяется по содержимому файла.",

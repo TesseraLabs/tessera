@@ -60,6 +60,7 @@ import {
   type LeafFormHandle,
 } from "./forms.ts";
 import { openModal } from "./modal.ts";
+import { availableIssuanceOperations, defaultIssuanceOperation, type IssuanceOperation } from "./operations.ts";
 import { hostListInput, stringListInput, tagListInput } from "./widgets.ts";
 
 const ALGORITHMS: SignatureAlgorithmTag[] = ["ecdsa-p256", "ecdsa-p384", "rsa-sha256", "ed25519"];
@@ -116,6 +117,14 @@ export class App {
   #pending?: PendingOperation;
   #error?: string;
   #activeTab: Tab = "issue";
+  /**
+   * Which envelope-scoped operation form is shown below the switch in
+   * {@link renderOperationSection} — reset to {@link defaultIssuanceOperation}
+   * for the new parent's `kind` on every {@link onParentFileChosen}, but
+   * otherwise survives a full {@link render} (design `cabinet-operation-choice`:
+   * both a root and an org_ca with an envelope can issue either operation).
+   */
+  #operationChoice: IssuanceOperation = "ca";
 
   constructor(
     root: HTMLElement,
@@ -351,6 +360,7 @@ export class App {
       this.#parentDerB64 = derB64;
       this.#parentFingerprintHex = await sha256HexOfDer(derBytes);
       this.#parentInfo = info;
+      this.#operationChoice = defaultIssuanceOperation(info.kind);
       this.#error = undefined;
     } catch (e) {
       this.#error = renderApiError(this.#locale, parseApiError(e));
@@ -363,21 +373,50 @@ export class App {
   private renderOperationSection(): HTMLElement {
     const info = this.#parentInfo;
     if (!info) return el("section", {});
-    if (info.kind === "root" && info.envelope) {
+    const envelope = info.envelope;
+    const operations = availableIssuanceOperations(info.kind, envelope !== undefined);
+    if (envelope && operations.length > 0) {
       return el("div", { class: "operation-group" }, [
-        this.renderCaOperation(info.envelope),
-        this.renderCrlOperation(),
-      ]);
-    }
-    if (info.kind === "org_ca" && info.envelope) {
-      return el("div", { class: "operation-group" }, [
-        this.renderLeafOperation(info.envelope),
+        this.renderOperationChoice(operations),
+        this.#operationChoice === "leaf"
+          ? this.renderLeafOperation(envelope)
+          : this.renderCaOperation(envelope),
         this.renderCrlOperation(),
       ]);
     }
     return el("section", { class: "section section-operation" }, [
       el("h2", {}, [this.t("section_operation")]),
       el("p", { class: "hint" }, [info.reason ?? this.t("parent_kind_unusable")]),
+    ]);
+  }
+
+  /**
+   * The switch between the two envelope-scoped operations (design
+   * `cabinet-operation-choice`) — a radio pair in the same style as the
+   * snapshot mode picker (`renderSnapshotSection`). Selecting an option is a
+   * full {@link render}: unlike the agent connectivity indicator, switching
+   * operations is meant to discard whatever is half-filled in the form being
+   * left, the same way switching the active tab does.
+   */
+  private renderOperationChoice(operations: IssuanceOperation[]): HTMLElement {
+    const labelFor = (op: IssuanceOperation): string =>
+      op === "ca" ? this.t("operation_choice_ca") : this.t("operation_choice_leaf");
+    const radios = operations.map((op) => {
+      const radio = el("input", {
+        type: "radio",
+        name: "operation-choice",
+        value: op,
+        checked: this.#operationChoice === op ? "checked" : undefined,
+      });
+      radio.addEventListener("change", () => {
+        this.#operationChoice = op;
+        this.render();
+      });
+      return el("label", {}, [radio, labelFor(op)]);
+    });
+    return el("div", { class: "operation-choice-picker" }, [
+      el("span", { class: "operation-choice-label" }, [this.t("operation_choice_label")]),
+      ...radios,
     ]);
   }
 
