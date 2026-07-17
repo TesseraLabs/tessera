@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 env:
-  ISSUER_FEATURES: cli,pkcs11,vault,serve,embed-cabinet
+  ISSUER_FEATURES: cli,pkcs11,vault,file,serve,embed-cabinet
 
 jobs:
   # Кабинет — npm/esbuild/TypeScript SPA поверх wasm-ядра; build.sh нужны Node и

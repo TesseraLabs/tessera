@@ -64,6 +64,16 @@ spki = { version = "0.7", features = ["alloc"] }
 const-oid = "0.9"
 x509-cert = { version = "0.2", default-features = false }
 p256 = "0.13"
+# ECDSA P-384 signing for the file backend (native-only, behind the `file`
+# feature). Same RustCrypto family and pkcs8 version as p256, so the graph
+# unifies; never pulled into the wasm core.
+p384 = "0.13"
+# Direct PKCS#8 access for the file backend: parse PrivateKeyInfo, and decrypt
+# EncryptedPrivateKeyInfo (PBES2). `pem` decodes `-----BEGIN [ENCRYPTED] PRIVATE
+# KEY-----`; `encryption` pulls the pkcs5/pbes2 backends (scrypt/PBKDF2 +
+# AES-CBC) used to decrypt operator keys and to generate encrypted fixtures in
+# tests. Native-only, behind the `file` feature.
+pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
 # Pure-Rust RSA (MIT OR Apache-2.0), verification-only in the issuer: checks a
 # CSR's PKCS#1 v1.5 / SHA-256 self-signature (proof of possession). No key
 # generation or signing, so no RNG is pulled into the wasm core.

@@ -581,10 +581,13 @@ here is a single ranked registry (impact × likelihood, descending).
 
 TOE extension: the client-side certificate issuance tooling — the
 `tessera_issuer` core, the `issuer` CLI, the static web cabinet (WASM) and the
-local `issuer serve` agent (browser ↔ PKCS#11 bridge). The tool is not a
-custodian: private keys live in the token/HSM/Vault Transit and never pass
-through the issuance code. The requirements canon is the openspec specs
-`cert-issuance`, `issuer-signing`, `issuer-cabinet`, `issuance-journal`.
+local `issuer serve` agent (browser ↔ signing-backend bridge). The tool is not
+a custodian: with the `pkcs11` and `vault` backends private keys live in the
+token/HSM/Vault Transit and never pass through the issuance code. The exception
+is the explicit file backend (`file`): the key from a PKCS#8 file is loaded
+into the issuance process memory (see 11.1.7 and 11.3). The requirements canon
+is the openspec specs `cert-issuance`, `issuer-signing`, `issuer-cabinet`,
+`issuance-journal`.
 
 ### 11.1 Attack surface
 
@@ -596,6 +599,7 @@ through the issuance code. The requirements canon is the openspec specs
 | 11.1.4 | Vault/OpenBao Transit                 | Transit signs whatever TBS it is sent                                                  | every issuance check runs client-side before signing; Vault policy restricts who may call `sign`; the Vault token is never logged                                                           |
 | 11.1.5 | Inventory snapshot feeding the forms  | a forged snapshot plants foreign devices/roles into the forms                          | the snapshot signature is verified, a broken one → rejection; an unsigned snapshot is explicitly marked as manual, its age is displayed                                                     |
 | 11.1.6 | Issuance journal                      | hiding/rewriting the fact of an issuance                                               | hash chain with a fixed genesis + signed head; the record is written before the artifact is released (fail-closed); secondary to the primary truth — the login audit on the devices          |
+| 11.1.7 | File-based CA key (`--backend file`)  | theft of the key file from disk; offline passphrase cracking; passphrase leak          | file permissions are checked before reading (group/other access → refusal); the recommendation is encrypted PKCS#8 (PBES2), an unencrypted key is accepted only with a warning on every start; the passphrase comes from pinentry/env, `Secret`+`zeroize`, never in argv/logs; the decrypted buffer is zeroized after loading. The protection class is below a token/HSM/Vault — see 11.3 |
 
 ### 11.2 What bounds the damage of issuance abuse
 
@@ -613,6 +617,14 @@ operators is needed, and serials cannot serve as a channel.
   envelope of the presented CA (but cannot steal the key — it is in the
   token/HSM; and cannot escape the envelope — see 11.2). Parity with 4.1
   (host compromise is outside the TOE).
+- **A file-based key under host compromise**: with `--backend file` the CA key,
+  unlike a token/HSM/Vault key, is extractable — an attacker with access to the
+  file (and the passphrase or the process memory) walks away with the key
+  itself, not just the issuance session. The file backend is an accepted risk
+  for test benches, CI and small installations; the production recommendation
+  is PKCS#11 or Vault Transit. The delegation envelope still holds: a stolen
+  organisation-CA key cannot escape its envelope (11.2); a stolen root is a
+  catastrophe of the same class as 2.3.
 - **A substituted cabinet slips in a different TBS** — closed by the mandatory
   per-operation confirmation (11.1.1): the agent parses the TBS and displays
   subject/validity/roles/envelope in the trusted channel before the PIN
