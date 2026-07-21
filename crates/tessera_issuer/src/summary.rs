@@ -41,7 +41,7 @@ const TAG_GENERALIZED_TIME: u8 = 0x18;
 /// The standard `cRLNumber` extension OID.
 const CRL_NUMBER_OID: &str = "2.5.29.20";
 
-/// What kind of operation a TBS describes.
+/// What kind of operation a summary describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
     /// An engineer shift-leaf certificate.
@@ -50,6 +50,10 @@ pub enum OperationKind {
     OrgCa,
     /// A certificate revocation list.
     Crl,
+    /// An exported device registry signed with the dedicated registry key. It
+    /// carries no certificate subject or validity window; its identifying data
+    /// (key label, payload digest, size) is carried in the detail lines.
+    DeviceRegistry,
 }
 
 impl OperationKind {
@@ -65,6 +69,7 @@ impl OperationKind {
             OperationKind::ShiftLeaf => Caption::KindShiftLeaf,
             OperationKind::OrgCa => Caption::KindOrgCa,
             OperationKind::Crl => Caption::KindCrl,
+            OperationKind::DeviceRegistry => Caption::KindDeviceRegistry,
         }
     }
 }
@@ -105,15 +110,25 @@ impl OperationSummary {
     #[must_use]
     pub fn render(&self, locale: Locale) -> String {
         let mut out = format!(
-            "{}: {}\n{}: {}\n{}: {} .. {}",
+            "{}: {}",
             Caption::Operation.text(locale),
             self.kind.label(locale),
-            Caption::Subject.text(locale),
-            neutralize_bidi(&self.subject),
-            Caption::Validity.text(locale),
-            neutralize_bidi(&self.not_before),
-            neutralize_bidi(&self.not_after),
         );
+        // A device registry has neither a certificate subject nor a validity
+        // window; only the operation line and the detail lines are shown. Every
+        // certificate/CRL kind keeps the subject and validity block verbatim.
+        if self.kind != OperationKind::DeviceRegistry {
+            out.push('\n');
+            out.push_str(Caption::Subject.text(locale));
+            out.push_str(": ");
+            out.push_str(&neutralize_bidi(&self.subject));
+            out.push('\n');
+            out.push_str(Caption::Validity.text(locale));
+            out.push_str(": ");
+            out.push_str(&neutralize_bidi(&self.not_before));
+            out.push_str(" .. ");
+            out.push_str(&neutralize_bidi(&self.not_after));
+        }
         for line in &self.lines {
             out.push_str("\n  ");
             out.push_str(line.caption.text(locale));

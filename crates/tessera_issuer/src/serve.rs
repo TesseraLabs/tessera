@@ -27,16 +27,23 @@
 //!
 //! # Serving the cabinet
 //!
-//! The agent may *also* serve the cabinet SPA (its `index.html`, script, styles
-//! and WASM) on the same loopback origin as `/sign`, from either assets embedded
-//! into the binary (feature `embed-cabinet`) or an external `dist/` directory
-//! (see [`CabinetSource`]). Static serving answers browser navigations and
-//! subresource fetches — which carry neither an `Origin` nor the session token —
-//! so it runs *ahead* of the gates above, but only for a fixed set of asset
-//! paths: nothing outside that set is ever read from the filesystem, and the
-//! `/sign` gate is never weakened. When it serves `index.html` the agent injects
-//! the current session token and key label as `<meta>` tags so the operator need
-//! not retype them.
+//! The agent may *also* serve the cabinet SPA on the same loopback origin as
+//! `/sign`, from an external directory the operator points it at with
+//! `--cabinet-dir` (see [`CabinetSource::Directory`]). The cabinet ships as a
+//! separate static bundle, so the agent treats the directory as an opaque SPA
+//! root: it serves the files as they are, falls back to `index.html` for any
+//! non-file path (client-side routing), and never inspects what the bundle
+//! contains. Static serving answers browser navigations and subresource
+//! fetches — which carry neither an `Origin` nor the session token — so it runs
+//! *ahead* of the gates above, but the API routes (`/sign`, `/sign-registry`,
+//! `/info`) are reserved and stay gated, and a resolved file is verified to stay
+//! inside the directory so nothing outside it is ever read. When it serves
+//! `index.html` the agent injects the current session token and key label as
+//! `<meta>` tags so the operator need not retype them.
+//!
+//! Without `--cabinet-dir` the agent still starts and serves a small localized
+//! placeholder page at `/` telling the operator how to attach a cabinet; the
+//! signing bridge works either way.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -46,9 +53,9 @@ use subtle::ConstantTimeEq as _;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::confirm::Confirmer;
-use crate::l10n::{Locale, Msg};
+use crate::l10n::{Caption, Locale, Msg};
 use crate::sign::{KeyId, SignatureAlgorithm, SignatureBackend};
-use crate::summary::parse_operation_summary;
+use crate::summary::{parse_operation_summary, OperationKind, OperationSummary, SummaryLine};
 
 pub use crate::confirm::DefaultConfirmer;
 
@@ -59,41 +66,18 @@ pub const SESSION_HEADER: &str = "X-Tessera-Session";
 /// few KiB; this is a generous ceiling that bounds memory per request).
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// The cabinet's embedded assets (`cabinet/dist/`), compiled into the binary.
-///
-/// The path is resolved relative to this crate (`crates/tessera_issuer/`), so
-/// `../../cabinet/dist` reaches the repository's `cabinet/dist/`. The directory
-/// must exist at build time (produced by `cabinet/build.sh`).
-#[cfg(feature = "embed-cabinet")]
-static EMBEDDED_CABINET: include_dir::Dir<'static> =
-    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../cabinet/dist");
-
-/// The document served for `GET /` (and `GET /index.html`).
+/// The SPA entry document, served for `GET /` and as the fallback for any path
+/// that does not resolve to a file in the cabinet directory.
 const INDEX_FILE: &str = "index.html";
 
 /// Content type for the cabinet document.
 const INDEX_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 
-/// The fixed set of non-document cabinet assets, each with its content type.
-///
-/// A request path must equal one of these names exactly (leading `/` stripped).
-/// Some names now contain a `/` (the bundled `fonts/` subdirectory), but each is
-/// a single literal string compared for full equality — there is no path parsing
-/// or normalization, so `..`, an absolute path, or any unlisted subpath can
-/// never equal a listed name, and nothing outside this set is ever read.
-/// The source map (`main.js.map`) and the font licences (`fonts/LICENSE-*.txt`)
-/// are deliberately absent: debugging and provenance artifacts with no place in
-/// a shipped agent.
-const CABINET_ASSETS: &[(&str, &str)] = &[
-    ("main.js", "text/javascript"),
-    ("styles.css", "text/css"),
-    ("tessera_issuer_wasm_bg.wasm", "application/wasm"),
-    ("fonts/inter-400.woff2", "font/woff2"),
-    ("fonts/inter-600.woff2", "font/woff2"),
-    ("fonts/inter-800.woff2", "font/woff2"),
-    ("fonts/jbmono-400.woff2", "font/woff2"),
-    ("fonts/jbmono-700.woff2", "font/woff2"),
-];
+/// The API routes the agent owns. They are reserved: static cabinet serving
+/// never answers them (even in SPA-fallback mode), so `/sign`, `/sign-registry`,
+/// and `/info` always reach their gated handlers rather than a served file or
+/// `index.html`.
+const RESERVED_ROUTES: &[&str] = &["/sign", "/sign-registry", "/info"];
 
 /// The Content-Security-Policy the agent sends as a real header when it serves
 /// the cabinet. It mirrors the cabinet's own `<meta>` CSP and adds
@@ -104,22 +88,36 @@ const CABINET_CSP: &str = "default-src 'self'; connect-src 'self' \
      style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'none'; \
      base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-/// Where the agent gets the cabinet's static assets, if it serves them at all.
+/// What the agent serves on the cabinet's static-file surface, if anything.
 ///
-/// Default is [`CabinetSource::Disabled`] — a pure signing bridge, unchanged
-/// from the agent's original behaviour. An external directory overrides embedded
-/// assets when both are available.
+/// Default is [`CabinetSource::Disabled`] — a pure signing bridge. The usual
+/// mode is [`CabinetSource::Directory`], an external SPA bundle the operator
+/// points at with `--cabinet-dir`; [`CabinetSource::Placeholder`] is what the
+/// agent serves when no directory is given, so `GET /` explains how to attach
+/// one instead of returning nothing.
 #[derive(Debug, Clone, Default)]
 pub enum CabinetSource {
-    /// Do not serve the cabinet; act only as the `/sign` + `/info` bridge.
+    /// Do not serve any static surface; act only as the `/sign` + `/info`
+    /// bridge. `GET /` is a 404.
     #[default]
     Disabled,
-    /// Serve assets from an external `dist/` directory. The directory is
-    /// canonicalized and every resolved file is verified to stay inside it.
+    /// Serve a small localized page at `/` telling the operator to attach a
+    /// cabinet with `--cabinet-dir`. The signing bridge still works.
+    Placeholder,
+    /// Serve an external SPA bundle from this directory. The directory is
+    /// canonicalized and every resolved file is verified to stay inside it; any
+    /// path that is not a file falls back to `index.html`.
     Directory(std::path::PathBuf),
-    /// Serve the assets embedded into the binary at build time.
-    #[cfg(feature = "embed-cabinet")]
-    Embedded,
+}
+
+impl CabinetSource {
+    /// Whether this source serves a real cabinet SPA (as opposed to a
+    /// placeholder or nothing). Only an SPA source auto-opens the browser and
+    /// allowlists the agent's own loopback origin for same-origin `POST`s.
+    #[must_use]
+    fn serves_spa(&self) -> bool {
+        matches!(self, CabinetSource::Directory(_))
+    }
 }
 
 /// Configuration for the local signing agent.
@@ -447,6 +445,13 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
     /// The payload is signed as raw bytes (the backend digests it with SHA-256),
     /// and the DER `Ecdsa-Sig-Value` the backend returns is converted to the raw
     /// `r || s` the cabinet's snapshot verifier expects.
+    ///
+    /// Signing goes through the same operator-confirmation channel as issuance:
+    /// the operator is shown the registry's SHA-256 digest, its size, and the
+    /// signing-key label, and a decline is refused before the backend is touched.
+    /// The session token authenticates the cabinet; this confirmation authorizes
+    /// the specific registry — a substituted cabinet cannot get a silent
+    /// attestation signature.
     fn handle_sign_registry(&self, origin: Option<&str>, body: &[u8]) -> HttpOutput {
         let Some(registry_key) = self.registry_key.as_ref() else {
             return HttpOutput::json(400, error_json("registry key is not configured"), origin);
@@ -461,10 +466,37 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
             return HttpOutput::json(400, error_json("payload_b64 is not base64"), origin);
         };
 
-        // No operator confirmation here: a registry is not an issuance operation
-        // and carries no TBS to summarise. Signing it is the operator's own act
-        // of attestation, gated by the session token and Origin like every other
-        // request — the same gates ran before this handler.
+        // The session token authenticated the cabinet; operator confirmation
+        // authorizes this specific registry. A registry has no TBS to parse, so
+        // the operator is shown its SHA-256 digest, size, and the signing-key
+        // label — enough to attest to the exact bytes without trusting the
+        // (possibly substituted) cabinet. Both are required, as for issuance.
+        let summary = registry_summary(registry_key, &payload);
+        match self.confirmer.confirm(&summary) {
+            Ok(true) => {}
+            Ok(false) => {
+                println!(
+                    "{} {} — {}",
+                    Msg::ServeOperatorDeclined.text(self.locale),
+                    summary.kind.label(self.locale),
+                    registry_key.as_str()
+                );
+                return HttpOutput::json(
+                    403,
+                    error_json("operation not confirmed by operator"),
+                    origin,
+                );
+            }
+            Err(e) => {
+                println!("{} {e}", Msg::ServeConfirmChannelFailed.text(self.locale));
+                return HttpOutput::json(
+                    500,
+                    error_json("confirmation channel unavailable"),
+                    origin,
+                );
+            }
+        }
+
         match self.backend.sign(&payload, registry_key) {
             Ok(signature) => match ecdsa_der_to_raw(&signature.bytes) {
                 Ok(raw) => {
@@ -505,97 +537,133 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         HttpOutput::json(200, body, origin)
     }
 
-    /// Serve a cabinet asset for `path`, or `None` to fall through to the gated
-    /// routes (`/info`, `/sign`, and any non-cabinet path).
+    /// Serve the cabinet's static surface for a `GET` `path`, or `None` to fall
+    /// through to the gated routes (`/info`, `/sign`, and any other path).
     ///
-    /// Returns `None` when cabinet serving is disabled or when `path` is not one
-    /// of the fixed cabinet asset paths, so `/info` stays gated and no path
-    /// outside the asset set is ever read from the filesystem.
+    /// The reserved API routes are never served here, so they stay gated; a
+    /// [`CabinetSource::Directory`] otherwise serves files as they are and falls
+    /// back to `index.html` for non-file paths, and [`CabinetSource::Placeholder`]
+    /// answers only `/` with the attach-a-cabinet page.
     fn try_serve_cabinet(&self, path: &str) -> Option<HttpOutput> {
-        if matches!(self.cabinet, CabinetSource::Disabled) {
-            return None;
+        match &self.cabinet {
+            CabinetSource::Disabled => None,
+            CabinetSource::Placeholder => self.try_serve_placeholder(path),
+            CabinetSource::Directory(root) => self.try_serve_spa(root, path),
         }
-        let asset = resolve_asset(path)?;
-        let Some(bytes) = self.load_asset(asset.file) else {
-            return Some(HttpOutput::asset_not_found());
-        };
-        if asset.is_index {
-            let html = String::from_utf8_lossy(&bytes);
-            let injected =
-                inject_agent_meta(&html, self.session_token.expose_secret(), &self.key_label);
+    }
+
+    /// Serve the localized placeholder page at `/` (and `/index.html`); every
+    /// other path falls through so the API routes stay gated.
+    fn try_serve_placeholder(&self, path: &str) -> Option<HttpOutput> {
+        if path == "/" || path == "/index.html" {
+            let page = placeholder_page(self.locale);
             Some(HttpOutput::asset(
                 200,
-                injected.into_bytes(),
+                page.into_bytes(),
                 INDEX_CONTENT_TYPE,
             ))
         } else {
-            Some(HttpOutput::asset(200, bytes, asset.content_type))
+            None
         }
     }
 
-    /// Load a fixed cabinet asset's bytes from the configured source.
+    /// Serve `path` from the external SPA directory `root`.
     ///
-    /// `file` is always one of the fixed asset names — a literal relative path
-    /// that may include the `fonts/` subdirectory. The embedded source resolves
-    /// it through `include_dir`'s nested lookup; the directory source joins it
-    /// under the root and additionally canonicalizes and verifies containment.
-    fn load_asset(&self, file: &str) -> Option<Vec<u8>> {
-        match &self.cabinet {
-            CabinetSource::Disabled => None,
-            CabinetSource::Directory(root) => read_asset_from_dir(root, file),
-            #[cfg(feature = "embed-cabinet")]
-            CabinetSource::Embedded => EMBEDDED_CABINET
-                .get_file(file)
-                .map(|f| f.contents().to_vec()),
+    /// An existing file is served with a content type guessed from its
+    /// extension; any other path falls back to `index.html` for client-side
+    /// routing. The reserved API routes are excluded first so they never resolve
+    /// to a file or the fallback. Containment is enforced in [`read_file_within`],
+    /// so a path escaping the directory reads nothing and falls back like any
+    /// other non-file path.
+    fn try_serve_spa(&self, root: &Path, path: &str) -> Option<HttpOutput> {
+        if RESERVED_ROUTES.contains(&path) {
+            return None;
+        }
+        let rel = path.strip_prefix('/').unwrap_or(path);
+        if rel != INDEX_FILE {
+            if let Some(bytes) = read_file_within(root, rel) {
+                return Some(HttpOutput::asset(200, bytes, content_type_for(rel)));
+            }
+        }
+        // The entry document (requested directly, or reached as the SPA
+        // fallback) gets the agent `<meta>` injection; a bundle with no
+        // `index.html` is a cabinet 404 rather than a filesystem probe.
+        match read_file_within(root, INDEX_FILE) {
+            Some(bytes) => Some(self.serve_index(&bytes)),
+            None => Some(HttpOutput::asset_not_found()),
         }
     }
-}
 
-/// A resolved cabinet asset: which file to load and how to label it.
-struct ResolvedAsset {
-    file: &'static str,
-    content_type: &'static str,
-    is_index: bool,
-}
-
-/// Map a request path to a fixed cabinet asset, or `None` if it is not one.
-///
-/// Only `/`, `/index.html`, and the exact [`CABINET_ASSETS`] names match. A
-/// listed name may contain a `/` (the bundled `fonts/` subdirectory), but the
-/// match is full-string equality against the list, so `..`, an unlisted subpath,
-/// or any other name yields `None`.
-fn resolve_asset(path: &str) -> Option<ResolvedAsset> {
-    if path == "/" || path == "/index.html" {
-        return Some(ResolvedAsset {
-            file: INDEX_FILE,
-            content_type: INDEX_CONTENT_TYPE,
-            is_index: true,
-        });
+    /// Build the `index.html` response, injecting the session token and key
+    /// label as `<meta>` tags so the served cabinet pairs without manual entry.
+    fn serve_index(&self, bytes: &[u8]) -> HttpOutput {
+        let html = String::from_utf8_lossy(bytes);
+        let injected =
+            inject_agent_meta(&html, self.session_token.expose_secret(), &self.key_label);
+        HttpOutput::asset(200, injected.into_bytes(), INDEX_CONTENT_TYPE)
     }
-    let name = path.strip_prefix('/')?;
-    CABINET_ASSETS
-        .iter()
-        .find(|(asset, _)| *asset == name)
-        .map(|(asset, content_type)| ResolvedAsset {
-            file: asset,
-            content_type,
-            is_index: false,
-        })
 }
 
-/// Read a fixed asset from an external directory, refusing anything that
-/// escapes it.
+/// Read `rel` from within `root`, refusing anything that escapes it.
 ///
-/// `file` is already one of the fixed asset names, but the directory root and
-/// the resolved file are both canonicalized and containment is checked, so a
-/// symlink pointing outside the directory is refused too.
-fn read_asset_from_dir(root: &Path, file: &str) -> Option<Vec<u8>> {
+/// Both the root and the resolved file are canonicalized and containment is
+/// checked, so a `..` segment or a symlink pointing outside the directory reads
+/// nothing (returns `None`). `rel` is an untrusted request path, so this check
+/// is the only thing standing between the caller and the wider filesystem.
+fn read_file_within(root: &Path, rel: &str) -> Option<Vec<u8>> {
     let root = root.canonicalize().ok()?;
-    let candidate = root.join(file).canonicalize().ok()?;
+    let candidate = root.join(rel).canonicalize().ok()?;
     if !candidate.starts_with(&root) {
         return None;
     }
     std::fs::read(&candidate).ok()
+}
+
+/// Guess a response content type from a file's extension, defaulting to
+/// `application/octet-stream` for anything unrecognized. The cabinet is an
+/// opaque external bundle, so this covers the common SPA asset types rather than
+/// a fixed manifest.
+fn content_type_for(rel: &str) -> &'static str {
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    match ext {
+        "html" | "htm" => INDEX_CONTENT_TYPE,
+        "js" | "mjs" => "text/javascript",
+        "css" => "text/css",
+        "wasm" => "application/wasm",
+        "json" | "map" => "application/json",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The localized placeholder document served at `/` when no cabinet directory is
+/// attached. It carries no script and no operator input, only two static
+/// localized strings, so no escaping is needed.
+fn placeholder_page(locale: Locale) -> String {
+    let title = Msg::CabinetNotConnectedTitle.text(locale);
+    let body = Msg::CabinetNotConnectedBody.text(locale);
+    let lang = match locale {
+        Locale::Ru => "ru",
+        Locale::En => "en",
+    };
+    format!(
+        "<!doctype html>\n<html lang=\"{lang}\">\n<head>\n<meta charset=\"utf-8\" />\n\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n\
+         <title>{title}</title>\n</head>\n<body>\n<main>\n<h1>{title}</h1>\n<p>{body}</p>\n\
+         </main>\n</body>\n</html>\n",
+    )
 }
 
 /// Inject the session token and key label into the cabinet's `index.html` as
@@ -686,12 +754,12 @@ pub fn serve<B: SignatureBackend, C: Confirmer>(
         .map_or_else(|| "127.0.0.1".to_owned(), |a| a.to_string());
     let address = format!("http://{bound}");
     println!("{} {address}", Msg::ServeListening.text(config.locale));
-    // When the agent serves the cabinet, the served page's same-origin `POST`
-    // carries the agent's own loopback origin — known only now that the port is
-    // bound (important under `--port 0`). Add it so that gate passes without the
-    // operator supplying `--allow-origin`.
-    let cabinet_active = !matches!(config.cabinet, CabinetSource::Disabled);
-    if cabinet_active {
+    // When the agent serves a real cabinet SPA, the served page's same-origin
+    // `POST` carries the agent's own loopback origin — known only now that the
+    // port is bound (important under `--port 0`). Add it so that gate passes
+    // without the operator supplying `--allow-origin`.
+    let serves_spa = config.cabinet.serves_spa();
+    if serves_spa {
         config.allowed_origins.extend(self_origins(&bound));
     }
     // The pairing token is printed for the operator to paste into the cabinet;
@@ -700,10 +768,10 @@ pub fn serve<B: SignatureBackend, C: Confirmer>(
     println!("{} {hex}", Msg::ServeSessionToken.text(config.locale));
     // The agent runs in the foreground until interrupted; tell the operator how.
     println!("{}", Msg::ServeStopHint.text(config.locale));
-    // Auto-open the operator's browser at the cabinet — but only when there is a
-    // cabinet to open and the operator did not opt out. A failed open is
+    // Auto-open the operator's browser at the cabinet — but only when a real
+    // cabinet SPA is served and the operator did not opt out. A failed open is
     // non-fatal: the address is already printed for manual use.
-    if should_open_browser(cabinet_active, config.no_browser) && !open_browser(&address) {
+    if should_open_browser(serves_spa, config.no_browser) && !open_browser(&address) {
         eprintln!("{}", Msg::ServeBrowserOpenFailed.text(config.locale));
     }
     let mut agent = Agent::new(backend, confirmer, config, SecretString::from(hex));
@@ -718,10 +786,11 @@ pub fn serve<B: SignatureBackend, C: Confirmer>(
 
 /// Whether to auto-open the operator's browser at the agent address.
 ///
-/// Only when the agent actually serves the cabinet (a pure bridge has nothing to
-/// open) and the operator did not pass `--no-browser`.
-fn should_open_browser(cabinet_active: bool, no_browser: bool) -> bool {
-    cabinet_active && !no_browser
+/// Only when the agent serves a real cabinet SPA (a pure bridge or the
+/// placeholder page has nothing worth opening) and the operator did not pass
+/// `--no-browser`.
+fn should_open_browser(serves_spa: bool, no_browser: bool) -> bool {
+    serves_spa && !no_browser
 }
 
 /// Best-effort launch of the operator's default browser at `url`.
@@ -844,8 +913,15 @@ fn build_response(output: &HttpOutput) -> Response<std::io::Cursor<Vec<u8>>> {
             response = response.with_header(h);
         }
     }
+    // The `csp` flag marks a static cabinet response (an asset, the placeholder,
+    // or a cabinet 404). Such responses carry the cabinet CSP and, since their
+    // Content-Type is guessed from the file extension, `nosniff` so the browser
+    // does not MIME-sniff a served file into a more dangerous type.
     if output.csp {
         if let Ok(h) = Header::from_bytes(&b"Content-Security-Policy"[..], CABINET_CSP.as_bytes()) {
+            response = response.with_header(h);
+        }
+        if let Ok(h) = Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]) {
             response = response.with_header(h);
         }
     }
@@ -899,6 +975,38 @@ struct SignRegistryRequest {
 fn ecdsa_der_to_raw(der: &[u8]) -> Result<[u8; 64], ()> {
     let signature = p256::ecdsa::Signature::from_der(der).map_err(|_| ())?;
     Ok(signature.to_bytes().into())
+}
+
+/// Build the operator-confirmation summary for a registry signing request.
+///
+/// A registry carries no certificate structure to parse, so the summary shows
+/// the exact payload's SHA-256 digest and byte length, plus the signing-key
+/// label — the datum the operator attests to. It has no subject or validity
+/// window (see [`OperationKind::DeviceRegistry`]).
+fn registry_summary(key: &KeyId, payload: &[u8]) -> OperationSummary {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = hex::encode(Sha256::digest(payload));
+    OperationSummary {
+        kind: OperationKind::DeviceRegistry,
+        subject: String::new(),
+        not_before: String::new(),
+        not_after: String::new(),
+        lines: vec![
+            SummaryLine {
+                caption: Caption::Key,
+                value: key.as_str().to_owned(),
+            },
+            SummaryLine {
+                caption: Caption::Digest,
+                value: format!("sha256:{digest}"),
+            },
+            SummaryLine {
+                caption: Caption::Size,
+                value: format!("{} bytes", payload.len()),
+            },
+        ],
+    }
 }
 
 /// Validate a registry-signing key before the agent accepts it.
@@ -1598,10 +1706,10 @@ mod tests {
         }
     }
 
-    /// A cabinet `dist/` with a minimal `index.html` (carrying a `<head>`) and
-    /// the fixed asset set, served from a temporary directory. Includes the
-    /// `fonts/` subdirectory with a listed font plus its (unlisted) licence, so
-    /// tests can prove the subdirectory asset serves while the licence does not.
+    /// A cabinet bundle directory with a minimal `index.html` (carrying a
+    /// `<head>`) and a spread of typical SPA assets, served from a temporary
+    /// directory. Includes a `fonts/` subdirectory so tests can prove a file in a
+    /// subdirectory serves.
     fn cabinet_dir() -> TempDir {
         let dir = TempDir::new("cabinet");
         dir.write(
@@ -1609,12 +1717,10 @@ mod tests {
             b"<!doctype html>\n<html>\n  <head>\n    <title>Cabinet</title>\n  </head>\n  <body></body>\n</html>\n",
         );
         dir.write("main.js", b"export const x = 1;\n");
-        dir.write("main.js.map", b"{\"version\":3}\n");
         dir.write("styles.css", b"body{}\n");
-        dir.write("tessera_issuer_wasm_bg.wasm", b"\0asm\x01\0\0\0");
+        dir.write("cabinet.wasm", b"\0asm\x01\0\0\0");
         std::fs::create_dir_all(dir.0.join("fonts")).expect("create fonts dir");
         dir.write("fonts/inter-400.woff2", b"wOF2-inter-400-fake");
-        dir.write("fonts/LICENSE-Inter.txt", b"INTER FONT LICENCE TEXT\n");
         dir
     }
 
@@ -1663,7 +1769,7 @@ mod tests {
         for (path, expected) in [
             ("/main.js", "text/javascript"),
             ("/styles.css", "text/css"),
-            ("/tessera_issuer_wasm_bg.wasm", "application/wasm"),
+            ("/cabinet.wasm", "application/wasm"),
         ] {
             let out = get(&a, path);
             assert_eq!(out.status, 200, "{path}");
@@ -1673,12 +1779,13 @@ mod tests {
     }
 
     #[test]
-    fn font_in_subdirectory_is_served_and_licence_is_not() {
+    fn a_file_in_a_subdirectory_is_served_with_its_guessed_type() {
         let dir = cabinet_dir();
         let a = agent_serving(RecordingSigner::new(), source(&dir));
 
-        // A listed font under `fonts/` is a served asset. Static serving runs
-        // ahead of the gates, so it answers a request that carries a token...
+        // A file under `fonts/` is served with a type guessed from its
+        // extension. Static serving runs ahead of the gates, so it answers a
+        // request that carries a token...
         let with_token = a.handle(&HttpInput {
             method: ReqMethod::Get,
             path: "/fonts/inter-400.woff2",
@@ -1696,82 +1803,40 @@ mod tests {
         let without_token = get(&a, "/fonts/inter-400.woff2");
         assert_eq!(without_token.status, 200);
         assert_eq!(without_token.content_type, Some("font/woff2"));
-
-        // The font licence sits on disk beside the font but is not a listed
-        // asset, so it falls through to the gated routes and is refused — never
-        // read, so its contents cannot leak.
-        let licence = a.handle(&HttpInput {
-            method: ReqMethod::Get,
-            path: "/fonts/LICENSE-Inter.txt",
-            origin: Some(ORIGIN),
-            session_token: Some(TOKEN),
-            body: &[],
-        });
-        assert_eq!(licence.status, 404);
-        assert!(
-            !licence.body.windows(7).any(|w| w == b"LICENCE"),
-            "licence contents must not leak"
-        );
-
-        // An arbitrary path under `fonts/` is likewise not a listed asset.
-        let arbitrary = a.handle(&HttpInput {
-            method: ReqMethod::Get,
-            path: "/fonts/secret.woff2",
-            origin: Some(ORIGIN),
-            session_token: Some(TOKEN),
-            body: &[],
-        });
-        assert_eq!(arbitrary.status, 404);
     }
 
-    #[cfg(feature = "embed-cabinet")]
     #[test]
-    fn embedded_source_serves_a_font_from_the_fonts_subdirectory() {
-        // Prove the include_dir lookup resolves a listed asset whose name has a
-        // `fonts/` subdirectory against the assets compiled into the binary.
-        let a = agent_serving(RecordingSigner::new(), CabinetSource::Embedded);
-        let out = get(&a, "/fonts/jbmono-400.woff2");
+    fn a_non_file_path_falls_back_to_the_index() {
+        // A client-side route (no file on disk) resolves to index.html so the SPA
+        // router can take over; the served document carries the injected meta.
+        let dir = cabinet_dir();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+        let out = get(&a, "/issue/some/deep/route");
         assert_eq!(out.status, 200);
-        assert_eq!(out.content_type, Some("font/woff2"));
-        assert!(!out.body.is_empty());
+        assert_eq!(out.content_type, Some(INDEX_CONTENT_TYPE));
+        let html = String::from_utf8(out.body).unwrap();
+        assert!(
+            html.contains("tessera-agent-token"),
+            "the fallback document is the injected index: {html}"
+        );
     }
 
     #[test]
-    fn source_map_is_not_served() {
-        // The source map exists on disk but is not in the shipped asset set, so
-        // it falls through to the gated routes and is not returned as a file.
+    fn a_missing_asset_with_an_extension_also_falls_back_to_the_index() {
+        // A subresource that does not exist is not a 404 file probe: it too falls
+        // back to index.html (standard SPA catch-all), never leaking a filesystem
+        // miss as a distinct status.
         let dir = cabinet_dir();
         let a = agent_serving(RecordingSigner::new(), source(&dir));
-        let out = a.handle(&HttpInput {
-            method: ReqMethod::Get,
-            path: "/main.js.map",
-            origin: Some(ORIGIN),
-            session_token: Some(TOKEN),
-            body: &[],
-        });
-        assert_eq!(out.status, 404);
+        let out = get(&a, "/does-not-exist.js");
+        assert_eq!(out.status, 200);
+        assert_eq!(out.content_type, Some(INDEX_CONTENT_TYPE));
     }
 
     #[test]
-    fn path_outside_the_asset_set_is_not_served() {
+    fn path_traversal_reads_nothing_outside_the_directory() {
         let dir = cabinet_dir();
-        let a = agent_serving(RecordingSigner::new(), source(&dir));
-        // Not in the fixed set: falls through to the gated routes, which — with a
-        // valid origin and token — 404 rather than reading anything from disk.
-        let out = a.handle(&HttpInput {
-            method: ReqMethod::Get,
-            path: "/secret.txt",
-            origin: Some(ORIGIN),
-            session_token: Some(TOKEN),
-            body: &[],
-        });
-        assert_eq!(out.status, 404);
-    }
-
-    #[test]
-    fn path_traversal_is_refused() {
-        let dir = cabinet_dir();
-        // Plant a file next to (outside) the dist directory.
+        // Plant a file next to (outside) the served directory.
         std::fs::write(dir.0.join("..").join("outside.txt"), b"secret").ok();
         let a = agent_serving(RecordingSigner::new(), source(&dir));
         for path in ["/../outside.txt", "/../../Cargo.toml", "/..%2fCargo.toml"] {
@@ -1782,10 +1847,16 @@ mod tests {
                 session_token: Some(TOKEN),
                 body: &[],
             });
-            assert_ne!(out.status, 200, "{path} must not serve a file");
+            // Containment means nothing outside the directory is ever read; the
+            // path is just an unknown route, so it falls back to index.html — the
+            // outside file's contents can never appear in the response.
             assert!(
                 !out.body.windows(6).any(|w| w == b"secret"),
                 "{path} must not leak file contents"
+            );
+            assert!(
+                !out.body.windows(11).any(|w| w == b"[workspace]"),
+                "{path} must not leak the workspace Cargo.toml"
             );
         }
     }
@@ -1807,8 +1878,8 @@ mod tests {
 
     #[test]
     fn without_cabinet_root_is_not_served() {
-        // Bridge mode: `GET /` with a valid origin and token is a 404, never a
-        // document.
+        // Pure bridge mode (`--no-cabinet`): `GET /` with a valid origin and
+        // token is a 404, never a document.
         let a = agent(RecordingSigner::new());
         let out = a.handle(&HttpInput {
             method: ReqMethod::Get,
@@ -1819,6 +1890,55 @@ mod tests {
         });
         assert_eq!(out.status, 404);
         assert!(!out.csp, "bridge mode sends no cabinet CSP");
+    }
+
+    #[test]
+    fn placeholder_page_is_served_at_root_without_a_cabinet_dir() {
+        // No `--cabinet-dir`: `GET /` serves the localized placeholder page, and
+        // it carries no injected session token (there is no cabinet to pair).
+        let a = agent_serving(RecordingSigner::new(), CabinetSource::Placeholder);
+        let out = get(&a, "/");
+        assert_eq!(out.status, 200);
+        assert_eq!(out.content_type, Some(INDEX_CONTENT_TYPE));
+        assert!(out.csp, "the placeholder page carries the cabinet CSP");
+        let html = String::from_utf8(out.body).unwrap();
+        assert!(
+            html.contains("--cabinet-dir"),
+            "the placeholder tells the operator how to attach a cabinet: {html}"
+        );
+        assert!(
+            !html.contains("tessera-agent-token"),
+            "the placeholder must not inject a session token"
+        );
+    }
+
+    #[test]
+    fn placeholder_mode_keeps_info_gated_and_signing_working() {
+        let a = agent_serving(RecordingSigner::new(), CabinetSource::Placeholder);
+        // `/info` is reserved, so the placeholder never shadows it: no token → 403.
+        let refused = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/info",
+            origin: Some(ORIGIN),
+            session_token: None,
+            body: &[],
+        });
+        assert_eq!(refused.status, 403);
+        // The signing bridge still works in placeholder mode.
+        let signed = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: sign_body().as_bytes(),
+        });
+        assert_eq!(
+            signed.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&signed.body)
+        );
+        assert!(a.backend.signed.get(), "backend must sign");
     }
 
     #[test]
@@ -2230,6 +2350,110 @@ mod tests {
             ),
         })
         .to_string()
+    }
+
+    /// A registry agent over the real P-256 backend with a custom confirmer.
+    fn registry_agent_with<C: Confirmer>(confirmer: C) -> Agent<P256Backend, C> {
+        Agent::new(
+            P256Backend::new(),
+            confirmer,
+            config(),
+            SecretString::from(TOKEN.to_owned()),
+        )
+        .with_registry_key(KeyId::new(REGISTRY_LABEL))
+    }
+
+    #[test]
+    fn sign_registry_operator_decline_refuses_and_backend_untouched() {
+        // A registry, like an issuance, needs operator confirmation: a decline is
+        // refused before the backend signs, so a substituted cabinet cannot get a
+        // silent attestation signature.
+        let a = registry_agent_with(RecordingConfirmer {
+            decision: false,
+            called: Cell::new(false),
+        });
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign-registry",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: sign_registry_body(b"{\"generated_at\":1}").as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            403,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        assert!(a.confirmer.called.get(), "confirmer must have been asked");
+        assert!(
+            a.backend.last_signed.take().is_none(),
+            "backend must not sign a declined registry"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(value["error"], "operation not confirmed by operator");
+    }
+
+    #[test]
+    fn sign_registry_confirmation_channel_failure_is_a_server_error() {
+        // A broken confirmation channel (not a decline) is a 500, and the backend
+        // is never reached — symmetric to the issuance path.
+        fn broken(_: &OperationSummary) -> Result<bool, ConfirmError> {
+            Err(ConfirmError::Io("no channel".to_owned()))
+        }
+        let a = registry_agent_with(broken as ConfirmFn);
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign-registry",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: sign_registry_body(b"{}").as_bytes(),
+        });
+        assert_eq!(out.status, 500);
+        assert!(
+            a.backend.last_signed.take().is_none(),
+            "backend must not sign when the channel failed"
+        );
+    }
+
+    #[test]
+    fn sign_registry_shows_the_operator_the_digest_size_and_key() {
+        use std::cell::RefCell;
+
+        use sha2::{Digest as _, Sha256};
+
+        // Capture what the operator is shown: it must carry the registry kind,
+        // the signing-key label, the payload size, and the SHA-256 of the exact
+        // payload bytes — enough to attest without trusting the cabinet.
+        let seen = RefCell::new(String::new());
+        let confirm = |summary: &OperationSummary| -> Result<bool, ConfirmError> {
+            *seen.borrow_mut() = summary.render(Locale::En);
+            Ok(true)
+        };
+        let payload = br#"{"generated_at":1750000000,"hosts":[]}"#;
+        let a = registry_agent_with(confirm);
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign-registry",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: sign_registry_body(payload).as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        let shown = seen.borrow();
+        assert!(shown.contains("device registry"), "{shown}");
+        assert!(shown.contains(REGISTRY_LABEL), "{shown}");
+        assert!(shown.contains("size"), "{shown}");
+        let digest = hex::encode(Sha256::digest(payload));
+        assert!(
+            shown.contains(&digest),
+            "the payload digest must be shown to the operator: {shown}"
+        );
     }
 
     #[test]

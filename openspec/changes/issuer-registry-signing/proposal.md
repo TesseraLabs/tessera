@@ -15,6 +15,9 @@ different questions and must not be confusable.
   sign anything else; identical key labels refuse to start.
 - Without a configured registry key the endpoint answers an explicit
   "key not configured" error.
+- Registry signing goes through the same operator confirmation channel as
+  issuance signing (digest, payload size and key label shown; refusal is an
+  explicit client-visible error).
 
 ## Capabilities
 

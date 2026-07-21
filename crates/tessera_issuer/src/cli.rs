@@ -402,13 +402,13 @@ struct ServeArgs {
     /// Send a locally computed digest with `prehashed=true` (vault backend).
     #[arg(long)]
     prehashed: bool,
-    /// Run as a pure signing bridge without serving the cabinet SPA (the cabinet
-    /// is served by default when this binary carries it or `--cabinet-dir` is
-    /// given).
+    /// Run as a pure signing bridge, serving nothing at `/` (not even the
+    /// placeholder page). Requires at least one `--allow-origin`.
     #[arg(long)]
     no_cabinet: bool,
-    /// Serve the cabinet SPA from an external `dist/` directory instead of the
-    /// assets embedded in this binary (overridden by `--no-cabinet`).
+    /// Serve the cabinet SPA from this external bundle directory. Without it the
+    /// agent serves a placeholder page explaining how to attach one; overridden
+    /// by `--no-cabinet`.
     #[arg(long)]
     cabinet_dir: Option<PathBuf>,
     /// Do not auto-open the operator's browser at the agent address on startup
@@ -1445,15 +1445,16 @@ fn finish_serve<B: SignatureBackend>(
     use crate::serve::{serve, AgentConfig, CabinetSource};
 
     let cabinet = resolve_cabinet_source(args.cabinet_dir, args.no_cabinet);
-    // Serving the cabinet supplies the allowlist entry itself (the bound
-    // loopback origin, added after bind), so `--allow-origin` is optional then;
-    // a pure bridge still needs at least one.
-    let serving_cabinet = !matches!(cabinet, CabinetSource::Disabled);
-    if args.allow_origins.is_empty() && !serving_cabinet {
+    // Only `--no-cabinet` (a pure bridge) needs an explicit `--allow-origin`:
+    // serving an external cabinet supplies the allowlist entry itself (the bound
+    // loopback origin, added after bind), and the default placeholder mode
+    // accepts same-origin requests without one, so neither requires the flag.
+    let pure_bridge = matches!(cabinet, CabinetSource::Disabled);
+    if args.allow_origins.is_empty() && pure_bridge {
         return Err(CliError::Usage(
-            "issuer serve: at least one --allow-origin is required in bridge mode (drop \
-             --no-cabinet — serving the cabinet is the default and allowlists the agent's \
-             own origin)"
+            "issuer serve: at least one --allow-origin is required with --no-cabinet (drop it \
+             to serve the cabinet from --cabinet-dir, or to serve the placeholder page, which \
+             allowlist the agent's own origin)"
                 .to_owned(),
         ));
     }
@@ -1650,13 +1651,12 @@ fn reject_registry_key(args: &ServeArgs, backend: &str) -> Result<(), CliError> 
     Ok(())
 }
 
-/// Resolve the cabinet source: serving is the default when the cabinet is
-/// available, and `--no-cabinet` opts out.
+/// Resolve what the agent serves on its static surface.
 ///
 /// `--no-cabinet` forces a pure bridge; otherwise an explicit `--cabinet-dir`
-/// wins, else the assets embedded in this binary are used, and if the binary
-/// carries none the agent falls back to a bridge (no error — a build without the
-/// `embed-cabinet` feature simply has nothing to serve).
+/// serves that external SPA bundle, and with neither flag the agent serves a
+/// placeholder page telling the operator how to attach one — the cabinet ships
+/// separately, so the binary carries none itself.
 #[cfg(all(
     feature = "serve",
     any(feature = "pkcs11", feature = "vault", feature = "file")
@@ -1670,16 +1670,9 @@ fn resolve_cabinet_source(
     if no_cabinet {
         return CabinetSource::Disabled;
     }
-    if let Some(dir) = cabinet_dir {
-        return CabinetSource::Directory(dir);
-    }
-    #[cfg(feature = "embed-cabinet")]
-    {
-        CabinetSource::Embedded
-    }
-    #[cfg(not(feature = "embed-cabinet"))]
-    {
-        CabinetSource::Disabled
+    match cabinet_dir {
+        Some(dir) => CabinetSource::Directory(dir),
+        None => CabinetSource::Placeholder,
     }
 }
 
@@ -1958,25 +1951,14 @@ mod tests {
         ));
     }
 
-    #[cfg(all(feature = "serve", feature = "pkcs11", feature = "embed-cabinet"))]
+    #[cfg(all(feature = "serve", feature = "pkcs11"))]
     #[test]
-    fn default_serves_embedded_cabinet() {
+    fn default_serves_the_placeholder() {
         use crate::serve::CabinetSource;
-        // No flag and a binary carrying the cabinet → serve it (the default).
+        // No flag and no `--cabinet-dir` → the placeholder page, not an error.
         assert!(matches!(
             resolve_cabinet_source(None, false),
-            CabinetSource::Embedded
-        ));
-    }
-
-    #[cfg(all(feature = "serve", feature = "pkcs11", not(feature = "embed-cabinet")))]
-    #[test]
-    fn default_falls_back_to_bridge_without_embedded_cabinet() {
-        use crate::serve::CabinetSource;
-        // No flag and no embedded assets → bridge, no error.
-        assert!(matches!(
-            resolve_cabinet_source(None, false),
-            CabinetSource::Disabled
+            CabinetSource::Placeholder
         ));
     }
 

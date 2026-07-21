@@ -115,6 +115,14 @@ pub enum Caption {
     KindOrgCa,
     /// The operation-kind name for a certificate revocation list.
     KindCrl,
+    /// The operation-kind name for an exported device registry.
+    KindDeviceRegistry,
+    /// The signing-key label field.
+    Key,
+    /// The payload-digest field (a SHA-256 of the signed bytes).
+    Digest,
+    /// The payload-size field.
+    Size,
 }
 
 impl Caption {
@@ -145,6 +153,10 @@ impl Caption {
             Caption::KindShiftLeaf => "shift-leaf certificate",
             Caption::KindOrgCa => "organisation CA certificate",
             Caption::KindCrl => "certificate revocation list",
+            Caption::KindDeviceRegistry => "device registry",
+            Caption::Key => "key",
+            Caption::Digest => "digest",
+            Caption::Size => "size",
         }
     }
 
@@ -167,6 +179,10 @@ impl Caption {
             Caption::KindShiftLeaf => "сертификат смены (лист)",
             Caption::KindOrgCa => "сертификат УЦ организации",
             Caption::KindCrl => "список отзыва (CRL)",
+            Caption::KindDeviceRegistry => "реестр устройств",
+            Caption::Key => "ключ",
+            Caption::Digest => "дайджест",
+            Caption::Size => "размер",
         }
     }
 }
@@ -196,6 +212,12 @@ pub(crate) enum Msg {
     ServeConfirmChannelFailed,
     /// `issuer serve`: pinentry unavailable, terminal used (an error follows).
     ServePinentryFellBack,
+    /// Placeholder page served at `/` with no cabinet attached: heading (full
+    /// line).
+    CabinetNotConnectedTitle,
+    /// Placeholder page served at `/` with no cabinet attached: body text (full
+    /// line).
+    CabinetNotConnectedBody,
     /// Terminal confirmation dialog header (full line).
     ConfirmHeader,
     /// Terminal confirmation prompt (full line).
@@ -258,6 +280,11 @@ impl Msg {
             Msg::ServePinentryFellBack => {
                 "issuer serve: pinentry unavailable, using terminal prompt:"
             }
+            Msg::CabinetNotConnectedTitle => "Cabinet not connected",
+            Msg::CabinetNotConnectedBody => {
+                "Restart issuer serve with --cabinet-dir <path> to serve the issuance \
+                 cabinet from a static bundle. The signing bridge is running."
+            }
             Msg::ConfirmHeader => "=== Confirm issuance operation ===",
             Msg::ConfirmPrompt => "Sign this operation? [y/N]:",
             Msg::CliCertWritten => "certificate written to",
@@ -296,6 +323,11 @@ impl Msg {
             Msg::ServeConfirmChannelFailed => "issuer serve: канал подтверждения недоступен:",
             Msg::ServePinentryFellBack => {
                 "issuer serve: pinentry недоступен, используется терминал:"
+            }
+            Msg::CabinetNotConnectedTitle => "Кабинет не подключён",
+            Msg::CabinetNotConnectedBody => {
+                "Перезапустите issuer serve с --cabinet-dir <путь>, чтобы раздавать кабинет \
+                 выпуска из статического бандла. Мост подписи уже работает."
             }
             Msg::ConfirmHeader => "=== Подтверждение операции выпуска ===",
             Msg::ConfirmPrompt => "Подписать эту операцию? [y/N]:",

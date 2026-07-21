@@ -3,18 +3,21 @@ name: issuer
 # Кроссплатформенный CI стороны выпуска (D11). Отдельный workflow, а не нога
 # build.yml, потому что build.yml завязан на .deb-конвейер: Astra
 # builder-контейнер, сверку debian/changelog, deb-артефакты — всё это про
-# Linux-only агент. Крейты выпуска (tessera_ext / tessera_issuer /
-# tessera_issuer_wasm) — pure-Rust, собираются на ubuntu/macos/windows и в
-# wasm32, ставить их в ту же matrix значило бы смешать два несвязанных
-# конвейера. Держим по образцу lint.yml/nightly.yml — отдельный workflow на
-# свою заботу.
+# Linux-only агент. Крейты выпуска (tessera_ext / tessera_issuer) — pure-Rust,
+# собираются на ubuntu/macos/windows и в wasm32, ставить их в ту же matrix
+# значило бы смешать два несвязанных конвейера. Держим по образцу
+# lint.yml/nightly.yml — отдельный workflow на свою заботу.
+#
+# Кабинет выпуска — внешний статический бандл (отдельная поставка), в этом репо
+# его нет: `issuer serve` раздаёт его из каталога `--cabinet-dir`, встраивания в
+# бинарь больше нет. Поэтому здесь ни сборки статики кабинета, ни фичи
+# `embed-cabinet` — `--all-features` работает без спец-подготовки.
 #
 # Что покрывает:
 #   - build-test  — сборка+тесты tessera_issuer/tessera_ext на трёх ОС;
 #   - clippy      — линт issuer-крейтов со всеми фичами (адаптеры pkcs11/vault/
 #                   serve видны только под --all-features);
-#   - wasm        — сборка ядра и биндингов кабинета под wasm32;
-#   - cabinet     — сборка статики кабинета (gated: только если каталог есть);
+#   - wasm        — сборка ядра выпуска под wasm32 (внешний кабинет линкует его);
 #   - mac-tests   — mac-gated сюиты tessera_core (в т.ч. issuer_contract),
 #                   которые до сих пор не исполнялись в CI (пробел из 7.1).
 
@@ -80,12 +83,10 @@ jobs:
       - name: Test (default features)
         run: cargo test -p tessera_issuer -p tessera_ext
 
-      # На Linux — весь набор фич, КРОМЕ embed-cabinet: она через `include_dir!`
-      # встраивает cabinet/dist, которого в этом job'е нет (кабинет собирается
-      # отдельным cabinet-job'ом, там же и тестируется embed). pkcs11-tests/
-      # vault-tests компилируются, но без внешней зависимости (SoftHSM-модуль,
-      # бинарь vault) в рантайме печатают `skipped:` и возвращают Ok.
-      - name: Test (Linux, all features except embed-cabinet)
+      # На Linux — весь набор фич. pkcs11-tests/vault-tests компилируются, но без
+      # внешней зависимости (SoftHSM-модуль, бинарь vault) в рантайме печатают
+      # `skipped:` и возвращают Ok.
+      - name: Test (Linux, all features)
         if: runner.os == 'Linux'
         run: cargo test -p tessera_issuer --features cli,pkcs11,vault,serve,test-support
 
@@ -118,22 +119,15 @@ jobs:
         with:
           shared-key: issuer-clippy
 
-      # embed-cabinet (в --all-features) через `include_dir!` требует
-      # cabinet/dist на этапе компиляции. Для линта содержимое не нужно —
-      # достаточно существования каталога (clippy не исполняет serving-тесты),
-      # поэтому кладём пустой placeholder; реальный embed собирается и тестируется
-      # в cabinet-job'е, где build.sh уже наполнил dist.
-      - name: Placeholder cabinet/dist for embed-cabinet lint
-        run: mkdir -p cabinet/dist
-
       - name: cargo clippy (issuer crates, all features, -D warnings)
         run: >
           cargo clippy
-          -p tessera_issuer -p tessera_ext -p tessera_issuer_wasm
+          -p tessera_issuer -p tessera_ext
           --all-targets --all-features -- -D warnings
 
-  # Ядро issuer собирается под wasm32 (браузерный кабинет). --no-default-features
-  # выключает native (rand/clap): в браузере энтропия — от хоста, бинаря нет.
+  # Ядро issuer собирается под wasm32: внешний браузерный кабинет линкует его как
+  # WASM-ядро. --no-default-features выключает native (rand/clap): в браузере
+  # энтропия — от хоста, бинаря нет.
   wasm:
     runs-on: ubuntu-latest
     steps:
@@ -154,72 +148,6 @@ jobs:
         run: >
           cargo build -p tessera_issuer --lib
           --target wasm32-unknown-unknown --no-default-features
-
-      - name: Build cabinet wasm bindings
-        run: >
-          cargo build -p tessera_issuer_wasm
-          --target wasm32-unknown-unknown --release
-
-  # Наличие кабинета определяем отдельным дешёвым job'ом: hashFiles() в
-  # job-level `if` не годится — он вычисляется до checkout, когда workspace ещё
-  # пуст, и всегда дал бы пусто. Скрипт кабинета создаёт смежный агент; пока его
-  # нет — cabinet-job корректно скипается (needs + output), а не краснеет.
-  detect-cabinet:
-    runs-on: ubuntu-latest
-    outputs:
-      present: ${{ steps.check.outputs.present }}
-    steps:
-      - uses: actions/checkout@v6
-      - id: check
-        run: |
-          if [ -f cabinet/build.sh ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  # Верификация кабинета. КОНТРАКТ: cabinet/build.sh без аргументов кладёт статику
-  # в cabinet/dist/ вместе с SHA256SUMS; затем бинарь issuer собирается с фичей
-  # embed-cabinet — ловим и поломку сборки SPA, и поломку встраивания. Наружу
-  # ничего не публикуется: кабинет едет встроенным в бинарь агента (deb собирает
-  # build.yml), отдельного хостинга нет.
-  cabinet:
-    needs: detect-cabinet
-    if: needs.detect-cabinet.outputs.present == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      # Кабинет — npm/esbuild/TypeScript SPA поверх wasm-ядра, поэтому build.sh
-      # нужны оба тулчейна: Node (сборка SPA) и Rust+wasm32 (ядро). Сам скрипт
-      # самодостаточен — ставит свои npm-зависимости и собирает wasm; job лишь
-      # даёт ему тулчейны.
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install Rust toolchain (from rust-toolchain.toml)
-        run: rustup show
-
-      - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Cache cargo registry + target (Swatinem/rust-cache)
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-        with:
-          shared-key: issuer-cabinet
-
-      - name: Build cabinet
-        run: bash cabinet/build.sh
-
-      # Guard: релизный бинарь встраивает cabinet/dist через `include_dir!` за
-      # фичей `embed-cabinet` (кабинет раздаётся `issuer serve` по умолчанию).
-      # build.sh уже наполнил dist настоящим кабинетом — тестируем embed здесь
-      # (единственный job с реальным dist): поломка пути include_dir/встраивания
-      # и embed-serving-тесты падают здесь, а не при выпуске бинаря.
-      - name: Test issuer with the embedded cabinet
-        run: cargo test -p tessera_issuer --features embed-cabinet,serve,pkcs11,test-support
 
   # mac-gated сюиты tessera_core (в т.ч. issuer_contract — «что выпустил issuer,
   # то принял разбор Engine»). Без фичи mac-tests эти тесты не компилируются и в
