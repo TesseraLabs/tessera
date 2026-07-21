@@ -54,13 +54,16 @@
 //! };
 //! let ca = self_signed_ca(&signer, &key, &ca_req, &Serial::generate(), &mut journal, now).unwrap();
 //!
-//! // Issue a leaf under it.
+//! // Issue a leaf under it. Login happens *into a role account* named for the
+//! // role (`oper@host`), so `user_binding` lists the allowed role accounts
+//! // (mirroring `allowed_roles`), not a person — the engineer's identity lives
+//! // in the subject CN and the journal.
 //! let leaf_req = LeafRequest {
 //!     subject: "CN=ivanov".to_owned(),
 //!     subject_spki_der: spki,
 //!     validity: Validity { not_before: 1_600_000_000, not_after: 1_600_003_600 },
 //!     host_binding: vec!["*".to_owned()],
-//!     user_binding: vec!["ivanov".to_owned()],
+//!     user_binding: vec!["oper".to_owned()],
 //!     allowed_roles: vec!["oper".to_owned()],
 //!     max_integrity: None,
 //!     profile_version: 1,

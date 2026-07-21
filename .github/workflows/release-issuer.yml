@@ -1,11 +1,12 @@
 name: release-issuer
 
-# Публикует бинарь `issuer` с ВСТРОЕННЫМ веб-кабинетом выпуска (фича
-# `embed-cabinet`) под Linux/macOS/Windows в тот же draft GitHub Release, что и
-# `.deb` агента (build.yml). Кабинет собирается один раз (cabinet-dist) и
-# встраивается на каждой платформе — так astra-контейнеру и раннерам не нужен
-# Node. Linux собирается в astra-builder (самый старый glibc среди целей →
-# бинарь работает на Astra, Ubuntu и Debian по обратной совместимости glibc).
+# Публикует бинарь `issuer` под Linux/macOS/Windows в тот же draft GitHub
+# Release, что и `.deb` агента (build.yml). Веб-кабинет выпуска — внешний
+# статический бандл (отдельная поставка): бинарь раздаёт его из каталога
+# `issuer serve --cabinet-dir`, в бинарь он больше не встраивается, поэтому здесь
+# нет ни сборки статики кабинета, ни Node. Linux собирается в astra-builder
+# (самый старый glibc среди целей → бинарь работает на Astra, Ubuntu и Debian по
+# обратной совместимости glibc).
 #
 # Спека: openspec/specs/build-release (требование «Release job»).
 
@@ -22,51 +23,13 @@ permissions:
   contents: read
 
 env:
-  ISSUER_FEATURES: cli,pkcs11,vault,file,serve,embed-cabinet
+  ISSUER_FEATURES: cli,pkcs11,vault,file,serve
 
 jobs:
-  # Кабинет — npm/esbuild/TypeScript SPA поверх wasm-ядра; build.sh нужны Node и
-  # Rust+wasm32. Собираем один раз, dist раздаём артефактом для embed.
-  cabinet-dist:
-    if: github.repository == 'TesseraLabs/tessera'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install Rust toolchain (from rust-toolchain.toml)
-        run: rustup show
-
-      - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Cache cargo registry + target (Swatinem/rust-cache)
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-        with:
-          shared-key: release-issuer-cabinet
-
-      - name: Build cabinet
-        run: bash cabinet/build.sh
-
-      - name: Upload cabinet dist
-        uses: actions/upload-artifact@v7
-        with:
-          name: cabinet-dist
-          path: cabinet/dist/**
-          if-no-files-found: error
-          retention-days: 7
-
   # Linux: в astra-builder (тот же контейнер, что собирает .deb). Старый glibc →
   # бинарь работает на Astra и новее (Ubuntu/Debian). Rust и openssl (vault
   # native-tls) в образе уже есть — им же собирается tessera_core.
   build-issuer-linux:
-    needs: cabinet-dist
     if: github.repository == 'TesseraLabs/tessera'
     runs-on: ubuntu-latest
     container:
@@ -79,13 +42,7 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
-      - name: Download cabinet dist
-        uses: actions/download-artifact@v8
-        with:
-          name: cabinet-dist
-          path: cabinet/dist
-
-      - name: Build issuer (release, embedded cabinet)
+      - name: Build issuer (release)
         run: cargo build --release -p tessera_issuer --features "$ISSUER_FEATURES"
 
       - name: Stage binary
@@ -106,7 +63,6 @@ jobs:
   # openssl не нужен. Rust предустановлен; rustup show ставит версию из
   # rust-toolchain.toml.
   build-issuer-desktop:
-    needs: cabinet-dist
     if: github.repository == 'TesseraLabs/tessera'
     strategy:
       fail-fast: false
@@ -124,12 +80,6 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
-      - name: Download cabinet dist
-        uses: actions/download-artifact@v8
-        with:
-          name: cabinet-dist
-          path: cabinet/dist
-
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show
 
@@ -138,7 +88,7 @@ jobs:
         with:
           shared-key: release-issuer-${{ matrix.target }}
 
-      - name: Build issuer (release, embedded cabinet)
+      - name: Build issuer (release)
         run: cargo build --release -p tessera_issuer --features "$ISSUER_FEATURES"
         shell: bash
 

@@ -57,10 +57,6 @@ serve = [
     "dep:secrecy",
     "dep:zeroize",
 ]
-# Embed the built cabinet SPA (`cabinet/dist/`) into the `issuer` binary so
-# `issuer serve --serve-cabinet` is a fully self-contained, offline agent.
-# Requires `cabinet/build.sh` to have produced `cabinet/dist/` before building.
-embed-cabinet = ["serve", "dep:include_dir"]
 # Integration-test gates, mirroring tessera_core's `pkcs11-tests`: the heavy
 # tests compile only with these on and still skip gracefully (print `skipped:`
 # and return Ok) when the external dependency — a SoftHSM module, the `vault`
@@ -95,7 +91,6 @@ zeroize = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
 tiny_http = { workspace = true, optional = true }
-include_dir = { workspace = true, optional = true }
 
 # The wasm core (browser cabinet) needs an entropy backend for the RustCrypto
 # stack pulled by CSR verification; the browser provides one via getrandom's

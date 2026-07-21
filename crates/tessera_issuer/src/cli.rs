@@ -365,6 +365,13 @@ struct ServeArgs {
     /// file's basename without extension.
     #[arg(long)]
     key: Option<String>,
+    /// PKCS#11 `CKA_LABEL` of a second, registry-signing key, distinct from
+    /// `--key`. When set, the agent answers `/sign-registry`, signing exported
+    /// device registries with this key and nothing else. It must be an ECDSA
+    /// P-256 key in the same token as `--key`, and its label must differ from
+    /// `--key`. Only the pkcs11 backend supports it.
+    #[arg(long)]
+    registry_key: Option<String>,
     /// Signing algorithm: `ecdsa-p256`, `ecdsa-p384`, or `rsa-sha256`. Defaults
     /// to `ecdsa-p256` for pkcs11/vault; for the file backend the algorithm is
     /// derived from the key and this flag is only a cross-check.
@@ -395,15 +402,19 @@ struct ServeArgs {
     /// Send a locally computed digest with `prehashed=true` (vault backend).
     #[arg(long)]
     prehashed: bool,
-    /// Run as a pure signing bridge without serving the cabinet SPA (the cabinet
-    /// is served by default when this binary carries it or `--cabinet-dir` is
-    /// given).
+    /// Run as a pure signing bridge, serving nothing at `/` (not even the
+    /// placeholder page). Requires at least one `--allow-origin`.
     #[arg(long)]
     no_cabinet: bool,
-    /// Serve the cabinet SPA from an external `dist/` directory instead of the
-    /// assets embedded in this binary (overridden by `--no-cabinet`).
+    /// Serve the cabinet SPA from this external bundle directory. Without it the
+    /// agent serves a placeholder page explaining how to attach one; overridden
+    /// by `--no-cabinet`.
     #[arg(long)]
     cabinet_dir: Option<PathBuf>,
+    /// Do not auto-open the operator's browser at the agent address on startup
+    /// (no effect in bridge mode, where there is no cabinet to open).
+    #[arg(long)]
+    no_browser: bool,
     /// Path to a pinentry program for the operator-confirmation dialog and the
     /// file-backend key passphrase.
     #[arg(long)]
@@ -581,6 +592,7 @@ fn run_pkcs11(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Resul
         token_label: args.token_label.clone(),
         key_id: effective_key_id(args)?,
         algorithm: resolved_algorithm(args)?,
+        registry_key: None,
     };
     let signer = Pkcs11Signer::open(config, pin::CliPinSource::new(args.pinentry.clone()))
         .map_err(|e| CliError::Backend(e.to_string()))?;
@@ -1427,20 +1439,22 @@ fn finish_serve<B: SignatureBackend>(
     signer: B,
     advertised: SignatureAlgorithm,
     key_label: String,
+    registry_key: Option<KeyId>,
 ) -> Result<(), CliError> {
     use crate::confirm::DefaultConfirmer;
     use crate::serve::{serve, AgentConfig, CabinetSource};
 
     let cabinet = resolve_cabinet_source(args.cabinet_dir, args.no_cabinet);
-    // Serving the cabinet supplies the allowlist entry itself (the bound
-    // loopback origin, added after bind), so `--allow-origin` is optional then;
-    // a pure bridge still needs at least one.
-    let serving_cabinet = !matches!(cabinet, CabinetSource::Disabled);
-    if args.allow_origins.is_empty() && !serving_cabinet {
+    // Only `--no-cabinet` (a pure bridge) needs an explicit `--allow-origin`:
+    // serving an external cabinet supplies the allowlist entry itself (the bound
+    // loopback origin, added after bind), and the default placeholder mode
+    // accepts same-origin requests without one, so neither requires the flag.
+    let pure_bridge = matches!(cabinet, CabinetSource::Disabled);
+    if args.allow_origins.is_empty() && pure_bridge {
         return Err(CliError::Usage(
-            "issuer serve: at least one --allow-origin is required in bridge mode (drop \
-             --no-cabinet — serving the cabinet is the default and allowlists the agent's \
-             own origin)"
+            "issuer serve: at least one --allow-origin is required with --no-cabinet (drop it \
+             to serve the cabinet from --cabinet-dir, or to serve the placeholder page, which \
+             allowlist the agent's own origin)"
                 .to_owned(),
         ));
     }
@@ -1451,9 +1465,11 @@ fn finish_serve<B: SignatureBackend>(
         cabinet,
         key_label,
         locale,
+        no_browser: args.no_browser,
     };
     let confirmer = DefaultConfirmer::new(args.pinentry, locale);
-    serve(signer, confirmer, agent_config).map_err(|e| CliError::Backend(e.to_string()))
+    serve(signer, confirmer, agent_config, registry_key)
+        .map_err(|e| CliError::Backend(e.to_string()))
 }
 
 /// Build the PKCS#11 agent backend and serve.
@@ -1468,11 +1484,13 @@ fn run_serve_pkcs11(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
     })?;
     let key = serve_required_key(&args, "pkcs11")?;
     let algorithm = serve_algorithm(&args)?;
+    let registry_key = resolve_registry_key(args.registry_key.as_deref(), &key)?;
     let config = Pkcs11Config {
         module_path,
         token_label: args.token_label.clone(),
         key_id: KeyId::new(&key),
         algorithm,
+        registry_key: registry_key.clone(),
     };
     // Agent-side PIN source: read from the environment for the duration of a
     // login, never from an HTTP request or a command-line argument.
@@ -1485,7 +1503,7 @@ fn run_serve_pkcs11(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
     };
     let signer =
         Pkcs11Signer::open(config, pin_source).map_err(|e| CliError::Backend(e.to_string()))?;
-    finish_serve(args, locale, signer, algorithm, key)
+    finish_serve(args, locale, signer, algorithm, key, registry_key)
 }
 
 /// Fallback when `serve` is built without the `pkcs11` backend.
@@ -1502,6 +1520,7 @@ fn run_serve_pkcs11(_args: ServeArgs, _locale: Locale) -> Result<(), CliError> {
 fn run_serve_vault(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
     use crate::vault::{VaultConfig, VaultSigner};
 
+    reject_registry_key(&args, "vault")?;
     let address = args.vault_addr.clone().ok_or_else(|| {
         CliError::Usage("issuer serve: --vault-addr is required for the vault backend".to_owned())
     })?;
@@ -1519,7 +1538,7 @@ fn run_serve_vault(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
     };
     // Reads VAULT_TOKEN from the agent's environment, never from an HTTP request.
     let signer = VaultSigner::from_env(config).map_err(|e| CliError::Backend(e.to_string()))?;
-    finish_serve(args, locale, signer, algorithm, key)
+    finish_serve(args, locale, signer, algorithm, key, None)
 }
 
 /// Fallback when `serve` is built without the `vault` backend.
@@ -1536,6 +1555,7 @@ fn run_serve_vault(_args: ServeArgs, _locale: Locale) -> Result<(), CliError> {
 fn run_serve_file(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
     use crate::file::{FileConfig, FileSigner};
 
+    reject_registry_key(&args, "file")?;
     let path = args.key_file.clone().ok_or_else(|| {
         CliError::Usage("issuer serve: --key-file is required for the file backend".to_owned())
     })?;
@@ -1569,7 +1589,7 @@ fn run_serve_file(args: ServeArgs, locale: Locale) -> Result<(), CliError> {
         .algorithm(&key_id)
         .map_err(|e| CliError::Backend(e.to_string()))?;
     let key_label = key_id.as_str().to_owned();
-    finish_serve(args, locale, signer, advertised, key_label)
+    finish_serve(args, locale, signer, advertised, key_label, None)
 }
 
 /// Fallback when `serve` is built without the `file` backend.
@@ -1595,13 +1615,48 @@ fn serve_required_key(args: &ServeArgs, backend: &str) -> Result<String, CliErro
         })
 }
 
-/// Resolve the cabinet source: serving is the default when the cabinet is
-/// available, and `--no-cabinet` opts out.
+/// Resolve the optional registry-signing key for the pkcs11 agent.
+///
+/// Returns `None` when `--registry-key` is unset or empty. A non-empty label
+/// equal to the issuance `--key` is a usage error: the registry and issuance
+/// domains must not share a key. The comparison is a plain string match on
+/// labels — aliasing one physical key under two labels is not detected and is
+/// the operator's responsibility.
+#[cfg(all(feature = "serve", feature = "pkcs11"))]
+fn resolve_registry_key(
+    registry_key: Option<&str>,
+    issue_key: &str,
+) -> Result<Option<KeyId>, CliError> {
+    match registry_key.filter(|k| !k.is_empty()) {
+        None => Ok(None),
+        Some(label) if label == issue_key => Err(CliError::Usage(
+            "issuer serve: --registry-key must differ from --key (a distinct PKCS#11 key must \
+             sign registries)"
+                .to_owned(),
+        )),
+        Some(label) => Ok(Some(KeyId::new(label))),
+    }
+}
+
+/// Refuse `--registry-key` for a backend that does not support it. Registry
+/// signing needs a second key in the same token, which only the pkcs11 backend
+/// loads; `backend` names the selected one for the error text.
+#[cfg(all(feature = "serve", any(feature = "vault", feature = "file")))]
+fn reject_registry_key(args: &ServeArgs, backend: &str) -> Result<(), CliError> {
+    if args.registry_key.as_deref().is_some_and(|k| !k.is_empty()) {
+        return Err(CliError::Usage(format!(
+            "issuer serve: --registry-key is only supported by the pkcs11 backend, not {backend}"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve what the agent serves on its static surface.
 ///
 /// `--no-cabinet` forces a pure bridge; otherwise an explicit `--cabinet-dir`
-/// wins, else the assets embedded in this binary are used, and if the binary
-/// carries none the agent falls back to a bridge (no error — a build without the
-/// `embed-cabinet` feature simply has nothing to serve).
+/// serves that external SPA bundle, and with neither flag the agent serves a
+/// placeholder page telling the operator how to attach one — the cabinet ships
+/// separately, so the binary carries none itself.
 #[cfg(all(
     feature = "serve",
     any(feature = "pkcs11", feature = "vault", feature = "file")
@@ -1615,16 +1670,9 @@ fn resolve_cabinet_source(
     if no_cabinet {
         return CabinetSource::Disabled;
     }
-    if let Some(dir) = cabinet_dir {
-        return CabinetSource::Directory(dir);
-    }
-    #[cfg(feature = "embed-cabinet")]
-    {
-        CabinetSource::Embedded
-    }
-    #[cfg(not(feature = "embed-cabinet"))]
-    {
-        CabinetSource::Disabled
+    match cabinet_dir {
+        Some(dir) => CabinetSource::Directory(dir),
+        None => CabinetSource::Placeholder,
     }
 }
 
@@ -1685,7 +1733,7 @@ mod tests {
                 not_after: 1_600_003_600,
             },
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["ivanov".to_owned()],
+            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["root".to_owned()],
             max_integrity: None,
             profile_version: 1,
@@ -1815,7 +1863,7 @@ mod tests {
                 not_after: 1_600_003_600,
             },
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["ivanov".to_owned()],
+            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["oper".to_owned()],
             max_integrity: None,
             profile_version: 1,
@@ -1903,25 +1951,14 @@ mod tests {
         ));
     }
 
-    #[cfg(all(feature = "serve", feature = "pkcs11", feature = "embed-cabinet"))]
+    #[cfg(all(feature = "serve", feature = "pkcs11"))]
     #[test]
-    fn default_serves_embedded_cabinet() {
+    fn default_serves_the_placeholder() {
         use crate::serve::CabinetSource;
-        // No flag and a binary carrying the cabinet → serve it (the default).
+        // No flag and no `--cabinet-dir` → the placeholder page, not an error.
         assert!(matches!(
             resolve_cabinet_source(None, false),
-            CabinetSource::Embedded
-        ));
-    }
-
-    #[cfg(all(feature = "serve", feature = "pkcs11", not(feature = "embed-cabinet")))]
-    #[test]
-    fn default_falls_back_to_bridge_without_embedded_cabinet() {
-        use crate::serve::CabinetSource;
-        // No flag and no embedded assets → bridge, no error.
-        assert!(matches!(
-            resolve_cabinet_source(None, false),
-            CabinetSource::Disabled
+            CabinetSource::Placeholder
         ));
     }
 
@@ -1935,6 +1972,7 @@ mod tests {
             allow_origins: vec!["https://cabinet.example".to_owned()],
             backend,
             key: None,
+            registry_key: None,
             algorithm: None,
             module: None,
             token_label: None,
@@ -1946,6 +1984,7 @@ mod tests {
             prehashed: false,
             no_cabinet: true,
             cabinet_dir: None,
+            no_browser: true,
             pinentry: None,
         }
     }
@@ -2033,6 +2072,70 @@ mod tests {
         let args = serve_args(BackendKind::Mock);
         match run_serve(args, Locale::En).unwrap_err() {
             CliError::Usage(msg) => assert!(msg.contains("mock"), "{msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    /// `--registry-key` parses into `ServeArgs` for the pkcs11 form.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_parses_registry_key() {
+        let cli = Cli::try_parse_from([
+            "issuer",
+            "serve",
+            "--module",
+            "/tmp/x.so",
+            "--key",
+            "ca",
+            "--registry-key",
+            "reg",
+        ])
+        .expect("serve with --registry-key must parse");
+        match cli.command {
+            Command::Serve(args) => assert_eq!(args.registry_key.as_deref(), Some("reg")),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "serve", feature = "pkcs11"))]
+    #[test]
+    fn resolve_registry_key_handles_absent_empty_distinct_and_collision() {
+        // Absent or empty → no registry key.
+        assert!(resolve_registry_key(None, "ca").unwrap().is_none());
+        assert!(resolve_registry_key(Some(""), "ca").unwrap().is_none());
+        // A distinct label → that key.
+        assert_eq!(
+            resolve_registry_key(Some("reg"), "ca").unwrap(),
+            Some(KeyId::new("reg"))
+        );
+        // A label equal to --key is a usage error (domain separation).
+        match resolve_registry_key(Some("ca"), "ca").unwrap_err() {
+            CliError::Usage(msg) => assert!(msg.contains("--registry-key"), "{msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "serve", feature = "vault"))]
+    #[test]
+    fn serve_vault_rejects_registry_key() {
+        let mut args = serve_args(BackendKind::Vault);
+        args.key = Some("ca".to_owned());
+        args.vault_addr = Some("https://vault.example:8200".to_owned());
+        args.registry_key = Some("reg".to_owned());
+        match run_serve(args, Locale::En).unwrap_err() {
+            CliError::Usage(msg) => assert!(msg.contains("--registry-key"), "{msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "serve", feature = "file"))]
+    #[test]
+    fn serve_file_rejects_registry_key() {
+        let mut args = serve_args(BackendKind::File);
+        args.key_file = Some(std::path::PathBuf::from("/tmp/ca.p8"));
+        args.registry_key = Some("reg".to_owned());
+        match run_serve(args, Locale::En).unwrap_err() {
+            CliError::Usage(msg) => assert!(msg.contains("--registry-key"), "{msg}"),
             other => panic!("expected Usage, got {other:?}"),
         }
     }

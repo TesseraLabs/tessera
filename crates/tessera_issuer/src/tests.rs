@@ -143,7 +143,7 @@ fn leaf_request() -> LeafRequest {
         subject_spki_der: spki_fixture(),
         validity: validity(3_600),
         host_binding: vec!["*".to_owned()],
-        user_binding: vec!["ivanov".to_owned()],
+        user_binding: vec!["oper".to_owned()],
         allowed_roles: vec!["oper".to_owned()],
         max_integrity: Some(IntegrityCeiling {
             level: 5,
@@ -749,7 +749,7 @@ mod csr {
         LeafScope {
             validity: super::validity(3_600),
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["ivanov".to_owned()],
+            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["oper".to_owned()],
             max_integrity: Some(crate::IntegrityCeiling {
                 level: 5,

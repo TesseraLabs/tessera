@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::mechanism::Mechanism;
-use cryptoki::object::{Attribute, ObjectClass, ObjectHandle};
+use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
 use secrecy::SecretString;
@@ -79,6 +79,14 @@ pub struct Pkcs11Config {
     /// The algorithm the key signs with; picks the mechanism and the
     /// `AlgorithmIdentifier`.
     pub algorithm: SignatureAlgorithm,
+    /// An optional second key, in the *same* module, used only to sign device
+    /// registries (the agent's `/sign-registry` endpoint). Its `CKA_LABEL` is
+    /// matched like `key_id`; it always signs with
+    /// [`SignatureAlgorithm::EcdsaWithSha256`] (P-256), the algorithm the
+    /// cabinet's registry verifier expects. Loading it here keeps both keys
+    /// behind one `C_Initialize`, since a second module context on the same
+    /// library would be refused.
+    pub registry_key: Option<KeyId>,
 }
 
 /// A [`SignatureBackend`] backed by a PKCS#11 module.
@@ -124,11 +132,83 @@ impl<P: PinSource> Pkcs11Signer<P> {
             .map_err(|e| Pkcs11SignError::ModuleLoad(e.to_string()))?;
         ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
             .map_err(|e| Pkcs11SignError::Init(e.to_string()))?;
-        Ok(Self {
+        let signer = Self {
             ctx,
             config,
             pin_source,
-        })
+        };
+        // A configured registry key must be ECDSA P-256 (the cabinet's registry
+        // verifier accepts nothing else). Confirm the real curve from the token
+        // now, at startup, so a P-384/RSA key is refused before the agent
+        // listens rather than failing only on the first registry signature.
+        signer.verify_registry_key_p256()?;
+        Ok(signer)
+    }
+
+    /// Confirm the configured registry key is an ECDSA P-256 key by reading its
+    /// real type from the token; a no-op when no registry key is configured.
+    ///
+    /// Reads `CKA_KEY_TYPE` (must be `CKK_EC`) and `CKA_EC_PARAMS` (must name the
+    /// P-256 curve) from the key's public object, which a token exposes without a
+    /// login. If the token has no public object for the label, it logs in once
+    /// and reads the same non-sensitive attributes from the private key. The
+    /// check fails closed: a key whose type cannot be confirmed P-256 is refused.
+    ///
+    /// # Errors
+    ///
+    /// - [`Pkcs11SignError::RegistryKeyNotP256`] when the key is not EC or not on
+    ///   the P-256 curve.
+    /// - [`Pkcs11SignError::KeyNotFound`] when no key object carries the label.
+    /// - [`Pkcs11SignError::Session`] / [`Pkcs11SignError::Login`] on a token or
+    ///   login failure while reading the attributes.
+    fn verify_registry_key_p256(&self) -> Result<(), Pkcs11SignError> {
+        let Some(registry) = self.config.registry_key.as_ref() else {
+            return Ok(());
+        };
+        let label = registry.as_str();
+        let slot = self.find_slot()?;
+        let session = self
+            .ctx
+            .open_rw_session(slot)
+            .map_err(|e| Pkcs11SignError::Session(e.to_string()))?;
+
+        // Prefer the public key object: it is readable without a login. Fall back
+        // to the private key (after a login) only when no public object exists.
+        let handle =
+            if let Some(handle) = find_key_by_label(&session, ObjectClass::PUBLIC_KEY, label)? {
+                handle
+            } else {
+                let pin = self.pin_source.pin()?;
+                session
+                    .login(UserType::User, Some(&pin))
+                    .map_err(|e| Pkcs11SignError::Login(e.to_string()))?;
+                find_key_by_label(&session, ObjectClass::PRIVATE_KEY, label)?
+                    .ok_or_else(|| Pkcs11SignError::KeyNotFound(label.to_owned()))?
+            };
+
+        let attributes = session
+            .get_attributes(handle, &[AttributeType::KeyType, AttributeType::EcParams])
+            .map_err(|e| Pkcs11SignError::Session(e.to_string()))?;
+        let mut key_type = None;
+        let mut ec_params = None;
+        for attribute in attributes {
+            match attribute {
+                Attribute::KeyType(value) => key_type = Some(value),
+                Attribute::EcParams(value) => ec_params = Some(value),
+                _ => {}
+            }
+        }
+        if key_type != Some(KeyType::EC) {
+            return Err(Pkcs11SignError::RegistryKeyNotP256(
+                "the registry key is not an EC key".to_owned(),
+            ));
+        }
+        match ec_params {
+            Some(params) if ec_params_is_p256(&params) => Ok(()),
+            _ => Err(Pkcs11SignError::RegistryKeyNotP256(
+                "the registry key is not on the P-256 curve".to_owned(),
+            )),
+        }
     }
 
     /// Resolve the slot to sign in: the labelled token, or the first present.
@@ -152,8 +232,31 @@ impl<P: PinSource> Pkcs11Signer<P> {
         Err(Pkcs11SignError::TokenNotFound(want.to_owned()))
     }
 
-    /// Sign `tbs_der` on the token and return the certificate-ready signature.
-    fn sign_on_token(&self, tbs_der: &[u8]) -> Result<Vec<u8>, Pkcs11SignError> {
+    /// Resolve the algorithm `key_id` signs with, or `None` when the signer
+    /// addresses neither the issuance nor the registry key.
+    ///
+    /// The `CKA_LABEL` to look up is always `key_id` itself, so only the
+    /// algorithm varies: the issuance key uses its configured algorithm, and the
+    /// registry key always signs P-256, so the two never share a mechanism by
+    /// accident.
+    fn resolve_algorithm(&self, key_id: &KeyId) -> Option<SignatureAlgorithm> {
+        if key_id == &self.config.key_id {
+            return Some(self.config.algorithm);
+        }
+        if self.config.registry_key.as_ref() == Some(key_id) {
+            return Some(SignatureAlgorithm::EcdsaWithSha256);
+        }
+        None
+    }
+
+    /// Sign `tbs_der` on the token with the key at `label` using `algorithm`,
+    /// returning the certificate-ready signature.
+    fn sign_on_token(
+        &self,
+        tbs_der: &[u8],
+        label: &str,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<Vec<u8>, Pkcs11SignError> {
         let slot = self.find_slot()?;
         let session = self
             .ctx
@@ -169,8 +272,8 @@ impl<P: PinSource> Pkcs11Signer<P> {
                 .map_err(|e| Pkcs11SignError::Login(e.to_string()))?;
         }
 
-        let key = find_private_key(&session, self.config.key_id.as_str())?;
-        let mechanism = mechanism_for(self.config.algorithm)?;
+        let key = find_private_key(&session, label)?;
+        let mechanism = mechanism_for(algorithm)?;
         let raw = session
             .sign(&mechanism, key, tbs_der)
             .map_err(|e| Pkcs11SignError::Sign(e.to_string()))?;
@@ -178,48 +281,59 @@ impl<P: PinSource> Pkcs11Signer<P> {
         if session.logout().is_err() {
             // Nothing actionable on a failed logout — the handle is dropped next.
         }
-        post_process_signature(self.config.algorithm, raw)
+        post_process_signature(algorithm, raw)
     }
 }
 
 impl<P: PinSource> SignatureBackend for Pkcs11Signer<P> {
     fn algorithm(&self, key_id: &KeyId) -> Result<SignatureAlgorithm, SignError> {
-        if key_id == &self.config.key_id {
-            Ok(self.config.algorithm)
-        } else {
-            Err(SignError::UnknownKey(key_id.as_str().to_owned()))
-        }
+        self.resolve_algorithm(key_id)
+            .ok_or_else(|| SignError::UnknownKey(key_id.as_str().to_owned()))
     }
 
     fn sign(&self, tbs_der: &[u8], key_id: &KeyId) -> Result<Signature, SignError> {
-        if key_id != &self.config.key_id {
+        let Some(algorithm) = self.resolve_algorithm(key_id) else {
             return Err(SignError::UnknownKey(key_id.as_str().to_owned()));
-        }
+        };
         // Map the rich PKCS#11 error to the trait's `Backend` variant. The
         // Display of `Pkcs11SignError` never contains PIN bytes.
         let bytes = self
-            .sign_on_token(tbs_der)
+            .sign_on_token(tbs_der, key_id.as_str(), algorithm)
             .map_err(|e| SignError::Backend(e.to_string()))?;
-        Ok(Signature {
-            algorithm: self.config.algorithm,
-            bytes,
-        })
+        Ok(Signature { algorithm, bytes })
     }
 }
 
 /// Find the private-key object whose `CKA_LABEL` equals `label`.
 fn find_private_key(session: &Session, label: &str) -> Result<ObjectHandle, Pkcs11SignError> {
+    find_key_by_label(session, ObjectClass::PRIVATE_KEY, label)?
+        .ok_or_else(|| Pkcs11SignError::KeyNotFound(label.to_owned()))
+}
+
+/// Find the first object of `class` whose `CKA_LABEL` equals `label`, or `None`
+/// when the token exposes no such object (e.g. a private object before login).
+fn find_key_by_label(
+    session: &Session,
+    class: ObjectClass,
+    label: &str,
+) -> Result<Option<ObjectHandle>, Pkcs11SignError> {
     let template = [
-        Attribute::Class(ObjectClass::PRIVATE_KEY),
+        Attribute::Class(class),
         Attribute::Label(label.as_bytes().to_vec()),
     ];
     let handles = session
         .find_objects(&template)
         .map_err(|e| Pkcs11SignError::Session(e.to_string()))?;
-    handles
-        .into_iter()
-        .next()
-        .ok_or_else(|| Pkcs11SignError::KeyNotFound(label.to_owned()))
+    Ok(handles.into_iter().next())
+}
+
+/// DER encoding of the `prime256v1` / `secp256r1` named-curve OID
+/// (`1.2.840.10045.3.1.7`) — the value `CKA_EC_PARAMS` carries for a P-256 key.
+const P256_EC_PARAMS: [u8; 10] = [0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+
+/// Whether `CKA_EC_PARAMS` names the P-256 curve (the named-curve OID form).
+fn ec_params_is_p256(ec_params: &[u8]) -> bool {
+    ec_params == P256_EC_PARAMS
 }
 
 /// Map a [`SignatureAlgorithm`] to the PKCS#11 mechanism that produces it.
@@ -339,6 +453,11 @@ pub enum Pkcs11SignError {
     /// The token returned an ECDSA signature that is not a `r || s` pair.
     #[error("token returned a malformed ecdsa signature")]
     MalformedEcdsaSignature,
+    /// The configured registry key is not an ECDSA P-256 key, read from the
+    /// token at startup. The registry signature format the cabinet verifies
+    /// accepts only P-256.
+    #[error("registry key must be ecdsa p-256: {0}")]
+    RegistryKeyNotP256(String),
 }
 
 #[cfg(test)]
@@ -363,6 +482,7 @@ mod tests {
             token_label: Some("Tessera CA".to_owned()),
             key_id: KeyId::new("ca-key"),
             algorithm: SignatureAlgorithm::EcdsaWithSha256,
+            registry_key: None,
         }
     }
 
@@ -457,6 +577,22 @@ mod tests {
     fn ecdsa_raw_rejects_empty() {
         let err = ecdsa_raw_to_der(&[]).unwrap_err();
         assert!(matches!(err, Pkcs11SignError::MalformedEcdsaSignature));
+    }
+
+    #[test]
+    fn ec_params_p256_check_accepts_only_the_p256_named_curve() {
+        // The exact prime256v1 OID bytes are accepted; this is what the startup
+        // registry-key probe reads from CKA_EC_PARAMS on the token.
+        assert!(ec_params_is_p256(&[
+            0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07
+        ]));
+        // secp384r1 (1.3.132.0.34) — a real EC key, wrong curve.
+        assert!(!ec_params_is_p256(&[
+            0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22
+        ]));
+        // Empty and truncated params fail closed.
+        assert!(!ec_params_is_p256(&[]));
+        assert!(!ec_params_is_p256(&[0x06, 0x08, 0x2A, 0x86]));
     }
 
     #[test]

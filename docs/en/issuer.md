@@ -23,11 +23,11 @@ Components:
   scripts). No check is re-implemented in the CLI: a request the core would
   refuse, the CLI refuses identically.
 - **Agent `issuer serve`** — a local HTTP server bound strictly to `127.0.0.1`
-  with two roles: the browser-to-token bridge and serving the cabinet itself
-  (by default).
+  with two roles: the browser-to-token bridge and, optionally, serving the
+  cabinet itself from an external directory.
 - **Web cabinet** — one static SPA (a WASM build of the same core):
-  issuance through the browser with no server side. Served locally by the agent
-  itself (`issuer serve`, the cabinet is embedded in the binary)
+  issuance through the browser with no server side. A separate bundle (not in
+  this repository or the binary): served by the agent itself via `--cabinet-dir`
   or by separate static hosting in an air-gapped environment (see the
   "Web cabinet" section below).
 
@@ -202,11 +202,13 @@ Operator side — `issue-leaf --csr` (above). What matters:
 
 `issuer serve` is a local HTTP server bound strictly to `127.0.0.1`: (1) the
 browser-to-token bridge — it accepts a built TBS from the cabinet and returns a
-signature (the cabinet cannot talk to PKCS#11 directly); (2) by default it serves
-the cabinet itself from the same address. When serving the cabinet, the whole
-cabinet lives in a single signed binary — no separate hosting is needed. The
-`--no-cabinet` flag disables serving (pure bridge mode, when the SPA is served
-externally).
+signature (the cabinet cannot talk to PKCS#11 directly); (2) optionally it serves
+the cabinet itself from the same address, out of an external directory. The
+cabinet is a separate static bundle: point the agent at it with
+`--cabinet-dir <path>` and it is served from the same loopback address as
+`/sign`. Without the flag the agent still starts and serves a short placeholder
+page at `/` explaining how to attach a cabinet. The `--no-cabinet` flag is pure
+bridge mode (not even the placeholder is served at `/`).
 
 The agent supports the same signing backends as the issuing subcommands —
 `--backend pkcs11|vault|file` (the default is `pkcs11`, so the old command form
@@ -236,11 +238,12 @@ environment are required. For `file`, `--key-file` is required; the key-file
 rules are in ["Key in a file"](#key-in-a-file). The agent's gates (loopback,
 paired token, Origin, operator confirmation) are identical across backends.
 `--port 0` (the default) picks an ephemeral port — the actual address is printed at startup and
-is the one to open in the browser. When serving the cabinet (by default, or
-`--cabinet-dir <dist>`) `--allow-origin` is not required: the agent is in its own
-allowlist. For the pure bridge mode (`--no-cabinet`, or when there is no embedded
-cabinet and it is served by separate static hosting) `--allow-origin` is required
-(at least one; it repeats).
+is the one to open in the browser. When serving the cabinet (`--cabinet-dir
+<path>`) and in the default placeholder mode `--allow-origin` is not required: the
+agent is in its own allowlist, or accepts only same-origin requests. It is
+required (at least one; it repeats) only for the pure bridge mode
+(`--no-cabinet`), when the cabinet is served by separate static hosting from its
+own Origin.
 
 ### Access model
 
@@ -291,24 +294,24 @@ terminal; an operator decline is honestly treated as a decline.
 
 ### Serving the cabinet
 
-`issuer serve` by default serves the cabinet (SPA) embedded in the binary
-from the same `127.0.0.1` address as `/sign`. The canonical path: start the agent
-→ open the printed localhost address → issue, offline, from a single signed
-binary. `--cabinet-dir <dist>` serves the cabinet from an external `dist/`
-directory (for self-hosting and development) and overrides the embedded one.
-`--no-cabinet` disables serving — the agent runs as a pure bridge, the cabinet is
-then served by separate static hosting. Priority: `--no-cabinet` → bridge;
-otherwise `--cabinet-dir` → external directory; otherwise the embedded cabinet
-(if the binary is built with the `embed-cabinet` feature); otherwise → bridge
-(without error).
+The cabinet is a separate static bundle (SPA); it is not part of this repository
+or the `issuer` binary. `--cabinet-dir <path>` serves it from an external
+directory on the same `127.0.0.1` address as `/sign`: files are served as they
+are, and any non-file path resolves to `index.html` (client-side routing). The
+canonical path: start the agent with `--cabinet-dir` → open the printed localhost
+address → issue, offline. The agent does not inspect the directory's contents —
+which bundle it is is none of its business; the API routes (`/sign`,
+`/sign-registry`, `/info`) are reserved and never shadowed by static files, and
+anything escaping the directory is refused. Priority: `--no-cabinet` → bridge
+(nothing at `/`); otherwise `--cabinet-dir` → external directory; otherwise the
+placeholder page at `/` telling the operator to attach a cabinet.
 
-When serving the page, the agent injects the paired session token and the key
+When serving `index.html`, the agent injects the paired session token and the key
 label into it — the cabinet preconfigures its connection itself, the operator
 does not have to retype the address and token, and the agent settings block
-collapses to a "connected / not connected" indicator. Cabinet integrity rests on
-the binary signature: from a substituted agent the keys are still unreachable —
-the private cryptography sits behind the token (see
-[threat-model.md §11](threat-model.md)).
+collapses to a "connected / not connected" indicator. From a substituted cabinet
+the keys are still unreachable — the private cryptography sits behind the agent
+and the token (see [threat-model.md §11](threat-model.md)).
 
 The agent runs for the duration of the issuing session (foreground): a smaller
 attack window. A system service and daemon autostart are not provided — the agent
@@ -436,25 +439,25 @@ narrowed assigned envelope and shift-leaves within its own envelope — the
 operation is chosen with a switch; a leaf/unsuitable certificate → operations
 unavailable, with an explanation. There are no separate "by job title" builds.
 
-The cabinet is part of the signed `issuer` binary: `issuer serve` by default
-serves it from `127.0.0.1`, with no separate hosting. The
-artifact is bilingual, with a language switch in the UI. Cabinet integrity rests
-on the binary's own signature — no separate hash pinning is needed; the private
-cryptography is always behind the agent and the token, and the keys are
-unreachable from a substituted SPA (see [threat-model.md §11](threat-model.md)).
+The cabinet is a separate static bundle; it is not part of this repository or the
+`issuer` binary. `issuer serve --cabinet-dir <path>` serves it from `127.0.0.1`;
+the cabinet has no server side. The artifact is bilingual, with a language switch
+in the UI. The private cryptography is always behind the agent and the token, and
+the keys are unreachable from a substituted SPA (see
+[threat-model.md §11](threat-model.md)).
 
-### Building and serving the static assets
+### Serving the static assets
 
-`cabinet/build.sh` builds the `dist/` directory — `index.html`, `main.js`,
-`styles.css`, the WASM binary and a `SHA256SUMS` manifest. The release binary
-embeds this directory (served by default). For an air-gapped
-environment the same `dist/` can be served by any static web server or pointed to
-the agent with `--cabinet-dir <dist>`; the cabinet has no server side.
+The cabinet bundle (`index.html`, its script, styles and the WASM core) is served
+by any static web server in an air-gapped environment, or by the agent itself —
+point it at the directory with `--cabinet-dir <path>`. The agent serves files as
+they are and falls back to `index.html` for non-file paths (SPA routing); the
+cabinet has no server side.
 
 ### How to work with the cabinet
 
 1. On the machine with the token, start the agent with the cabinet:
-   `issuer serve --module <…> --key <…>` and open the
+   `issuer serve --module <…> --key <…> --cabinet-dir <path>` and open the
    `http://127.0.0.1:<port>` address it prints (see ["The `issuer serve`
    agent"](#the-issuer-serve-agent)). The agent preconfigures the connection
    itself — the agent block in the cabinet shows only a "connected" status.

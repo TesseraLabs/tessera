@@ -4,7 +4,6 @@ members = [
     "crates/tessera_core",
     "crates/tessera_ext",
     "crates/tessera_issuer",
-    "crates/tessera_issuer_wasm",
     "crates/tessera_proto",
     "crates/pam_tessera",
     "crates/tessera_cli",
@@ -82,10 +81,6 @@ rsa = { version = "0.9", default-features = false, features = ["std"] }
 # tiny_http backs the local `issuer serve` agent; ureq drives Vault Transit
 # signing; base64 (de)serialises DER on the JSON boundaries.
 tiny_http = "0.12"
-# Compile-time embedding of the built cabinet SPA (`cabinet/dist/`) into the
-# `issuer` binary, behind the `embed-cabinet` feature: a fully self-contained,
-# offline agent whose integrity rides on the signed binary.
-include_dir = "0.7"
 # native-tls (OS TLS: Security.framework / SChannel / system OpenSSL), no bundled
 # Mozilla roots: trust comes from the host certificate store or an
 # operator-supplied CA bundle. This keeps both `webpki-roots` and
@@ -100,9 +95,6 @@ base64 = "0.22"
 # (p256/rsa) pulls `getrandom`, which needs the `js` feature on
 # `wasm32-unknown-unknown`. Native targets never use this.
 getrandom = "0.2"
-# JS bindings for the browser issuer cabinet (tessera_issuer_wasm). The cabinet
-# core is the only WASM target; the rest of the workspace never links this.
-wasm-bindgen = "0.2"
 
 [profile.dev]
 panic = "unwind"

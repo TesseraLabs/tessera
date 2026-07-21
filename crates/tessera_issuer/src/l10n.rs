@@ -101,7 +101,7 @@ pub enum Caption {
     RequiredTags,
     /// The host-binding field label.
     Hosts,
-    /// The user-binding field label.
+    /// The user-binding field label (the allowed role accounts).
     Users,
     /// The leaf integrity-ceiling field label.
     Integrity,
@@ -115,6 +115,14 @@ pub enum Caption {
     KindOrgCa,
     /// The operation-kind name for a certificate revocation list.
     KindCrl,
+    /// The operation-kind name for an exported device registry.
+    KindDeviceRegistry,
+    /// The signing-key label field.
+    Key,
+    /// The payload-digest field (a SHA-256 of the signed bytes).
+    Digest,
+    /// The payload-size field.
+    Size,
 }
 
 impl Caption {
@@ -138,13 +146,17 @@ impl Caption {
             Caption::MaxTtl => "max TTL",
             Caption::RequiredTags => "required tags",
             Caption::Hosts => "hosts",
-            Caption::Users => "users",
+            Caption::Users => "role accounts",
             Caption::Integrity => "integrity",
             Caption::Profile => "profile",
             Caption::CrlNumber => "crlNumber",
             Caption::KindShiftLeaf => "shift-leaf certificate",
             Caption::KindOrgCa => "organisation CA certificate",
             Caption::KindCrl => "certificate revocation list",
+            Caption::KindDeviceRegistry => "device registry",
+            Caption::Key => "key",
+            Caption::Digest => "digest",
+            Caption::Size => "size",
         }
     }
 
@@ -159,7 +171,7 @@ impl Caption {
             Caption::MaxTtl => "макс. TTL",
             Caption::RequiredTags => "требуемые метки",
             Caption::Hosts => "узлы",
-            Caption::Users => "пользователи",
+            Caption::Users => "ролевые УЗ",
             Caption::Integrity => "целостность",
             Caption::Profile => "профиль",
             // An X.509 field name — a technical identifier, not translated.
@@ -167,6 +179,10 @@ impl Caption {
             Caption::KindShiftLeaf => "сертификат смены (лист)",
             Caption::KindOrgCa => "сертификат УЦ организации",
             Caption::KindCrl => "список отзыва (CRL)",
+            Caption::KindDeviceRegistry => "реестр устройств",
+            Caption::Key => "ключ",
+            Caption::Digest => "дайджест",
+            Caption::Size => "размер",
         }
     }
 }
@@ -184,6 +200,10 @@ pub(crate) enum Msg {
     ServeListening,
     /// `issuer serve`: the session token follows.
     ServeSessionToken,
+    /// `issuer serve`: how to stop the foreground agent (full line).
+    ServeStopHint,
+    /// `issuer serve`: the browser could not be opened automatically (full line).
+    ServeBrowserOpenFailed,
     /// `issuer serve`: a TBS that could not be shown was refused (full line).
     ServeUnreadableTbs,
     /// `issuer serve`: the operator declined (a kind and subject follow).
@@ -192,6 +212,12 @@ pub(crate) enum Msg {
     ServeConfirmChannelFailed,
     /// `issuer serve`: pinentry unavailable, terminal used (an error follows).
     ServePinentryFellBack,
+    /// Placeholder page served at `/` with no cabinet attached: heading (full
+    /// line).
+    CabinetNotConnectedTitle,
+    /// Placeholder page served at `/` with no cabinet attached: body text (full
+    /// line).
+    CabinetNotConnectedBody,
     /// Terminal confirmation dialog header (full line).
     ConfirmHeader,
     /// Terminal confirmation prompt (full line).
@@ -242,6 +268,10 @@ impl Msg {
         match self {
             Msg::ServeListening => "issuer serve: listening on",
             Msg::ServeSessionToken => "issuer serve: session token:",
+            Msg::ServeStopHint => "Press Ctrl+C to stop the agent",
+            Msg::ServeBrowserOpenFailed => {
+                "issuer serve: could not open a browser; open the address above manually"
+            }
             Msg::ServeUnreadableTbs => {
                 "issuer serve: rejected sign — TBS is not a readable issuance operation"
             }
@@ -249,6 +279,11 @@ impl Msg {
             Msg::ServeConfirmChannelFailed => "issuer serve: confirmation channel failed:",
             Msg::ServePinentryFellBack => {
                 "issuer serve: pinentry unavailable, using terminal prompt:"
+            }
+            Msg::CabinetNotConnectedTitle => "Cabinet not connected",
+            Msg::CabinetNotConnectedBody => {
+                "Restart issuer serve with --cabinet-dir <path> to serve the issuance \
+                 cabinet from a static bundle. The signing bridge is running."
             }
             Msg::ConfirmHeader => "=== Confirm issuance operation ===",
             Msg::ConfirmPrompt => "Sign this operation? [y/N]:",
@@ -277,6 +312,10 @@ impl Msg {
         match self {
             Msg::ServeListening => "issuer serve: приём на",
             Msg::ServeSessionToken => "issuer serve: токен сессии:",
+            Msg::ServeStopHint => "Остановка агента: Ctrl+C",
+            Msg::ServeBrowserOpenFailed => {
+                "issuer serve: не удалось открыть браузер; откройте адрес выше вручную"
+            }
             Msg::ServeUnreadableTbs => {
                 "issuer serve: подпись отклонена — TBS не читается как операция выпуска"
             }
@@ -284,6 +323,11 @@ impl Msg {
             Msg::ServeConfirmChannelFailed => "issuer serve: канал подтверждения недоступен:",
             Msg::ServePinentryFellBack => {
                 "issuer serve: pinentry недоступен, используется терминал:"
+            }
+            Msg::CabinetNotConnectedTitle => "Кабинет не подключён",
+            Msg::CabinetNotConnectedBody => {
+                "Перезапустите issuer serve с --cabinet-dir <путь>, чтобы раздавать кабинет \
+                 выпуска из статического бандла. Мост подписи уже работает."
             }
             Msg::ConfirmHeader => "=== Подтверждение операции выпуска ===",
             Msg::ConfirmPrompt => "Подписать эту операцию? [y/N]:",
