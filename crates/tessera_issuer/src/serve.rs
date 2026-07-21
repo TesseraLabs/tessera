@@ -76,15 +76,23 @@ const INDEX_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 
 /// The fixed set of non-document cabinet assets, each with its content type.
 ///
-/// A request path must match one of these names exactly (leading `/` stripped):
-/// nothing else is ever read, which — together with the exact-match lookup —
-/// keeps path-traversal (`..`, absolute paths, subdirectories) off the table.
-/// The source map (`main.js.map`) is deliberately absent: it is a debugging
-/// artifact with no place in a shipped agent.
+/// A request path must equal one of these names exactly (leading `/` stripped).
+/// Some names now contain a `/` (the bundled `fonts/` subdirectory), but each is
+/// a single literal string compared for full equality — there is no path parsing
+/// or normalization, so `..`, an absolute path, or any unlisted subpath can
+/// never equal a listed name, and nothing outside this set is ever read.
+/// The source map (`main.js.map`) and the font licences (`fonts/LICENSE-*.txt`)
+/// are deliberately absent: debugging and provenance artifacts with no place in
+/// a shipped agent.
 const CABINET_ASSETS: &[(&str, &str)] = &[
     ("main.js", "text/javascript"),
     ("styles.css", "text/css"),
     ("tessera_issuer_wasm_bg.wasm", "application/wasm"),
+    ("fonts/inter-400.woff2", "font/woff2"),
+    ("fonts/inter-600.woff2", "font/woff2"),
+    ("fonts/inter-800.woff2", "font/woff2"),
+    ("fonts/jbmono-400.woff2", "font/woff2"),
+    ("fonts/jbmono-700.woff2", "font/woff2"),
 ];
 
 /// The Content-Security-Policy the agent sends as a real header when it serves
@@ -134,6 +142,9 @@ pub struct AgentConfig {
     pub key_label: String,
     /// The locale for the agent's operator messages.
     pub locale: Locale,
+    /// Suppress auto-opening the operator's browser at startup. Ignored in pure
+    /// bridge mode ([`CabinetSource::Disabled`]), where there is nothing to open.
+    pub no_browser: bool,
 }
 
 /// The signing agent: a backend, an operator-confirmation channel, and the
@@ -147,6 +158,10 @@ pub struct Agent<B: SignatureBackend, C: Confirmer> {
     key_label: String,
     session_token: SecretString,
     locale: Locale,
+    /// The registry-signing key id, when configured. The same `backend` signs
+    /// with it (a distinct key it also recognises), so `/sign-registry` never
+    /// needs a second signer; `None` disables that endpoint.
+    registry_key: Option<KeyId>,
 }
 
 /// The HTTP method, decoupled from `tiny_http` so the handler is unit-testable.
@@ -260,7 +275,18 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
             key_label: config.key_label,
             session_token,
             locale: config.locale,
+            registry_key: None,
         }
+    }
+
+    /// Configure the registry-signing key the agent's `/sign-registry` endpoint
+    /// uses. The `backend` passed to [`Agent::new`] must also recognise this key
+    /// id (a second key in the same store); the caller is expected to have
+    /// validated it first with [`validate_registry_key`].
+    #[must_use]
+    pub fn with_registry_key(mut self, registry_key: KeyId) -> Self {
+        self.registry_key = Some(registry_key);
+        self
     }
 
     fn origin_allowed(&self, origin: &str) -> bool {
@@ -330,6 +356,7 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         // 4. Route.
         match (input.method, input.path) {
             (ReqMethod::Post, "/sign") => self.handle_sign(origin, input.body),
+            (ReqMethod::Post, "/sign-registry") => self.handle_sign_registry(origin, input.body),
             (ReqMethod::Get, "/info") => self.handle_info(origin),
             _ => HttpOutput::json(404, error_json("not found"), origin),
         }
@@ -345,6 +372,21 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         ) else {
             return HttpOutput::json(400, error_json("tbs_der_b64 is not base64"), origin);
         };
+        // Domain separation: the registry key signs registries and nothing else.
+        // Even though the backend can address it, `/sign` must never let a caller
+        // borrow it to sign a TBS — so refuse a request naming the registry key
+        // here, before the backend is touched.
+        if self
+            .registry_key
+            .as_ref()
+            .is_some_and(|reg| reg.as_str() == request.key_id)
+        {
+            return HttpOutput::json(
+                403,
+                error_json("the registry key cannot sign issuance requests"),
+                origin,
+            );
+        }
         let key = KeyId::new(request.key_id);
 
         // The agent is a trusted display: parse the TBS with the shared code and
@@ -398,6 +440,57 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
         }
     }
 
+    /// Sign an exported device registry with the dedicated registry key.
+    ///
+    /// The key is fixed by configuration — the request carries only the payload,
+    /// never a key id — so a caller can never redirect this to the issuance key.
+    /// The payload is signed as raw bytes (the backend digests it with SHA-256),
+    /// and the DER `Ecdsa-Sig-Value` the backend returns is converted to the raw
+    /// `r || s` the cabinet's snapshot verifier expects.
+    fn handle_sign_registry(&self, origin: Option<&str>, body: &[u8]) -> HttpOutput {
+        let Some(registry_key) = self.registry_key.as_ref() else {
+            return HttpOutput::json(400, error_json("registry key is not configured"), origin);
+        };
+        let Ok(request) = serde_json::from_slice::<SignRegistryRequest>(body) else {
+            return HttpOutput::json(400, error_json("malformed registry sign request"), origin);
+        };
+        let Ok(payload) = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            request.payload_b64.as_bytes(),
+        ) else {
+            return HttpOutput::json(400, error_json("payload_b64 is not base64"), origin);
+        };
+
+        // No operator confirmation here: a registry is not an issuance operation
+        // and carries no TBS to summarise. Signing it is the operator's own act
+        // of attestation, gated by the session token and Origin like every other
+        // request — the same gates ran before this handler.
+        match self.backend.sign(&payload, registry_key) {
+            Ok(signature) => match ecdsa_der_to_raw(&signature.bytes) {
+                Ok(raw) => {
+                    let body = serde_json::json!({
+                        "signature_b64": base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            raw,
+                        ),
+                    })
+                    .to_string();
+                    HttpOutput::json(200, body, origin)
+                }
+                Err(()) => HttpOutput::json(
+                    502,
+                    error_json("registry backend returned a non-P-256 signature"),
+                    origin,
+                ),
+            },
+            Err(e) => HttpOutput::json(
+                502,
+                error_json(&format!("registry signing failed: {e}")),
+                origin,
+            ),
+        }
+    }
+
     fn handle_info(&self, origin: Option<&str>) -> HttpOutput {
         let algorithms: Vec<&str> = self
             .advertised_algorithms
@@ -442,8 +535,10 @@ impl<B: SignatureBackend, C: Confirmer> Agent<B, C> {
 
     /// Load a fixed cabinet asset's bytes from the configured source.
     ///
-    /// `file` is always one of the fixed asset names (no path separators); the
-    /// directory source additionally canonicalizes and verifies containment.
+    /// `file` is always one of the fixed asset names — a literal relative path
+    /// that may include the `fonts/` subdirectory. The embedded source resolves
+    /// it through `include_dir`'s nested lookup; the directory source joins it
+    /// under the root and additionally canonicalizes and verifies containment.
     fn load_asset(&self, file: &str) -> Option<Vec<u8>> {
         match &self.cabinet {
             CabinetSource::Disabled => None,
@@ -465,8 +560,10 @@ struct ResolvedAsset {
 
 /// Map a request path to a fixed cabinet asset, or `None` if it is not one.
 ///
-/// Only `/`, `/index.html`, and the exact [`CABINET_ASSETS`] names match; a
-/// path with separators, `..`, or any other name yields `None`.
+/// Only `/`, `/index.html`, and the exact [`CABINET_ASSETS`] names match. A
+/// listed name may contain a `/` (the bundled `fonts/` subdirectory), but the
+/// match is full-string equality against the list, so `..`, an unlisted subpath,
+/// or any other name yields `None`.
 fn resolve_asset(path: &str) -> Option<ResolvedAsset> {
     if path == "/" || path == "/index.html" {
         return Some(ResolvedAsset {
@@ -558,14 +655,28 @@ fn escape_attr(value: &str) -> String {
 /// freshly generated session token, then serve requests until the process is
 /// stopped.
 ///
+/// When `registry_key` is set, the agent also answers `/sign-registry`, signing
+/// exported device registries with that key (a second key the same `backend`
+/// recognises). It is validated with [`validate_registry_key`] *before* the
+/// socket is bound, so a misconfigured registry key fails fast.
+///
 /// # Errors
 ///
-/// [`ServeError::Bind`] when the loopback socket cannot be bound.
+/// - [`ServeError::Bind`] when the loopback socket cannot be bound.
+/// - [`ServeError::RegistryKeyCollision`], [`ServeError::RegistryKeyNotP256`],
+///   or [`ServeError::RegistryKeyUnavailable`] when a configured registry key
+///   fails validation.
 pub fn serve<B: SignatureBackend, C: Confirmer>(
     backend: B,
     confirmer: C,
     mut config: AgentConfig,
+    registry_key: Option<KeyId>,
 ) -> Result<(), ServeError> {
+    // Validate the registry key before touching the socket, so a misconfigured
+    // key never reaches a listening state.
+    if let Some(registry_key) = &registry_key {
+        validate_registry_key(&backend, registry_key, &config.key_label)?;
+    }
     let hex = random_session_token();
     let server = Server::http(("127.0.0.1", config.bind_port))
         .map_err(|e| ServeError::Bind(e.to_string()))?;
@@ -573,23 +684,83 @@ pub fn serve<B: SignatureBackend, C: Confirmer>(
         .server_addr()
         .to_ip()
         .map_or_else(|| "127.0.0.1".to_owned(), |a| a.to_string());
-    println!("{} http://{bound}", Msg::ServeListening.text(config.locale));
+    let address = format!("http://{bound}");
+    println!("{} {address}", Msg::ServeListening.text(config.locale));
     // When the agent serves the cabinet, the served page's same-origin `POST`
     // carries the agent's own loopback origin — known only now that the port is
     // bound (important under `--port 0`). Add it so that gate passes without the
     // operator supplying `--allow-origin`.
-    if !matches!(config.cabinet, CabinetSource::Disabled) {
+    let cabinet_active = !matches!(config.cabinet, CabinetSource::Disabled);
+    if cabinet_active {
         config.allowed_origins.extend(self_origins(&bound));
     }
     // The pairing token is printed for the operator to paste into the cabinet;
     // when the agent also serves the cabinet, it is injected into the served
     // page so no manual entry is needed.
     println!("{} {hex}", Msg::ServeSessionToken.text(config.locale));
-    let agent = Agent::new(backend, confirmer, config, SecretString::from(hex));
+    // The agent runs in the foreground until interrupted; tell the operator how.
+    println!("{}", Msg::ServeStopHint.text(config.locale));
+    // Auto-open the operator's browser at the cabinet — but only when there is a
+    // cabinet to open and the operator did not opt out. A failed open is
+    // non-fatal: the address is already printed for manual use.
+    if should_open_browser(cabinet_active, config.no_browser) && !open_browser(&address) {
+        eprintln!("{}", Msg::ServeBrowserOpenFailed.text(config.locale));
+    }
+    let mut agent = Agent::new(backend, confirmer, config, SecretString::from(hex));
+    if let Some(registry_key) = registry_key {
+        agent = agent.with_registry_key(registry_key);
+    }
     for request in server.incoming_requests() {
         agent.serve_one(request);
     }
     Ok(())
+}
+
+/// Whether to auto-open the operator's browser at the agent address.
+///
+/// Only when the agent actually serves the cabinet (a pure bridge has nothing to
+/// open) and the operator did not pass `--no-browser`.
+fn should_open_browser(cabinet_active: bool, no_browser: bool) -> bool {
+    cabinet_active && !no_browser
+}
+
+/// Best-effort launch of the operator's default browser at `url`.
+///
+/// Spawns the platform opener (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /C
+/// start` on Windows) detached — no wait — with its streams discarded. Returns
+/// `true` when the opener was spawned; `false` when it could not be (missing
+/// binary, spawn error), so the caller can warn and carry on. The address is
+/// already printed, so a failed open is never fatal.
+fn open_browser(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        // `start` is a `cmd` builtin; the empty `""` is its window-title argument
+        // so a URL with spaces is not mistaken for the title.
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
 }
 
 /// The agent's own loopback origins for a bound `host:port`, in both the
@@ -711,6 +882,59 @@ struct SignRequest {
     tbs_der_b64: String,
 }
 
+/// The registry-sign request body. Only the payload is read: there is no key
+/// field, so a caller cannot select which key signs — it is always the
+/// configured registry key. Any extra field is ignored by serde.
+#[derive(serde::Deserialize)]
+struct SignRegistryRequest {
+    payload_b64: String,
+}
+
+/// Convert a DER `Ecdsa-Sig-Value` (`SEQUENCE { INTEGER r, INTEGER s }`) to the
+/// fixed-width raw `r || s` (64 bytes for P-256) the cabinet's snapshot verifier
+/// expects — `WebCrypto`'s default ECDSA encoding.
+///
+/// Returns `Err(())` when the bytes are not a valid P-256 signature (the backend
+/// signed with a curve other than P-256, or returned something unparsable).
+fn ecdsa_der_to_raw(der: &[u8]) -> Result<[u8; 64], ()> {
+    let signature = p256::ecdsa::Signature::from_der(der).map_err(|_| ())?;
+    Ok(signature.to_bytes().into())
+}
+
+/// Validate a registry-signing key before the agent accepts it.
+///
+/// Two conditions must hold, checked in this order so a label collision is
+/// reported as such even when both keys happen to be P-256:
+///
+/// 1. The registry key label differs from the issuance key label. The check is a
+///    plain string comparison of labels: aliasing one physical key under two
+///    labels is not detected and is the operator's responsibility (see the
+///    `issuer` docs).
+/// 2. The backend signs the registry key with ECDSA P-256, the only algorithm
+///    the cabinet's registry verifier accepts.
+///
+/// # Errors
+///
+/// - [`ServeError::RegistryKeyCollision`] when the labels are equal.
+/// - [`ServeError::RegistryKeyNotP256`] when the backend reports a non-P-256
+///   algorithm for the registry key.
+/// - [`ServeError::RegistryKeyUnavailable`] when the backend does not recognise
+///   the registry key at all.
+pub fn validate_registry_key<B: SignatureBackend>(
+    backend: &B,
+    registry_key: &KeyId,
+    issue_label: &str,
+) -> Result<(), ServeError> {
+    if registry_key.as_str() == issue_label {
+        return Err(ServeError::RegistryKeyCollision);
+    }
+    match backend.algorithm(registry_key) {
+        Ok(SignatureAlgorithm::EcdsaWithSha256) => Ok(()),
+        Ok(other) => Err(ServeError::RegistryKeyNotP256(other)),
+        Err(e) => Err(ServeError::RegistryKeyUnavailable(e.to_string())),
+    }
+}
+
 /// The wire name for a [`SignatureAlgorithm`].
 fn algorithm_str(algorithm: SignatureAlgorithm) -> &'static str {
     match algorithm {
@@ -747,6 +971,17 @@ pub enum ServeError {
     /// The loopback socket could not be bound.
     #[error("failed to bind 127.0.0.1 agent socket: {0}")]
     Bind(String),
+    /// The registry key label equals the issuance key label. A distinct key must
+    /// sign registries so the issuance and registry domains never share a key.
+    #[error("registry key label must differ from the issuance key label")]
+    RegistryKeyCollision,
+    /// The registry key does not sign with ECDSA P-256, the only algorithm the
+    /// cabinet's registry verifier accepts.
+    #[error("registry key must be ECDSA P-256, but the backend reports {0:?}")]
+    RegistryKeyNotP256(SignatureAlgorithm),
+    /// The signing backend does not recognise the configured registry key.
+    #[error("registry key is not usable by the signing backend: {0}")]
+    RegistryKeyUnavailable(String),
 }
 
 #[cfg(test)]
@@ -839,7 +1074,19 @@ mod tests {
             cabinet,
             key_label: KEY_LABEL.to_owned(),
             locale: Locale::En,
+            no_browser: true,
         }
+    }
+
+    #[test]
+    fn browser_opens_only_when_serving_cabinet_and_not_opted_out() {
+        // Serving the cabinet and not opted out: open.
+        assert!(should_open_browser(true, false));
+        // Opted out with `--no-browser`: do not open.
+        assert!(!should_open_browser(true, true));
+        // Pure bridge (no cabinet): nothing to open, regardless of the flag.
+        assert!(!should_open_browser(false, false));
+        assert!(!should_open_browser(false, true));
     }
 
     fn agent(backend: RecordingSigner) -> Agent<RecordingSigner, ConfirmFn> {
@@ -921,7 +1168,7 @@ mod tests {
                 not_after: 1_600_003_600,
             },
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["ivanov".to_owned()],
+            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["oper".to_owned()],
             max_integrity: Some(IntegrityCeiling {
                 level: 5,
@@ -1352,7 +1599,9 @@ mod tests {
     }
 
     /// A cabinet `dist/` with a minimal `index.html` (carrying a `<head>`) and
-    /// the fixed asset set, served from a temporary directory.
+    /// the fixed asset set, served from a temporary directory. Includes the
+    /// `fonts/` subdirectory with a listed font plus its (unlisted) licence, so
+    /// tests can prove the subdirectory asset serves while the licence does not.
     fn cabinet_dir() -> TempDir {
         let dir = TempDir::new("cabinet");
         dir.write(
@@ -1363,6 +1612,9 @@ mod tests {
         dir.write("main.js.map", b"{\"version\":3}\n");
         dir.write("styles.css", b"body{}\n");
         dir.write("tessera_issuer_wasm_bg.wasm", b"\0asm\x01\0\0\0");
+        std::fs::create_dir_all(dir.0.join("fonts")).expect("create fonts dir");
+        dir.write("fonts/inter-400.woff2", b"wOF2-inter-400-fake");
+        dir.write("fonts/LICENSE-Inter.txt", b"INTER FONT LICENCE TEXT\n");
         dir
     }
 
@@ -1418,6 +1670,70 @@ mod tests {
             assert_eq!(out.content_type, Some(expected), "{path}");
             assert!(!out.body.is_empty(), "{path}");
         }
+    }
+
+    #[test]
+    fn font_in_subdirectory_is_served_and_licence_is_not() {
+        let dir = cabinet_dir();
+        let a = agent_serving(RecordingSigner::new(), source(&dir));
+
+        // A listed font under `fonts/` is a served asset. Static serving runs
+        // ahead of the gates, so it answers a request that carries a token...
+        let with_token = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/fonts/inter-400.woff2",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(with_token.status, 200);
+        assert_eq!(with_token.content_type, Some("font/woff2"));
+        assert!(!with_token.body.is_empty());
+        assert!(with_token.csp, "a served font carries the cabinet CSP");
+
+        // ...and, like every other subresource, one that carries none: a browser
+        // font fetch sends neither an Origin nor the session token.
+        let without_token = get(&a, "/fonts/inter-400.woff2");
+        assert_eq!(without_token.status, 200);
+        assert_eq!(without_token.content_type, Some("font/woff2"));
+
+        // The font licence sits on disk beside the font but is not a listed
+        // asset, so it falls through to the gated routes and is refused — never
+        // read, so its contents cannot leak.
+        let licence = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/fonts/LICENSE-Inter.txt",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(licence.status, 404);
+        assert!(
+            !licence.body.windows(7).any(|w| w == b"LICENCE"),
+            "licence contents must not leak"
+        );
+
+        // An arbitrary path under `fonts/` is likewise not a listed asset.
+        let arbitrary = a.handle(&HttpInput {
+            method: ReqMethod::Get,
+            path: "/fonts/secret.woff2",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: &[],
+        });
+        assert_eq!(arbitrary.status, 404);
+    }
+
+    #[cfg(feature = "embed-cabinet")]
+    #[test]
+    fn embedded_source_serves_a_font_from_the_fonts_subdirectory() {
+        // Prove the include_dir lookup resolves a listed asset whose name has a
+        // `fonts/` subdirectory against the assets compiled into the binary.
+        let a = agent_serving(RecordingSigner::new(), CabinetSource::Embedded);
+        let out = get(&a, "/fonts/jbmono-400.woff2");
+        assert_eq!(out.status, 200);
+        assert_eq!(out.content_type, Some("font/woff2"));
+        assert!(!out.body.is_empty());
     }
 
     #[test]
@@ -1833,5 +2149,301 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(value["algorithm"], "ecdsa-with-sha256");
         assert!(value.get("signature_b64").is_some());
+    }
+
+    // --- Registry signing (`/sign-registry`) ---------------------------------
+
+    const REGISTRY_LABEL: &str = "registry-key";
+
+    /// A real P-256 backend that recognises both the issuance and the registry
+    /// key label, signing with one on-disk key so `/sign-registry` output can be
+    /// verified. It records the last key id it signed for, so a test can prove
+    /// `/sign` never borrows the registry key.
+    struct P256Backend {
+        signing_key: p256::ecdsa::SigningKey,
+        issue_key: KeyId,
+        registry_key: KeyId,
+        last_signed: Cell<Option<String>>,
+    }
+
+    impl P256Backend {
+        fn new() -> Self {
+            Self {
+                signing_key: p256::ecdsa::SigningKey::from_slice(&[0x33; 32]).unwrap(),
+                issue_key: KeyId::new(KEY_LABEL),
+                registry_key: KeyId::new(REGISTRY_LABEL),
+                last_signed: Cell::new(None),
+            }
+        }
+
+        fn verifying_key(&self) -> p256::ecdsa::VerifyingKey {
+            *self.signing_key.verifying_key()
+        }
+
+        fn knows(&self, key_id: &KeyId) -> bool {
+            key_id == &self.issue_key || key_id == &self.registry_key
+        }
+    }
+
+    impl SignatureBackend for P256Backend {
+        fn algorithm(&self, key_id: &KeyId) -> Result<SignatureAlgorithm, SignError> {
+            if self.knows(key_id) {
+                Ok(SignatureAlgorithm::EcdsaWithSha256)
+            } else {
+                Err(SignError::UnknownKey(key_id.as_str().to_owned()))
+            }
+        }
+
+        fn sign(&self, tbs_der: &[u8], key_id: &KeyId) -> Result<Signature, SignError> {
+            use p256::ecdsa::signature::Signer as _;
+            if !self.knows(key_id) {
+                return Err(SignError::UnknownKey(key_id.as_str().to_owned()));
+            }
+            self.last_signed.set(Some(key_id.as_str().to_owned()));
+            // A real ECDSA-with-SHA256 signature: the signer digests the bytes
+            // itself, and the certificate-shaped output is DER, like every real
+            // backend returns.
+            let signature: p256::ecdsa::Signature = self.signing_key.try_sign(tbs_der).unwrap();
+            Ok(Signature {
+                algorithm: SignatureAlgorithm::EcdsaWithSha256,
+                bytes: signature.to_der().as_bytes().to_vec(),
+            })
+        }
+    }
+
+    /// An agent over a real P-256 backend with the registry key configured.
+    fn registry_agent() -> Agent<P256Backend, ConfirmFn> {
+        Agent::new(
+            P256Backend::new(),
+            auto_confirm as ConfirmFn,
+            config(),
+            SecretString::from(TOKEN.to_owned()),
+        )
+        .with_registry_key(KeyId::new(REGISTRY_LABEL))
+    }
+
+    fn sign_registry_body(payload: &[u8]) -> String {
+        serde_json::json!({
+            "payload_b64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                payload,
+            ),
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn sign_registry_without_a_configured_key_reports_not_configured() {
+        // A plain agent (no registry key) refuses `/sign-registry` with the
+        // documented "not configured" error, and never touches the backend.
+        let a = agent(RecordingSigner::new());
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign-registry",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: sign_registry_body(b"{\"generated_at\":1}").as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            400,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(value["error"], "registry key is not configured");
+        assert!(!a.backend.signed.get(), "backend must not be reached");
+    }
+
+    #[test]
+    fn sign_registry_produces_a_signature_the_cabinet_verifier_accepts() {
+        use p256::ecdsa::signature::Verifier as _;
+
+        let a = registry_agent();
+        let payload = br#"{"generated_at":1750000000,"hosts":[],"users":[],"roles":[],"tags":[]}"#;
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign-registry",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: sign_registry_body(payload).as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        assert_eq!(
+            a.backend.last_signed.take().as_deref(),
+            Some(REGISTRY_LABEL)
+        );
+
+        let value: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        let sig_b64 = value["signature_b64"].as_str().expect("signature present");
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64)
+            .expect("signature is base64");
+        // The cabinet verifies raw `r || s` P-256 over SHA-256 of the exact
+        // payload bytes — reproduce that here.
+        assert_eq!(raw.len(), 64, "raw ecdsa signature is r||s (64 bytes)");
+        let signature = p256::ecdsa::Signature::from_slice(&raw).expect("valid raw signature");
+        a.backend
+            .verifying_key()
+            .verify(payload, &signature)
+            .expect("registry signature must verify as P-256 over SHA-256 of the payload");
+    }
+
+    #[test]
+    fn sign_registry_requires_the_session_token() {
+        let a = registry_agent();
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign-registry",
+            origin: Some(ORIGIN),
+            session_token: None,
+            body: sign_registry_body(b"{}").as_bytes(),
+        });
+        assert_eq!(out.status, 403);
+        assert!(
+            a.backend.last_signed.take().is_none(),
+            "backend must not sign"
+        );
+    }
+
+    #[test]
+    fn sign_registry_refuses_a_foreign_origin() {
+        let a = registry_agent();
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign-registry",
+            origin: Some("https://evil.example"),
+            session_token: Some(TOKEN),
+            body: sign_registry_body(b"{}").as_bytes(),
+        });
+        assert_eq!(out.status, 403);
+        assert!(
+            out.cors_origin.is_none(),
+            "no CORS header for a foreign origin"
+        );
+        assert!(
+            a.backend.last_signed.take().is_none(),
+            "backend must not sign"
+        );
+    }
+
+    #[test]
+    fn sign_registry_ignores_a_smuggled_key_field() {
+        // The request has no key field; an extra one is ignored and the registry
+        // key still signs — a caller cannot redirect this to the issuance key.
+        let a = registry_agent();
+        let body = serde_json::json!({
+            "payload_b64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                b"{}",
+            ),
+            "key_id": KEY_LABEL,
+        })
+        .to_string();
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign-registry",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: body.as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        assert_eq!(
+            a.backend.last_signed.take().as_deref(),
+            Some(REGISTRY_LABEL),
+            "the registry key must sign, never the issuance key"
+        );
+    }
+
+    #[test]
+    fn sign_refuses_the_registry_key_for_issuance() {
+        // The other half of domain separation: `/sign` must not sign a TBS with
+        // the registry key even though the backend can address it.
+        let a = registry_agent();
+        let body = serde_json::json!({ "key_id": REGISTRY_LABEL, "tbs_der_b64": leaf_tbs_b64() })
+            .to_string();
+        let out = a.handle(&HttpInput {
+            method: ReqMethod::Post,
+            path: "/sign",
+            origin: Some(ORIGIN),
+            session_token: Some(TOKEN),
+            body: body.as_bytes(),
+        });
+        assert_eq!(
+            out.status,
+            403,
+            "body: {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        assert!(
+            a.backend.last_signed.take().is_none(),
+            "the registry key must never sign a TBS"
+        );
+    }
+
+    #[test]
+    fn validate_registry_key_rejects_a_label_collision() {
+        let backend = MockSigner::ecdsa_sha256(KeyId::new(KEY_LABEL));
+        let err = validate_registry_key(&backend, &KeyId::new(KEY_LABEL), KEY_LABEL).unwrap_err();
+        assert!(matches!(err, ServeError::RegistryKeyCollision), "{err:?}");
+    }
+
+    #[test]
+    fn validate_registry_key_rejects_a_non_p256_key() {
+        // A registry key the backend signs with P-384 is refused at startup.
+        let backend = MockSigner::new(
+            KeyId::new(REGISTRY_LABEL),
+            SignatureAlgorithm::EcdsaWithSha384,
+        );
+        let err =
+            validate_registry_key(&backend, &KeyId::new(REGISTRY_LABEL), KEY_LABEL).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ServeError::RegistryKeyNotP256(SignatureAlgorithm::EcdsaWithSha384)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_registry_key_reports_an_unknown_key() {
+        // The backend does not recognise the registry label at all.
+        let backend = MockSigner::ecdsa_sha256(KeyId::new("some-other-key"));
+        let err =
+            validate_registry_key(&backend, &KeyId::new(REGISTRY_LABEL), KEY_LABEL).unwrap_err();
+        assert!(
+            matches!(err, ServeError::RegistryKeyUnavailable(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_registry_key_accepts_a_distinct_p256_key() {
+        let backend = MockSigner::ecdsa_sha256(KeyId::new(REGISTRY_LABEL));
+        assert!(validate_registry_key(&backend, &KeyId::new(REGISTRY_LABEL), KEY_LABEL).is_ok());
+    }
+
+    #[test]
+    fn ecdsa_der_to_raw_round_trips_a_real_signature() {
+        use p256::ecdsa::signature::Signer as _;
+        let key = p256::ecdsa::SigningKey::from_slice(&[0x44; 32]).unwrap();
+        let signature: p256::ecdsa::Signature = key.sign(b"payload bytes");
+        let raw = ecdsa_der_to_raw(signature.to_der().as_bytes()).expect("valid p256 der");
+        assert_eq!(raw, <[u8; 64]>::from(signature.to_bytes()));
+    }
+
+    #[test]
+    fn ecdsa_der_to_raw_rejects_non_signature_bytes() {
+        assert!(ecdsa_der_to_raw(b"not a der signature").is_err());
     }
 }

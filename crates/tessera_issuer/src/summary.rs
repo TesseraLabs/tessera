@@ -521,7 +521,7 @@ mod tests {
                 not_after: 1_600_003_600,
             },
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["ivanov".to_owned()],
+            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["oper".to_owned()],
             max_integrity: Some(IntegrityCeiling {
                 level: 5,

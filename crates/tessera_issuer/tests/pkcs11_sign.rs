@@ -63,6 +63,7 @@ fn softhsm_signs_a_sample_tbs() {
         token_label: env_nonempty("TESSERA_TEST_PKCS11_TOKEN"),
         key_id: KeyId::new(key.clone()),
         algorithm,
+        registry_key: None,
     };
     let pin_source =
         move || -> Result<SecretString, Pkcs11SignError> { Ok(SecretString::from(pin.clone())) };
@@ -83,4 +84,91 @@ fn softhsm_signs_a_sample_tbs() {
         p256::ecdsa::Signature::from_der(&signature.bytes)
             .expect("P-256 ECDSA signature must be DER-encoded");
     }
+}
+
+/// Opening a signer with a P-256 registry key succeeds: the startup probe reads
+/// the curve from the token and accepts it.
+///
+/// Reuses `TESSERA_TEST_PKCS11_KEY` as the registry key, but only when it is a
+/// P-256 key (the default algorithm), so the probe's accept path is exercised.
+#[test]
+fn softhsm_accepts_a_p256_registry_key() {
+    let Some(module) = env_nonempty("PKCS11_MODULE_PATH").map(PathBuf::from) else {
+        println!("skipped: PKCS#11 module not available (set PKCS11_MODULE_PATH)");
+        return;
+    };
+    if !module.exists() {
+        println!(
+            "skipped: PKCS#11 module path does not exist ({})",
+            module.display()
+        );
+        return;
+    }
+    let (Some(key), Some(pin)) = (
+        env_nonempty("TESSERA_TEST_PKCS11_KEY"),
+        env_nonempty("TESSERA_TEST_PKCS11_PIN"),
+    ) else {
+        println!("skipped: set TESSERA_TEST_PKCS11_KEY and TESSERA_TEST_PKCS11_PIN");
+        return;
+    };
+    if algorithm_from_env() != SignatureAlgorithm::EcdsaWithSha256 {
+        println!("skipped: TESSERA_TEST_PKCS11_KEY is not a P-256 key (set TESSERA_TEST_PKCS11_ALG=ecdsa-p256)");
+        return;
+    }
+
+    let config = Pkcs11Config {
+        module_path: module,
+        token_label: env_nonempty("TESSERA_TEST_PKCS11_TOKEN"),
+        key_id: KeyId::new("issuance-does-not-need-to-exist-for-this-probe"),
+        algorithm: SignatureAlgorithm::EcdsaWithSha256,
+        registry_key: Some(KeyId::new(key)),
+    };
+    let pin_source =
+        move || -> Result<SecretString, Pkcs11SignError> { Ok(SecretString::from(pin.clone())) };
+    // The probe runs inside open(): a P-256 registry key must let it construct.
+    Pkcs11Signer::open(config, pin_source)
+        .expect("a P-256 registry key must be accepted at startup");
+}
+
+/// Opening a signer with a non-P-256 registry key is refused at startup. Gated
+/// on `TESSERA_TEST_PKCS11_P384_KEY` (a P-384 key label in the same token); when
+/// unset the test skips, so CI can provision the key to exercise the reject path.
+#[test]
+fn softhsm_rejects_a_non_p256_registry_key() {
+    let Some(module) = env_nonempty("PKCS11_MODULE_PATH").map(PathBuf::from) else {
+        println!("skipped: PKCS#11 module not available (set PKCS11_MODULE_PATH)");
+        return;
+    };
+    if !module.exists() {
+        println!(
+            "skipped: PKCS#11 module path does not exist ({})",
+            module.display()
+        );
+        return;
+    }
+    let (Some(p384_key), Some(pin)) = (
+        env_nonempty("TESSERA_TEST_PKCS11_P384_KEY"),
+        env_nonempty("TESSERA_TEST_PKCS11_PIN"),
+    ) else {
+        println!(
+            "skipped: set TESSERA_TEST_PKCS11_P384_KEY (a P-384 key) and TESSERA_TEST_PKCS11_PIN"
+        );
+        return;
+    };
+
+    let config = Pkcs11Config {
+        module_path: module,
+        token_label: env_nonempty("TESSERA_TEST_PKCS11_TOKEN"),
+        key_id: KeyId::new("issuance-does-not-need-to-exist-for-this-probe"),
+        algorithm: SignatureAlgorithm::EcdsaWithSha256,
+        registry_key: Some(KeyId::new(p384_key)),
+    };
+    let pin_source =
+        move || -> Result<SecretString, Pkcs11SignError> { Ok(SecretString::from(pin.clone())) };
+    let err = Pkcs11Signer::open(config, pin_source)
+        .expect_err("a P-384 registry key must be refused at startup");
+    assert!(
+        matches!(err, Pkcs11SignError::RegistryKeyNotP256(_)),
+        "expected RegistryKeyNotP256, got {err:?}"
+    );
 }

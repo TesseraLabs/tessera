@@ -101,7 +101,7 @@ pub enum Caption {
     RequiredTags,
     /// The host-binding field label.
     Hosts,
-    /// The user-binding field label.
+    /// The user-binding field label (the allowed role accounts).
     Users,
     /// The leaf integrity-ceiling field label.
     Integrity,
@@ -138,7 +138,7 @@ impl Caption {
             Caption::MaxTtl => "max TTL",
             Caption::RequiredTags => "required tags",
             Caption::Hosts => "hosts",
-            Caption::Users => "users",
+            Caption::Users => "role accounts",
             Caption::Integrity => "integrity",
             Caption::Profile => "profile",
             Caption::CrlNumber => "crlNumber",
@@ -159,7 +159,7 @@ impl Caption {
             Caption::MaxTtl => "макс. TTL",
             Caption::RequiredTags => "требуемые метки",
             Caption::Hosts => "узлы",
-            Caption::Users => "пользователи",
+            Caption::Users => "ролевые УЗ",
             Caption::Integrity => "целостность",
             Caption::Profile => "профиль",
             // An X.509 field name — a technical identifier, not translated.
@@ -184,6 +184,10 @@ pub(crate) enum Msg {
     ServeListening,
     /// `issuer serve`: the session token follows.
     ServeSessionToken,
+    /// `issuer serve`: how to stop the foreground agent (full line).
+    ServeStopHint,
+    /// `issuer serve`: the browser could not be opened automatically (full line).
+    ServeBrowserOpenFailed,
     /// `issuer serve`: a TBS that could not be shown was refused (full line).
     ServeUnreadableTbs,
     /// `issuer serve`: the operator declined (a kind and subject follow).
@@ -242,6 +246,10 @@ impl Msg {
         match self {
             Msg::ServeListening => "issuer serve: listening on",
             Msg::ServeSessionToken => "issuer serve: session token:",
+            Msg::ServeStopHint => "Press Ctrl+C to stop the agent",
+            Msg::ServeBrowserOpenFailed => {
+                "issuer serve: could not open a browser; open the address above manually"
+            }
             Msg::ServeUnreadableTbs => {
                 "issuer serve: rejected sign — TBS is not a readable issuance operation"
             }
@@ -277,6 +285,10 @@ impl Msg {
         match self {
             Msg::ServeListening => "issuer serve: приём на",
             Msg::ServeSessionToken => "issuer serve: токен сессии:",
+            Msg::ServeStopHint => "Остановка агента: Ctrl+C",
+            Msg::ServeBrowserOpenFailed => {
+                "issuer serve: не удалось открыть браузер; откройте адрес выше вручную"
+            }
             Msg::ServeUnreadableTbs => {
                 "issuer serve: подпись отклонена — TBS не читается как операция выпуска"
             }
