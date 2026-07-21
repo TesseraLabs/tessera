@@ -1,5 +1,9 @@
 # Tessera documentation
 
+This is the technical documentation: installation, configuration,
+operations. For a product overview — features, use cases, contacts —
+see [tessera-access.com](https://tessera-access.com/).
+
 The Russian documents in `docs/ru/` are the primary source; this
 English tree (`docs/en/`) mirrors them. The changelog is Russian-only —
 see [../ru/changelog.md](../ru/changelog.md) (Russian).
