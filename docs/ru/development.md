@@ -157,20 +157,7 @@ cargo test --workspace
 5. **Слить через squash + rebase merge.** Большие PR — review по 3–5
    коммитов; squash в `main` для чистой истории.
 
-## 6. Git hooks
-
-Репозиторий поставляет хуки в `scripts/git-hooks/`, которые блокируют
-коммиты и пуши в `main` по будням с 08:00 до 19:00 локального времени.
-Включаются однократно на каждый клон:
-
-```sh
-git config core.hooksPath scripts/git-hooks
-```
-
-`git commit --no-verify` / `git push --no-verify` — обход в экстренных
-случаях.
-
-## 7. Как добавить новый PKCS#11-провайдер
+## 6. Как добавить новый PKCS#11-провайдер
 
 Текущая поддержка реализована в
 [`crates/tessera_core/src/token/`](../../crates/tessera_core/src/token/).
@@ -192,7 +179,7 @@ git config core.hooksPath scripts/git-hooks
    - [docs/threat-model.md](threat-model.md) — §3.3 (если меняется
      модель угроз).
 
-## 8. Как добавить новый источник host_id
+## 7. Как добавить новый источник host_id
 
 См. [`crates/tessera_core/src/host_identity/`](../../crates/tessera_core/src/host_identity/).
 
@@ -208,7 +195,7 @@ git config core.hooksPath scripts/git-hooks
 6. Обновить [docs/configuration.md](configuration.md) (таблица
    `[host_identity]`) и [architecture.md §12](architecture.md#12-host-identity-chain).
 
-## 8.1 Где живёт логика авторизации сертификата
+## 7.1 Где живёт логика авторизации сертификата
 
 Авторизация «какой пользователь на каком хосте» полностью описана в
 самом сертификате через X.509-расширения и проверяется в коде:
@@ -222,7 +209,7 @@ git config core.hooksPath scripts/git-hooks
   `host_id_hash` и `pam_user`. См. также
   [docs/cert-issuance.md](cert-issuance.md) для семантики записей.
 
-## 9. Версионирование
+## 8. Версионирование
 
 Семантика SemVer 2.0.0:
 
@@ -241,7 +228,7 @@ git config core.hooksPath scripts/git-hooks
   (если изменяется wire-протокол);
 - обновления модели угроз ([docs/threat-model.md](threat-model.md)).
 
-## 10. Дальнейшее чтение
+## 9. Дальнейшее чтение
 
 - [docs/architecture.md](architecture.md).
 - [docs/configuration.md](configuration.md).
