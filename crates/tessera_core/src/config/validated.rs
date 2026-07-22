@@ -1433,6 +1433,20 @@ fn validate_host_identity(raw: &RawHostIdentity) -> Result<HostIdentitySection, 
                 ),
             });
         }
+        // The custom command runs with the PAM host's root authority. If it is
+        // already installed on this host, reject it at startup when it is not
+        // root-controlled, so an attacker-owned helper is a hard configuration
+        // failure rather than a silent root-privileged execution. A command not
+        // yet present (config validated ahead of deployment) is deferred to the
+        // resolver, which re-validates immediately before every execution.
+        if cmd.exists() {
+            crate::privileged_path::validate_path(cmd, crate::privileged_path::ExecTrust::Root)
+                .map_err(|source| Error::ConfigInvalid {
+                    reason: format!(
+                        "host_identity.custom_command is not root-controlled: {source}"
+                    ),
+                })?;
+        }
     }
     Ok(HostIdentitySection {
         sources,

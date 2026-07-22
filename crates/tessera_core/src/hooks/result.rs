@@ -52,6 +52,13 @@ pub enum HookError {
         /// The path the executor attempted to run.
         path: PathBuf,
     },
+    /// The command path (or a directory on the way to it) failed the
+    /// privileged-execution ownership/integrity walk: it is not owned by a
+    /// trusted UID, is group/other-writable, or was swapped. Running it would
+    /// let a local user have the daemon execute their file at the hook's
+    /// privilege, so it is refused (fail closed).
+    #[error("hook command failed path validation: {0}")]
+    CommandUnsafe(#[from] crate::privileged_path::PrivilegedPathError),
     /// Looking up the requested PAM user failed (`getpwnam_r` returned NULL or
     /// errored).
     #[error("user lookup failed for {user:?}: {source}")]

@@ -262,7 +262,7 @@ lifecycle stage. The full implementation is in
 | `command`          | list of strings | —    | `[ "/usr/local/sbin/foo", "arg" ]`, the first element is an absolute path                             | The hook's argv. Passed **literally**; placeholders in argv are NOT substituted. | Dynamic data is passed only through `env` — argv injection is impossible. |
 | `timeout_seconds`  | integer      | `10`    | `1..=120`                                                                                             | Execution timeout.                                      | The hook is killed with `SIGKILL` when it expires.                                     |
 | `on_failure`       | string       | `None`  | `"warn"`, `"ignore"`; any other value → abort                                                        | What to do on a non-zero hook return code.              | Default: abort (deny) for `pre_auth` (there, `"warn"` is also forced to abort); `"warn"` for the other stages. |
-| `run_as`           | string       | `None`  | UNIX name                                                                                             | The UID the hook runs under.                            | Defaults to `root`. Dropping privileges is best practice.                             |
+| `run_as`           | string       | `None`  | `"root"`, `"user"`                                                                                    | The privilege the hook runs under: `root` or `user` (the authenticated PAM user). | Defaults to `root`. Any other value (a typo, an account name) is a **configuration error**, not a silent fall-back to root. Dropping privileges (`user`) is best practice. |
 | `env`              | table        | `{}`    | `{ KEY = "literal ${placeholder}" }` strings                                                         | Environment variables passed to the hook.               | Base: a whitelist of `PATH`/`HOME`/`USER`/`LOGNAME`/`LANG` + all `TESSERA_*` variables; custom keys may override them. |
 
 `${...}` substitution works **only in `env` values** — `command` is
@@ -502,7 +502,7 @@ stage           = "post_auth_success"
 command         = ["/usr/local/sbin/audit-login"]
 timeout_seconds = 5
 on_failure      = "warn"
-run_as          = "audit"
+run_as          = "user"
 env             = { AUDIT_USER = "${pam_user}", AUDIT_SERIAL = "${cert_serial}" }
 ```
 

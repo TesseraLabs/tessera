@@ -105,6 +105,16 @@ pub enum HostIdentityError {
     /// Command timed out.
     #[error("host identity command timed out")]
     CommandTimeout,
+    /// The custom command path failed the privileged-execution ownership and
+    /// integrity walk (not root-owned, group/other-writable, or swapped).
+    /// Fail closed: a command root could be tricked into running as a
+    /// non-root-controlled binary is refused rather than executed.
+    #[error("host identity command failed path validation: {source}")]
+    CommandUntrusted {
+        /// Underlying validation failure.
+        #[source]
+        source: crate::privileged_path::PrivilegedPathError,
+    },
     /// Command missing.
     #[error("custom command is not configured")]
     CommandNotConfigured,
@@ -183,6 +193,15 @@ pub enum HookValidationError {
     /// Timeout is invalid.
     #[error("hook timeout must be in 1..=120")]
     InvalidTimeout,
+    /// `run_as` names an identity the module cannot map to a concrete UID.
+    /// Only `root` and `user` (the authenticating PAM user) are recognized;
+    /// anything else — a typo, or an account name the module does not resolve —
+    /// is rejected rather than silently amplified to root.
+    #[error("invalid run_as {value:?}: expected \"root\" or \"user\"")]
+    InvalidRunAs {
+        /// The unrecognized value from config.
+        value: String,
+    },
     /// Template error.
     #[error("{reason}")]
     Template {
