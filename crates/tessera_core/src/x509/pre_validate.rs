@@ -41,9 +41,12 @@ pub struct PreValidateConfig {
 /// 1. The certificate is X.509 v3 (per RFC 5280, all extensions require v3).
 /// 2. The validity window (with `clock_skew` tolerance) covers `now`.
 /// 3. The signature algorithm is in the whitelist.
-/// 4. `keyUsage` asserts `digitalSignature`.
-/// 5. `extendedKeyUsage` includes `clientAuth`.
-/// 6. `basicConstraints` is absent or `cA = FALSE`.
+/// 4. The subject public key meets the minimum strength policy
+///    ([`crate::x509::key_strength`]) — a strong signature over a weak key is
+///    still a weak key.
+/// 5. `keyUsage` asserts `digitalSignature`.
+/// 6. `extendedKeyUsage` includes `clientAuth`.
+/// 7. `basicConstraints` is absent or `cA = FALSE`.
 ///
 /// # Errors
 ///
@@ -81,17 +84,24 @@ pub fn pre_validate_end_entity(
         return Err(TrustError::SignatureAlgorithm(sig_alg));
     }
 
-    // 4. KeyUsage = digitalSignature
+    // 4. Subject public-key strength.  Allow-listing the signature algorithm
+    //    bounds how the cert was signed, not the strength of the key it
+    //    carries; a 1024-bit RSA leaf signed with SHA-256 must still be
+    //    refused before the challenge-response trusts that key.
+    let pk = cert.public_key()?;
+    crate::x509::key_strength::validate_public_key_strength(&pk)?;
+
+    // 5. KeyUsage = digitalSignature
     if !cert.key_usage_digital_signature()? {
         return Err(TrustError::KeyUsage);
     }
 
-    // 5. EKU = clientAuth
+    // 6. EKU = clientAuth
     if !cert.eku_client_auth()? {
         return Err(TrustError::Eku);
     }
 
-    // 6. BasicConstraints absent OR CA=FALSE
+    // 7. BasicConstraints absent OR CA=FALSE
     if let Some(bc) = cert.basic_constraints()? {
         if bc.is_ca {
             return Err(TrustError::BasicConstraints("end-entity must not be CA"));

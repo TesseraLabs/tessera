@@ -169,6 +169,14 @@ pub enum Pkcs11Error {
         /// Stringified mechanism identifier.
         mechanism: String,
     },
+    /// The token's public key is below the minimum accepted strength (e.g.
+    /// sub-2048-bit RSA).  Refused during mechanism selection so a weak key is
+    /// never driven through the token's `C_Sign`.
+    #[error("pkcs#11 weak public key: {detail}")]
+    WeakKey {
+        /// Human-readable reason the key was rejected (algorithm and size).
+        detail: String,
+    },
     /// Bridge variant for OpenSSL errors during mechanism selection
     /// (e.g. `pubkey.ec_key()` when the leaf cert is malformed).
     #[error("pkcs#11 openssl error: {0}")]

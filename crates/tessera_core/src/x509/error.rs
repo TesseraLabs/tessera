@@ -36,6 +36,28 @@ pub enum TrustError {
     #[error("extended key usage does not include clientAuth")]
     Eku,
 
+    /// A CA certificate in the built path carries an `extendedKeyUsage`
+    /// extension that excludes the client-authentication purpose.
+    ///
+    /// RFC 5280 §4.2.1.12: an EKU on an intermediate constrains the purposes
+    /// its subordinate certificates may be used for.  When the intersection of
+    /// all issuing CAs' EKUs no longer contains `clientAuth` (nor
+    /// `anyExtendedKeyUsage`), the leaf cannot be used for engineer
+    /// authentication and the chain is refused.
+    #[error("extended key usage chain violation: {0}")]
+    EkuChainViolation(&'static str),
+
+    /// A certificate's subject public key is below the minimum accepted
+    /// strength for its algorithm family.
+    ///
+    /// Signature-algorithm allow-listing constrains how a certificate was
+    /// *signed*, but says nothing about the strength of the key it *carries*.
+    /// A weak key (e.g. 1024-bit RSA) is rejected regardless of how strongly
+    /// it was signed, because the challenge-response that proves possession of
+    /// the private key is only as sound as that key.
+    #[error("public key below minimum strength: {0}")]
+    WeakKey(String),
+
     /// `basicConstraints` extension is incompatible with this position
     /// in the chain (e.g. CA=TRUE on a leaf or CA=FALSE on an intermediate).
     #[error("basic constraints violation: {0}")]

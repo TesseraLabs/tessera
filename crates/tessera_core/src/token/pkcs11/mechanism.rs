@@ -112,6 +112,19 @@ impl TokenSignMechanism {
     }
 }
 
+/// Maps a public-key-strength [`crate::x509::TrustError`] onto the PKCS#11
+/// error surface, preserving OpenSSL failures distinctly from weak-key
+/// rejections.
+fn weak_key_err(err: crate::x509::TrustError) -> Pkcs11Error {
+    match err {
+        crate::x509::TrustError::Openssl(stack) => Pkcs11Error::Openssl(stack),
+        crate::x509::TrustError::WeakKey(detail) => Pkcs11Error::WeakKey { detail },
+        other => Pkcs11Error::WeakKey {
+            detail: other.to_string(),
+        },
+    }
+}
+
 /// Pick the token signing mechanism for `(key_type, pubkey)`.
 ///
 /// # Errors
@@ -121,11 +134,19 @@ impl TokenSignMechanism {
 /// - [`Pkcs11Error::MechanismNotSupported`] — the key type is in the
 ///   matrix but the binding crate exposes no matching mechanism (today
 ///   true for GOST under cryptoki 0.7).
+/// - [`Pkcs11Error::WeakKey`] — the key is of an accepted family but below the
+///   minimum strength (e.g. sub-2048-bit RSA).
 pub fn select_mechanism(
     key_type: KeyType,
     pubkey: &PKeyRef<Public>,
 ) -> Result<TokenSignMechanism, Pkcs11Error> {
     if key_type == KeyType::RSA {
+        // Reject a weak key before committing to a mechanism: signature
+        // -algorithm policy elsewhere bounds how a cert was signed, not the
+        // strength of the key the token will sign with.  The EC/GOST branches
+        // are already pinned to approved curves/params, so the shared strength
+        // gate only needs to fire for RSA's variable modulus size.
+        crate::x509::key_strength::validate_public_key_strength(pubkey).map_err(weak_key_err)?;
         return Ok(TokenSignMechanism::RawSign {
             mechanism: Mechanism::Sha256RsaPkcsPss(PkcsPssParams {
                 hash_alg: MechanismType::SHA256,
@@ -186,7 +207,11 @@ mod tests {
     use openssl::rsa::Rsa;
 
     fn rsa_pubkey() -> PKey<Public> {
-        let priv_pkey = Rsa::generate(2048).expect("rsa gen");
+        rsa_pubkey_bits(2048)
+    }
+
+    fn rsa_pubkey_bits(bits: u32) -> PKey<Public> {
+        let priv_pkey = Rsa::generate(bits).expect("rsa gen");
         let der = priv_pkey.public_key_to_der().expect("rsa pub der");
         PKey::public_key_from_der(&der).expect("pkey")
     }
@@ -216,6 +241,17 @@ mod tests {
         assert!(!m.requires_host_pre_hash());
         // Mechanism shape: RSA-PSS hashed by token.
         assert!(matches!(m.mechanism(), Mechanism::Sha256RsaPkcsPss(_)));
+    }
+
+    #[test]
+    fn rsa_1024_is_rejected_as_weak() {
+        // The PKCS#11 selection path must refuse a sub-2048-bit RSA token key
+        // before handing it a mechanism to sign with.
+        let pk = rsa_pubkey_bits(1024);
+        let err = select_mechanism(KeyType::RSA, &pk)
+            .err()
+            .expect("must fail");
+        assert!(matches!(err, Pkcs11Error::WeakKey { .. }), "got {err:?}");
     }
 
     #[test]

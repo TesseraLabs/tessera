@@ -39,7 +39,11 @@ use super::{Certificate, TrustError, VerifiedX509};
 /// * `2.5.29.15` keyUsage — `x509::ext::key_usage_bit`
 ///   (`keyCertSign`/`digitalSignature` enforced per chain position).
 /// * `2.5.29.37` extendedKeyUsage — `x509::ext::eku_oids` /
-///   `Certificate::eku_client_auth` (clientAuth enforced on the leaf).
+///   `Certificate::eku_client_auth` (clientAuth enforced on the leaf) and
+///   `x509::chain_policy` (the EKU intersection enforced across issuing CAs, so
+///   a critical `serverAuth`-only EKU on an intermediate now fails closed
+///   instead of being silently accepted). A trust anchor's EKU is not
+///   processed, per RFC 5280.
 ///
 /// Deliberately **excluded** standard criticals (parsed by nobody here, so a
 /// critical instance must reject rather than be ignored): nameConstraints

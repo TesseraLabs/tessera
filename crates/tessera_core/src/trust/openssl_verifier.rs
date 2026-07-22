@@ -304,6 +304,18 @@ impl OpensslVerifier {
         //     intermediate without keyCertSign slips through.
         verify_intermediate_constraints(&chain, now, self.pre_cfg.clock_skew)?;
 
+        // 4b-bis. Per-link chain policy: public-key strength on every cert,
+        //     signature-algorithm allow-listing on every non-anchor link, and
+        //     the EKU intersection that keeps `clientAuth` reachable. The
+        //     crate does manual path validation, so these RFC 5280 rules are
+        //     applied explicitly here rather than by `X509_verify_cert`.
+        crate::x509::chain_policy::enforce_chain_policy(
+            &chain,
+            &crate::x509::chain_policy::ChainPolicy {
+                signature_alg_whitelist: &self.pre_cfg.signature_alg_whitelist,
+            },
+        )?;
+
         // 4c. Profile version-gate (4.1) + unknown-critical-extension scan
         //     (2.3) over every cert in the chain (fail-closed). The
         //     delegation-envelope checks (4.2-4.4, device.tags ⊇ requireTags +
