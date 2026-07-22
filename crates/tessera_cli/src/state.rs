@@ -171,6 +171,17 @@ pub enum ActionRequest {
         /// Action.
         action: OnUsbRemoved,
     },
+    /// The session's bounded role TTL elapsed — revoke continued access using
+    /// the same session-ending action configured for USB removal. Both mean
+    /// "the authorised window is over"; reusing the action keeps a single
+    /// fail-closed code path (Lock / Logout / Hook / Shutdown, including the
+    /// reboot fallback when no logind id is known).
+    HandleSessionExpired {
+        /// Session that reached its deadline.
+        session: ActiveSession,
+        /// Session-ending action to run.
+        action: OnUsbRemoved,
+    },
 }
 
 /// Spawn the state-manager task.
@@ -185,22 +196,40 @@ pub fn spawn_state_manager(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut grace_tokens: HashMap<String, CancellationToken> = HashMap::new();
+        // Per-session cancellation handles for bounded-TTL termination timers,
+        // keyed by session id. Mirrors `grace_tokens` but addresses sessions
+        // (a TTL is a per-session deadline) rather than USB serials.
+        let mut ttl_tokens: HashMap<Uuid, CancellationToken> = HashMap::new();
         let mut suspend_state = SuspendState::Awake;
+
+        // Re-arm TTL timers for sessions restored from the persisted registry.
+        // Without this a daemon restart would forget every deadline and a
+        // role session could outlive its ceiling indefinitely. Sessions whose
+        // deadline already passed while the daemon was down are terminated
+        // immediately by `schedule_session_ttl` (remaining time saturates to
+        // zero).
+        for session in registry.snapshot() {
+            schedule_session_ttl(&session, &cfg.on_usb_removed, &action_tx, &mut ttl_tokens);
+        }
+
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 ev = rx.recv() => {
                     let Some(ev) = ev else { break };
                     match ev {
-                        Event::Ipc(req) => handle_ipc(&cfg, &registry, udev_query.as_ref(), req).await,
+                        Event::Ipc(req) => handle_ipc(&cfg, &registry, udev_query.as_ref(), &action_tx, &mut ttl_tokens, req).await,
                         Event::Udev(u) => handle_udev(&cfg, &registry, &mut grace_tokens, &suspend_state, &action_tx, u),
-                        Event::Logind(s) => handle_logind(&cfg, &mut suspend_state, &registry, &mut grace_tokens, s).await,
+                        Event::Logind(s) => handle_logind(&cfg, &mut suspend_state, &registry, &mut grace_tokens, &mut ttl_tokens, s).await,
                     }
                 }
             }
         }
-        // Cancel any outstanding grace timers on shutdown.
+        // Cancel any outstanding grace and TTL timers on shutdown.
         for (_serial, tok) in grace_tokens.drain() {
+            tok.cancel();
+        }
+        for (_session_id, tok) in ttl_tokens.drain() {
             tok.cancel();
         }
     })
@@ -231,6 +260,8 @@ async fn handle_ipc(
     cfg: &StateConfig,
     registry: &SessionRegistry,
     udev_query: &dyn UdevQuery,
+    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
     req: IpcRequest,
 ) {
     match req {
@@ -276,6 +307,10 @@ async fn handle_ipc(
                 }
             }
             let s = *session;
+            // Arm the bounded-TTL termination timer (no-op when the session
+            // carries no TTL). Scheduled before `add` so the deadline is live
+            // the instant the session becomes visible.
+            schedule_session_ttl(&s, &cfg.on_usb_removed, action_tx, ttl_tokens);
             registry.add(s);
             persist_async(&cfg.registry_store, registry.snapshot()).await;
             // Best-effort: клиент мог отключиться, ответ можно потерять.
@@ -286,6 +321,10 @@ async fn handle_ipc(
             closed_at: _,
             reply,
         } => {
+            // A cleanly-closed session must not later trip its TTL action.
+            if let Some(tok) = ttl_tokens.remove(&session_id) {
+                tok.cancel();
+            }
             let removed = registry.remove(session_id);
             if let Some(s) = &removed {
                 if let Some(serial) = s.usb_serial.as_deref() {
@@ -394,11 +433,77 @@ fn handle_udev(
     }
 }
 
+/// Arm a bounded-TTL termination timer for `session`.
+///
+/// No-op when the session carries no `session_expiry` (non-role sessions have
+/// no time ceiling). The deadline is the absolute wall-clock instant the PAM
+/// module computed at authentication time — already clamped to the
+/// certificate's `notAfter` — so the daemon schedules directly against it with
+/// no re-anchoring at its own `opened_at`; that is what keeps the enforced
+/// deadline from ever drifting past certificate expiry. The remaining sleep is
+/// `deadline − now`, saturating to zero when the deadline is already in the
+/// past (a restored session that expired while the daemon was down is then
+/// terminated on the next scheduler tick).
+///
+/// Any pre-existing timer for the same session id is cancelled first so a
+/// duplicate `SessionOpen` cannot leave two timers racing. Cancellation via
+/// the stored [`CancellationToken`] (on clean `SessionClose`, logind teardown,
+/// or shutdown) suppresses the action.
+fn schedule_session_ttl(
+    session: &ActiveSession,
+    action: &OnUsbRemoved,
+    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
+) {
+    let Some(deadline) = session.session_expiry else {
+        return;
+    };
+    let remaining = deadline
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO);
+
+    // Replace any stale timer for this session id.
+    if let Some(old) = ttl_tokens.remove(&session.session_id) {
+        old.cancel();
+    }
+    let token = CancellationToken::new();
+    ttl_tokens.insert(session.session_id, token.clone());
+
+    let action_tx = action_tx.clone();
+    let action = action.clone();
+    let session = session.clone();
+    let session_id = session.session_id;
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tokio::time::sleep(remaining) => {
+                tracing::warn!(
+                    target: "tessera.monitord",
+                    session_id = %session_id,
+                    session_expiry = ?deadline,
+                    pam_user = %session.pam_user,
+                    "bounded role-session TTL reached; revoking continued access"
+                );
+                // Best-effort: if the action runner is already gone the daemon
+                // is shutting down and there is nothing left to enforce.
+                drop(action_tx.send(ActionRequest::HandleSessionExpired { session, action }));
+            }
+            () = token.cancelled() => {
+                tracing::debug!(
+                    target: "tessera.monitord",
+                    session_id = %session_id,
+                    "bounded TTL timer cancelled before expiry"
+                );
+            }
+        }
+    });
+}
+
 async fn handle_logind(
     cfg: &StateConfig,
     suspend_state: &mut SuspendState,
     registry: &SessionRegistry,
     grace_tokens: &mut HashMap<String, CancellationToken>,
+    ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
     sig: LogindSignal,
 ) {
     match sig {
@@ -425,6 +530,11 @@ async fn handle_logind(
                 return;
             }
             for uuid in to_remove {
+                // logind already tore the session down; drop its TTL timer so
+                // it does not later fire an action against a dead session.
+                if let Some(tok) = ttl_tokens.remove(&uuid) {
+                    tok.cancel();
+                }
                 let _ = registry.remove(uuid);
             }
             // Persist after removals so a daemon restart does not

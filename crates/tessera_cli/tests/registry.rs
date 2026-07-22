@@ -27,6 +27,7 @@ fn make(id: u128, serial: Option<&str>) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     }
 }
 
@@ -44,6 +45,7 @@ fn make_with_uid(id: u128, uid: u32, engineer_ski: &str) -> ActiveSession {
         engineer_ski: engineer_ski.into(),
         engineer_cert_sha256: "1234".into(),
         uid,
+        session_expiry: None,
     }
 }
 

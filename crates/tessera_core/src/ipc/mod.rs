@@ -63,6 +63,17 @@ pub struct OpenSessionInfo<'a> {
     /// Resolved role slice version for audit (role-format). `None` when no
     /// role was selected.
     pub role_version: Option<u32>,
+    /// Absolute wall-clock instant at which a bounded role session must end —
+    /// the earliest of `authenticated_at + role.session.max_ttl`,
+    /// `authenticated_at + global default`, and the certificate's `notAfter`.
+    /// `None` for non-role sessions, which carry no time-bound ceiling.
+    ///
+    /// Anchoring at the authentication instant and clamping against `notAfter`
+    /// here (rather than shipping a relative TTL the daemon re-anchors at its
+    /// own `opened_at`) guarantees the enforced deadline can never outlive the
+    /// certificate. The daemon schedules termination directly against this
+    /// instant.
+    pub session_expiry: Option<std::time::SystemTime>,
 }
 
 /// Sync IPC client trait used by the PAM flow.

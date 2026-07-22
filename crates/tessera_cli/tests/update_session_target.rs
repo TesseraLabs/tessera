@@ -42,6 +42,7 @@ fn seed_session(uuid: Uuid) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 1000,
+        session_expiry: None,
     }
 }
 

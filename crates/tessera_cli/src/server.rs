@@ -499,6 +499,7 @@ async fn dispatch(msg: ClientMessage, event_tx: &mpsc::UnboundedSender<Event>) -
             // daemon does not yet persist them; ignore gracefully (role-format).
             role: _,
             role_version: _,
+            session_expiry,
         } => {
             let session = ActiveSession {
                 session_id,
@@ -513,6 +514,7 @@ async fn dispatch(msg: ClientMessage, event_tx: &mpsc::UnboundedSender<Event>) -
                 engineer_ski,
                 engineer_cert_sha256,
                 uid,
+                session_expiry,
             };
             let (tx, rx) = oneshot::channel();
             if event_tx

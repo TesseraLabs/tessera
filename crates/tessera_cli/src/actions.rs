@@ -39,32 +39,67 @@ pub fn spawn_action_runner(
 async fn handle(actions: &Arc<dyn LogindActionsTrait>, req: ActionRequest) -> anyhow::Result<()> {
     match req {
         ActionRequest::HandleUsbRemoved { session, action } => {
-            let logind_id = session.target.logind_id().map(str::to_string);
-            match action {
-                OnUsbRemoved::Lock => match logind_id {
-                    Some(id) => actions.lock_session(&id).await?,
-                    None => fail_closed_no_logind_id(actions, "Lock", &session).await?,
-                },
-                OnUsbRemoved::Logout => match logind_id {
-                    Some(id) => actions.terminate_session(&id).await?,
-                    None => fail_closed_no_logind_id(actions, "Logout", &session).await?,
-                },
-                OnUsbRemoved::Hook { path } => {
-                    let session_clone = session.clone();
-                    let path_clone = path.clone();
-                    tokio::task::spawn_blocking(move || run_hook(&path_clone, &session_clone))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("hook task join error: {e}"))??;
-                }
-                OnUsbRemoved::Shutdown => {
-                    tracing::error!(
-                        target: "tessera.monitord",
-                        session_id = %session.session_id,
-                        "ALERT: powering off due to usb removal"
-                    );
-                    actions.power_off().await?;
+            run_session_ending_action(actions, &session, action).await
+        }
+        ActionRequest::HandleSessionExpired { session, action } => {
+            // Distinct diagnostic so operators can tell a time-bound expiry
+            // apart from a physical token removal in the audit trail; the
+            // enforcement that follows is identical.
+            tracing::warn!(
+                target: "tessera.monitord",
+                session_id = %session.session_id,
+                pam_user = %session.pam_user,
+                pam_service = %session.pam_service,
+                "bounded role-session TTL expired; enforcing configured session-ending action"
+            );
+            run_session_ending_action(actions, &session, action).await
+        }
+    }
+}
+
+/// Execute the configured session-ending `action` against `session`.
+///
+/// Shared by USB-removal and TTL-expiry dispatch: both revoke an
+/// already-authorised session and must fail closed the same way — a
+/// Lock/Logout that cannot reach logind escalates to a reboot rather than
+/// silently leaving the engineer logged in.
+async fn run_session_ending_action(
+    actions: &Arc<dyn LogindActionsTrait>,
+    session: &crate::registry::ActiveSession,
+    action: OnUsbRemoved,
+) -> anyhow::Result<()> {
+    let logind_id = session.target.logind_id().map(str::to_string);
+    match action {
+        OnUsbRemoved::Lock => match logind_id {
+            Some(id) => {
+                if let Err(e) = actions.lock_session(&id).await {
+                    fail_closed_logind_error(actions, "Lock", session, &e).await?;
                 }
             }
+            None => fail_closed_no_logind_id(actions, "Lock", session).await?,
+        },
+        OnUsbRemoved::Logout => match logind_id {
+            Some(id) => {
+                if let Err(e) = actions.terminate_session(&id).await {
+                    fail_closed_logind_error(actions, "Logout", session, &e).await?;
+                }
+            }
+            None => fail_closed_no_logind_id(actions, "Logout", session).await?,
+        },
+        OnUsbRemoved::Hook { path } => {
+            let session_clone = session.clone();
+            let path_clone = path.clone();
+            tokio::task::spawn_blocking(move || run_hook(&path_clone, &session_clone))
+                .await
+                .map_err(|e| anyhow::anyhow!("hook task join error: {e}"))??;
+        }
+        OnUsbRemoved::Shutdown => {
+            tracing::error!(
+                target: "tessera.monitord",
+                session_id = %session.session_id,
+                "ALERT: powering off to revoke access"
+            );
+            actions.power_off().await?;
         }
     }
     Ok(())
@@ -102,6 +137,36 @@ async fn fail_closed_no_logind_id(
          ensure pam_systemd.so precedes pam_tessera.so in the session phase of /etc/pam.d/<{service}> \
          (see docs/ru/install.md §10)",
         service = session.pam_service,
+    );
+    actions.reboot().await
+}
+
+/// Fail closed when a Lock/Logout call reached logind (the session had a
+/// `LogindSession` target) but the call itself returned an error — logind
+/// unreachable, the D-Bus method failed, or the session id was already gone.
+///
+/// Dropping that error would leave the engineer authenticated with the token
+/// unplugged or the bounded TTL already expired: exactly the access the
+/// USB-removal / TTL-expiry policy exists to revoke. Rather than log-and-forget
+/// (with no retry and no escalation), escalate to the same reboot fallback used
+/// when no logind id is available — the workstation is forced back to the login
+/// screen. This mirrors the contract of [`run_session_ending_action`]: a
+/// Lock/Logout that cannot be carried out must never leave the session active.
+async fn fail_closed_logind_error(
+    actions: &Arc<dyn LogindActionsTrait>,
+    action: &str,
+    session: &crate::registry::ActiveSession,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    tracing::error!(
+        target: "tessera.monitord",
+        action,
+        session_id = %session.session_id,
+        target = ?session.target,
+        pam_user = %session.pam_user,
+        pam_service = %session.pam_service,
+        error = %error,
+        "ALERT: session-ending {action} reached logind but failed; failing closed with reboot"
     );
     actions.reboot().await
 }

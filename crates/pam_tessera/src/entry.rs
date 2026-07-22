@@ -434,8 +434,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         let pam_target = parse_pam_tty(pam_tty_value.as_deref());
 
         // 3. Resolve host identity (before wire so we fail fast on misconfig).
-        let (host_id_source, _host_id_raw, host_id_hash) = match crate::resolve_host_identity(&cfg)
-        {
+        let (host_id_source, host_id_raw, host_id_hash) = match crate::resolve_host_identity(&cfg) {
             Ok(t) => t,
             Err(err) => {
                 tracing::error!(target: "tessera.auth", error = %err, "host identity unresolved");
@@ -444,7 +443,9 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         };
 
         // 4. Wire trust verifier + monitor (consumes cfg; we keep wired.cfg).
-        let wired = match crate::di::wire(cfg) {
+        // The resolved raw host id selects any per-host `[[trust_override]]`
+        // that narrows the accepted trust anchors for this device.
+        let wired = match crate::di::wire(cfg, &host_id_raw) {
             Ok(w) => w,
             Err(err) => {
                 tracing::error!(target: "tessera.auth", error = %err, "wiring failed");

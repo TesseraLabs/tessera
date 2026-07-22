@@ -68,6 +68,7 @@ fn seeded_session(uid: u32, ski: &str) -> ActiveSession {
         engineer_ski: ski.into(),
         engineer_cert_sha256: "1234".into(),
         uid,
+        session_expiry: None,
     }
 }
 

@@ -7,8 +7,8 @@
 //! * no redirects — any non-200 status is a hard error;
 //! * `Content-Length` framing only — `Transfer-Encoding` (chunked or
 //!   otherwise) is rejected with a typed error;
-//! * a single overall deadline covers connect + TLS handshake + write +
-//!   read (`ocsp_timeout_seconds`);
+//! * a single overall deadline covers hostname resolution + connect + TLS
+//!   handshake + write + read (`ocsp_timeout_seconds`);
 //! * the response body is capped at [`MAX_RESPONSE_BYTES`].
 //!
 //! `https://` responders are reached through `openssl::ssl::SslConnector`
@@ -20,7 +20,9 @@
 use crate::error::TrustError;
 use openssl::ssl::{SslConnector, SslMethod, SslStream};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Hard cap on the accepted OCSP response body size.
@@ -232,14 +234,71 @@ fn map_io(e: &std::io::Error, what: &str) -> TrustError {
     }
 }
 
-fn connect(url: &OcspUrl, deadline: Instant) -> Result<TcpStream, TrustError> {
-    // Note: std offers no timeout control over DNS resolution itself; the
-    // connect/read/write budget starts applying from the first socket op.
-    let addrs = (url.host.as_str(), url.port)
-        .to_socket_addrs()
-        .map_err(|e| TrustError::OcspTransport {
-            reason: format!("resolve {}:{}: {e}", url.host, url.port),
-        })?;
+/// Resolves an OCSP responder host name to candidate socket addresses.
+///
+/// Abstracted behind a trait for two reasons: the platform resolver
+/// (`getaddrinfo` via [`ToSocketAddrs`]) is a blocking syscall with no
+/// caller-controlled timeout, so it is driven on a throwaway thread and
+/// bounded by a wall-clock deadline; and tests can inject a resolver that
+/// models a wedged NSS/DNS backend (one that never returns) to prove the
+/// deadline still fires.
+trait HostResolver: Send + Sync {
+    /// Resolves `host:port`, blocking until the platform resolver answers.
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>>;
+}
+
+/// Host resolver backed by the platform's blocking name service.
+struct SystemResolver;
+
+impl HostResolver for SystemResolver {
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        (host, port).to_socket_addrs().map(Iterator::collect)
+    }
+}
+
+/// Resolves `url`'s host to socket addresses without exceeding `deadline`.
+///
+/// The blocking resolver call runs on a detached thread and its result is
+/// awaited on a channel bounded by the remaining OCSP budget. If the
+/// deadline elapses first the resolution is abandoned — the late thread can
+/// finish and drop its result into a receiver that no longer exists — so a
+/// stuck resolver cannot pin the caller past `ocsp_timeout_seconds`.
+fn resolve_within_budget(
+    resolver: &Arc<dyn HostResolver>,
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, TrustError> {
+    let budget = remaining(deadline)?;
+    let (tx, rx) = mpsc::channel();
+    let worker_resolver = Arc::clone(resolver);
+    let worker_host = host.to_string();
+    std::thread::spawn(move || {
+        let result = worker_resolver.resolve(&worker_host, port);
+        // A send failure means the deadline already elapsed and the receiver
+        // was dropped; the stale result is discarded on purpose.
+        drop(tx.send(result));
+    });
+    match rx.recv_timeout(budget) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(TrustError::OcspTransport {
+            reason: format!("resolve {host}:{port}: {e}"),
+        }),
+        Err(RecvTimeoutError::Timeout) => Err(TrustError::OcspTimeout),
+        Err(RecvTimeoutError::Disconnected) => Err(TrustError::OcspTransport {
+            reason: format!("resolver for {host}:{port} exited without a result"),
+        }),
+    }
+}
+
+fn connect(
+    url: &OcspUrl,
+    deadline: Instant,
+    resolver: &Arc<dyn HostResolver>,
+) -> Result<TcpStream, TrustError> {
+    // Name resolution shares the single OCSP deadline with the socket
+    // operations below: a wedged resolver cannot outlast the overall budget.
+    let addrs = resolve_within_budget(resolver, &url.host, url.port, deadline)?;
     let mut last: Option<TrustError> = None;
     for addr in addrs {
         let budget = remaining(deadline)?;
@@ -262,8 +321,12 @@ fn set_timeouts(tcp: &TcpStream, deadline: Instant) -> Result<(), TrustError> {
     Ok(())
 }
 
-fn open_transport(url: &OcspUrl, deadline: Instant) -> Result<Transport, TrustError> {
-    let tcp = connect(url, deadline)?;
+fn open_transport(
+    url: &OcspUrl,
+    deadline: Instant,
+    resolver: &Arc<dyn HostResolver>,
+) -> Result<Transport, TrustError> {
+    let tcp = connect(url, deadline, resolver)?;
     set_timeouts(&tcp, deadline)?;
     match url.scheme {
         OcspScheme::Http => Ok(Transport::Plain(tcp)),
@@ -411,14 +474,17 @@ fn read_body(
 /// Performs the single OCSP POST exchange and returns the raw response
 /// body (a DER-encoded `OCSPResponse`, parsed/verified by the caller).
 ///
-/// `timeout` is the *total* deadline across connect, TLS handshake, write
-/// and read, per `ocsp_timeout_seconds`.
+/// `timeout` is the *total* deadline across hostname resolution, connect,
+/// TLS handshake, write and read, per `ocsp_timeout_seconds`. Resolution is
+/// included so a stuck platform resolver cannot block the caller past the
+/// configured budget.
 ///
 /// # Errors
 ///
-/// * [`TrustError::OcspTimeout`] when the overall deadline elapses.
-/// * [`TrustError::OcspTransport`] on connect/IO failures and premature
-///   connection close.
+/// * [`TrustError::OcspTimeout`] when the overall deadline elapses, whether
+///   during name resolution or a later socket operation.
+/// * [`TrustError::OcspTransport`] on resolve/connect/IO failures and
+///   premature connection close.
 /// * [`TrustError::OcspHttp`] on any HTTP-level refusal: status != 200,
 ///   `Transfer-Encoding` present, missing or oversized `Content-Length`,
 ///   malformed framing.
@@ -427,8 +493,22 @@ pub fn post_ocsp_request(
     request_der: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, TrustError> {
+    let resolver: Arc<dyn HostResolver> = Arc::new(SystemResolver);
+    post_ocsp_request_with(url, request_der, timeout, &resolver)
+}
+
+/// Runs the OCSP exchange against an injected [`HostResolver`].
+///
+/// Splitting the resolver out lets tests substitute a resolver that never
+/// returns, proving the total-budget deadline still bounds the call.
+fn post_ocsp_request_with(
+    url: &OcspUrl,
+    request_der: &[u8],
+    timeout: Duration,
+    resolver: &Arc<dyn HostResolver>,
+) -> Result<Vec<u8>, TrustError> {
     let deadline = Instant::now() + timeout;
-    let mut transport = open_transport(url, deadline)?;
+    let mut transport = open_transport(url, deadline, resolver)?;
 
     let head = format!(
         "POST {} HTTP/1.1\r\n\
@@ -489,11 +569,15 @@ mod tests {
     #![allow(clippy::panic)]
     #![allow(clippy::indexing_slicing)]
 
-    use super::{post_ocsp_request, OcspScheme, OcspUrl, MAX_RESPONSE_BYTES};
+    use super::{
+        post_ocsp_request, post_ocsp_request_with, HostResolver, OcspScheme, OcspUrl,
+        MAX_RESPONSE_BYTES,
+    };
     use crate::error::TrustError;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     // ----------------------------------------------------------------
     // URL parser
@@ -693,6 +777,68 @@ mod tests {
             TrustError::OcspHttp { reason } => assert!(reason.contains("Content-Length")),
             other => panic!("expected OcspHttp, got {other:?}"),
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Hostname resolution shares the total OCSP budget
+    // ----------------------------------------------------------------
+
+    /// Models a wedged NSS/DNS backend: the resolve call never returns.
+    struct WedgedResolver;
+
+    impl HostResolver for WedgedResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            // Block indefinitely; the loop guards against spurious wakeups.
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    /// Returns a fixed address set immediately, bypassing the platform
+    /// resolver so the success path can target the mock server.
+    struct FixedResolver(Vec<SocketAddr>);
+
+    impl HostResolver for FixedResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn wedged_resolver_times_out_within_budget() {
+        let url = OcspUrl::parse("http://ocsp.example.org/").unwrap();
+        let resolver: Arc<dyn HostResolver> = Arc::new(WedgedResolver);
+        let start = Instant::now();
+        let err = post_ocsp_request_with(&url, b"request", Duration::from_millis(200), &resolver)
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(matches!(err, TrustError::OcspTimeout), "got {err:?}");
+        // The call must abort near the 200 ms budget rather than blocking on
+        // the platform resolver's own multi-second retry schedule.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "resolution should abort near the budget, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn injected_resolver_success_path_returns_body() {
+        let body = b"fake-der-bytes";
+        let addr = spawn_server(move |mut s| {
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+            s.write_all(body).unwrap();
+        });
+        // The host name is irrelevant; the injected resolver maps it to the
+        // mock server, then the normal connect/write/read flow runs.
+        let url = OcspUrl::parse("http://ocsp.example.org/").unwrap();
+        let resolver: Arc<dyn HostResolver> = Arc::new(FixedResolver(vec![addr]));
+        let got = post_ocsp_request_with(&url, b"request", TIMEOUT, &resolver).unwrap();
+        assert_eq!(got, body);
     }
 
     #[test]

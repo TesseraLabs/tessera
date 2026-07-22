@@ -34,6 +34,7 @@ fn session(serial: &str) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     }
 }
 

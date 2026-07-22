@@ -378,6 +378,42 @@ pub enum TrustError {
         /// Entry.
         entry: String,
     },
+    /// A `[[trust_override]]` entry lists no anchors. An override replaces the
+    /// global trust anchors for the hosts it names; an empty replacement would
+    /// either silently widen trust back to the global set or leave the verifier
+    /// with no anchors at all. Both defeat the purpose of narrowing trust, so
+    /// the entry is rejected at configuration time.
+    #[error(
+        "trust_override.anchors must not be empty: an override that narrows trust \
+         to no anchor cannot be satisfied; give it at least one anchor or remove it"
+    )]
+    TrustOverrideAnchorsEmpty,
+    /// Two `[[trust_override]]` entries both claim the same host id. The
+    /// applicable anchor set would be ambiguous for that host at runtime, so
+    /// the overlap is rejected at configuration time rather than resolved by
+    /// silently picking one entry.
+    #[error(
+        "trust_override.when_host_id_in overlap: host id {host_id:?} appears in more \
+         than one [[trust_override]] entry; each host may match at most one override"
+    )]
+    TrustOverrideHostIdOverlap {
+        /// The normalized host id claimed by more than one override.
+        host_id: String,
+    },
+    /// A `[[trust_override]]` entry lists a host id that is empty once
+    /// normalized (e.g. only whitespace or colons). The runtime host-id
+    /// resolver rejects an empty normalized id, so such a candidate can never
+    /// match a real host: the override would silently never fire and the host
+    /// would fall back to the broader global anchors — the opposite of the
+    /// narrowing the operator intended. Reject it at load time.
+    #[error(
+        "trust_override.when_host_id_in contains {raw:?}, which is empty after \
+         normalization and can never match a host; remove it or give a real host id"
+    )]
+    TrustOverrideHostIdEmpty {
+        /// The offending raw host id as written in the config.
+        raw: String,
+    },
 }
 
 /// IPC errors.

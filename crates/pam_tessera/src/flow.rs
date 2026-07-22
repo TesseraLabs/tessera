@@ -152,6 +152,15 @@ pub enum FlowError {
     /// message (envelope structure is not leaked pre-auth).
     #[error("delegation denied")]
     DelegationDenied(#[source] tessera_core::trust::DelegationError),
+
+    /// Strict monitoring was configured but the session could not be
+    /// registered with monitord. In permissive mode the `FailModeWrapper`
+    /// converts transport errors to success, so this variant is only reached
+    /// under `monitor_fail_mode = "strict"`: continuous-presence enforcement
+    /// (the lock/logout on token or USB removal) cannot be guaranteed for a
+    /// session the daemon never learned about, so authentication fails closed.
+    #[error("monitor session registration failed (strict fail mode): {0}")]
+    MonitorRegistration(#[source] tessera_core::error::IpcError),
 }
 
 impl From<AcquireError> for FlowError {
@@ -196,7 +205,7 @@ impl FlowError {
     /// | `Conv` / `Pkcs11Acquire(Conv)` / `Pkcs11(PinIncorrect)`| `PAM_AUTH_ERR` (7)         |
     /// | `CertScope`                                            | `PAM_AUTH_ERR` (7)         |
     /// | `Pkcs12` / `Crypto` / `Trust`                          | `PAM_PERM_DENIED` (6)      |
-    /// | `Mapping`                                              | `PAM_PERM_DENIED` (6)      |
+    /// | `Mapping` / `MonitorRegistration`                      | `PAM_PERM_DENIED` (6)      |
     /// | other `Pkcs11(...)` / `Pkcs11Acquire(Pkcs11)`          | `PAM_AUTH_ERR` (7)         |
     /// | `Internal`                                             | `PAM_SYSTEM_ERR` (4)       |
     #[must_use]
@@ -222,15 +231,18 @@ impl FlowError {
             // PAM_MAXTRIES — exhausted PIN-retry budget on either path.
             Self::MaxTries
             | Self::Pkcs11Acquire(P11Acquire::PinLocked | P11Acquire::MaxAttemptsExceeded) => 8,
-            // PAM_PERM_DENIED — cert chain rejected the auth, or the
-            // requested role was denied (not found / not covered / needs an
-            // absent backend) under `[roles].enforce = require`.
+            // PAM_PERM_DENIED — cert chain rejected the auth, the requested
+            // role was denied (not found / not covered / needs an absent
+            // backend) under `[roles].enforce = require`, or a strict-mode
+            // monitord registration failure denied a session that could not
+            // be placed under continuous-presence enforcement.
             Self::Pkcs12(_)
             | Self::Crypto(_)
             | Self::Trust(_)
             | Self::Mapping(_)
             | Self::RoleDenied(_)
-            | Self::DelegationDenied(_) => 6,
+            | Self::DelegationDenied(_)
+            | Self::MonitorRegistration(_) => 6,
             // PAM_SYSTEM_ERR — internal invariants.
             Self::Internal(_) => 4,
             // PAM_AUTH_ERR — every other authentication-side failure
@@ -829,9 +841,11 @@ where
 
     // Step 11c — notify monitord with the FULL post-auth payload (USB
     // serial from the discovered device, cert CN/serial from the
-    // validated leaf, target from PAM_TTY). Failure stays non-fatal:
-    // the auth itself already succeeded, and the FailModeWrapper around
-    // the production client decides whether to swallow IPC errors.
+    // validated leaf, target from PAM_TTY). Under strict fail mode a
+    // registration failure denies the login: a cert-authenticated session
+    // monitord never recorded can never have its token/USB removal enforced.
+    // Under permissive mode the FailModeWrapper has already converted the
+    // transport error to Ok, so this branch fires only in strict mode.
     let cert_cn_str = auth_ctx.cert_cn.as_deref().unwrap_or("");
     let cert_serial_str = auth_ctx.cert_serial.as_deref().unwrap_or("");
     let extras = session_open_extras(&loaded.end_entity, pam_user);
@@ -849,14 +863,16 @@ where
         uid: extras.uid,
         role: auth_ctx.role.as_ref().map(|r| r.role.as_str()),
         role_version: auth_ctx.role.as_ref().map(|r| r.role_version),
+        // Only role sessions carry a time-bound ceiling. The absolute expiry is
+        // clamped to the certificate's notAfter so the enforced deadline can
+        // never outlive the certificate.
+        session_expiry: session_expiry(
+            auth_ctx.role.as_ref(),
+            auth_ctx.authenticated_at,
+            auth_ctx.cert_not_after,
+        ),
     };
-    if let Err(e) = deps.monitor.open_session(&info) {
-        tracing::warn!(
-            target: "tessera.flow",
-            error = %e,
-            "monitor open_session failed (non-fatal)"
-        );
-    }
+    register_session_or_deny(deps.monitor, &info)?;
 
     tracing::info!(
         target: "tessera.flow",
@@ -1201,7 +1217,11 @@ where
 
     // Step 11c — notify monitord with the FULL post-auth payload. In
     // PKCS#11 mode the token serial occupies the `usb_serial` slot the
-    // daemon keys removal enforcement on.
+    // daemon keys removal enforcement on. Under strict fail mode a
+    // registration failure denies the login: without a recorded session the
+    // token's removal could never trigger the configured lock/logout. Under
+    // permissive mode the FailModeWrapper absorbs the transport error, so
+    // this branch fires only in strict mode.
     let cert_cn_str = auth_ctx.cert_cn.as_deref().unwrap_or("");
     let cert_serial_str = auth_ctx.cert_serial.as_deref().unwrap_or("");
     let extras = session_open_extras(&cert.certificate, pam_user);
@@ -1219,18 +1239,46 @@ where
         uid: extras.uid,
         role: auth_ctx.role.as_ref().map(|r| r.role.as_str()),
         role_version: auth_ctx.role.as_ref().map(|r| r.role_version),
+        // Only role sessions carry a time-bound ceiling. The absolute expiry is
+        // clamped to the certificate's notAfter so the enforced deadline can
+        // never outlive the certificate.
+        session_expiry: session_expiry(
+            auth_ctx.role.as_ref(),
+            auth_ctx.authenticated_at,
+            auth_ctx.cert_not_after,
+        ),
     };
-    if let Err(e) = deps.monitor.open_session(&info) {
-        tracing::warn!(
-            target: "tessera.flow",
-            error = %e,
-            "monitor open_session failed (non-fatal)"
-        );
-    }
+    register_session_or_deny(deps.monitor, &info)?;
 
     Ok(FlowOutcome {
         auth_ctx,
         mount: None,
+    })
+}
+
+/// Registers a freshly authenticated session with monitord, failing closed
+/// when the configured fail mode demands it.
+///
+/// `monitor` is already wrapped in a [`tessera_core::ipc::FailModeWrapper`]:
+/// in permissive mode that wrapper turns transport failures (connect / timeout
+/// / decode) into `Ok(())` before they reach this function, so the login is
+/// unaffected. A returned `Err` therefore means either the fail mode is strict
+/// or the error is one that changes the verdict regardless of mode (the device
+/// backing the session is gone, or the daemon rejected us). In every such case
+/// the session cannot be placed under continuous-presence enforcement — later
+/// token or USB removal could never trigger the configured lock/logout — so we
+/// deny rather than grant a session monitord never recorded.
+fn register_session_or_deny(
+    monitor: &dyn MonitorClient,
+    info: &OpenSessionInfo<'_>,
+) -> Result<(), FlowError> {
+    monitor.open_session(info).map_err(|e| {
+        tracing::warn!(
+            target: "tessera.flow",
+            error = %e,
+            "monitor open_session failed under strict fail mode; denying auth"
+        );
+        FlowError::MonitorRegistration(e)
     })
 }
 
@@ -1867,6 +1915,38 @@ fn cert_remaining_ttl(cert_not_after: Option<SystemTime>) -> Option<std::time::D
     )
 }
 
+/// Absolute wall-clock instant at which a bounded role session must end.
+///
+/// The deadline is the earliest of the role/default TTL measured from the
+/// authentication instant (`authenticated_at + role.ttl`) and the
+/// certificate's own `notAfter`. Anchoring the role/default component at
+/// `authenticated_at` and then clamping against `notAfter` is what guarantees
+/// the enforced deadline can never outlive the certificate — even though the
+/// daemon records its own `opened_at` a moment later and the role TTL was
+/// itself derived from a cert-remaining value sampled slightly earlier still.
+/// Because the daemon schedules termination directly against this absolute
+/// instant (no re-anchoring), the drift that a relative TTL would introduce is
+/// eliminated.
+///
+/// Returns `None` when the session has no role (hence no time ceiling). A role
+/// TTL so large that `authenticated_at + ttl` overflows the clock falls back to
+/// the certificate's `notAfter`, or to `None` when the certificate is
+/// non-expiring — never a panic.
+fn session_expiry(
+    role: Option<&tessera_core::role::SessionRolePayload>,
+    authenticated_at: SystemTime,
+    cert_not_after: Option<SystemTime>,
+) -> Option<SystemTime> {
+    let ttl = role?.ttl;
+    let role_deadline = authenticated_at.checked_add(ttl);
+    match (role_deadline, cert_not_after) {
+        (Some(rd), Some(na)) => Some(rd.min(na)),
+        (Some(rd), None) => Some(rd),
+        (None, Some(na)) => Some(na),
+        (None, None) => None,
+    }
+}
+
 fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
     let Some(cert) = tessera_core::pkcs12::try_extract_cert_without_pin(p12_bytes) else {
         return "Пароль .p12 неверный. Проверьте флешку и попробуйте ещё раз.".to_string();
@@ -1920,7 +2000,7 @@ mod tests {
     use std::time::Duration;
     use tessera_core::config::validated::{UserMapping, UserMatchCriteria};
     use tessera_core::host_identity::HostIdSourceKind;
-    use tessera_core::ipc::StubClient;
+    use tessera_core::ipc::{FailModeWrapper, MonitorFailMode, StubClient};
     use tessera_core::trust::openssl_verifier::{OpensslVerifier, OpensslVerifierConfig};
 
     /// Loads a fixture under `crates/tessera_core/tests/fixtures/`.
@@ -3261,8 +3341,239 @@ level = "info"
     }
 
     #[test]
+    fn session_expiry_never_exceeds_cert_not_after_under_delay() {
+        use tessera_core::role::{bounded_ttl, RoleId, SessionRolePayload};
+
+        // Reference instant at which cert-remaining is sampled (the earlier
+        // instant in the flow). The cert expires one hour later.
+        let ttl_sampled_at = SystemTime::now();
+        let not_after = ttl_sampled_at + Duration::from_secs(3600);
+
+        // The role TTL folds in the cert-remaining sampled at `ttl_sampled_at`
+        // together with a very large global default, so the certificate is the
+        // binding constraint (as it is for a short-lived cert).
+        let cert_ttl_at_sample = cert_remaining_ttl(Some(not_after));
+        let ttl = bounded_ttl(cert_ttl_at_sample, None, Duration::from_secs(100_000));
+        let payload = SessionRolePayload {
+            role: RoleId::new("serv").expect("valid role id"),
+            role_version: 1,
+            ttl,
+            mac_mask: None,
+        };
+
+        // `authenticated_at` lands LATER than the cert-ttl sample — the exact
+        // drift the fix must absorb. A naive `authenticated_at + ttl` would push
+        // the deadline past `not_after`; clamping must pin it to `not_after`.
+        let authenticated_at = ttl_sampled_at + Duration::from_secs(30);
+        let expiry = session_expiry(Some(&payload), authenticated_at, Some(not_after))
+            .expect("role session has an expiry");
+
+        assert!(
+            expiry <= not_after,
+            "enforced deadline {expiry:?} must not exceed cert notAfter {not_after:?}"
+        );
+        assert_eq!(
+            expiry, not_after,
+            "when the cert binds, the deadline must equal notAfter exactly"
+        );
+    }
+
+    #[test]
+    fn session_expiry_uses_role_deadline_when_shorter_than_cert() {
+        use tessera_core::role::{bounded_ttl, RoleId, SessionRolePayload};
+
+        // Cert valid for an hour, but the role/default TTL is only 10 minutes,
+        // so the role component binds and the deadline sits before notAfter.
+        let authenticated_at = SystemTime::now();
+        let not_after = authenticated_at + Duration::from_secs(3600);
+        let ttl = bounded_ttl(
+            cert_remaining_ttl(Some(not_after)),
+            Some(Duration::from_secs(600)),
+            Duration::from_secs(100_000),
+        );
+        let payload = SessionRolePayload {
+            role: RoleId::new("serv").expect("valid role id"),
+            role_version: 1,
+            ttl,
+            mac_mask: None,
+        };
+
+        let expiry = session_expiry(Some(&payload), authenticated_at, Some(not_after))
+            .expect("role session has an expiry");
+        assert_eq!(expiry, authenticated_at + Duration::from_secs(600));
+        assert!(expiry < not_after);
+    }
+
+    #[test]
+    fn session_expiry_is_none_without_role() {
+        let authenticated_at = SystemTime::now();
+        let not_after = authenticated_at + Duration::from_secs(3600);
+        assert_eq!(
+            session_expiry(None, authenticated_at, Some(not_after)),
+            None
+        );
+    }
+
+    #[test]
     fn role_denied_maps_to_perm_denied() {
         let err = FlowError::RoleDenied(tessera_core::role::RoleDenyReason::NotCovered);
         assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    }
+
+    // -----------------------------------------------------------------
+    // Strict monitor-registration fail-closed (continuous-presence
+    // enforcement).
+    //
+    // A cert-authenticated session that monitord never records is a
+    // session whose token / USB removal can never trigger the configured
+    // lock or logout. Under `monitor_fail_mode = "strict"` a registration
+    // failure must therefore deny the login; under `permissive` the
+    // `FailModeWrapper` absorbs transport errors and the login proceeds.
+    // -----------------------------------------------------------------
+
+    /// [`MonitorClient`] whose `open_session` always fails with a transport
+    /// error (`monitord unavailable`). That error is *not* one of the
+    /// verdict-changing kinds (`DeviceGone` / `Unauthorized`), so the
+    /// `FailModeWrapper` propagates it only in strict mode — exactly the
+    /// distinction under test. All other methods succeed.
+    struct FailingMonitor;
+
+    impl MonitorClient for FailingMonitor {
+        fn hello(&self) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+        fn open_session(
+            &self,
+            _info: &OpenSessionInfo<'_>,
+        ) -> Result<(), tessera_core::error::IpcError> {
+            Err(tessera_core::error::IpcError::Unavailable)
+        }
+        fn close_session(
+            &self,
+            _session_id: &str,
+            _reason: &str,
+        ) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+        fn ping(&self) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pkcs12_strict_monitor_failure_denies_auth() {
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let cfg = minimal_cfg();
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        // Strict fail mode: a monitord that cannot record the session must
+        // turn the otherwise-successful cert auth into a definitive denial.
+        let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Strict);
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+
+        let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let err = authenticate(deps, &io, "alice", "ssh", "sess-mon-strict".into(), |_| {
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .expect_err("strict monitor failure must deny auth");
+        assert!(
+            matches!(err, FlowError::MonitorRegistration(_)),
+            "got {err:?}"
+        );
+        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    }
+
+    #[test]
+    fn pkcs12_permissive_monitor_failure_succeeds() {
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let cfg = minimal_cfg();
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        // Permissive fail mode: the wrapper converts the transport error to
+        // Ok(()) before the flow ever sees it, so auth still succeeds.
+        let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Permissive);
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+
+        let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-mon-perm".into(), |_| {
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .expect("permissive monitor failure must not block auth");
+        assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
+    }
+
+    /// Minimal [`OpenSessionInfo`] for exercising the registration
+    /// chokepoint directly.
+    fn sample_open_session_info(session_id: &str) -> OpenSessionInfo<'_> {
+        OpenSessionInfo {
+            session_id,
+            pam_user: "alice",
+            pam_service: "ssh",
+            host_id_hash: "host-T-hash",
+            target: tessera_proto::SessionTarget::Unknown,
+            usb_serial: Some("TOKEN-SERIAL"),
+            cert_cn: "alice",
+            cert_serial: "00",
+            engineer_ski: "",
+            engineer_cert_sha256: "",
+            uid: 1000,
+            role: None,
+            role_version: None,
+            session_expiry: None,
+        }
+    }
+
+    #[test]
+    fn pkcs11_strict_monitor_registration_denies() {
+        // The PKCS#11 success path ends by registering the session with
+        // monitord through the same `register_session_or_deny` chokepoint the
+        // PKCS#12 path uses. A full `authenticate_pkcs11` cannot run without a
+        // live token (a `Pkcs11Session` is not synthesizable), so we drive that
+        // final registration step directly under strict fail mode.
+        let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Strict);
+        let info = sample_open_session_info("sess-p11-strict");
+        let err = register_session_or_deny(&monitor, &info)
+            .expect_err("strict monitor failure must deny the pkcs11 session");
+        assert!(
+            matches!(err, FlowError::MonitorRegistration(_)),
+            "got {err:?}"
+        );
+        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    }
+
+    #[test]
+    fn pkcs11_permissive_monitor_registration_absorbed() {
+        // Under permissive fail mode the wrapper absorbs the transport error,
+        // so the PKCS#11 registration step (and thus the login) succeeds.
+        let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Permissive);
+        let info = sample_open_session_info("sess-p11-perm");
+        register_session_or_deny(&monitor, &info)
+            .expect("permissive monitor failure must not block the pkcs11 session");
     }
 }

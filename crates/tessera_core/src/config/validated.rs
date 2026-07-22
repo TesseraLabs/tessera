@@ -611,11 +611,7 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             },
             monitor: validate_monitor(raw, &raw.monitor, raw.monitor_fail_mode)?,
             trust,
-            trust_overrides: raw
-                .trust_override
-                .iter()
-                .map(validate_trust_override)
-                .collect::<Result<Vec<_>, _>>()?,
+            trust_overrides: validate_trust_overrides(&raw.trust_override)?,
             host_identity,
             user_mappings,
             logging,
@@ -1343,11 +1339,63 @@ fn validate_pem(path: &PathBuf) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validate every `[[trust_override]]` entry and reject cross-entry ambiguity.
+///
+/// Each entry is validated in isolation by [`validate_trust_override`]. In
+/// addition, no host id may be claimed by more than one entry: a host that
+/// matched two overrides would have an ambiguous trust set at runtime. Because
+/// override matching normalizes host ids the same way the host-id hash is
+/// computed (see [`crate::host_identity::normalize_host_id`]), the overlap
+/// check compares normalized ids so that casing/spacing variants of the same
+/// host are caught here rather than colliding silently at authentication time.
+fn validate_trust_overrides(raw: &[RawTrustOverride]) -> Result<Vec<TrustOverride>, Error> {
+    let mut overrides = Vec::with_capacity(raw.len());
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    for entry in raw {
+        let validated = validate_trust_override(entry)?;
+        // Collect this entry's host ids in normalized form first so that
+        // redundant aliases within a single entry collapse quietly; only a
+        // clash with a *different* entry is an ambiguity worth rejecting.
+        let normalized: BTreeSet<String> = validated
+            .when_host_id_in
+            .iter()
+            .map(|h| crate::host_identity::normalize_host_id(h))
+            .collect();
+        for host in &normalized {
+            if claimed.contains(host) {
+                return Err(TrustError::TrustOverrideHostIdOverlap {
+                    host_id: host.clone(),
+                }
+                .into());
+            }
+        }
+        claimed.extend(normalized);
+        overrides.push(validated);
+    }
+    Ok(overrides)
+}
+
 fn validate_trust_override(raw: &RawTrustOverride) -> Result<TrustOverride, Error> {
     if raw.when_host_id_in.is_empty() {
         return Err(Error::ConfigInvalid {
             reason: "trust_override.when_host_id_in must be non-empty".to_string(),
         });
+    }
+    // A candidate that normalizes to the empty string (whitespace- or
+    // colon-only) can never match a host: the runtime resolver rejects an empty
+    // normalized id, so the override would silently never fire and the host
+    // would fall back to the broader global anchors. Reject it here to keep
+    // config validation consistent with the resolver.
+    for host in &raw.when_host_id_in {
+        if crate::host_identity::normalize_host_id(host).is_empty() {
+            return Err(TrustError::TrustOverrideHostIdEmpty { raw: host.clone() }.into());
+        }
+    }
+    // An override replaces the global anchors for the named hosts. An empty
+    // replacement anchor set cannot narrow trust — it would either fall back to
+    // global trust or yield an anchorless verifier — so reject it here.
+    if raw.anchors.is_empty() {
+        return Err(TrustError::TrustOverrideAnchorsEmpty.into());
     }
     for path in raw.anchors.iter().chain(raw.intermediates.iter()) {
         validate_pem(path)?;
@@ -2115,6 +2163,102 @@ mod tests {
     fn roles_rejects_unknown_field() {
         let err = toml::from_str::<RawRoles>("enforce = \"warn\"\nbogus = 1\n").unwrap_err();
         assert!(err.to_string().contains("bogus") || err.to_string().contains("unknown"));
+    }
+
+    fn fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    #[test]
+    fn trust_override_empty_anchors_rejected() {
+        // An override replaces the global anchors for the named hosts. An empty
+        // anchor list would either silently widen trust back to the global set
+        // or produce an anchorless verifier that accepts nothing; either way it
+        // is a misconfiguration and must be rejected at load time.
+        let raw = RawTrustOverride {
+            when_host_id_in: vec!["ws-001.example.org".to_string()],
+            anchors: vec![],
+            intermediates: vec![],
+        };
+        let err = validate_trust_override(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::Trust(TrustError::TrustOverrideAnchorsEmpty)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trust_override_whitespace_or_colon_only_host_id_rejected() {
+        // A host id that normalizes to the empty string (here colon+space)
+        // could never match a real host at runtime, so the override would
+        // silently never fire and the host would fall back to the broader
+        // global anchors. That is the opposite of the operator's narrowing
+        // intent, so it must be rejected at load time.
+        let anchor = fixtures_dir().join("ca.pem");
+        let raw = RawTrustOverride {
+            when_host_id_in: vec![": ".to_string()],
+            anchors: vec![anchor],
+            intermediates: vec![],
+        };
+        let err = validate_trust_override(&raw).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Trust(TrustError::TrustOverrideHostIdEmpty { .. })
+            ),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trust_override_overlapping_host_ids_rejected() {
+        // Two overrides that both claim the same (normalized) host id make the
+        // applicable trust set ambiguous at runtime. Reject the ambiguity at
+        // configuration time rather than pick one silently.
+        let anchor = fixtures_dir().join("ca.pem");
+        let anchor_site = fixtures_dir().join("ca_site.pem");
+        let overrides = vec![
+            RawTrustOverride {
+                when_host_id_in: vec!["WS-001.example.org".to_string()],
+                anchors: vec![anchor.clone()],
+                intermediates: vec![],
+            },
+            // Same host, different casing/spacing — collapses to the same
+            // normalized id and must be detected as an overlap.
+            RawTrustOverride {
+                when_host_id_in: vec![" ws-001.example.org ".to_string()],
+                anchors: vec![anchor_site],
+                intermediates: vec![],
+            },
+        ];
+        let err = validate_trust_overrides(&overrides).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Trust(TrustError::TrustOverrideHostIdOverlap { .. })
+            ),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trust_override_distinct_host_ids_accepted() {
+        let anchor = fixtures_dir().join("ca.pem");
+        let anchor_site = fixtures_dir().join("ca_site.pem");
+        let overrides = vec![
+            RawTrustOverride {
+                when_host_id_in: vec!["ws-001.example.org".to_string()],
+                anchors: vec![anchor],
+                intermediates: vec![],
+            },
+            RawTrustOverride {
+                when_host_id_in: vec!["ws-002.example.org".to_string()],
+                anchors: vec![anchor_site],
+                intermediates: vec![],
+            },
+        ];
+        let parsed = validate_trust_overrides(&overrides).expect("distinct hosts ok");
+        assert_eq!(parsed.len(), 2);
     }
 
     #[test]

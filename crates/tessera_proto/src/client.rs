@@ -58,6 +58,22 @@ pub struct SessionOpenPayload {
     /// when no role was selected. Optional NDJSON field; see [`Self::role`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_version: Option<u32>,
+    /// Absolute wall-clock instant at which a bounded role session must end,
+    /// as Unix seconds. The earliest of `authenticated_at + role.max_ttl`,
+    /// `authenticated_at + global default`, and the certificate's `notAfter`.
+    /// `None` when no role/TTL applies. Additive optional field within
+    /// `PROTOCOL_VERSION` 2 — old frames deserialize to `None`.
+    ///
+    /// Sending an absolute deadline (rather than a relative TTL the daemon
+    /// re-anchors at its own `opened_at`) guarantees the enforced deadline can
+    /// never drift past the certificate's `notAfter`: the daemon schedules
+    /// termination directly against this instant.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::system_time_serde::option"
+    )]
+    pub session_expiry: Option<SystemTime>,
 }
 
 /// Client message.
@@ -116,6 +132,19 @@ pub enum ClientMessage {
         /// field; see `role`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role_version: Option<u32>,
+        /// Absolute wall-clock instant (Unix seconds) at which a bounded role
+        /// session must end — the earliest of `authenticated_at + role.max_ttl`,
+        /// `authenticated_at + global default`, and the certificate's
+        /// `notAfter`. `None` when no role/TTL applies. Additive optional field
+        /// within `PROTOCOL_VERSION` 2 — old frames deserialize to `None`. The
+        /// daemon schedules termination directly against this instant, so the
+        /// deadline can never drift past the certificate's `notAfter`.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::system_time_serde::option"
+        )]
+        session_expiry: Option<SystemTime>,
     },
     /// Look up the active session for a given Unix uid.
     ///

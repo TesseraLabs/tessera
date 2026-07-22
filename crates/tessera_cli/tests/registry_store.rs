@@ -27,6 +27,7 @@ fn s(i: u128) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     }
 }
 
@@ -39,6 +40,30 @@ fn persist_then_load_is_identical() {
     store.persist(&snapshot).expect("persist");
     let loaded = store.load().expect("load");
     assert_eq!(loaded.len(), 2);
+}
+
+#[test]
+fn session_expiry_round_trips_through_store() {
+    // The scheduled-termination deadline must survive a daemon restart, so
+    // the persisted registry has to carry `session_expiry` verbatim.
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("sessions.json");
+    let store = RegistryStore::new(path);
+    let deadline = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234);
+    let mut with_ttl = s(7);
+    with_ttl.session_expiry = Some(deadline);
+    store.persist(&[with_ttl.clone(), s(8)]).expect("persist");
+    let loaded = store.load().expect("load");
+    let restored = loaded
+        .iter()
+        .find(|r| r.session_id == with_ttl.session_id)
+        .expect("session present");
+    assert_eq!(restored.session_expiry, Some(deadline));
+    let plain = loaded
+        .iter()
+        .find(|r| r.session_id == Uuid::from_u128(8))
+        .expect("session present");
+    assert_eq!(plain.session_expiry, None);
 }
 
 #[test]

@@ -119,6 +119,7 @@ impl MonitordClient {
             uid: payload.uid,
             role: payload.role.clone(),
             role_version: payload.role_version,
+            session_expiry: payload.session_expiry,
         };
         self.send(&msg)?;
         match self.recv()? {
@@ -280,6 +281,7 @@ impl MonitorClient for ConnectPerCall {
             uid: info.uid,
             role: info.role.map(str::to_string),
             role_version: info.role_version,
+            session_expiry: info.session_expiry,
         };
         c.send_session_open(&payload)
     }

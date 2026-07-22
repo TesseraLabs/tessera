@@ -41,6 +41,7 @@ async fn full_session_lifecycle_via_real_socket() {
         uid: 0,
         role: None,
         role_version: None,
+        session_expiry: None,
     };
     // Drive a sync client from a worker thread.
     let payload_for_thread = payload.clone();

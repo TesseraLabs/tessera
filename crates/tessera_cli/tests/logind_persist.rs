@@ -38,6 +38,7 @@ fn session_with_logind_id(uuid_seed: u128, logind_id: &str) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     }
 }
 

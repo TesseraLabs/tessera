@@ -443,6 +443,7 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     };
     Ok(())
 }

@@ -12,8 +12,11 @@
 //! A later stage will introduce an `OnceLock<Wired>` cache with an explicit
 //! reload trigger (config change → `pam_sm_setcred` or signal).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+use tessera_core::config::validated::TrustOverride;
 use tessera_core::config::ValidatedConfig;
 use tessera_core::ipc::{ConnectPerCall, FailModeWrapper, MonitorClient, MonitorClientFactory};
 use tessera_core::trust::openssl_verifier::{OpensslVerifier, OpensslVerifierConfig};
@@ -54,6 +57,55 @@ pub enum WireError {
         /// Why parsing failed.
         reason: String,
     },
+    /// More than one `[[trust_override]]` matched the resolved host at wiring
+    /// time. Config validation rejects overlapping overrides, so reaching this
+    /// means the config changed underneath us; fail closed rather than silently
+    /// pick one anchor set and widen (or misdirect) issuance authority.
+    #[error("ambiguous trust override: host {host_id_hash_prefix} matched more than one entry")]
+    AmbiguousTrustOverride {
+        /// First 8 hex chars of the SHA-256 of the normalized host id, logged
+        /// in place of the raw host id to avoid leaking identity.
+        host_id_hash_prefix: String,
+    },
+}
+
+/// First 8 hex chars of the SHA-256 of a normalized host id.
+///
+/// Mirrors the host-id hashing used elsewhere (normalize, then SHA-256) so the
+/// prefix logged here lines up with the `host_id_hash_prefix` emitted by host
+/// identity resolution, without ever writing the raw host id to the log.
+fn host_id_hash_prefix(normalized_host: &str) -> String {
+    let digest = Sha256::digest(normalized_host.as_bytes());
+    hex::encode(digest).chars().take(8).collect()
+}
+
+/// Select the single `[[trust_override]]` applicable to `normalized_host`.
+///
+/// A host matches an override when its normalized id is a member of the
+/// override's `when_host_id_in` set (each candidate normalized the same way).
+/// At most one override may match: configuration validation already rejects
+/// overlapping entries, but a runtime collision is treated as fail-closed
+/// ([`WireError::AmbiguousTrustOverride`]) rather than resolved by guessing.
+fn select_trust_override<'a>(
+    overrides: &'a [TrustOverride],
+    normalized_host: &str,
+) -> Result<Option<&'a TrustOverride>, WireError> {
+    let mut selected: Option<&TrustOverride> = None;
+    for candidate in overrides {
+        let matched = candidate
+            .when_host_id_in
+            .iter()
+            .any(|h| tessera_core::host_identity::normalize_host_id(h) == normalized_host);
+        if matched {
+            if selected.is_some() {
+                return Err(WireError::AmbiguousTrustOverride {
+                    host_id_hash_prefix: host_id_hash_prefix(normalized_host),
+                });
+            }
+            selected = Some(candidate);
+        }
+    }
+    Ok(selected)
 }
 
 /// Decode the validated SPKI pin hex strings into raw 32-byte arrays.
@@ -82,19 +134,55 @@ fn decode_spki_pins(hex_entries: &[String]) -> Result<Vec<SpkiPin>, WireError> {
 
 /// Build a [`Wired`] collaborator bundle from a validated config.
 ///
+/// `host_id_raw` is the resolved raw host identity (before hashing). When it
+/// matches a `[[trust_override]]` entry, that entry's anchors and intermediates
+/// REPLACE the global `[trust]` anchors/intermediates for this host, narrowing
+/// (or retargeting) which CAs the device will accept. Every other trust
+/// parameter — revocation, pinning, signature allow-list, depth, clock skew —
+/// stays taken from the global `[trust]` section.
+///
 /// # Errors
 ///
-/// Returns [`WireError::Io`] when any configured PEM/CRL path is unreadable
-/// and [`WireError::Trust`] for verifier construction failures (e.g.
-/// `max_chain_depth == 0`).
-pub fn wire(cfg: ValidatedConfig) -> Result<Wired, WireError> {
-    let mut anchors: Vec<Certificate> = Vec::with_capacity(cfg.trust.anchors.len());
-    for path in &cfg.trust.anchors {
+/// Returns [`WireError::Io`] when any configured PEM/CRL path is unreadable,
+/// [`WireError::Trust`] for verifier construction failures (e.g.
+/// `max_chain_depth == 0`), and [`WireError::AmbiguousTrustOverride`] when the
+/// host matches more than one override (fail-closed).
+pub fn wire(cfg: ValidatedConfig, host_id_raw: &str) -> Result<Wired, WireError> {
+    // Resolve the applicable per-host trust override BEFORE constructing the
+    // verifier: an override replaces the anchor/intermediate set for this host,
+    // so a globally-trusted-but-excluded CA is rejected here rather than
+    // silently accepted. Matching normalizes the host id the same way the
+    // host-id hash is derived.
+    let normalized_host = tessera_core::host_identity::normalize_host_id(host_id_raw);
+    let selected_override = select_trust_override(&cfg.trust_overrides, &normalized_host)?;
+    let (anchor_paths, intermediate_paths): (&[PathBuf], &[PathBuf]) = match selected_override {
+        Some(over) => (&over.anchors, &over.intermediates),
+        None => (&cfg.trust.anchors, &cfg.trust.intermediates),
+    };
+    if selected_override.is_some() {
+        tracing::info!(
+            target: "tessera.trust",
+            host_id_hash_prefix = %host_id_hash_prefix(&normalized_host),
+            anchor_source = "override",
+            anchor_count = anchor_paths.len(),
+            "trust anchors selected from per-host [[trust_override]]"
+        );
+    } else {
+        tracing::info!(
+            target: "tessera.trust",
+            anchor_source = "base",
+            anchor_count = anchor_paths.len(),
+            "trust anchors selected from global [trust]"
+        );
+    }
+
+    let mut anchors: Vec<Certificate> = Vec::with_capacity(anchor_paths.len());
+    for path in anchor_paths {
         let bytes = std::fs::read(path)?;
         anchors.push(Certificate::from_pem(&bytes)?);
     }
-    let mut intermediates: Vec<Certificate> = Vec::with_capacity(cfg.trust.intermediates.len());
-    for path in &cfg.trust.intermediates {
+    let mut intermediates: Vec<Certificate> = Vec::with_capacity(intermediate_paths.len());
+    for path in intermediate_paths {
         let bytes = std::fs::read(path)?;
         intermediates.push(Certificate::from_pem(&bytes)?);
     }
@@ -264,7 +352,7 @@ syslog_facility = "auth"
         cfg.monitor.socket_path = tmp.path().join("nope.sock");
         cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
 
-        let wired = wire(cfg).unwrap();
+        let wired = wire(cfg, "test-host").unwrap();
         // In Strict + missing socket, `ping()` must surface
         // `IpcError::Unavailable`. StubClient would have returned Ok.
         let err = wired
@@ -285,11 +373,136 @@ syslog_facility = "auth"
         let mut cfg = cfg;
         cfg.monitor.socket_path = tmp.path().join("nope.sock");
         cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Permissive;
-        let wired = wire(cfg).unwrap();
+        let wired = wire(cfg, "test-host").unwrap();
         // Permissive mode swallows transport errors → Ok.
         wired
             .monitor
             .ping()
             .expect("permissive mode swallows IO errors");
+    }
+
+    /// Host id that the site override applies to.
+    const SITE_HOST_ID: &str = "ws-site.example.org";
+
+    /// Writes a config whose global trust anchors are the main root (`ca.pem`,
+    /// with `int.pem` as intermediate) and that additionally carries a
+    /// `[[trust_override]]` narrowing trust for [`SITE_HOST_ID`] to the
+    /// independent site root (`ca_site.pem`).
+    fn write_config_with_site_override(dir: &std::path::Path) -> std::path::PathBuf {
+        let anchor = fixtures_dir().join("ca.pem");
+        let intermediate = fixtures_dir().join("int.pem");
+        let site_anchor = fixtures_dir().join("ca_site.pem");
+
+        let cfg = dir.join("config.toml");
+        let mut f = std::fs::File::create(&cfg).unwrap();
+        let body = format!(
+            r#"
+crypto_backend = "openssl"
+mode = "pkcs11"
+pkcs11_module = "/bin/sh"
+usb_wait_seconds = 10
+on_usb_removed = "lock"
+suspend_grace_seconds = 5
+
+[monitor]
+socket_path = "/run/tessera/monitord.sock"
+timeout_ms = 1500
+fail_mode = "permissive"
+
+[trust]
+anchors = ["{anchor}"]
+intermediates = ["{intermediate}"]
+max_chain_depth = 5
+clock_skew_seconds = 60
+allowed_signature_algorithms = []
+
+[trust.revocation]
+mode = "none"
+crl_paths = []
+
+[trust.pinning]
+enabled = false
+allowed_root_spki_sha256 = []
+
+[[trust_override]]
+when_host_id_in = ["{site_host}"]
+anchors = ["{site_anchor}"]
+intermediates = []
+
+[host_identity]
+sources = ["machine_id"]
+fallback = "warn"
+
+[logging]
+level = "info"
+"#,
+            anchor = anchor.display(),
+            intermediate = intermediate.display(),
+            site_anchor = site_anchor.display(),
+            site_host = SITE_HOST_ID,
+        );
+        f.write_all(body.as_bytes()).unwrap();
+        cfg
+    }
+
+    fn read_cert(name: &str) -> Certificate {
+        let bytes = std::fs::read(fixtures_dir().join(name)).unwrap();
+        Certificate::from_pem(&bytes).unwrap()
+    }
+
+    /// Core proof for the per-host trust-override fix: on a host whose override
+    /// narrows trust to the site root, a leaf chaining only to the *global*
+    /// root is REJECTED, while a leaf chaining to the site root is ACCEPTED.
+    #[test]
+    fn wire_applies_matching_trust_override() {
+        use tessera_core::trust::openssl_verifier::Stage2TrustVerifier;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = write_config_with_site_override(tmp.path());
+        let cfg = load_validated_config(&cfg_path).unwrap();
+
+        let wired = wire(cfg, SITE_HOST_ID).unwrap();
+
+        // Leaf under the GLOBAL root must be refused: the override replaced the
+        // anchors with the site root, so no chain to a trusted anchor exists.
+        let global_leaf = read_cert("leaf_rsa.pem");
+        let global_intermediate = vec![read_cert("int.pem")];
+        let err = wired
+            .trust
+            .verify(&global_leaf, &global_intermediate)
+            .expect_err("global-CA leaf must be rejected under the site override");
+        assert!(
+            matches!(err, tessera_core::x509::TrustError::PathBuild(_)),
+            "expected PathBuild (no trusted anchor), got {err:?}"
+        );
+
+        // Leaf under the SITE root must be accepted.
+        let site_leaf = read_cert("leaf_site.pem");
+        let chain = wired
+            .trust
+            .verify(&site_leaf, &[])
+            .expect("site-CA leaf must be accepted under the site override");
+        assert_eq!(chain.anchor.subject_cn().unwrap(), "Site Test Root CA");
+    }
+
+    /// A host that matches no override keeps the global anchor set: a leaf under
+    /// the global root is accepted.
+    #[test]
+    fn wire_uses_global_anchors_when_no_override_matches() {
+        use tessera_core::trust::openssl_verifier::Stage2TrustVerifier;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = write_config_with_site_override(tmp.path());
+        let cfg = load_validated_config(&cfg_path).unwrap();
+
+        let wired = wire(cfg, "some-other-host.example.org").unwrap();
+
+        let global_leaf = read_cert("leaf_rsa.pem");
+        let global_intermediate = vec![read_cert("int.pem")];
+        let chain = wired
+            .trust
+            .verify(&global_leaf, &global_intermediate)
+            .expect("global-CA leaf must be accepted when no override matches");
+        assert_eq!(chain.anchor.subject_cn().unwrap(), "CertAuth Test Root CA");
     }
 }

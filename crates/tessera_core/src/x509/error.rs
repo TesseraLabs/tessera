@@ -74,6 +74,13 @@ pub enum TrustError {
     #[error("CRL signature invalid: {0}")]
     CrlSignatureInvalid(String),
 
+    /// No fresh, authentic, in-scope CRL covers this non-anchor certificate.
+    /// Treated as the same class of refusal as [`TrustError::Revoked`]: in pure
+    /// `crl` revocation mode an indeterminable status must fail closed, never
+    /// pass. Carries the certificate serial (lowercase hex).
+    #[error("no in-scope CRL covers certificate: serial={0}")]
+    CrlNotCovered(String),
+
     /// SPKI pin mismatch — the trust anchor's `SubjectPublicKeyInfo` SHA-256
     /// is not in the configured set of pinned hashes.
     #[error("SPKI pin mismatch")]

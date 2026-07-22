@@ -27,6 +27,7 @@ fn sample_open() -> ClientMessage {
         uid: 0,
         role: Some("serv".into()),
         role_version: Some(7),
+        session_expiry: Some(UNIX_EPOCH + Duration::from_secs(1_700_003_600)),
     }
 }
 

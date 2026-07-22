@@ -63,6 +63,7 @@ fn payload() -> SessionOpenPayload {
         uid: 0,
         role: None,
         role_version: None,
+        session_expiry: None,
     }
 }
 
@@ -118,6 +119,69 @@ fn session_open_roundtrip() {
     });
     let mut c = MonitordClient::connect(&path, Duration::from_secs(2)).expect("connect");
     c.send_session_open(&payload()).expect("send");
+}
+
+#[test]
+fn open_session_info_session_expiry_maps_to_wire_seconds() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tessera_core::ipc::{
+        client::{ConnectPerCall, MonitorClientFactory},
+        MonitorClient, OpenSessionInfo,
+    };
+
+    // Capture the SessionOpen frame the daemon would receive so we can assert
+    // the absolute `SystemTime` on `OpenSessionInfo` is carried verbatim (as
+    // Unix seconds) in `session_expiry` for the daemon to schedule termination.
+    let (frame_tx, frame_rx) = mpsc::channel::<String>();
+    let (path, _done) = spawn_mock(move |mut br, mut stream| {
+        let mut hello = String::new();
+        br.read_line(&mut hello).expect("read hello");
+        stream
+            .write_all(
+                &encode_message(&ServerMessage::HelloAck {
+                    server_version: "test".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                })
+                .expect("encode"),
+            )
+            .expect("write");
+        let mut open = String::new();
+        br.read_line(&mut open).expect("read open");
+        frame_tx.send(open).expect("forward frame");
+        stream
+            .write_all(&encode_message(&ServerMessage::Ack).expect("encode"))
+            .expect("write ack");
+    });
+
+    let factory = MonitorClientFactory::new(path, Duration::from_secs(2));
+    let client = ConnectPerCall::new(factory);
+    let info = OpenSessionInfo {
+        session_id: "00000000-0000-0000-0000-00000000002a",
+        pam_user: "alice",
+        pam_service: "sshd",
+        host_id_hash: "h",
+        target: SessionTarget::logind("c1"),
+        usb_serial: Some("AB"),
+        cert_cn: "cn",
+        cert_serial: "01",
+        engineer_ski: "",
+        engineer_cert_sha256: "",
+        uid: 1000,
+        role: Some("serv"),
+        role_version: Some(3),
+        session_expiry: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_900)),
+    };
+    client.open_session(&info).expect("open_session");
+
+    let frame = frame_rx.recv().expect("frame captured");
+    let parsed: ClientMessage = serde_json::from_str(frame.trim()).expect("parse");
+    match parsed {
+        ClientMessage::SessionOpen { session_expiry, .. } => assert_eq!(
+            session_expiry,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_900))
+        ),
+        other => panic!("expected SessionOpen, got {other:?}"),
+    }
 }
 
 #[test]

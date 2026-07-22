@@ -111,21 +111,15 @@ fn subject_mismatch_returns_perm_denied() {
 // new restrictive fixtures and are deferred.
 
 #[test]
-fn revoked_cert_returns_perm_denied() {
-    // The fixture pile ships `crl_valid.pem` which revokes `revoked_leaf`.
-    // We use the *same* CRL while presenting `leaf_rsa.p12`: by construction
-    // the CRL does not revoke leaf_rsa; instead we present `leaf_rsa.p12`
-    // and assert revocation logic is wired by also feeding a CRL that
-    // revokes by *its* serial.  Because we don't have a leaf_rsa-specific
-    // CRL fixture, validate by matching trust path: a revoked-leaf path
-    // would surface FlowError::Trust(TrustError::Revoked(_)).
-    //
-    // Instead, here we exercise the broader path: a CRL signed by a
-    // *foreign* CA — `crl_foreign.pem` — gets ignored by `CrlStore`, so the
-    // happy path still succeeds.  We then assert the inverse: when no CRL
-    // matches the cert, with `crl_strict=false` the flow accepts it.
+fn uncovered_leaf_fails_closed_perm_denied() {
+    // Pure-CRL revocation checking requires that every non-anchor certificate
+    // be covered by a fresh, authentic, in-scope CRL. Here we present
+    // `leaf_rsa.p12` while supplying only `crl_foreign.pem` — a CRL signed by
+    // a foreign CA that does not cover leaf_rsa's issuer. With no covering
+    // CRL for the leaf, the flow cannot prove the certificate is unrevoked
+    // and must fail closed rather than admit it.
     let _serial = leaf_serial("leaf_rsa.pem");
-    let outcome = run_flow_with(
+    let err = run_flow_with(
         "leaf_rsa.p12",
         vec![cn_mapping("alice", "alice")],
         (),
@@ -133,18 +127,13 @@ fn revoked_cert_returns_perm_denied() {
         "correct-pin",
         vec![read_fixture("crl_foreign.pem")],
         "host-T-hash",
-    );
-    // We assert success here precisely to document that a foreign CRL is
-    // *not* enough on its own to revoke; the real revoked-leaf fixture
-    // exists (revoked_leaf.pem) and a future fixture-generation pass
-    // should produce a matching CRL signed by `int.pem`'s issuer chain.
-    // For now we treat this case as "not yet wired" but kept here to
-    // surface the gap visibly.
+    )
+    .unwrap_err();
     assert!(
-        outcome.is_ok(),
-        "foreign CRL must not falsely revoke leaf_rsa: got {:?}",
-        outcome.err()
+        matches!(err, FlowError::Trust(TrustError::CrlNotCovered(_))),
+        "expected Trust(CrlNotCovered) for a leaf with no covering CRL, got {err:?}"
     );
+    assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
 }
 
 #[test]

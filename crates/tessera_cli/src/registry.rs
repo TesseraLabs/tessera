@@ -57,6 +57,18 @@ pub struct ActiveSession {
     /// key for `find_by_uid`. `0` means "v1 client / unknown".
     #[serde(default)]
     pub uid: u32,
+    /// Absolute wall-clock instant at which a bounded role session must end,
+    /// as computed by the PAM module at authentication time (earliest of the
+    /// role/default TTL measured from the authentication instant and the
+    /// certificate's `notAfter`). `None` for sessions with no role/TTL.
+    /// Persisted so the deadline survives a daemon restart and the scheduled
+    /// termination is re-armed against the same absolute instant on startup.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "tessera_proto::system_time_serde::option"
+    )]
+    pub session_expiry: Option<SystemTime>,
 }
 
 /// Two-level state held under one mutex: `by_id` is the primary store,

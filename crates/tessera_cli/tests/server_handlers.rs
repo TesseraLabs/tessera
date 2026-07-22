@@ -35,6 +35,7 @@ fn sample(usb: Option<&str>) -> SessionOpenPayload {
         uid: 0,
         role: None,
         role_version: None,
+        session_expiry: None,
     }
 }
 

@@ -230,19 +230,31 @@ impl CrlStore {
     }
 }
 
-/// Walks a leaf-first chain and rejects revoked certificates.
+/// Walks a leaf-first chain and rejects revoked or uncovered certificates.
 ///
-/// For each certificate in the chain (anchor included), this function checks
-/// every CRL in the store; if any applicable CRL lists the certificate's
-/// serial as lowercase hex, it returns [`TrustError::Revoked`].
+/// This is the pure `crl` revocation mode: revocation status must be
+/// determined offline, from configured CRLs alone, with no network fallback.
+/// Because there is no fallback, an indeterminable status is a refusal, not a
+/// pass. Every non-anchor certificate must receive a definite verdict from a
+/// fresh, authentic, in-scope CRL; a certificate that no such CRL covers
+/// returns [`TrustError::CrlNotCovered`]. This closes the fail-open gap where
+/// a revoked certificate chaining through an issuer whose CRL is absent (CA
+/// rotated, one issuer's CRL omitted while an unrelated CRL is present, …)
+/// would otherwise authenticate in the exact mode operators chose to enforce
+/// offline revocation.
 ///
+/// The anchor is the last chain element (self-signed) and is trusted by
+/// configuration, not by CRL, so it is never required to be covered — only
+/// `chain[0..len-1]` is checked, matching the OCSP path.
+///
+/// For each non-anchor certificate, every CRL whose issuer DN matches the
+/// certificate's issuer DN byte-for-byte (RFC 5280 § 6.3.3) is consulted.
 /// Before a CRL is allowed to vouch for (or revoke) a certificate, its
-/// signature is verified against the public key of the certificate's issuer
-/// found in `chain` (the chain is leaf-first and complete up to the
-/// self-signed anchor, so the issuer is always present in a verified chain).
-/// A CRL whose signature does not validate fails closed with
+/// signature is verified against the public key of its issuer found in
+/// `chain`; a CRL whose signature does not validate fails closed with
 /// [`TrustError::CrlSignatureInvalid`] — the same refusal class as a revoked
-/// certificate.
+/// certificate. A serial match returns [`TrustError::Revoked`]; otherwise the
+/// certificate is marked covered.
 ///
 /// Stale CRLs are treated according to [`RevocationConfig::crl_strict`].
 /// A CRL is stale when either condition holds:
@@ -252,18 +264,25 @@ impl CrlStore {
 ///   `now > thisUpdate + crl_max_age`.
 ///
 /// * `crl_strict = true`  — return [`TrustError::Crl`].
-/// * `crl_strict = false` — log a warning via `tracing` and skip the CRL.
+/// * `crl_strict = false` — log a warning via `tracing` and skip the CRL. A
+///   skipped CRL contributes no coverage, so a certificate left uncovered by
+///   the skip fails closed with [`TrustError::CrlNotCovered`].
 ///
 /// A CRL with no `nextUpdate` while `crl_max_age` is unset has no verifiable
 /// freshness; this is logged as a warning (target `tessera.crl`) and the CRL
 /// is still used — documented behaviour for operators that cannot set either
 /// bound.
 ///
-/// An empty store is treated as "no CRLs configured" and returns `Ok`.
+/// An empty store covers no certificate: a chain with any non-anchor
+/// certificate fails closed with [`TrustError::CrlNotCovered`]. (Config
+/// validation already rejects an empty CRL set for `crl` mode via
+/// `CrlPathsEmpty`; this is the last line of defence.)
 ///
 /// # Errors
 ///
-/// * [`TrustError::Revoked`] when a serial matches.
+/// * [`TrustError::Revoked`] when a serial matches an in-scope CRL.
+/// * [`TrustError::CrlNotCovered`] when a non-anchor certificate is covered by
+///   no fresh, authentic, in-scope CRL.
 /// * [`TrustError::CrlSignatureInvalid`] when an applicable CRL's signature
 ///   does not validate under its issuer's key (or the issuer certificate is
 ///   not present in `chain`, leaving the signature unverifiable).
@@ -274,55 +293,55 @@ pub fn check_revocation(
     cfg: &RevocationConfig,
     now: SystemTime,
 ) -> Result<(), TrustError> {
-    if store.is_empty() {
-        return Ok(());
-    }
-    for crl in store.iter() {
-        if crl_is_stale(crl, cfg, now) {
-            if cfg.crl_strict {
-                return Err(TrustError::Crl("CRL stale".into()));
+    // The anchor (last element) is self-signed and trusted by configuration,
+    // not by any CRL, so it is exempt from the coverage requirement.
+    let non_anchor = chain.len().saturating_sub(1);
+    for cert in chain.iter().take(non_anchor) {
+        let serial = cert.serial_hex().to_lowercase();
+        // RFC 5280 § 6.3.3: a CRL only covers certificates issued by the CRL
+        // issuer.  A certificate whose issuer DN cannot be DER-encoded cannot
+        // be proven in scope for any CRL, so it stays uncovered.
+        let Ok(cert_issuer_der) = cert.x509().issuer_name().to_der() else {
+            return Err(TrustError::CrlNotCovered(serial));
+        };
+        let mut covered = false;
+        for crl in store.iter() {
+            if crl.issuer_dn_der() != cert_issuer_der.as_slice() {
+                continue;
             }
-            tracing::warn!(target: "tessera.crl", "skipping stale CRL");
-            continue;
-        }
-        if crl.next_update.is_none() && cfg.crl_max_age.is_none() {
-            tracing::warn!(
-                target: "tessera.crl",
-                "CRL has no nextUpdate and crl_max_age_hours is not configured; \
-                 CRL freshness cannot be verified"
-            );
-        }
-        // Verify the CRL signature at most once per CRL per call.
-        let mut signature_checked = false;
-        for cert in chain {
-            // RFC 5280 § 6.3.3: a CRL only covers certificates issued by the
-            // CRL issuer.  Compare the certificate's issuer DN against the
-            // CRL's issuer DN byte-for-byte; on mismatch (or on a DER-encode
-            // failure that leaves the scope unprovable) this CRL is not
-            // applicable to this certificate.
-            match cert.x509().issuer_name().to_der() {
-                Ok(issuer_der) if issuer_der == crl.issuer_dn_der => {}
-                _ => continue,
+            if crl_is_stale(crl, cfg, now) {
+                if cfg.crl_strict {
+                    return Err(TrustError::Crl("CRL stale".into()));
+                }
+                tracing::warn!(target: "tessera.crl", "skipping stale CRL");
+                continue;
             }
-            if !signature_checked {
-                // Defensive; unreachable for chains produced by
-                // `build_chain` (every issuer up to the self-signed anchor
-                // is guaranteed present) — kept fail-closed in case callers
-                // pass partial chains.
-                let issuer = find_issuer(chain, &crl.issuer_dn_der).ok_or_else(|| {
-                    TrustError::CrlSignatureInvalid(
-                        "CRL issuer certificate not present in verified chain; \
-                         signature cannot be verified"
-                            .into(),
-                    )
-                })?;
-                crl.verify_signature_with_issuer(issuer, cfg.gost_engine_path.as_deref())?;
-                signature_checked = true;
+            if crl.next_update.is_none() && cfg.crl_max_age.is_none() {
+                tracing::warn!(
+                    target: "tessera.crl",
+                    "CRL has no nextUpdate and crl_max_age_hours is not configured; \
+                     CRL freshness cannot be verified"
+                );
             }
-            let serial = cert.serial_hex().to_lowercase();
-            if crl.revoked.iter().any(|s| s == &serial) {
+            // In scope and fresh: prove the CRL authentic before trusting its
+            // verdict.  The issuer is guaranteed present for chains produced by
+            // `build_chain`; a missing issuer fails closed rather than trusting
+            // an unverifiable CRL.
+            let issuer = find_issuer(chain, crl.issuer_dn_der()).ok_or_else(|| {
+                TrustError::CrlSignatureInvalid(
+                    "CRL issuer certificate not present in verified chain; \
+                     signature cannot be verified"
+                        .into(),
+                )
+            })?;
+            crl.verify_signature_with_issuer(issuer, cfg.gost_engine_path.as_deref())?;
+            if crl.revoked_serials().iter().any(|s| s == &serial) {
                 return Err(TrustError::Revoked(serial));
             }
+            covered = true;
+        }
+        if !covered {
+            return Err(TrustError::CrlNotCovered(serial));
         }
     }
     Ok(())
@@ -436,5 +455,102 @@ fn asn1_to_system(t: &Asn1TimeRef) -> Result<SystemTime, TrustError> {
     } else {
         let unsigned = u64::try_from(-secs).unwrap_or(0);
         Ok(UNIX_EPOCH - Duration::from_secs(unsigned))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::duration_suboptimal_units
+)]
+mod tests {
+    use super::*;
+
+    const LEAF: &[u8] = include_bytes!("../../tests/fixtures/leaf_rsa.pem");
+    const REVOKED: &[u8] = include_bytes!("../../tests/fixtures/revoked_leaf.pem");
+    const INT: &[u8] = include_bytes!("../../tests/fixtures/int.pem");
+    const CA: &[u8] = include_bytes!("../../tests/fixtures/ca.pem");
+    /// CRL signed by the intermediate; covers certificates issued by it (the
+    /// leaves). Lists mallory's serial `0x99` as revoked.
+    const CRL_VALID: &[u8] = include_bytes!("../../tests/fixtures/crl_valid.pem");
+    /// CRL signed by the root; covers certificates issued by the root (the
+    /// intermediate). Lists serial `0x99` (the revoked leaf) as revoked — a
+    /// serial that is NOT part of the `[leaf, intermediate, root]` chain under
+    /// test, so coverage still succeeds without a revocation hit.
+    const CRL_FOREIGN: &[u8] = include_bytes!("../../tests/fixtures/crl_foreign.pem");
+
+    /// Leaf-first chain `[leaf, intermediate, root]`; the root is the anchor.
+    fn chain(leaf: &[u8]) -> Vec<Certificate> {
+        vec![
+            Certificate::from_pem(leaf).unwrap(),
+            Certificate::from_pem(INT).unwrap(),
+            Certificate::from_pem(CA).unwrap(),
+        ]
+    }
+
+    fn strict_cfg() -> RevocationConfig {
+        RevocationConfig {
+            crl_strict: true,
+            ..RevocationConfig::default()
+        }
+    }
+
+    #[test]
+    fn uncovered_issuer_fails_closed() {
+        // Only the leaf's issuer (the intermediate) has a CRL; the
+        // intermediate's issuer (the root) has none, so the intermediate is
+        // covered by nothing and pure crl mode must refuse the chain.
+        let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
+        let err = check_revocation(&chain(LEAF), &store, &strict_cfg(), SystemTime::now())
+            .expect_err("uncovered intermediate must fail closed");
+        assert!(matches!(err, TrustError::CrlNotCovered(_)), "{err:?}");
+    }
+
+    #[test]
+    fn uncovered_intermediate_reports_its_serial() {
+        // The refusal names the certificate that lacked coverage — the
+        // intermediate, not the (covered) leaf.
+        let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
+        let int_serial = Certificate::from_pem(INT)
+            .unwrap()
+            .serial_hex()
+            .to_lowercase();
+        let err = check_revocation(&chain(LEAF), &store, &strict_cfg(), SystemTime::now())
+            .expect_err("uncovered intermediate must fail closed");
+        match err {
+            TrustError::CrlNotCovered(serial) => assert_eq!(serial, int_serial),
+            other => panic!("expected CrlNotCovered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_non_anchor_covered_passes() {
+        // The intermediate-signed CRL covers the leaf; the root-signed CRL
+        // covers the intermediate. Neither lists the chain's serials.
+        let store = CrlStore::from_pems(&[CRL_VALID, CRL_FOREIGN]).unwrap();
+        check_revocation(&chain(LEAF), &store, &strict_cfg(), SystemTime::now()).unwrap();
+    }
+
+    #[test]
+    fn covered_revoked_cert_is_rejected() {
+        // The revoked leaf is covered by its issuer's CRL and listed there;
+        // it must fail as Revoked (not merely as uncovered).
+        let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
+        let err = check_revocation(&chain(REVOKED), &store, &strict_cfg(), SystemTime::now())
+            .expect_err("revoked leaf must be rejected");
+        assert!(matches!(err, TrustError::Revoked(_)), "{err:?}");
+    }
+
+    #[test]
+    fn strict_stale_crl_is_hard_error() {
+        // A stale in-scope CRL under crl_strict remains a hard error, ahead of
+        // any coverage verdict.
+        let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
+        let future = SystemTime::now() + Duration::from_secs(11 * 365 * 24 * 3600);
+        let err = check_revocation(&chain(LEAF), &store, &strict_cfg(), future)
+            .expect_err("stale CRL in strict mode must be a hard error");
+        assert!(matches!(err, TrustError::Crl(_)), "{err:?}");
     }
 }
