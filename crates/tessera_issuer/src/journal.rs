@@ -28,6 +28,17 @@
 //! check of a head signature needs the CA public key and is delegated to the
 //! caller: [`verify_lines`] confirms structure and reports which head each
 //! signature covers; a caller re-signs or verifies out of band.
+//!
+//! # Annotations
+//!
+//! [`Journal::append_annotation`] records a general-purpose `annotation` line
+//! carrying a `kind` (a non-empty namespace tag chosen by the writer) and an
+//! opaque `data` JSON object. The core neither interprets nor validates
+//! `kind`/`data` beyond structure: an annotation chains, hashes, and verifies
+//! exactly like any other line, so tampering with one breaks the chain at its
+//! position, but an unknown `kind` verifies without complaint. This lets a
+//! caller attach out-of-band context to the record without the core growing a
+//! new operation for every use.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -53,6 +64,17 @@ pub enum JournalError {
     /// A record could not be serialized to NDJSON.
     #[error("journal record encoding failed: {0}")]
     Encoding(String),
+    /// An annotation was appended with an empty `kind`. The `kind` is the
+    /// writer's namespace tag and MUST identify who wrote the annotation, so an
+    /// empty one is rejected before it reaches the chain.
+    #[error("annotation kind must not be empty")]
+    EmptyAnnotationKind,
+    /// An annotation's `data` was not a JSON object. The format promises an
+    /// object (a null, array, or scalar would let writers smuggle a bare value
+    /// past the contract), so a non-object is rejected before it reaches the
+    /// chain.
+    #[error("annotation data must be a JSON object")]
+    AnnotationDataNotObject,
 }
 
 /// Append-only storage backing a [`Journal`].
@@ -84,7 +106,10 @@ pub trait JournalStorage {
 /// The payload is flattened, so a line is a single flat JSON object whose `op`
 /// field selects the operation, e.g.
 /// `{"seq":0,"prev_hash":"…","ts":1,"op":"issue_leaf","serial":"2a",…}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is not derived: the `annotation` payload carries an arbitrary
+/// [`serde_json::Value`], which is only `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Entry {
     /// Monotonic position, from 0, incremented for every line (head signatures
     /// included).
@@ -101,7 +126,10 @@ struct Entry {
 
 /// The operation a journal line records, tagged by its `op` field. No secret,
 /// PIN, or key material ever appears here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is not derived because [`Payload::Annotation`] holds an arbitrary
+/// [`serde_json::Value`], which implements only `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op")]
 enum Payload {
     /// A self-signed fleet-root issuance (issuer == subject).
@@ -149,6 +177,16 @@ enum Payload {
         algorithm: String,
         /// Base64 of the raw signature over the covered head's 32-byte hash.
         signature: String,
+    },
+    /// A general-purpose annotation. The core chains and verifies it like any
+    /// other line but never interprets `kind` or `data`.
+    #[serde(rename = "annotation")]
+    Annotation {
+        /// The writer's namespace tag. Non-empty; opaque to the core.
+        kind: String,
+        /// An arbitrary JSON object of writer-defined context. Opaque to the
+        /// core, which neither reads nor validates its contents.
+        data: serde_json::Value,
     },
 }
 
@@ -355,6 +393,44 @@ impl<S: JournalStorage> Journal<S> {
         Ok(())
     }
 
+    /// Records a general-purpose annotation on the chain.
+    ///
+    /// `kind` is the writer's namespace tag (e.g. `"acme.review"`); it must be
+    /// non-empty. `data` is a JSON object of writer-defined context; a non-object
+    /// (null, array, or scalar) is refused so the format's object promise holds.
+    /// The core stores both opaquely — it never interprets `kind` or `data` —
+    /// and chains the annotation like any other line, so a later
+    /// [`verify_lines`] covers it in the hash chain and the head-signature
+    /// accounting without needing to understand it.
+    ///
+    /// # Errors
+    ///
+    /// [`JournalError::EmptyAnnotationKind`] if `kind` is empty, or
+    /// [`JournalError::AnnotationDataNotObject`] if `data` is not a JSON object;
+    /// otherwise [`JournalError::Encoding`] or [`JournalError::Storage`] if the
+    /// line cannot be encoded or durably appended (fail-closed: on any error the
+    /// chain state is left untouched).
+    pub fn append_annotation(
+        &mut self,
+        kind: &str,
+        data: serde_json::Value,
+        now_unix: u64,
+    ) -> Result<(), JournalError> {
+        if kind.is_empty() {
+            return Err(JournalError::EmptyAnnotationKind);
+        }
+        if !data.is_object() {
+            return Err(JournalError::AnnotationDataNotObject);
+        }
+        self.append(
+            Payload::Annotation {
+                kind: kind.to_owned(),
+                data,
+            },
+            now_unix,
+        )
+    }
+
     /// Verifies the chain from the journal's own storage.
     ///
     /// # Errors
@@ -428,6 +504,12 @@ pub struct JournalReport {
 /// [`JournalStatus::Broken`] with that position. The cryptographic validity of
 /// a head signature is not checked here (it needs the CA public key); a signed
 /// tail means only that a `head_signature` line structurally covers it.
+///
+/// Annotation lines are checked structurally too — valid JSON, a non-empty
+/// `kind`, an object `data`, correct chaining — without the verifier knowing any
+/// `kind`: an unknown `kind` passes, an empty `kind` or a non-object `data` is
+/// [`JournalStatus::Broken`]. An annotation counts as an unsigned-tail record
+/// exactly like an issuance line.
 #[must_use]
 pub fn verify_lines(lines: &[String]) -> JournalReport {
     let mut expected_prev = genesis_hash();
@@ -455,10 +537,18 @@ pub fn verify_lines(lines: &[String]) -> JournalReport {
             return broken(last_signed_seq);
         }
 
-        match entry.payload {
+        match &entry.payload {
             Payload::HeadSignature { .. } => {
                 last_signed_seq = Some(entry.seq);
                 unsigned_from = None;
+            }
+            // An annotation is structurally invalid without a namespace tag or
+            // with a non-object `data`; a hand-crafted empty `kind` or a bare
+            // value breaks the chain at this position even though its JSON
+            // parses. The core still reads neither `kind`'s value (beyond
+            // non-emptiness) nor `data`'s contents (beyond being an object).
+            Payload::Annotation { kind, data } if kind.is_empty() || !data.is_object() => {
+                return broken(last_signed_seq);
             }
             _ => {
                 if unsigned_from.is_none() {
