@@ -8,15 +8,14 @@ name: issuer
 # значило бы смешать два несвязанных конвейера. Держим по образцу
 # lint.yml/nightly.yml — отдельный workflow на свою заботу.
 #
-# Кабинет выпуска — внешний статический бандл (отдельная поставка), в этом репо
-# его нет: `issuer serve` раздаёт его из каталога `--cabinet-dir`, встраивания в
-# бинарь больше нет. Поэтому здесь ни сборки статики кабинета, ни фичи
-# `embed-cabinet` — `--all-features` работает без спец-подготовки.
+# Открытый issuer — чистый CLI: локальный агент и кабинет выпуска поставляются
+# отдельно, в этом репо их нет. Поэтому здесь ни сборки статики кабинета, ни
+# соответствующих фич — `--all-features` работает без спец-подготовки.
 #
 # Что покрывает:
 #   - build-test  — сборка+тесты tessera_issuer/tessera_ext на трёх ОС;
 #   - clippy      — линт issuer-крейтов со всеми фичами (адаптеры pkcs11/vault/
-#                   serve видны только под --all-features);
+#                   file видны только под --all-features);
 #   - wasm        — сборка ядра выпуска под wasm32 (внешний кабинет линкует его);
 #   - mac-tests   — mac-gated сюиты tessera_core (в т.ч. issuer_contract),
 #                   которые до сих пор не исполнялись в CI (пробел из 7.1).
@@ -88,18 +87,18 @@ jobs:
       # `skipped:` и возвращают Ok.
       - name: Test (Linux, all features)
         if: runner.os == 'Linux'
-        run: cargo test -p tessera_issuer --features cli,pkcs11,vault,serve,test-support
+        run: cargo test -p tessera_issuer --features cli,pkcs11,vault,file,test-support
 
       # macOS/Windows: адаптеры собираются и тестируются с фичами, но без
       # железозависимых -tests-фич (нечего к ним подключать на раннере).
       - name: Test (adapters, macOS/Windows)
         if: runner.os != 'Linux'
-        run: cargo test -p tessera_issuer -p tessera_ext --features cli,pkcs11,vault,serve
+        run: cargo test -p tessera_issuer -p tessera_ext --features cli,pkcs11,vault,file
 
   # Линт issuer-крейтов. lint.yml уже гоняет `clippy --workspace` с дефолтными
   # фичами; здесь добавляем --all-features, потому что самый чувствительный код
-  # (PIN, Origin-allowlist, remote-подпись) живёт в pkcs11/vault/serve-модулях,
-  # невидимых без их фич.
+  # (PIN, remote-подпись) живёт в pkcs11/vault/file-модулях, невидимых без их
+  # фич.
   clippy:
     runs-on: ubuntu-latest
     steps:

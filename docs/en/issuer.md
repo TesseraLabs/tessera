@@ -16,20 +16,16 @@ Components:
 
 - **Core** (`tessera_issuer`, a library) — assembly of the shift-leaf and
   organisation-CA TBS, the envelope checks, random 128-bit serials, CRL
-  issuance, and the issuance journal. The core is pure Rust and builds for
-  `wasm32` (for the web cabinet); the signing adapters sit behind feature
-  flags.
-- **CLI `issuer`** — the same issuing code for automation (ticketing systems,
-  scripts). No check is re-implemented in the CLI: a request the core would
-  refuse, the CLI refuses identically.
-- **Agent `issuer serve`** — a local HTTP server bound strictly to `127.0.0.1`
-  with two roles: the browser-to-token bridge and, optionally, serving the
-  cabinet itself from an external directory.
-- **Web cabinet** — one static SPA (a WASM build of the same core):
-  issuance through the browser with no server side. A separate bundle (not in
-  this repository or the binary): served by the agent itself via `--cabinet-dir`
-  or by separate static hosting in an air-gapped environment (see the
-  "Web cabinet" section below).
+  issuance, and the issuance journal. The core is pure Rust and also builds for
+  `wasm32`; the signing adapters sit behind feature flags.
+- **CLI `issuer`** — the issuing code for automation (ticketing systems,
+  scripts) and hands-on use. No check is re-implemented in the CLI: a request
+  the core would refuse, the CLI refuses identically.
+
+Browser-based issuance — a local signing agent and a web cabinet driving the
+same core from a browser — is delivered separately, as part of the commercial
+tooling (see ["Browser-based issuance"](#browser-based-issuance)). The open
+repository ships the CLI.
 
 The role model comes from the parent certificate presented: any CA with a
 delegation envelope (the fleet root or an organisation CA) issues both
@@ -198,125 +194,18 @@ Operator side — `issue-leaf --csr` (above). What matters:
   attributes do not influence the extensions. Otherwise a CSR would become a
   channel for "the engineer requested a wider scope for themselves".
 
-## The `issuer serve` agent
+## Browser-based issuance
 
-`issuer serve` is a local HTTP server bound strictly to `127.0.0.1`: (1) the
-browser-to-token bridge — it accepts a built TBS from the cabinet and returns a
-signature (the cabinet cannot talk to PKCS#11 directly); (2) optionally it serves
-the cabinet itself from the same address, out of an external directory. The
-cabinet is a separate static bundle: point the agent at it with
-`--cabinet-dir <path>` and it is served from the same loopback address as
-`/sign`. Without the flag the agent still starts and serves a short placeholder
-page at `/` explaining how to attach a cabinet. The `--no-cabinet` flag is pure
-bridge mode (not even the placeholder is served at `/`).
+Issuing from a browser — a local signing agent bound to `127.0.0.1` that bridges
+the browser to the token/HSM, plus a web cabinet (an SPA over the same WASM core)
+that assembles the TBS client-side and shows the operator a summary to confirm —
+is delivered separately, as part of the commercial tooling (`tessera-enterprise`).
+It is not built from this repository. For contact, see
+[LICENSE.commercial](../../LICENSE.commercial).
 
-The agent supports the same signing backends as the issuing subcommands —
-`--backend pkcs11|vault|file` (the default is `pkcs11`, so the old command form
-without `--backend` works as before):
-
-```sh
-# Hardware token or HSM (the default)
-issuer serve \
-    --module /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so \
-    --key tessera-ca --algorithm ecdsa-p256 \
-    --port 0
-
-# Vault / OpenBao Transit (the Vault token comes from VAULT_TOKEN)
-issuer serve --backend vault \
-    --vault-addr https://vault.example:8200 \
-    --key tessera-ca
-
-# Key in a local file (PKCS#8; the passphrase comes from pinentry
-# or TESSERA_ISSUER_KEY_PASSPHRASE)
-issuer serve --backend file --key-file ca-key.p8
-```
-
-For `pkcs11`, `--module` and `--key` are required; `--token-label` selects a
-token when there are several; `--pinentry` names the pinentry program
-explicitly. For `vault`, `--vault-addr`, `--key` and a `VAULT_TOKEN` in the
-environment are required. For `file`, `--key-file` is required; the key-file
-rules are in ["Key in a file"](#key-in-a-file). The agent's gates (loopback,
-paired token, Origin, operator confirmation) are identical across backends.
-`--port 0` (the default) picks an ephemeral port — the actual address is printed at startup and
-is the one to open in the browser. When serving the cabinet (`--cabinet-dir
-<path>`) and in the default placeholder mode `--allow-origin` is not required: the
-agent is in its own allowlist, or accepts only same-origin requests. It is
-required (at least one; it repeats) only for the pure bridge mode
-(`--no-cabinet`), when the cabinet is served by separate static hosting from its
-own Origin.
-
-### Access model
-
-The primary gate is the **paired session token**. The agent mints a random token
-at startup, prints it to stdout and (when serving the cabinet) injects it into
-the page it serves; the cabinet passes it in the `X-Tessera-Session` header on
-every request, and the comparison is constant-time. A request without a valid
-token is rejected **before** the signing module is touched.
-
-**Origin** is a secondary barrier against cross-origin requests: if a request
-carries an `Origin` header, it must be in the allowlist (otherwise refused); a
-missing `Origin` (a legitimate same-origin GET, which browsers do not accompany
-with this header) is not a refusal in itself — the token gates it. A cross-origin
-page cannot read the injected token nor set `X-Tessera-Session` without a
-preflight, which the agent controls; a DNS-rebind carries the attacker's Origin
-and is cut off by the allowlist.
-
-**Routing:** `POST /sign`, `GET /info` and — when serving — the cabinet's static
-assets as a fixed set; everything else answers 404, and the static assets do not
-shadow the signing routes.
-
-The PIN is **not** sent over HTTP — the protocol has no field for it. A sign
-request carries only a key id and the base64 TBS; stray fields (a `pin`, say) are
-dropped by serde and never reach the backend.
-
-### Operation confirmation
-
-The session token authenticates the cabinet; **the operation itself is
-authorized by the operator**. Before touching the signing backend, the agent:
-
-1. Parses the TBS with the same shared code (`tessera_ext`) the Engine enforces.
-   A TBS that cannot be read as an issuance operation is refused **before** the
-   confirmation prompt — what cannot be shown cannot be signed.
-2. Shows the operator the operation kind (shift-leaf / organisation CA / CRL),
-   the subject, the validity, and the roles/bindings/envelope — and signs only
-   after an explicit yes.
-
-The agent here is a **trusted display**: even a substituted SPA or a foreign
-local process holding a valid token cannot get a signature the operator did not
-confirm (see [threat-model.md §11.1.1, §11.3](threat-model.md)).
-
-The confirmation/PIN channel is **pinentry** (the Assuan protocol, the gpg-agent
-precedent) when available, falling back to the **terminal**. This decouples the
-trusted channel from how the agent was launched. The answers `y`/`yes`/`д`/`да`
-are accepted regardless of locale. A failure of the pinentry channel itself (not
-a decline, but an inability to spawn / a protocol error) falls back to the
-terminal; an operator decline is honestly treated as a decline.
-
-### Serving the cabinet
-
-The cabinet is a separate static bundle (SPA); it is not part of this repository
-or the `issuer` binary. `--cabinet-dir <path>` serves it from an external
-directory on the same `127.0.0.1` address as `/sign`: files are served as they
-are, and any non-file path resolves to `index.html` (client-side routing). The
-canonical path: start the agent with `--cabinet-dir` → open the printed localhost
-address → issue, offline. The agent does not inspect the directory's contents —
-which bundle it is is none of its business; the API routes (`/sign`,
-`/sign-registry`, `/info`) are reserved and never shadowed by static files, and
-anything escaping the directory is refused. Priority: `--no-cabinet` → bridge
-(nothing at `/`); otherwise `--cabinet-dir` → external directory; otherwise the
-placeholder page at `/` telling the operator to attach a cabinet.
-
-When serving `index.html`, the agent injects the paired session token and the key
-label into it — the cabinet preconfigures its connection itself, the operator
-does not have to retype the address and token, and the agent settings block
-collapses to a "connected / not connected" indicator. From a substituted cabinet
-the keys are still unreachable — the private cryptography sits behind the agent
-and the token (see [threat-model.md §11](threat-model.md)).
-
-The agent runs for the duration of the issuing session (foreground): a smaller
-attack window. A system service and daemon autostart are not provided — the agent
-is launched explicitly when you sit down to issue; issuance itself is the reason
-to bring it up.
+The open repository ships the `issuer` CLI, which drives the same core and the
+same signing backends and enforces the same pre-signing checks. Everything below
+— the signing backends and the issuance journal — applies to the CLI.
 
 ## Signing backends
 
@@ -393,8 +282,7 @@ The backend's rules:
   recommendation is encrypted PKCS#8.
 - The signing algorithm is derived from the key itself; an `--algorithm` that
   does not match the key is an error. `--key` is optional (defaulting to the
-  file name) and serves as the key identifier in `/info`, the confirmation
-  summary and the journal.
+  file name) and serves as the key identifier in the issuance journal.
 
 A key in a file is a deliberate trade-off for test benches, CI and small
 installations: on host compromise it is extractable, unlike a token/HSM/Vault
@@ -423,83 +311,11 @@ three states:
 The journal is **secondary**: the primary truth is the login audit on the
 devices themselves; the journal serves issuance inventory and incident review.
 
-## Web cabinet
-
-The cabinet is one static artifact (an SPA + the WASM core) **with no
-server-side logic**: all checks and TBS assembly happen on the client, and all
-state is files (the parent certificate, the issued certificates, the journal, the
-CRL, the inventory snapshot). It runs self-hosted and offline; the only network
-call is to the local `issuer serve` agent on `127.0.0.1`. Issuance data is not
-sent to any external address.
-
-There is one cabinet for all issuing roles: the available operations are derived
-from the parent certificate presented. Any CA with a delegation envelope (the
-root or an organisation CA) issues both subordinate organisation CAs with a
-narrowed assigned envelope and shift-leaves within its own envelope — the
-operation is chosen with a switch; a leaf/unsuitable certificate → operations
-unavailable, with an explanation. There are no separate "by job title" builds.
-
-The cabinet is a separate static bundle; it is not part of this repository or the
-`issuer` binary. `issuer serve --cabinet-dir <path>` serves it from `127.0.0.1`;
-the cabinet has no server side. The artifact is bilingual, with a language switch
-in the UI. The private cryptography is always behind the agent and the token, and
-the keys are unreachable from a substituted SPA (see
-[threat-model.md §11](threat-model.md)).
-
-### Serving the static assets
-
-The cabinet bundle (`index.html`, its script, styles and the WASM core) is served
-by any static web server in an air-gapped environment, or by the agent itself —
-point it at the directory with `--cabinet-dir <path>`. The agent serves files as
-they are and falls back to `index.html` for non-file paths (SPA routing); the
-cabinet has no server side.
-
-### How to work with the cabinet
-
-1. On the machine with the token, start the agent with the cabinet:
-   `issuer serve --module <…> --key <…> --cabinet-dir <path>` and open the
-   `http://127.0.0.1:<port>` address it prints (see ["The `issuer serve`
-   agent"](#the-issuer-serve-agent)). The agent preconfigures the connection
-   itself — the agent block in the cabinet shows only a "connected" status.
-2. Present the parent certificate — the available
-   operations are derived from it: a CA with a delegation envelope (the
-   root or an organisation CA) → issue subordinate organisation CAs with
-   a narrowed assigned envelope, or shift-leaves within its own envelope;
-   the operation is chosen with a switch (defaults: root — organisation
-   CA, organisation CA — shift-leaf); a leaf or an unsuitable certificate
-   → operations unavailable, with an explanation.
-3. Device inventory: build it right in the cabinet (a constructor —
-   devices, users, roles, tags; the result is a "manual" snapshot that
-   downloads as a file) or load a ready snapshot file. A signed snapshot
-   the cabinet verifies (broken signature → refusal) and labels the
-   source ("signed"/"manual") with its age. The inventory feeds the
-   issuance-form suggestions: devices and users are offered from it (a
-   typed value is still kept), and the leaf's role set narrows to the
-   intersection of the parent's envelope with the inventory's roles. The
-   inventory is optional — without it the fields are filled in manually.
-4. The leaf key: local generation or a CSR upload. From a CSR the cabinet
-   shows the subject and the self-signature status and prefills the
-   attributes marked "requested in the CSR"; with a broken self-signature
-   the issuance is unavailable.
-5. The agent signs on the token after the operator confirms
-   (see ["Operation confirmation"](#operation-confirmation)) — the PIN
-   never leaves the machine running the agent. The issued certificate is
-   downloaded as a file, and the operation is recorded in the issuance
-   journal.
-
-The cabinet UI is split into two tabs: **"Issue"** (parent, operation,
-inventory, agent, summary) and **"Journal"** (loading, chain
-verification and export of the issuance journal). The parent-certificate
-and signing-agent blocks carry context help — how to obtain a parent and
-how to bring up and configure `issuer serve`.
-
 ## Localization
 
-The tool's operator surfaces (the confirmation summary in pinentry/the terminal,
-the `issuer serve` messages, the CLI output, the cabinet SPA) are
-localized to Russian and English without an i18n framework (a compact string
-table). The cabinet picks its language by the browser language, with a UI switch; for the
-CLI and the agent the locale is resolved once at startup:
+The tool's operator surfaces (the operation summary rendered from a TBS and the
+CLI output) are localized to Russian and English without an i18n framework (a
+compact string table). For the CLI the locale is resolved once at startup:
 
 1. an explicit setting — the `--lang` flag (`ru`/`en`);
 2. the `TESSERA_ISSUER_LANG` variable;

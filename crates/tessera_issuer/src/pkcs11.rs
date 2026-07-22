@@ -38,8 +38,8 @@ use crate::sign::{KeyId, SignError, Signature, SignatureAlgorithm, SignatureBack
 ///
 /// The returned [`SecretString`] is used only to log in and is dropped (and so
 /// zeroized) before the TBS is signed. Implementations MUST NOT persist, log,
-/// or echo the PIN, and MUST NOT read it from a process argument. The local
-/// agent implements this with a terminal/pinentry prompt; tests inject a fixed
+/// or echo the PIN, and MUST NOT read it from a process argument. The CLI
+/// implements this with a pinentry/environment prompt; tests inject a fixed
 /// value.
 ///
 /// A blanket impl covers any `Fn() -> Result<SecretString, Pkcs11SignError>`,
@@ -79,13 +79,13 @@ pub struct Pkcs11Config {
     /// The algorithm the key signs with; picks the mechanism and the
     /// `AlgorithmIdentifier`.
     pub algorithm: SignatureAlgorithm,
-    /// An optional second key, in the *same* module, used only to sign device
-    /// registries (the agent's `/sign-registry` endpoint). Its `CKA_LABEL` is
-    /// matched like `key_id`; it always signs with
-    /// [`SignatureAlgorithm::EcdsaWithSha256`] (P-256), the algorithm the
-    /// cabinet's registry verifier expects. Loading it here keeps both keys
-    /// behind one `C_Initialize`, since a second module context on the same
-    /// library would be refused.
+    /// An optional second key, in the *same* module, dedicated to signing device
+    /// registries for an external signing frontend. Its `CKA_LABEL` is matched
+    /// like `key_id`; it always signs with
+    /// [`SignatureAlgorithm::EcdsaWithSha256`] (P-256), the algorithm registry
+    /// verifiers expect. Loading it here keeps both keys behind one
+    /// `C_Initialize`, since a second module context on the same library would
+    /// be refused.
     pub registry_key: Option<KeyId>,
 }
 
@@ -137,10 +137,10 @@ impl<P: PinSource> Pkcs11Signer<P> {
             config,
             pin_source,
         };
-        // A configured registry key must be ECDSA P-256 (the cabinet's registry
-        // verifier accepts nothing else). Confirm the real curve from the token
-        // now, at startup, so a P-384/RSA key is refused before the agent
-        // listens rather than failing only on the first registry signature.
+        // A configured registry key must be ECDSA P-256 (registry verifiers
+        // accept nothing else). Confirm the real curve from the token now, at
+        // initialization, so a P-384/RSA key is refused up front rather than
+        // failing only on the first registry signature.
         signer.verify_registry_key_p256()?;
         Ok(signer)
     }
@@ -454,8 +454,8 @@ pub enum Pkcs11SignError {
     #[error("token returned a malformed ecdsa signature")]
     MalformedEcdsaSignature,
     /// The configured registry key is not an ECDSA P-256 key, read from the
-    /// token at startup. The registry signature format the cabinet verifies
-    /// accepts only P-256.
+    /// token at initialization. The registry signature format accepts only
+    /// P-256.
     #[error("registry key must be ecdsa p-256: {0}")]
     RegistryKeyNotP256(String),
 }
@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn ec_params_p256_check_accepts_only_the_p256_named_curve() {
-        // The exact prime256v1 OID bytes are accepted; this is what the startup
+        // The exact prime256v1 OID bytes are accepted; this is what the
         // registry-key probe reads from CKA_EC_PARAMS on the token.
         assert!(ec_params_is_p256(&[
             0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07

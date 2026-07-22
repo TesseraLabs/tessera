@@ -1,24 +1,25 @@
-//! Operator confirmation for the local signing agent — the trusted display.
+//! Operator confirmation for a certificate-issuance signing frontend.
 //!
-//! Before the agent signs anything, it parses the incoming TBS with the shared
+//! Before a key signs a TBS, an operator surface parses it with the shared
 //! [`tessera_ext`] code (the same definitions the Engine enforces), renders a
-//! human summary of the operation, and asks the operator to approve it. The
-//! paired session token authenticates the *cabinet*; this confirmation
-//! authorizes the *operation*. A TBS that the shared code cannot parse is
-//! refused before the operator is ever prompted — what cannot be shown cannot
-//! be signed.
+//! human summary of the operation, and asks the operator to approve it: the
+//! confirmation authorizes the *operation*, distinct from whatever authenticates
+//! the caller. A TBS that the shared code cannot parse is refused before the
+//! operator is ever prompted — what cannot be shown cannot be signed.
 //!
 //! Parsing a TBS into the shown [`OperationSummary`] lives in [`crate::summary`]
 //! (pure, `wasm32`-compatible); this module owns only the interactive channel.
-//! Two production backends ship here: a pinentry dialog (the gpg-agent
-//! precedent, spoken over the Assuan protocol) and a terminal prompt fallback.
-//! Both are injectable, so tests drive a controllable one.
+//! Two backends ship here: a pinentry dialog (the gpg-agent precedent, spoken
+//! over the Assuan protocol) and a terminal prompt fallback. Both are injectable,
+//! so a caller can drive a controllable one. This is the library's generic
+//! confirmation channel for signing frontends; the fixed strings it renders are
+//! localized through the passed [`Locale`].
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::l10n::{Locale, Msg};
+use crate::l10n::Locale;
 use crate::summary::OperationSummary;
 
 /// Errors from a confirmation channel that is present but failed to operate.
@@ -59,6 +60,30 @@ where
 {
     fn confirm(&self, summary: &OperationSummary) -> Result<bool, ConfirmError> {
         self(summary)
+    }
+}
+
+/// The terminal confirmation header, localized.
+fn confirm_header(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "=== Confirm issuance operation ===",
+        Locale::Ru => "=== Подтверждение операции выпуска ===",
+    }
+}
+
+/// The terminal confirmation prompt, localized.
+fn confirm_prompt(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Sign this operation? [y/N]:",
+        Locale::Ru => "Подписать эту операцию? [y/N]:",
+    }
+}
+
+/// The notice printed when the pinentry channel fails and the terminal is used.
+fn pinentry_fell_back(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "pinentry unavailable, using terminal prompt:",
+        Locale::Ru => "pinentry недоступен, используется терминал:",
     }
 }
 
@@ -151,9 +176,9 @@ impl Confirmer for PinentryConfirmer {
 
 /// A confirmer that prompts on the controlling terminal.
 ///
-/// The summary and prompt go to stderr (stdout carries machine output such as
-/// the session token); the answer is read from stdin. The summary, header, and
-/// prompt render in the configured [`Locale`].
+/// The summary and prompt go to stderr (stdout is left for machine output); the
+/// answer is read from stdin. The summary, header, and prompt render in the
+/// configured [`Locale`].
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalConfirmer {
     locale: Locale,
@@ -169,9 +194,9 @@ impl TerminalConfirmer {
 
 impl Confirmer for TerminalConfirmer {
     fn confirm(&self, summary: &OperationSummary) -> Result<bool, ConfirmError> {
-        eprintln!("\n{}", Msg::ConfirmHeader.text(self.locale));
+        eprintln!("\n{}", confirm_header(self.locale));
         eprintln!("{}", summary.render(self.locale));
-        eprint!("{} ", Msg::ConfirmPrompt.text(self.locale));
+        eprint!("{} ", confirm_prompt(self.locale));
         std::io::stderr()
             .flush()
             .map_err(|e| ConfirmError::Io(e.to_string()))?;
@@ -219,7 +244,7 @@ impl Confirmer for DefaultConfirmer {
             match pinentry.confirm(summary) {
                 Ok(decision) => return Ok(decision),
                 Err(e) => {
-                    eprintln!("{} {e}", Msg::ServePinentryFellBack.text(self.locale));
+                    eprintln!("{} {e}", pinentry_fell_back(self.locale));
                 }
             }
         }
