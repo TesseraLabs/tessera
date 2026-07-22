@@ -34,8 +34,8 @@ see [../ru/changelog.md](../ru/changelog.md) (Russian).
    `pam_cert_host_binding`, `pam_cert_user_binding`, and
    `pam_cert_max_integrity` extensions, and issuance scenarios.
 2. [issuer.md](issuer.md) — the issuer tooling (`tessera_issuer`):
-   the `issuer` CLI, the `serve` agent, the CSR flow, the PKCS#11 and
-   Vault Transit backends, the issuance journal, and the web cabinet.
+   the `issuer` CLI, the CSR flow, the PKCS#11, Vault Transit and file
+   backends, and the issuance journal.
 3. [clone-image.md §6](clone-image.md) — the CA side of the clone-image
    workflow (per-host issuance).
 

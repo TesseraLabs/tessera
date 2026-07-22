@@ -1,17 +1,15 @@
 //! Parsing a bare TBS into a human-readable operation summary.
 //!
-//! Before anything is signed, an operator surface — the local agent's
-//! confirmation dialog, or the browser cabinet's preview — has to show *what*
-//! the TBS actually is: an engineer shift-leaf, an organisation CA, or a CRL,
-//! with its subject, validity and the scope it carries. That decoding is done
-//! here with the shared [`tessera_ext`] definitions (the same ones the Engine
-//! enforces) plus `x509-cert` for the standard `Name`/`Time` fields, so a
-//! summary reflects exactly the bytes that will be signed.
+//! Before anything is signed, an operator surface — the browser cabinet's
+//! preview — has to show *what* the TBS actually is: an engineer shift-leaf, an
+//! organisation CA, or a CRL, with its subject, validity and the scope it
+//! carries. That decoding is done here with the shared [`tessera_ext`]
+//! definitions (the same ones the Engine enforces) plus `x509-cert` for the
+//! standard `Name`/`Time` fields, so a summary reflects exactly the bytes that
+//! will be signed.
 //!
 //! The module is pure and `wasm32`-compatible: it pulls in no process, socket,
-//! or system dependency, so it backs both the native `issuer serve` agent
-//! (behind the `serve` feature) and the browser cabinet's WASM core. The
-//! interactive confirmation channel lives in [`crate::confirm`]; only the
+//! or system dependency, so it backs the browser cabinet's WASM core. Only the
 //! parsing and rendering live here.
 
 use der::Decode as _;

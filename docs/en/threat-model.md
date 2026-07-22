@@ -580,14 +580,21 @@ here is a single ranked registry (impact × likelihood, descending).
 ## 11. Issuance tooling (`tessera_issuer`, issuer-tooling 2026-07)
 
 TOE extension: the client-side certificate issuance tooling — the
-`tessera_issuer` core, the `issuer` CLI, the static web cabinet (WASM) and the
-local `issuer serve` agent (browser ↔ signing-backend bridge). The tool is not
+`tessera_issuer` core and the `issuer` CLI. The tool is not
 a custodian: with the `pkcs11` and `vault` backends private keys live in the
 token/HSM/Vault Transit and never pass through the issuance code. The exception
 is the explicit file backend (`file`): the key from a PKCS#8 file is loaded
 into the issuance process memory (see 11.1.7 and 11.3). The requirements canon
 is the openspec specs `cert-issuance`, `issuer-signing`, `issuer-cabinet`,
 `issuance-journal`.
+
+> **Browser-issuance surface moved to the commercial tooling.** The local
+> `issuer serve` agent (browser ↔ signing-backend bridge) and the static web
+> cabinet are delivered as part of the commercial tooling and are no longer
+> built from the open repository. Their analysis is **retained below** (rows
+> 11.1.1–11.1.3, 11.1.5, and the substituted-cabinet item in 11.3) because the
+> surface still exists in the product; it is simply out of scope for the open
+> repository, which ships the CLI and the `pkcs11`/`vault`/`file` backends.
 
 ### 11.1 Attack surface
 

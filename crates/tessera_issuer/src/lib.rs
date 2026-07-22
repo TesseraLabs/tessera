@@ -92,16 +92,19 @@ mod verify;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+// The operator-confirmation channel: a generic surface a signing frontend uses
+// to show a parsed TBS and gate the operation on an explicit yes. Native-only
+// (it drives a pinentry subprocess / the terminal), so the wasm core pulls none
+// of it; it does not depend on any signing backend.
+#[cfg(feature = "native")]
+pub mod confirm;
+
 // Native-only signing adapters, each behind its feature flag so the wasm core
 // (built with `--no-default-features`) pulls none of them.
-#[cfg(feature = "serve")]
-pub mod confirm;
 #[cfg(feature = "file")]
 pub mod file;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
-#[cfg(feature = "serve")]
-pub mod serve;
 #[cfg(feature = "vault")]
 pub mod vault;
 

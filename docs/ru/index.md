@@ -35,8 +35,8 @@
    `pam_cert_host_binding`, `pam_cert_user_binding`,
    `pam_cert_max_integrity`, сценарии выпуска.
 2. [issuer.md](issuer.md) — инструменты выпуска (`tessera_issuer`):
-   CLI `issuer`, агент `serve`, CSR-поток, бэкенды PKCS#11 и
-   Vault Transit, журнал выпусков, веб-кабинет.
+   CLI `issuer`, CSR-поток, бэкенды PKCS#11, Vault Transit и файловый,
+   журнал выпусков.
 3. [clone-image.md §6](clone-image.md) — CA-сторона clone-image
    workflow (выпуск per-host).
 

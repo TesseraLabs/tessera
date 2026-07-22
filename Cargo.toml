@@ -78,9 +78,8 @@ pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
 # generation or signing, so no RNG is pulled into the wasm core.
 rsa = { version = "0.9", default-features = false, features = ["std"] }
 # Native-only signing adapters for the issuer tooling (behind feature flags).
-# tiny_http backs the local `issuer serve` agent; ureq drives Vault Transit
-# signing; base64 (de)serialises DER on the JSON boundaries.
-tiny_http = "0.12"
+# ureq drives Vault Transit signing; base64 (de)serialises DER on the JSON
+# boundaries.
 # native-tls (OS TLS: Security.framework / SChannel / system OpenSSL), no bundled
 # Mozilla roots: trust comes from the host certificate store or an
 # operator-supplied CA bundle. This keeps both `webpki-roots` and

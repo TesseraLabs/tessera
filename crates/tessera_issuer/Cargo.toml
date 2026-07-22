@@ -48,15 +48,6 @@ file = [
     "dep:secrecy",
     "dep:zeroize",
 ]
-# The browser-bridging local signing agent `issuer serve`. Native-only; the
-# `issuer` binary drives it, hence `cli`.
-serve = [
-    "cli",
-    "dep:tiny_http",
-    "dep:subtle",
-    "dep:secrecy",
-    "dep:zeroize",
-]
 # Integration-test gates, mirroring tessera_core's `pkcs11-tests`: the heavy
 # tests compile only with these on and still skip gracefully (print `skipped:`
 # and return Ok) when the external dependency — a SoftHSM module, the `vault`
@@ -88,9 +79,7 @@ clap = { workspace = true, optional = true }
 cryptoki = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
-subtle = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
-tiny_http = { workspace = true, optional = true }
 
 # The wasm core (browser cabinet) needs an entropy backend for the RustCrypto
 # stack pulled by CSR verification; the browser provides one via getrandom's

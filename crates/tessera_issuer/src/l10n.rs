@@ -1,8 +1,8 @@
 //! Operator-surface localization for the issuer (Russian and English).
 //!
-//! The issuer's operator surfaces — the confirmation summary shown in
-//! pinentry/the terminal, the `issuer serve` messages, and the CLI's own output
-//! — are localized to Russian and English through a small in-crate string table.
+//! The issuer's operator surfaces — the operation summary rendered from a TBS
+//! and the CLI's own output — are localized to Russian and English through a
+//! small in-crate string table.
 //! There is no `fluent`/`gettext`: for two locales and a few dozen strings a
 //! table keyed by an enum is smaller and has no runtime or build machinery.
 //!
@@ -13,8 +13,8 @@
 //!
 //! The locale is resolved once, at the start of the binary, from an explicit
 //! setting then the environment ([`Locale::resolve`]); it is then threaded by
-//! value into rendering and confirmation. The core never reads the environment
-//! on its own — a [`Locale`] is always passed in.
+//! value into rendering. The core never reads the environment on its own — a
+//! [`Locale`] is always passed in.
 
 /// A supported operator-surface locale.
 ///
@@ -191,37 +191,10 @@ impl Caption {
 ///
 /// Each variant is a caption; a caller appends the technical data (an address, a
 /// path, an error, a subject) after it, so no data ever enters the table. Only
-/// the operator-facing surfaces (`serve`, the CLI) consume these, so the table
-/// is compiled only when one of them is built.
-#[cfg(any(feature = "cli", feature = "serve"))]
+/// the CLI consumes these, so the table is compiled only when it is built.
+#[cfg(feature = "cli")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Msg {
-    /// `issuer serve`: bind announcement (an `http://…` address follows).
-    ServeListening,
-    /// `issuer serve`: the session token follows.
-    ServeSessionToken,
-    /// `issuer serve`: how to stop the foreground agent (full line).
-    ServeStopHint,
-    /// `issuer serve`: the browser could not be opened automatically (full line).
-    ServeBrowserOpenFailed,
-    /// `issuer serve`: a TBS that could not be shown was refused (full line).
-    ServeUnreadableTbs,
-    /// `issuer serve`: the operator declined (a kind and subject follow).
-    ServeOperatorDeclined,
-    /// `issuer serve`: the confirmation channel failed (an error follows).
-    ServeConfirmChannelFailed,
-    /// `issuer serve`: pinentry unavailable, terminal used (an error follows).
-    ServePinentryFellBack,
-    /// Placeholder page served at `/` with no cabinet attached: heading (full
-    /// line).
-    CabinetNotConnectedTitle,
-    /// Placeholder page served at `/` with no cabinet attached: body text (full
-    /// line).
-    CabinetNotConnectedBody,
-    /// Terminal confirmation dialog header (full line).
-    ConfirmHeader,
-    /// Terminal confirmation prompt (full line).
-    ConfirmPrompt,
     /// CLI: a certificate was written (a path follows).
     CliCertWritten,
     /// CLI: a CRL was written (a path follows).
@@ -253,7 +226,7 @@ pub(crate) enum Msg {
     FilePlaintextKeyWarning,
 }
 
-#[cfg(any(feature = "cli", feature = "serve"))]
+#[cfg(feature = "cli")]
 impl Msg {
     /// The message's text in `locale`.
     pub(crate) fn text(self, locale: Locale) -> &'static str {
@@ -266,27 +239,6 @@ impl Msg {
     /// The English message.
     fn en(self) -> &'static str {
         match self {
-            Msg::ServeListening => "issuer serve: listening on",
-            Msg::ServeSessionToken => "issuer serve: session token:",
-            Msg::ServeStopHint => "Press Ctrl+C to stop the agent",
-            Msg::ServeBrowserOpenFailed => {
-                "issuer serve: could not open a browser; open the address above manually"
-            }
-            Msg::ServeUnreadableTbs => {
-                "issuer serve: rejected sign — TBS is not a readable issuance operation"
-            }
-            Msg::ServeOperatorDeclined => "issuer serve: operator declined:",
-            Msg::ServeConfirmChannelFailed => "issuer serve: confirmation channel failed:",
-            Msg::ServePinentryFellBack => {
-                "issuer serve: pinentry unavailable, using terminal prompt:"
-            }
-            Msg::CabinetNotConnectedTitle => "Cabinet not connected",
-            Msg::CabinetNotConnectedBody => {
-                "Restart issuer serve with --cabinet-dir <path> to serve the issuance \
-                 cabinet from a static bundle. The signing bridge is running."
-            }
-            Msg::ConfirmHeader => "=== Confirm issuance operation ===",
-            Msg::ConfirmPrompt => "Sign this operation? [y/N]:",
             Msg::CliCertWritten => "certificate written to",
             Msg::CliCrlWritten => "CRL written to",
             Msg::CliCsrWritten => "CSR written to",
@@ -310,27 +262,6 @@ impl Msg {
     /// The Russian message.
     fn ru(self) -> &'static str {
         match self {
-            Msg::ServeListening => "issuer serve: приём на",
-            Msg::ServeSessionToken => "issuer serve: токен сессии:",
-            Msg::ServeStopHint => "Остановка агента: Ctrl+C",
-            Msg::ServeBrowserOpenFailed => {
-                "issuer serve: не удалось открыть браузер; откройте адрес выше вручную"
-            }
-            Msg::ServeUnreadableTbs => {
-                "issuer serve: подпись отклонена — TBS не читается как операция выпуска"
-            }
-            Msg::ServeOperatorDeclined => "issuer serve: оператор отклонил:",
-            Msg::ServeConfirmChannelFailed => "issuer serve: канал подтверждения недоступен:",
-            Msg::ServePinentryFellBack => {
-                "issuer serve: pinentry недоступен, используется терминал:"
-            }
-            Msg::CabinetNotConnectedTitle => "Кабинет не подключён",
-            Msg::CabinetNotConnectedBody => {
-                "Перезапустите issuer serve с --cabinet-dir <путь>, чтобы раздавать кабинет \
-                 выпуска из статического бандла. Мост подписи уже работает."
-            }
-            Msg::ConfirmHeader => "=== Подтверждение операции выпуска ===",
-            Msg::ConfirmPrompt => "Подписать эту операцию? [y/N]:",
             Msg::CliCertWritten => "сертификат записан в",
             Msg::CliCrlWritten => "CRL записан в",
             Msg::CliCsrWritten => "CSR записан в",
