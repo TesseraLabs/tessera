@@ -946,7 +946,9 @@ mod csr {
 mod journal {
     use super::{envelope, key, leaf_request, spki_fixture, validity, CaRequest, MockSigner, TS};
     use crate::test_support::{self_signed_ca, FailingStorage, MemoryStorage};
-    use crate::{issue_leaf, verify_lines, IssueError, Journal, JournalStatus, Serial};
+    use crate::{
+        issue_leaf, verify_lines, IssueError, Journal, JournalError, JournalStatus, Serial,
+    };
 
     /// A root [`CaRequest`] allowing `oper`, integrity ≤ 5, TTL ≤ 86400.
     fn root_req() -> CaRequest {
@@ -1147,6 +1149,202 @@ mod journal {
             }
         );
         assert_eq!(report.last_signed_seq, Some(1));
+    }
+
+    #[test]
+    fn annotation_is_covered_by_the_chain() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        journal
+            .append_annotation("acme.review", serde_json::json!({ "reviewer": "kim" }), TS)
+            .unwrap();
+        journal
+            .append_annotation("acme.note", serde_json::json!({ "n": 1 }), TS)
+            .unwrap();
+
+        // Both annotation lines are chained on general terms: the chain verifies
+        // as an unsigned tail (nothing signs the head), and the op is visible.
+        let lines = journal.storage().lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"op\":\"annotation\"") && lines[0].contains("acme.review"));
+        assert_eq!(
+            verify_lines(&lines).status,
+            JournalStatus::IntactUnsignedTail {
+                unsigned_from_seq: 0
+            }
+        );
+    }
+
+    #[test]
+    fn tampering_an_annotation_breaks_the_chain() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        journal
+            .append_annotation("acme.note", serde_json::json!({ "k": "v" }), TS)
+            .unwrap();
+        journal
+            .append_annotation("acme.note", serde_json::json!({ "k": "v" }), TS)
+            .unwrap();
+
+        let mut lines = journal.storage().lines();
+        // Editing the first annotation's data changes its bytes, so its hash no
+        // longer matches the next line's prev_hash: the break is at position 1.
+        lines[0] = lines[0].replace("\"v\"", "\"tampered\"");
+        assert_eq!(
+            verify_lines(&lines).status,
+            JournalStatus::Broken { position: 1 }
+        );
+    }
+
+    #[test]
+    fn empty_annotation_kind_is_rejected_on_append() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        let err = journal
+            .append_annotation("", serde_json::json!({}), TS)
+            .unwrap_err();
+        assert!(
+            matches!(err, JournalError::EmptyAnnotationKind),
+            "an empty kind is refused before it reaches the chain: {err:?}"
+        );
+        // Fail-closed: nothing was appended, chain state untouched.
+        assert!(journal.storage().lines().is_empty());
+    }
+
+    #[test]
+    fn unknown_annotation_kind_verifies() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        // A kind the core has never heard of, with an arbitrary nested object.
+        journal
+            .append_annotation(
+                "vendor.x.custom-op/v7",
+                serde_json::json!({ "nested": { "a": [1, 2, 3] }, "flag": true }),
+                TS,
+            )
+            .unwrap();
+        assert_eq!(
+            verify_lines(&journal.storage().lines()).status,
+            JournalStatus::IntactUnsignedTail {
+                unsigned_from_seq: 0
+            }
+        );
+    }
+
+    #[test]
+    fn hand_crafted_empty_kind_breaks_verification() {
+        // verify_lines rejects an empty kind structurally, even on a line
+        // append_annotation would never have produced (it refuses one earlier).
+        let genesis = "cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694";
+        let line = format!(
+            "{{\"seq\":0,\"prev_hash\":\"{genesis}\",\"ts\":1600000000,\
+             \"op\":\"annotation\",\"kind\":\"\",\"data\":{{}}}}"
+        );
+        assert_eq!(
+            verify_lines(&[line]).status,
+            JournalStatus::Broken { position: 0 }
+        );
+    }
+
+    #[test]
+    fn annotation_line_matches_golden() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        journal
+            .append_annotation(
+                "example.review",
+                serde_json::json!({ "count": 3, "text": "ok" }),
+                TS,
+            )
+            .unwrap();
+        let golden = "{\"seq\":0,\"prev_hash\":\"cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694\",\"ts\":1600000000,\"op\":\"annotation\",\"kind\":\"example.review\",\"data\":{\"count\":3,\"text\":\"ok\"}}";
+        assert_eq!(journal.storage().lines()[0], golden);
+    }
+
+    #[test]
+    fn prior_op_serialization_is_unchanged() {
+        // Locks the byte-for-byte NDJSON of a pre-annotation op: adding the
+        // annotation variant must not perturb existing lines.
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        journal
+            .record_leaf(&[0x2a], b"parent-cert", "CN=Shift", TS)
+            .unwrap();
+        let golden = "{\"seq\":0,\"prev_hash\":\"cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694\",\"ts\":1600000000,\"op\":\"issue_leaf\",\"serial\":\"2a\",\"parent\":\"f8fd035a13e497ca2b38c0274132f76d17e4c19f5483df61306f4ac3fbdcb5a3\",\"subject\":\"CN=Shift\"}";
+        assert_eq!(journal.storage().lines()[0], golden);
+    }
+
+    #[test]
+    fn non_object_annotation_data_is_rejected_on_append() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        // A null, an array, and two scalars: none is a JSON object.
+        for data in [
+            serde_json::json!(null),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("scalar"),
+            serde_json::json!(42),
+        ] {
+            let err = journal
+                .append_annotation("acme.note", data.clone(), TS)
+                .unwrap_err();
+            assert!(
+                matches!(err, JournalError::AnnotationDataNotObject),
+                "non-object data {data} is refused: {err:?}"
+            );
+        }
+        // Fail-closed: not one of them reached the chain.
+        assert!(journal.storage().lines().is_empty());
+    }
+
+    #[test]
+    fn hand_crafted_non_object_data_breaks_verification() {
+        // verify_lines rejects a non-object `data` structurally, even on lines
+        // append_annotation would never have produced.
+        let genesis = "cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694";
+        for data in ["null", "[1,2,3]", "\"scalar\"", "42"] {
+            let line = format!(
+                "{{\"seq\":0,\"prev_hash\":\"{genesis}\",\"ts\":1600000000,\
+                 \"op\":\"annotation\",\"kind\":\"acme.note\",\"data\":{data}}}"
+            );
+            assert_eq!(
+                verify_lines(&[line]).status,
+                JournalStatus::Broken { position: 0 },
+                "non-object data {data} breaks verification"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_root_line_matches_golden() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        journal
+            .record_root(&[0x01], b"root-cert", "CN=Root", TS)
+            .unwrap();
+        let golden = "{\"seq\":0,\"prev_hash\":\"cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694\",\"ts\":1600000000,\"op\":\"issue_root\",\"serial\":\"01\",\"parent\":\"3f357950b355c74992e0e73772377a3cc2fd14582684e7cc09ac26a5d8a8e0b6\",\"subject\":\"CN=Root\"}";
+        assert_eq!(journal.storage().lines()[0], golden);
+    }
+
+    #[test]
+    fn issue_ca_line_matches_golden() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        journal
+            .record_ca(&[0x05], b"parent-ca", "CN=Org", TS)
+            .unwrap();
+        let golden = "{\"seq\":0,\"prev_hash\":\"cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694\",\"ts\":1600000000,\"op\":\"issue_ca\",\"serial\":\"05\",\"parent\":\"613e71fa17fc048ca66759147855f55c578c441f6155b6fb4dceb8010a6beb49\",\"subject\":\"CN=Org\"}";
+        assert_eq!(journal.storage().lines()[0], golden);
+    }
+
+    #[test]
+    fn issue_crl_line_matches_golden() {
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        journal.record_crl(7, b"issuer-ca", TS).unwrap();
+        let golden = "{\"seq\":0,\"prev_hash\":\"cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694\",\"ts\":1600000000,\"op\":\"issue_crl\",\"crl_number\":7,\"parent\":\"d41496e77420d8821ec2a67668c81c9577aa7f62827dad0a13b8d79e013dcdff\"}";
+        assert_eq!(journal.storage().lines()[0], golden);
+    }
+
+    #[test]
+    fn head_signature_line_matches_golden() {
+        // Signing an empty journal's head is deterministic: the head is the
+        // genesis anchor and MockSigner folds it to a stable pseudo-signature.
+        let backend = MockSigner::ecdsa_sha256(key());
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        journal.sign_head(&backend, &key(), TS).unwrap();
+        let golden = "{\"seq\":0,\"prev_hash\":\"cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694\",\"ts\":1600000000,\"op\":\"head_signature\",\"algorithm\":\"ecdsa-sha256\",\"signature\":\"zyNVxmPAy97/JJkbcqkSXV9c5Qdr+JwfNo8t5qfwpUoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"}";
+        assert_eq!(journal.storage().lines()[0], golden);
     }
 }
 
