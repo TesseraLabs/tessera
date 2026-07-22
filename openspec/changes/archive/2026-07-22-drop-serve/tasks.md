@@ -26,7 +26,7 @@
 - [x] 4.2 `build-release` delta: MODIFIED `Release job` → CLI-only `issuer` binary (`cli,pkcs11,vault,file`); archive strictly after `cabinet-externalization` (see proposal)
 - [x] 4.3 Remove the `issuer-registry-signing` change (agent surface commercial; backend requirement folded into the `issuer-signing` delta)
 - [x] 4.4 Update the specs `README.md` index entry for `issuer-signing` (drop the agent clause)
-- [ ] 4.5 Sync the `issuer-signing` + `build-release` deltas (Purpose + requirements in the main specs) and archive this change
+- [x] 4.5 Sync the `issuer-signing` + `build-release` deltas (Purpose + requirements in the main specs) and archive this change
 
 ## 5. Verification
 

@@ -45,7 +45,7 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 |---|---|
 | [cert-issuance](cert-issuance/spec.md) | Сборка TBS с расширениями, монотонность рамок до подписи, самоподписанный корень, выпуск по CSR (PoP), случайные 128-бит серийники, CRL с монотонным crlNumber, самопроверка контрактом Engine |
 | [issuer-signing](issuer-signing/spec.md) | Единый интерфейс подписи готового TBS; адаптеры PKCS#11 (токен/HSM), Vault Transit и файловый (PKCS#8); кроссплатформенность CLI; локализация RU/EN |
-| [issuance-journal](issuance-journal/spec.md) | Локальный подписанный hash-chain журнал выпуска (запись до выдачи, fail-closed); верификация цепочки; подпись головы |
+| [issuance-journal](issuance-journal/spec.md) | Локальный подписанный hash-chain журнал выпуска (запись до выдачи, fail-closed); верификация цепочки; подпись головы; нейтральные аннотации в цепочке |
 
 ### Лицензирование
 | [licensing-distribution](licensing-distribution/spec.md) | Dual-license AGPL/commercial, граница open/commercial, SPI MacBackend, CLA |
