@@ -39,6 +39,8 @@ fn session(id: u128, opened_at: SystemTime, bounded_ttl_secs: Option<u64>) -> Ac
         pam_service: "sshd".into(),
         target: SessionTarget::logind("c1"),
         usb_serial: Some("AB".into()),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at,
         cert_cn: "cn".into(),

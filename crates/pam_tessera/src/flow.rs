@@ -81,6 +81,18 @@ pub enum FlowError {
     #[error("invalid PKCS#12 envelope on USB: {0}")]
     P12Envelope(#[from] P12EnvelopeError),
 
+    /// The authenticating USB device exposes no stable descriptor serial,
+    /// so the daemon could never match a removal event against the session.
+    ///
+    /// Continuous-presence enforcement keys sessions by the USB serial; a
+    /// device with `serial = None` would authenticate but stay permanently
+    /// invisible to removal enforcement (fail-open loss of the presence
+    /// guarantee). Under strict monitoring we refuse it fail-closed,
+    /// mirroring the PKCS#11 path's `TokenSerialMissing`. Permissive
+    /// monitoring is the documented escape hatch (see [`authenticate_pkcs12`]).
+    #[error("usb device exposes no stable serial; cannot enforce continuous presence")]
+    UsbSerialMissing,
+
     /// PIN-retry loop exhausted its attempts.
     #[error("max PIN tries")]
     MaxTries,
@@ -198,6 +210,7 @@ impl FlowError {
     /// | Variant                                                | Code                       |
     /// | ------------------------------------------------------ | -------------------------- |
     /// | `Usb` / `Mount` / `Discovery`                          | `PAM_AUTHINFO_UNAVAIL` (9) |
+    /// | `UsbSerialMissing`                                     | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11` (module load / wait / serial / config)        | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11OpensslEngineNotImplemented`                    | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11ModulePathMissingInConfig`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
@@ -217,6 +230,7 @@ impl FlowError {
             | Self::Mount(_)
             | Self::Discovery(_)
             | Self::P12Envelope(_)
+            | Self::UsbSerialMissing
             | Self::Pkcs11OpensslEngineNotImplemented
             | Self::Pkcs11ModulePathMissingInConfig
             | Self::Pkcs11(
@@ -667,6 +681,32 @@ where
         )));
     };
 
+    // Step 4b — continuous-presence precondition. The daemon keys removal
+    // enforcement on the USB descriptor serial; a device that exposes none
+    // authenticates but can never be matched by a removal event, silently
+    // losing the continuous-presence guarantee (fail-open). Refuse it here
+    // — before the PIN prompt — mirroring the PKCS#11 path, which requires
+    // a non-empty token serial.
+    //
+    // The escape hatch is the monitor fail mode. `on_usb_removed` has no
+    // non-enforcing variant (every value locks/logs-out/runs-hook/shuts-
+    // down), so the meaningful "monitoring is best-effort" signal is
+    // `fail_mode = permissive`: there the admin has accepted that presence
+    // checks may not hold, so a serial-less device is allowed. Strict mode
+    // (continuous presence is a hard requirement) denies it fail-closed.
+    if dev.serial.is_none()
+        && deps.cfg.monitor.fail_mode == tessera_core::config::validated::MonitorFailMode::Strict
+    {
+        tracing::warn!(
+            target: "tessera.flow",
+            devnode = ?dev.devnode,
+            vid = format!("{:04x}", dev.vid),
+            pid = format!("{:04x}", dev.pid),
+            "pkcs12 device exposes no stable USB serial; refusing auth under strict monitoring"
+        );
+        return Err(FlowError::UsbSerialMissing);
+    }
+
     // Step 5 — PIN-retry loop.  When the operator configured
     // `pkcs12_pin_prompt` it replaces the default "Smart-card PIN: "
     // prompt, mirroring `pkcs11_pin_prompt` on the PKCS#11 path.
@@ -856,6 +896,12 @@ where
         host_id_hash: deps.host_id_hash,
         target: deps.pam_target.clone(),
         usb_serial: dev.serial.as_deref(),
+        // Device-topology binding: the daemon uses VID/PID + devnode to
+        // decide whether a later udev `add` is really the same physical
+        // device before cancelling a pending removal action. The USB
+        // descriptor serial alone is attacker-controlled and cloneable.
+        usb_vid_pid: auth_ctx.usb_vid_pid.as_deref(),
+        usb_devnode: dev.devnode.to_str(),
         cert_cn: cert_cn_str,
         cert_serial: cert_serial_str,
         engineer_ski: &extras.engineer_ski,
@@ -1232,6 +1278,11 @@ where
         host_id_hash: deps.host_id_hash,
         target: deps.pam_target.clone(),
         usb_serial: auth_ctx.usb_serial.as_deref(),
+        // PKCS#11 tokens are not enumerated as USB block devices, so there
+        // is no VID/PID or devnode to bind removal cancellation to; the
+        // token serial in `usb_serial` is the only identifier available.
+        usb_vid_pid: None,
+        usb_devnode: None,
         cert_cn: cert_cn_str,
         cert_serial: cert_serial_str,
         engineer_ski: &extras.engineer_ski,
@@ -2250,6 +2301,82 @@ level = "info"
             FlowError::Discovery(DiscoveryError::P12NotFound { .. })
         ));
         assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+    }
+
+    #[test]
+    fn serial_less_pkcs12_device_denied_under_strict_monitoring() {
+        // A USB device that exposes no stable descriptor serial can never be
+        // matched by a removal event, so under strict monitoring (continuous
+        // presence is a hard requirement) it must be refused fail-closed —
+        // mirroring the PKCS#11 `TokenSerialMissing` path.
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let mut cfg = minimal_cfg();
+        cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+
+        let mut io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        io.device.serial = None;
+        let err = authenticate(deps, &io, "alice", "ssh", "sess-noserial".into(), |_| {
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, FlowError::UsbSerialMissing), "got {err:?}");
+        assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+    }
+
+    #[test]
+    fn serial_less_pkcs12_device_allowed_under_permissive_monitoring() {
+        // Permissive monitoring is the documented escape hatch: the admin has
+        // accepted that presence checks may be best-effort, so a serial-less
+        // device is allowed to authenticate. `minimal_cfg` is permissive.
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let cfg = minimal_cfg();
+        assert_eq!(
+            cfg.monitor.fail_mode,
+            tessera_core::config::validated::MonitorFailMode::Permissive
+        );
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+
+        let mut io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        io.device.serial = None;
+        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-noserial-ok".into(), |_| {
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .expect("permissive monitoring allows a serial-less device");
+        assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
+        assert!(outcome.auth_ctx.usb_serial.is_none());
     }
 
     #[test]
@@ -3538,6 +3665,8 @@ level = "info"
             host_id_hash: "host-T-hash",
             target: tessera_proto::SessionTarget::Unknown,
             usb_serial: Some("TOKEN-SERIAL"),
+            usb_vid_pid: None,
+            usb_devnode: None,
             cert_cn: "alice",
             cert_serial: "00",
             engineer_ski: "",

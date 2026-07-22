@@ -32,6 +32,8 @@ async fn full_session_lifecycle_via_real_socket() {
         pam_service: "sshd".into(),
         target: SessionTarget::logind("c1"),
         usb_serial: Some("AB".into()),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "host".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "Alice".into(),

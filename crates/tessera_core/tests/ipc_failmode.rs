@@ -47,6 +47,8 @@ fn open_info() -> OpenSessionInfo<'static> {
         host_id_hash: "h",
         target: SessionTarget::Unknown,
         usb_serial: None,
+        usb_vid_pid: None,
+        usb_devnode: None,
         cert_cn: "",
         cert_serial: "",
         engineer_ski: "",

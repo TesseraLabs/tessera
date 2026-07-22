@@ -41,6 +41,17 @@ pub struct OpenSessionInfo<'a> {
     pub target: SessionTarget,
     /// USB serial that authorised the session, when available.
     pub usb_serial: Option<&'a str>,
+    /// USB `VID:PID` (lowercase hex `vvvv:pppp`) of the authenticating
+    /// device, when available.
+    ///
+    /// Passed to the daemon so credential-removal cancellation can be bound
+    /// to the device's vendor/product identity rather than the cloneable
+    /// USB descriptor serial. `None` for PKCS#11 tokens.
+    pub usb_vid_pid: Option<&'a str>,
+    /// Block-device node the credential was read from (e.g. `/dev/sdb1`),
+    /// when available. Part of the same device-topology binding as
+    /// [`Self::usb_vid_pid`]. `None` for PKCS#11 tokens.
+    pub usb_devnode: Option<&'a str>,
     /// Common-Name from the validated end-entity certificate.
     pub cert_cn: &'a str,
     /// Hex serial of the validated end-entity certificate.

@@ -236,24 +236,127 @@ pub fn spawn_state_manager(
 }
 
 /// Persist `snapshot` on a blocking thread-pool worker so the JSON
-/// serialise + rename + fsync path does not stall a tokio runtime worker
-/// (P1-K). Logs a warning on failure — registry persistence is best-effort.
-async fn persist_async(store: &RegistryStore, snapshot: Vec<ActiveSession>) {
+/// serialise + rename + fsync path does not stall a tokio runtime worker.
+///
+/// Returns the outcome so callers can decide whether a durable write is a
+/// precondition (session open — the client must not be told the session is
+/// registered until it survives a restart) or best-effort (close / target
+/// update / logind teardown, where losing the write only risks a stale
+/// entry that later reconciliation removes).
+///
+/// # Errors
+///
+/// Returns an `io::Error` when the underlying [`RegistryStore::persist`]
+/// fails, or when the blocking worker panics/cancels (surfaced as
+/// [`io::ErrorKind::Other`]).
+async fn persist_async(store: &RegistryStore, snapshot: Vec<ActiveSession>) -> io::Result<()> {
     let store = store.clone();
-    let res = tokio::task::spawn_blocking(move || store.persist(&snapshot)).await;
-    match res {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(target: "tessera.monitord", error = %e, "registry persist failed");
-        }
-        Err(join_err) => {
-            tracing::warn!(
-                target: "tessera.monitord",
-                error = %join_err,
-                "registry persist task join failed"
-            );
+    match tokio::task::spawn_blocking(move || store.persist(&snapshot)).await {
+        Ok(res) => res,
+        Err(join_err) => Err(io::Error::other(format!(
+            "registry persist task join failed: {join_err}"
+        ))),
+    }
+}
+
+/// Persist a snapshot where losing the write is tolerable, logging a
+/// warning on failure. Used by session-close, target-update, and
+/// logind-teardown paths, whose in-memory mutation has already been
+/// committed and where a missed write only leaves a stale on-disk entry
+/// that startup reconciliation (or the next successful write) corrects.
+async fn persist_best_effort(store: &RegistryStore, snapshot: Vec<ActiveSession>, context: &str) {
+    if let Err(e) = persist_async(store, snapshot).await {
+        tracing::warn!(
+            target: "tessera.monitord",
+            error = %e,
+            context,
+            "registry persist failed (best-effort)"
+        );
+    }
+}
+
+/// Register a new session, acknowledging it only once the registry write is
+/// durable.
+///
+/// Three fail-closed guards bracket the `Ack`:
+/// 1. a SessionOpen-vs-Remove race check — if the USB serial is already gone
+///    the open is refused (`DEVICE_GONE`);
+/// 2. a bounded-TTL termination timer is armed before the session becomes
+///    visible, so a role session's deadline is live the instant any other
+///    task can observe it;
+/// 3. a durability check — if the on-disk write fails, both the in-memory
+///    insert AND the TTL timer just armed are rolled back, and the client is
+///    told (`INTERNAL`) so a strict-mode PAM client fails the authentication
+///    instead of believing a never-persisted session is active. Cancelling the
+///    timer is essential: a rejected session must never later fire
+///    `HandleSessionExpired`.
+// The parameters are the state-manager task's own borrows (config, registry,
+// udev probe, action channel, TTL-timer map) plus the request payload; folding
+// them into a parameter struct would only relocate the same coupling without
+// making any caller clearer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the state-manager task's borrows plus the request payload"
+)]
+async fn handle_session_open(
+    cfg: &StateConfig,
+    registry: &SessionRegistry,
+    udev_query: &dyn UdevQuery,
+    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
+    session: Box<ActiveSession>,
+    reply: oneshot::Sender<ServerMessage>,
+) {
+    // SessionOpen vs Remove race (T19): if the device was already unplugged
+    // between PAM completing and us receiving, refuse.
+    if let Some(serial) = session.usb_serial.as_deref() {
+        if !udev_query.is_serial_present(serial) {
+            // Best-effort: клиент мог отключиться, ответ можно потерять.
+            drop(reply.send(ServerMessage::Error {
+                code: tessera_proto::error_codes::DEVICE_GONE,
+                message: format!("usb serial {serial} not present"),
+            }));
+            return;
         }
     }
+    let s = *session;
+    let session_id = s.session_id;
+    // Arm the bounded-TTL termination timer (no-op when the session carries no
+    // TTL). Scheduled before `add` so the deadline is live the instant the
+    // session becomes visible.
+    schedule_session_ttl(&s, &cfg.on_usb_removed, action_tx, ttl_tokens);
+    registry.add(s);
+    // Durability is a precondition for acknowledging the open: the client (in
+    // strict monitor mode) treats a non-`Ack` reply as a failed, fail-closed
+    // authentication. If the write does not land, roll back everything the open
+    // provisionally created — the in-memory insert and the TTL timer — so the
+    // registry, the on-disk snapshot, and the scheduled-action state all stay
+    // consistent. Otherwise a daemon restart would silently drop this session
+    // and its future removal action while the client believed it was
+    // registered, and a leaked TTL timer would later fire `HandleSessionExpired`
+    // against a session the daemon rejected.
+    if let Err(e) = persist_async(&cfg.registry_store, registry.snapshot()).await {
+        registry.remove(session_id);
+        // Cancel and drop the TTL token armed above, using the same key
+        // `schedule_session_ttl` inserted under (the session id).
+        if let Some(tok) = ttl_tokens.remove(&session_id) {
+            tok.cancel();
+        }
+        tracing::error!(
+            target: "tessera.monitord",
+            session_id = %session_id,
+            error = %e,
+            "SessionOpen persist failed; rolled back in-memory registration and TTL timer"
+        );
+        // Best-effort: клиент мог отключиться, ответ можно потерять.
+        drop(reply.send(ServerMessage::Error {
+            code: tessera_proto::error_codes::INTERNAL,
+            message: format!("session registry persist failed: {e}"),
+        }));
+        return;
+    }
+    // Best-effort: клиент мог отключиться, ответ можно потерять.
+    drop(reply.send(ServerMessage::Ack));
 }
 
 async fn handle_ipc(
@@ -294,27 +397,10 @@ async fn handle_ipc(
             drop(reply.send(msg));
         }
         IpcRequest::SessionOpen { session, reply } => {
-            // SessionOpen vs Remove race (T19): if the device was already
-            // unplugged between PAM completing and us receiving, refuse.
-            if let Some(serial) = session.usb_serial.as_deref() {
-                if !udev_query.is_serial_present(serial) {
-                    // Best-effort: клиент мог отключиться, ответ можно потерять.
-                    drop(reply.send(ServerMessage::Error {
-                        code: tessera_proto::error_codes::DEVICE_GONE,
-                        message: format!("usb serial {serial} not present"),
-                    }));
-                    return;
-                }
-            }
-            let s = *session;
-            // Arm the bounded-TTL termination timer (no-op when the session
-            // carries no TTL). Scheduled before `add` so the deadline is live
-            // the instant the session becomes visible.
-            schedule_session_ttl(&s, &cfg.on_usb_removed, action_tx, ttl_tokens);
-            registry.add(s);
-            persist_async(&cfg.registry_store, registry.snapshot()).await;
-            // Best-effort: клиент мог отключиться, ответ можно потерять.
-            drop(reply.send(ServerMessage::Ack));
+            handle_session_open(
+                cfg, registry, udev_query, action_tx, ttl_tokens, session, reply,
+            )
+            .await;
         }
         IpcRequest::SessionClose {
             session_id,
@@ -334,7 +420,7 @@ async fn handle_ipc(
                     let _ = serial;
                 }
             }
-            persist_async(&cfg.registry_store, registry.snapshot()).await;
+            persist_best_effort(&cfg.registry_store, registry.snapshot(), "session_close").await;
             // Best-effort: клиент мог отключиться, ответ можно потерять.
             drop(reply.send(ServerMessage::Ack));
         }
@@ -351,7 +437,12 @@ async fn handle_ipc(
             // "Logout requested but session has no logind id").
             let msg = match registry.update_target(session_id, new_target.clone()) {
                 Ok(()) => {
-                    persist_async(&cfg.registry_store, registry.snapshot()).await;
+                    persist_best_effort(
+                        &cfg.registry_store,
+                        registry.snapshot(),
+                        "update_session_target",
+                    )
+                    .await;
                     tracing::info!(
                         target: "tessera.monitord",
                         session_id = %session_id,
@@ -373,6 +464,42 @@ async fn handle_ipc(
     }
 }
 
+/// Whether a udev `add` event is strong enough evidence that the same
+/// physical device that authenticated `session` has returned, and may
+/// therefore cancel a pending credential-removal action.
+///
+/// The USB descriptor serial is attacker-controlled and cloneable, so it is
+/// treated only as the map key. Every device-topology field the session
+/// captured at authentication time (VID/PID and the block-device node) must
+/// match the event:
+///
+/// - a field the session never recorded (a PKCS#11 token, or a client that
+///   predates topology capture) is left unconstrained, preserving the
+///   serial-only behaviour for those legacy sessions;
+/// - a field the session recorded but the event omits counts as a mismatch,
+///   so a pending removal is never cancelled on partial evidence.
+///
+/// Requiring both VID/PID and devpath to match is deliberately strict:
+/// a genuine re-seat that the kernel assigns a new devnode will not cancel,
+/// which is why a zero removal grace (no cancellation window at all) is the
+/// recommended terminal profile. A full re-add private-key challenge is the
+/// stronger future option and is out of scope here.
+fn add_event_rebinds_session(
+    session: &ActiveSession,
+    event_vid_pid: Option<&str>,
+    event_devnode: Option<&str>,
+) -> bool {
+    let vid_pid_ok = match session.usb_vid_pid.as_deref() {
+        None => true,
+        Some(captured) => event_vid_pid == Some(captured),
+    };
+    let devnode_ok = match session.usb_devnode.as_deref() {
+        None => true,
+        Some(captured) => event_devnode == Some(captured),
+    };
+    vid_pid_ok && devnode_ok
+}
+
 fn handle_udev(
     cfg: &StateConfig,
     registry: &SessionRegistry,
@@ -381,7 +508,14 @@ fn handle_udev(
     action_tx: &mpsc::UnboundedSender<ActionRequest>,
     event: UdevEvent,
 ) {
-    match (event.action, event.serial) {
+    let UdevEvent {
+        action,
+        devnode,
+        serial,
+        vid_pid,
+        is_usb: _,
+    } = event;
+    match (action, serial) {
         (UdevAction::Remove, Some(serial)) => {
             if suspend_state.is_in_grace_window(cfg.suspend_grace_seconds) {
                 tracing::info!(
@@ -425,8 +559,36 @@ fn handle_udev(
             });
         }
         (UdevAction::Add, Some(serial)) => {
-            if let Some(t) = grace_tokens.remove(&serial) {
-                t.cancel();
+            if !grace_tokens.contains_key(&serial) {
+                // Nothing pending for this serial — a bare add is a no-op.
+                return;
+            }
+            // A cloned serial must not be able to cancel enforcement on its
+            // own. Only cancel when the re-added device matches the topology
+            // (VID/PID + devnode) of the device that actually authenticated
+            // one of the sessions bound to this serial.
+            let event_vid_pid = vid_pid.map(|(v, p)| format!("{v:04x}:{p:04x}"));
+            let sessions = registry.find_by_serial(&serial);
+            let rebinds = sessions.iter().any(|s| {
+                add_event_rebinds_session(s, event_vid_pid.as_deref(), devnode.as_deref())
+            });
+            if rebinds {
+                if let Some(t) = grace_tokens.remove(&serial) {
+                    t.cancel();
+                    tracing::info!(
+                        target: "tessera.monitord",
+                        serial,
+                        "re-add matches authenticated device topology; cancelling pending removal"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    target: "tessera.monitord",
+                    serial,
+                    event_vid_pid = ?event_vid_pid,
+                    event_devnode = ?devnode,
+                    "re-add serial matches but device topology differs; NOT cancelling pending removal"
+                );
             }
         }
         _ => {}
@@ -539,9 +701,9 @@ async fn handle_logind(
             }
             // Persist after removals so a daemon restart does not
             // resurrect sessions that logind has already torn down.
-            // Mirrors the SessionOpen / SessionClose persistence policy:
-            // best-effort, log a warning on failure.
-            persist_async(&cfg.registry_store, registry.snapshot()).await;
+            // Mirrors the SessionClose persistence policy: best-effort, log a
+            // warning on failure.
+            persist_best_effort(&cfg.registry_store, registry.snapshot(), "logind_teardown").await;
         }
     }
 }

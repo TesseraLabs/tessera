@@ -244,7 +244,21 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     );
 
     let store = RegistryStore::new(state_file_path);
-    let initial = store.load().unwrap_or_default();
+    // Fail closed on a corrupt or unreadable registry rather than silently
+    // starting empty: an empty registry would drop every active session and
+    // its pending credential-removal action, defeating continuous-presence
+    // enforcement across a restart. A missing file is not an error — it
+    // simply means a fresh host with no sessions yet.
+    let initial = store.load().map_err(|e| {
+        tracing::error!(
+            target: "tessera.monitord",
+            error = %e,
+            audit_level = "CRITICAL",
+            "session registry could not be loaded; refusing to start with an empty registry"
+        );
+        anyhow::Error::new(e)
+            .context("load persisted session registry (refusing to start fail-open)")
+    })?;
     let registry = SessionRegistry::from_snapshot(initial);
 
     let shutdown_tok = CancellationToken::new();
@@ -436,6 +450,8 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         pam_service: String::new(),
         target: tessera_proto::SessionTarget::Unknown,
         usb_serial: None,
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: String::new(),
         opened_at: std::time::SystemTime::UNIX_EPOCH,
         cert_cn: String::new(),

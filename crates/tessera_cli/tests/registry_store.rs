@@ -20,6 +20,8 @@ fn s(i: u128) -> ActiveSession {
         pam_service: "s".into(),
         target: SessionTarget::logind("c1"),
         usb_serial: Some("AB".into()),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "cn".into(),
@@ -75,13 +77,20 @@ fn missing_file_returns_empty_no_error() {
 }
 
 #[test]
-fn corrupt_file_returns_empty() {
+fn corrupt_file_is_fail_closed() {
+    // A corrupt registry must NOT silently reset to empty: doing so would drop
+    // every active session and its pending credential-removal action across a
+    // restart. `load()` reports it so the daemon can refuse to start.
+    use tessera_cli::registry::RegistryLoadError;
     let dir = tempfile::tempdir().expect("tmp");
     let path = dir.path().join("bad.json");
     std::fs::write(&path, b"{not-json").expect("write");
-    let store = RegistryStore::new(path);
-    let loaded = store.load().expect("load");
-    assert!(loaded.is_empty());
+    let store = RegistryStore::new(path.clone());
+    let err = store.load().expect_err("corrupt registry must be an error");
+    assert!(
+        matches!(&err, RegistryLoadError::Corrupt { path: p, .. } if *p == path),
+        "expected Corrupt for {path:?}, got {err:?}"
+    );
 }
 
 #[test]

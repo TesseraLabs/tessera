@@ -15,7 +15,7 @@ use tessera_proto::SessionTarget;
 
 pub mod store;
 
-pub use store::RegistryStore;
+pub use store::{RegistryLoadError, RegistryStore};
 
 /// Errors raised by [`SessionRegistry::update_target`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -38,6 +38,21 @@ pub struct ActiveSession {
     pub target: SessionTarget,
     /// USB serial that authorised the session.
     pub usb_serial: Option<String>,
+    /// USB `VID:PID` (lowercase hex `vvvv:pppp`) of the authenticating
+    /// device, when known.
+    ///
+    /// Captured at authentication time so a udev `add` event can be checked
+    /// against the device's vendor/product identity — not just the
+    /// cloneable USB descriptor serial — before it is allowed to cancel a
+    /// pending credential-removal action. `None` for PKCS#11 tokens and for
+    /// sessions registered by a client that predates this field.
+    #[serde(default)]
+    pub usb_vid_pid: Option<String>,
+    /// Block-device node the credential was read from (e.g. `/dev/sdb1`),
+    /// when known. Part of the same device-topology binding as
+    /// [`Self::usb_vid_pid`].
+    #[serde(default)]
+    pub usb_devnode: Option<String>,
     /// Hex host id hash.
     pub host_id_hash: String,
     /// Wall-clock open time.

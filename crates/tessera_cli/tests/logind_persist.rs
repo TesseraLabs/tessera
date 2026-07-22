@@ -31,6 +31,8 @@ fn session_with_logind_id(uuid_seed: u128, logind_id: &str) -> ActiveSession {
         pam_service: "ssh".into(),
         target: SessionTarget::logind(logind_id),
         usb_serial: Some("AB".into()),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "alice".into(),
