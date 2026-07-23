@@ -309,4 +309,4 @@ EOF
 rm -f *.csr *.srl
 rm -rf crl_db crl_openssl.cnf
 rm -rf expired_db expired_openssl.cnf
-rm -f revoked_leaf.key expired_leaf.key
+rm -f revoked_leaf.key expired_leaf.key ca_site.key leaf_site.key
