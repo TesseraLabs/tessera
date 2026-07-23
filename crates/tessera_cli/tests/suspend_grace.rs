@@ -12,7 +12,9 @@ use std::time::{Duration, SystemTime};
 
 use tessera_cli::logind::LogindSignal;
 use tessera_cli::registry::{ActiveSession, RegistryStore, SessionRegistry};
-use tessera_cli::state::{spawn_state_manager, ActionRequest, Event, OnUsbRemoved, StateConfig};
+use tessera_cli::state::{
+    spawn_state_manager, ActionRequest, CredentialMode, Event, OnUsbRemoved, StateConfig,
+};
 use tessera_cli::udev_monitor::{UdevAction, UdevEvent};
 use tessera_cli::udev_query::AlwaysPresent;
 use tessera_proto::SessionTarget;
@@ -49,6 +51,7 @@ async fn suspend_window_blocks_actions() {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let cfg = StateConfig {
+        credential_mode: CredentialMode::Pkcs12,
         grace_seconds: 1,
         suspend_grace_seconds: 5,
         on_usb_removed: OnUsbRemoved::Lock,
@@ -91,6 +94,7 @@ async fn after_resume_grace_expires_actions_resume() {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let cfg = StateConfig {
+        credential_mode: CredentialMode::Pkcs12,
         grace_seconds: 1,
         suspend_grace_seconds: 1, // very short suspend grace for the test
         on_usb_removed: OnUsbRemoved::Lock,

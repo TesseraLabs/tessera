@@ -1,7 +1,7 @@
 //! Central state-manager task.
 //!
 //! Owns the [`SessionRegistry`], the [`RegistryStore`], the suspend-tracking
-//! state, and the per-serial grace-token map. Receives every external
+//! state, and the per-session grace-token map. Receives every external
 //! stimulus through a single `mpsc::UnboundedReceiver<Event>`. Emits action
 //! requests for the action-runner task.
 
@@ -25,7 +25,21 @@ use tessera_proto::{ServerMessage, SessionTarget};
 use crate::logind::LogindSignal;
 use crate::registry::{ActiveSession, RegistryStore, SessionRegistry};
 use crate::udev_monitor::{UdevAction, UdevEvent};
-use crate::udev_query::UdevQuery;
+use crate::udev_query::{UdevDeviceIdentity, UdevQuery};
+
+/// Credential transport selected by the shared daemon/PAM configuration.
+///
+/// PKCS#12 credentials are observable as USB block devices and therefore use
+/// udev presence/removal enforcement. PKCS#11 token serials live in a
+/// different namespace; the PAM authentication flow rejects strict
+/// continuous-presence mode until a native token-event monitor exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialMode {
+    /// PKCS#12 bundle discovered on a USB block device.
+    Pkcs12,
+    /// PKCS#11 token accessed through a provider.
+    Pkcs11,
+}
 
 /// What the daemon should do when a USB device is removed past the grace
 /// window. Mirrors the validated config enum but lives here so that the
@@ -72,6 +86,8 @@ impl SuspendState {
 /// Configuration for [`spawn_state_manager`].
 #[derive(Debug, Clone)]
 pub struct StateConfig {
+    /// Credential transport used by PAM and monitord.
+    pub credential_mode: CredentialMode,
     /// Grace seconds between USB removal and the configured action.
     pub grace_seconds: u64,
     /// Suspend grace seconds: removals seen during/just after suspend are
@@ -88,6 +104,7 @@ impl StateConfig {
     #[must_use]
     pub fn test_defaults(store: RegistryStore) -> Self {
         Self {
+            credential_mode: CredentialMode::Pkcs12,
             grace_seconds: 5,
             suspend_grace_seconds: 30,
             on_usb_removed: OnUsbRemoved::Lock,
@@ -184,6 +201,17 @@ pub enum ActionRequest {
     },
 }
 
+/// Identity of a TTL timer firing back into the single-writer state manager.
+///
+/// `opened_at` and `deadline` make stale timer messages harmless after a
+/// duplicate `SessionOpen` replaces a session under the same UUID.
+#[derive(Debug, Clone, Copy)]
+struct TtlExpired {
+    session_id: Uuid,
+    opened_at: SystemTime,
+    deadline: SystemTime,
+}
+
 /// Spawn the state-manager task.
 #[must_use]
 pub fn spawn_state_manager(
@@ -195,11 +223,15 @@ pub fn spawn_state_manager(
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut grace_tokens: HashMap<String, CancellationToken> = HashMap::new();
+        let mut grace_tokens: HashMap<Uuid, CancellationToken> = HashMap::new();
         // Per-session cancellation handles for bounded-TTL termination timers,
         // keyed by session id. Mirrors `grace_tokens` but addresses sessions
         // (a TTL is a per-session deadline) rather than USB serials.
         let mut ttl_tokens: HashMap<Uuid, CancellationToken> = HashMap::new();
+        // TTL tasks fire once and then wait for the state manager to durably
+        // retire the session. A bounded queue prevents an expiry burst from
+        // growing memory without limit.
+        let (ttl_expired_tx, mut ttl_expired_rx) = mpsc::channel::<TtlExpired>(64);
         let mut suspend_state = SuspendState::Awake;
 
         // Re-arm TTL timers for sessions restored from the persisted registry.
@@ -209,16 +241,36 @@ pub fn spawn_state_manager(
         // immediately by `schedule_session_ttl` (remaining time saturates to
         // zero).
         for session in registry.snapshot() {
-            schedule_session_ttl(&session, &cfg.on_usb_removed, &action_tx, &mut ttl_tokens);
+            schedule_session_ttl(&session, &ttl_expired_tx, &mut ttl_tokens);
         }
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                expired = ttl_expired_rx.recv() => {
+                    let Some(expired) = expired else { break };
+                    handle_session_expired(
+                        &cfg,
+                        &registry,
+                        &action_tx,
+                        &ttl_expired_tx,
+                        &mut grace_tokens,
+                        &mut ttl_tokens,
+                        expired,
+                    ).await;
+                }
                 ev = rx.recv() => {
                     let Some(ev) = ev else { break };
                     match ev {
-                        Event::Ipc(req) => handle_ipc(&cfg, &registry, udev_query.as_ref(), &action_tx, &mut ttl_tokens, req).await,
+                        Event::Ipc(req) => handle_ipc(
+                            &cfg,
+                            &registry,
+                            udev_query.as_ref(),
+                            &ttl_expired_tx,
+                            &mut grace_tokens,
+                            &mut ttl_tokens,
+                            req,
+                        ).await,
                         Event::Udev(u) => handle_udev(&cfg, &registry, &mut grace_tokens, &suspend_state, &action_tx, u),
                         Event::Logind(s) => handle_logind(&cfg, &mut suspend_state, &registry, &mut grace_tokens, &mut ttl_tokens, s).await,
                     }
@@ -226,7 +278,7 @@ pub fn spawn_state_manager(
             }
         }
         // Cancel any outstanding grace and TTL timers on shutdown.
-        for (_serial, tok) in grace_tokens.drain() {
+        for (_session_id, tok) in grace_tokens.drain() {
             tok.cancel();
         }
         for (_session_id, tok) in ttl_tokens.drain() {
@@ -279,17 +331,13 @@ async fn persist_best_effort(store: &RegistryStore, snapshot: Vec<ActiveSession>
 /// durable.
 ///
 /// Three fail-closed guards bracket the `Ack`:
-/// 1. a SessionOpen-vs-Remove race check — if the USB serial is already gone
-///    the open is refused (`DEVICE_GONE`);
-/// 2. a bounded-TTL termination timer is armed before the session becomes
-///    visible, so a role session's deadline is live the instant any other
-///    task can observe it;
-/// 3. a durability check — if the on-disk write fails, both the in-memory
-///    insert AND the TTL timer just armed are rolled back, and the client is
-///    told (`INTERNAL`) so a strict-mode PAM client fails the authentication
-///    instead of believing a never-persisted session is active. Cancelling the
-///    timer is essential: a rejected session must never later fire
-///    `HandleSessionExpired`.
+/// 1. for PKCS#12, a SessionOpen-vs-Remove race check verifies the full USB
+///    identity PAM captured, not only the cloneable descriptor serial;
+/// 2. the candidate snapshot is durably written before any in-memory entry or
+///    timer changes, so a failed duplicate open cannot destroy the previous
+///    valid session;
+/// 3. after persistence, the registry entry and bounded-TTL timer are replaced
+///    synchronously before the client can observe `Ack`.
 // The parameters are the state-manager task's own borrows (config, registry,
 // udev probe, action channel, TTL-timer map) plus the request payload; folding
 // them into a parameter struct would only relocate the same coupling without
@@ -302,51 +350,49 @@ async fn handle_session_open(
     cfg: &StateConfig,
     registry: &SessionRegistry,
     udev_query: &dyn UdevQuery,
-    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    ttl_expired_tx: &mpsc::Sender<TtlExpired>,
+    grace_tokens: &mut HashMap<Uuid, CancellationToken>,
     ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
     session: Box<ActiveSession>,
     reply: oneshot::Sender<ServerMessage>,
 ) {
-    // SessionOpen vs Remove race (T19): if the device was already unplugged
-    // between PAM completing and us receiving, refuse.
-    if let Some(serial) = session.usb_serial.as_deref() {
-        if !udev_query.is_serial_present(serial) {
-            // Best-effort: клиент мог отключиться, ответ можно потерять.
-            drop(reply.send(ServerMessage::Error {
-                code: tessera_proto::error_codes::DEVICE_GONE,
-                message: format!("usb serial {serial} not present"),
-            }));
-            return;
+    // SessionOpen vs Remove race (T19): PKCS#12 is observable through the
+    // block-device udev namespace, so require the exact captured device to
+    // still be present. PKCS#11 token serials are deliberately never compared
+    // to block-device serials; permissive PKCS#11 is best-effort and strict
+    // PKCS#11 is rejected by the PAM authentication flow.
+    if cfg.credential_mode == CredentialMode::Pkcs12 {
+        if let Some(serial) = session.usb_serial.as_deref() {
+            if !udev_query.is_device_present(UdevDeviceIdentity {
+                serial,
+                vid_pid: session.usb_vid_pid.as_deref(),
+                devnode: session.usb_devnode.as_deref(),
+            }) {
+                // Best-effort: клиент мог отключиться, ответ можно потерять.
+                drop(reply.send(ServerMessage::Error {
+                    code: tessera_proto::error_codes::DEVICE_GONE,
+                    message: format!("authenticated usb device {serial} is not present"),
+                }));
+                return;
+            }
         }
     }
     let s = *session;
     let session_id = s.session_id;
-    // Arm the bounded-TTL termination timer (no-op when the session carries no
-    // TTL). Scheduled before `add` so the deadline is live the instant the
-    // session becomes visible.
-    schedule_session_ttl(&s, &cfg.on_usb_removed, action_tx, ttl_tokens);
-    registry.add(s);
-    // Durability is a precondition for acknowledging the open: the client (in
-    // strict monitor mode) treats a non-`Ack` reply as a failed, fail-closed
-    // authentication. If the write does not land, roll back everything the open
-    // provisionally created — the in-memory insert and the TTL timer — so the
-    // registry, the on-disk snapshot, and the scheduled-action state all stay
-    // consistent. Otherwise a daemon restart would silently drop this session
-    // and its future removal action while the client believed it was
-    // registered, and a leaked TTL timer would later fire `HandleSessionExpired`
-    // against a session the daemon rejected.
-    if let Err(e) = persist_async(&cfg.registry_store, registry.snapshot()).await {
-        registry.remove(session_id);
-        // Cancel and drop the TTL token armed above, using the same key
-        // `schedule_session_ttl` inserted under (the session id).
-        if let Some(tok) = ttl_tokens.remove(&session_id) {
-            tok.cancel();
-        }
+
+    // Build the replacement snapshot without mutating the live registry.
+    // State-manager events are serialized, so while this write is in flight
+    // readers continue seeing the previous valid session. If persistence
+    // fails, neither that entry nor its existing timer is touched.
+    let mut candidate = registry.snapshot();
+    candidate.retain(|existing| existing.session_id != session_id);
+    candidate.push(s.clone());
+    if let Err(e) = persist_async(&cfg.registry_store, candidate).await {
         tracing::error!(
             target: "tessera.monitord",
             session_id = %session_id,
             error = %e,
-            "SessionOpen persist failed; rolled back in-memory registration and TTL timer"
+            "SessionOpen persist failed; previous in-memory session and timer preserved"
         );
         // Best-effort: клиент мог отключиться, ответ можно потерять.
         drop(reply.send(ServerMessage::Error {
@@ -355,15 +401,30 @@ async fn handle_session_open(
         }));
         return;
     }
+
+    // Commit memory and timers only after the candidate is durable. A
+    // successful retry/replacement must retire any removal grace task that
+    // captured the previous record under this UUID; the full presence check
+    // above already proved the replacement's PKCS#12 device is present.
+    if let Some(token) = grace_tokens.remove(&session_id) {
+        token.cancel();
+    }
+    registry.add(s.clone());
+    schedule_session_ttl(&s, ttl_expired_tx, ttl_tokens);
     // Best-effort: клиент мог отключиться, ответ можно потерять.
     drop(reply.send(ServerMessage::Ack));
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single-writer state manager threads its bounded timer maps and injected I/O dependencies"
+)]
 async fn handle_ipc(
     cfg: &StateConfig,
     registry: &SessionRegistry,
     udev_query: &dyn UdevQuery,
-    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    ttl_expired_tx: &mpsc::Sender<TtlExpired>,
+    grace_tokens: &mut HashMap<Uuid, CancellationToken>,
     ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
     req: IpcRequest,
 ) {
@@ -398,7 +459,14 @@ async fn handle_ipc(
         }
         IpcRequest::SessionOpen { session, reply } => {
             handle_session_open(
-                cfg, registry, udev_query, action_tx, ttl_tokens, session, reply,
+                cfg,
+                registry,
+                udev_query,
+                ttl_expired_tx,
+                grace_tokens,
+                ttl_tokens,
+                session,
+                reply,
             )
             .await;
         }
@@ -411,15 +479,10 @@ async fn handle_ipc(
             if let Some(tok) = ttl_tokens.remove(&session_id) {
                 tok.cancel();
             }
-            let removed = registry.remove(session_id);
-            if let Some(s) = &removed {
-                if let Some(serial) = s.usb_serial.as_deref() {
-                    // If this was the only session bound to that serial, we
-                    // can drop the active grace timer (handled in
-                    // handle_udev when checked next; here we just persist).
-                    let _ = serial;
-                }
+            if let Some(tok) = grace_tokens.remove(&session_id) {
+                tok.cancel();
             }
+            let _removed = registry.remove(session_id);
             persist_best_effort(&cfg.registry_store, registry.snapshot(), "session_close").await;
             // Best-effort: клиент мог отключиться, ответ можно потерять.
             drop(reply.send(ServerMessage::Ack));
@@ -500,14 +563,49 @@ fn add_event_rebinds_session(
     vid_pid_ok && devnode_ok
 }
 
+/// Whether a remove event can refer to this session's authenticating device.
+///
+/// A populated event field must match the captured value. Missing fields are
+/// treated as unknown rather than mismatch: acting on every ambiguous
+/// same-serial session is fail-closed, while suppressing all of them would let
+/// a sparse udev remove event bypass enforcement.
+fn remove_event_may_match_session(
+    session: &ActiveSession,
+    event_vid_pid: Option<&str>,
+    event_devnode: Option<&str>,
+) -> bool {
+    let vid_pid_ok = match (session.usb_vid_pid.as_deref(), event_vid_pid) {
+        (Some(captured), Some(observed)) => captured == observed,
+        _ => true,
+    };
+    let devnode_ok = match (session.usb_devnode.as_deref(), event_devnode) {
+        (Some(captured), Some(observed)) => captured == observed,
+        _ => true,
+    };
+    vid_pid_ok && devnode_ok
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "remove and add branches share one destructured udev event and per-session timer map"
+)]
 fn handle_udev(
     cfg: &StateConfig,
     registry: &SessionRegistry,
-    grace_tokens: &mut HashMap<String, CancellationToken>,
+    grace_tokens: &mut HashMap<Uuid, CancellationToken>,
     suspend_state: &SuspendState,
     action_tx: &mpsc::UnboundedSender<ActionRequest>,
     event: UdevEvent,
 ) {
+    // PKCS#11 token serials and USB block-device serials are unrelated
+    // namespaces. Permissive PKCS#11 deliberately has no continuous-presence
+    // enforcement until a native token-event source exists; reacting to an
+    // attacker-controlled block device with a colliding serial would only
+    // create a spurious session-ending action.
+    if cfg.credential_mode == CredentialMode::Pkcs11 {
+        return;
+    }
+
     let UdevEvent {
         action,
         devnode,
@@ -525,63 +623,98 @@ fn handle_udev(
                 );
                 return;
             }
-            let sessions = registry.find_by_serial(&serial);
+            let event_vid_pid = vid_pid.map(|(v, p)| format!("{v:04x}:{p:04x}"));
+            let sessions: Vec<ActiveSession> = registry
+                .find_by_serial(&serial)
+                .into_iter()
+                .filter(|session| {
+                    remove_event_may_match_session(
+                        session,
+                        event_vid_pid.as_deref(),
+                        devnode.as_deref(),
+                    )
+                })
+                .collect();
             if sessions.is_empty() {
                 return;
             }
-            if grace_tokens.contains_key(&serial) {
-                // Hub-disconnect dedup.
-                return;
-            }
-            let token = CancellationToken::new();
-            grace_tokens.insert(serial.clone(), token.clone());
-            let action_tx = action_tx.clone();
-            let action = cfg.on_usb_removed.clone();
             let grace = Duration::from_secs(cfg.grace_seconds);
-            let serial_for_log = serial.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(grace) => {
-                        tracing::info!(target: "tessera.monitord", serial = serial_for_log, "grace window expired, dispatching action");
-                        for s in sessions {
+            for session in sessions {
+                let session_id = session.session_id;
+                if grace_tokens
+                    .get(&session_id)
+                    .is_some_and(|token| !token.is_cancelled())
+                {
+                    // Duplicate remove/hub event for this exact session.
+                    continue;
+                }
+                grace_tokens.remove(&session_id);
+                let token = CancellationToken::new();
+                grace_tokens.insert(session_id, token.clone());
+                let completed = token.clone();
+                let action_tx = action_tx.clone();
+                let action = cfg.on_usb_removed.clone();
+                let serial_for_log = serial.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(grace) => {
+                            tracing::info!(
+                                target: "tessera.monitord",
+                                serial = serial_for_log,
+                                %session_id,
+                                "grace window expired, dispatching action"
+                            );
                             // Best-effort: если приёмник действий уже закрыт,
                             // демон всё равно завершается — терять нечего.
                             drop(action_tx.send(ActionRequest::HandleUsbRemoved {
-                                session: s,
-                                action: action.clone(),
+                                session,
+                                action,
                             }));
+                            // Mark the map entry reusable without retaining a
+                            // permanently "pending" timer after dispatch.
+                            completed.cancel();
+                        }
+                        _ = token.cancelled() => {
+                            tracing::info!(
+                                target: "tessera.monitord",
+                                serial = serial_for_log,
+                                %session_id,
+                                "grace cancelled"
+                            );
                         }
                     }
-                    _ = token.cancelled() => {
-                        tracing::info!(target: "tessera.monitord", serial = serial_for_log, "grace cancelled");
-                    }
-                }
-            });
+                });
+            }
         }
         (UdevAction::Add, Some(serial)) => {
-            if !grace_tokens.contains_key(&serial) {
-                // Nothing pending for this serial — a bare add is a no-op.
-                return;
-            }
             // A cloned serial must not be able to cancel enforcement on its
-            // own. Only cancel when the re-added device matches the topology
-            // (VID/PID + devnode) of the device that actually authenticated
-            // one of the sessions bound to this serial.
+            // own. Cancel only each exact session whose captured topology
+            // matches; same-serial sessions for other devices keep their own
+            // independent grace timers.
             let event_vid_pid = vid_pid.map(|(v, p)| format!("{v:04x}:{p:04x}"));
             let sessions = registry.find_by_serial(&serial);
-            let rebinds = sessions.iter().any(|s| {
-                add_event_rebinds_session(s, event_vid_pid.as_deref(), devnode.as_deref())
-            });
-            if rebinds {
-                if let Some(t) = grace_tokens.remove(&serial) {
-                    t.cancel();
-                    tracing::info!(
-                        target: "tessera.monitord",
-                        serial,
-                        "re-add matches authenticated device topology; cancelling pending removal"
-                    );
+            let mut cancelled = 0_usize;
+            for session in sessions {
+                if add_event_rebinds_session(&session, event_vid_pid.as_deref(), devnode.as_deref())
+                {
+                    if let Some(t) = grace_tokens.remove(&session.session_id) {
+                        cancelled += 1;
+                        t.cancel();
+                    }
                 }
-            } else {
+            }
+            if cancelled > 0 {
+                tracing::info!(
+                    target: "tessera.monitord",
+                    serial,
+                    cancelled,
+                    "re-add matches authenticated device topology; cancelling pending removals"
+                );
+            } else if grace_tokens.iter().any(|(session_id, _)| {
+                registry
+                    .find_by_session_id(*session_id)
+                    .is_some_and(|session| session.usb_serial.as_deref() == Some(serial.as_str()))
+            }) {
                 tracing::warn!(
                     target: "tessera.monitord",
                     serial,
@@ -613,10 +746,16 @@ fn handle_udev(
 /// or shutdown) suppresses the action.
 fn schedule_session_ttl(
     session: &ActiveSession,
-    action: &OnUsbRemoved,
-    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    ttl_expired_tx: &mpsc::Sender<TtlExpired>,
     ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
 ) {
+    // Replacing a session with no TTL must cancel the previous bounded timer
+    // too; checking `session_expiry` before this point would leave that stale
+    // timer armed.
+    if let Some(old) = ttl_tokens.remove(&session.session_id) {
+        old.cancel();
+    }
+
     let Some(deadline) = session.session_expiry else {
         return;
     };
@@ -624,17 +763,12 @@ fn schedule_session_ttl(
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO);
 
-    // Replace any stale timer for this session id.
-    if let Some(old) = ttl_tokens.remove(&session.session_id) {
-        old.cancel();
-    }
     let token = CancellationToken::new();
     ttl_tokens.insert(session.session_id, token.clone());
 
-    let action_tx = action_tx.clone();
-    let action = action.clone();
-    let session = session.clone();
+    let ttl_expired_tx = ttl_expired_tx.clone();
     let session_id = session.session_id;
+    let opened_at = session.opened_at;
     tokio::spawn(async move {
         tokio::select! {
             () = tokio::time::sleep(remaining) => {
@@ -642,12 +776,23 @@ fn schedule_session_ttl(
                     target: "tessera.monitord",
                     session_id = %session_id,
                     session_expiry = ?deadline,
-                    pam_user = %session.pam_user,
                     "bounded role-session TTL reached; revoking continued access"
                 );
-                // Best-effort: if the action runner is already gone the daemon
-                // is shutting down and there is nothing left to enforce.
-                drop(action_tx.send(ActionRequest::HandleSessionExpired { session, action }));
+                if ttl_expired_tx
+                    .send(TtlExpired {
+                        session_id,
+                        opened_at,
+                        deadline,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(
+                        target: "tessera.monitord",
+                        %session_id,
+                        "state manager stopped before TTL expiry could be retired"
+                    );
+                }
             }
             () = token.cancelled() => {
                 tracing::debug!(
@@ -660,11 +805,71 @@ fn schedule_session_ttl(
     });
 }
 
+/// Retire an expired session in the single-writer state manager before
+/// dispatching the configured enforcement action.
+///
+/// Removing the registry record first ensures role lookups fail closed even
+/// when Lock is the configured action or the action backend itself fails.
+/// Persistence is best-effort after the in-memory revocation: an old on-disk
+/// record still carries the absolute expired deadline and is retired
+/// immediately on the next daemon start.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "expiry atomically coordinates registry, action queue, persistence, and both timer maps"
+)]
+async fn handle_session_expired(
+    cfg: &StateConfig,
+    registry: &SessionRegistry,
+    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    ttl_expired_tx: &mpsc::Sender<TtlExpired>,
+    grace_tokens: &mut HashMap<Uuid, CancellationToken>,
+    ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
+    expired: TtlExpired,
+) {
+    let Some(session) = registry.find_by_session_id(expired.session_id) else {
+        return;
+    };
+    if session.opened_at != expired.opened_at || session.session_expiry != Some(expired.deadline) {
+        tracing::debug!(
+            target: "tessera.monitord",
+            session_id = %expired.session_id,
+            "ignoring stale TTL event for replaced session"
+        );
+        return;
+    }
+
+    // Wall-clock time can move backwards while the monotonic sleep is
+    // running. Re-arm against the same absolute deadline instead of expiring
+    // early after such an adjustment.
+    if expired.deadline > SystemTime::now() {
+        schedule_session_ttl(&session, ttl_expired_tx, ttl_tokens);
+        return;
+    }
+
+    if let Some(token) = ttl_tokens.remove(&expired.session_id) {
+        token.cancel();
+    }
+    if let Some(token) = grace_tokens.remove(&expired.session_id) {
+        token.cancel();
+    }
+    let Some(session) = registry.remove(expired.session_id) else {
+        return;
+    };
+
+    // Dispatch immediately after the in-memory revocation; a slow fsync must
+    // not postpone the security action.
+    drop(action_tx.send(ActionRequest::HandleSessionExpired {
+        session,
+        action: cfg.on_usb_removed.clone(),
+    }));
+    persist_best_effort(&cfg.registry_store, registry.snapshot(), "session_expired").await;
+}
+
 async fn handle_logind(
     cfg: &StateConfig,
     suspend_state: &mut SuspendState,
     registry: &SessionRegistry,
-    grace_tokens: &mut HashMap<String, CancellationToken>,
+    grace_tokens: &mut HashMap<Uuid, CancellationToken>,
     ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
     sig: LogindSignal,
 ) {
@@ -673,7 +878,7 @@ async fn handle_logind(
             *suspend_state = SuspendState::SuspendingAt(Instant::now());
             // Cancel any pending grace timers — the suspend may legitimately
             // explain the removal.
-            for (_serial, tok) in grace_tokens.drain() {
+            for (_session_id, tok) in grace_tokens.drain() {
                 tok.cancel();
             }
         }
@@ -695,6 +900,9 @@ async fn handle_logind(
                 // logind already tore the session down; drop its TTL timer so
                 // it does not later fire an action against a dead session.
                 if let Some(tok) = ttl_tokens.remove(&uuid) {
+                    tok.cancel();
+                }
+                if let Some(tok) = grace_tokens.remove(&uuid) {
                     tok.cancel();
                 }
                 let _ = registry.remove(uuid);

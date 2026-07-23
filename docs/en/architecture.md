@@ -584,14 +584,12 @@ Principles:
   mapping) → `PAM_PERM_DENIED`; cert-scope failures
   (`pam_cert_host_binding` / `pam_cert_user_binding`) and other auth errors →
   `PAM_AUTH_ERR`; an exhausted PIN budget → `PAM_MAXTRIES`.
-- **Monitord being unavailable does not make auth fail-closed**, even with
-  `monitor_fail_mode = "strict"`: only `DEVICE_GONE` and `UNAUTHORIZED` are
-  fatal (they change the verdict)
-  (`crates/tessera_core/src/ipc/failmode.rs`); IPC transport errors on the
-  auth path are logged as non-fatal — the notification to monitord happens
-  after an authentication success that has already occurred. `strict` /
-  `permissive` control only whether the `FailModeWrapper` wrapper propagates
-  non-fatal IPC errors to the calling code.
+- Monitord registration is part of the authentication verdict. With
+  `monitor_fail_mode = "strict"`, an IPC transport or registration failure
+  denies the login because the session could not be placed under removal
+  enforcement. With `permissive`, the `FailModeWrapper` absorbs transport
+  failures, while `DEVICE_GONE` and `UNAUTHORIZED` remain fatal in every
+  mode (`crates/tessera_core/src/ipc/failmode.rs`).
 
 ## 14. Logging: `tracing` → syslog / journald
 

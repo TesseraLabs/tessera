@@ -17,7 +17,7 @@
 #                   provided by gost-engine.
 # "pkcs11_native" — verification keys live on the token; OpenSSL is bypassed
 #                   for signing. GOST via the token's own provider.
-crypto_backend = "openssl"
+crypto_backend = "pkcs11_native"
 
 # --- Mode --------------------------------------------------------------------
 # "pkcs12" : passphrase-protected PKCS#12 file on a USB filesystem.
@@ -97,7 +97,10 @@ suspend_grace_seconds = 30
 #   "strict"     — any daemon I/O / timeout error fails auth.
 #   "permissive" — transient I/O errors are tolerated; typed failures
 #                  (DeviceGone / Unauthorized) always propagate.
-monitor_fail_mode = "strict"
+# PKCS#11 token-removal events are not observable by monitord yet, so strict
+# continuous-presence auth is refused for mode = "pkcs11". Use permissive
+# until a native token-event source is configured.
+monitor_fail_mode = "permissive"
 
 # --- Monitor (PAM client + tessera daemon) -----------------------------
 # Both pam_tessera.so AND tessera read this section. Any field
@@ -201,7 +204,7 @@ allowed_root_spki_sha256 = []
 
 # --- Trust overrides (optional) ---------------------------------------------
 # Per-host override of trust anchors. Each entry must list at least one host
-# id and (optionally) replacement anchors / intermediates.
+# id and at least one replacement anchor; intermediates are optional.
 # [[trust_override]]
 # when_host_id_in = ["ws-001.example.org"]
 # anchors         = ["/etc/tessera/ca/site-foo.pem"]

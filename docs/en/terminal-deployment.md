@@ -113,11 +113,12 @@ description of each is in [configuration.md](configuration.md). The profile's
 principle is fail-closed: when in doubt, access is denied.
 
 ```toml
-# Credential on a hardware token (Rutoken/JaCarta). For a container
-# on a USB stick, use mode = "pkcs12".
+# Credential in a PKCS#12 container on a USB stick. Native PKCS#11 token
+# removal monitoring is not available yet, so PKCS#11 cannot provide this
+# terminal profile's immediate-removal guarantee.
 crypto_backend = "openssl"
-mode = "pkcs11"
-pkcs11_module = "/usr/lib/librtpkcs11ecp.so"
+mode = "pkcs12"
+pkcs12_path_pattern = "certs/${user}.p12"
 
 # Reaction to media removal. For a terminal — close the session at once.
 on_usb_removed = "logout"     # or "shutdown" — power off the host

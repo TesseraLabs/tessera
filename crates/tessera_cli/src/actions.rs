@@ -89,9 +89,16 @@ async fn run_session_ending_action(
         OnUsbRemoved::Hook { path } => {
             let session_clone = session.clone();
             let path_clone = path.clone();
-            tokio::task::spawn_blocking(move || run_hook(&path_clone, &session_clone))
-                .await
-                .map_err(|e| anyhow::anyhow!("hook task join error: {e}"))??;
+            let result =
+                match tokio::task::spawn_blocking(move || run_hook(&path_clone, &session_clone))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => Err(anyhow::anyhow!("hook task join error: {e}")),
+                };
+            if let Err(e) = result {
+                fail_closed_action_error(actions, "Hook", session, &e).await?;
+            }
         }
         OnUsbRemoved::Shutdown => {
             tracing::error!(
@@ -99,7 +106,9 @@ async fn run_session_ending_action(
                 session_id = %session.session_id,
                 "ALERT: powering off to revoke access"
             );
-            actions.power_off().await?;
+            if let Err(e) = actions.power_off().await {
+                fail_closed_action_error(actions, "Shutdown", session, &e).await?;
+            }
         }
     }
     Ok(())
@@ -171,6 +180,26 @@ async fn fail_closed_logind_error(
     actions.reboot().await
 }
 
+/// Fail closed when a non-logind session-ending action (Hook / Shutdown)
+/// cannot complete.
+async fn fail_closed_action_error(
+    actions: &Arc<dyn LogindActionsTrait>,
+    action: &str,
+    session: &crate::registry::ActiveSession,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    tracing::error!(
+        target: "tessera.monitord",
+        action,
+        session_id = %session.session_id,
+        pam_user = %session.pam_user,
+        pam_service = %session.pam_service,
+        error = %error,
+        "ALERT: session-ending {action} failed; failing closed with reboot"
+    );
+    actions.reboot().await
+}
+
 /// Runs the operator-configured USB-removal hook as root.
 ///
 /// # Security
@@ -196,7 +225,22 @@ fn run_hook(
     session: &crate::registry::ActiveSession,
 ) -> anyhow::Result<()> {
     use std::process::Command;
-    let mut cmd = Command::new(path);
+    // Validate every component immediately before execution. Keeping the
+    // descriptor alive through `status()` pins the validated leaf while the
+    // canonical path is resolved by exec; non-root users cannot replace any
+    // validated ancestor or the root-owned leaf.
+    let validated = tessera_core::privileged_path::validate_path(
+        path,
+        tessera_core::privileged_path::ExecTrust::Root,
+    )
+    .map_err(|e| anyhow::anyhow!("unsafe root hook path {}: {e}", path.display()))?;
+    let canonical = validated.canonical().to_owned();
+    let _validated_descriptor = validated.into_descriptor();
+
+    let mut cmd = Command::new(canonical);
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    cmd.env("LANG", "C");
     cmd.env("CERT_CN", &session.cert_cn);
     cmd.env("PAM_USER", &session.pam_user);
     cmd.env("PAM_SERVICE", &session.pam_service);

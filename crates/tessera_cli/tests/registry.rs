@@ -8,7 +8,7 @@
     clippy::let_underscore_must_use
 )]
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tessera_cli::registry::{ActiveSession, SessionRegistry};
 use tessera_proto::SessionTarget;
 use uuid::Uuid;
@@ -95,6 +95,19 @@ fn lookup_by_uid_missing_returns_none() {
     let r = SessionRegistry::new();
     r.add(make_with_uid(1, 1000, "abcd"));
     assert!(r.find_by_uid(999).is_none());
+}
+
+#[test]
+fn lookup_by_uid_rejects_expired_session_before_timer_cleanup() {
+    let r = SessionRegistry::new();
+    let mut expired = make_with_uid(1, 1000, "abcd");
+    expired.session_expiry = Some(SystemTime::now() - Duration::from_secs(1));
+    r.add(expired);
+
+    assert!(
+        r.find_by_uid(1000).is_none(),
+        "absolute TTL must gate authorization even before timer cleanup"
+    );
 }
 
 #[test]

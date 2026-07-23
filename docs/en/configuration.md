@@ -59,7 +59,7 @@ the example really validates through `ValidatedConfig::try_from`.
 | `on_usb_removed`           | string             | `"lock"`    | `"lock"`, `"logout"`, `"hook"`, `"shutdown"`                   | Action on confirmed USB removal.                             | `"shutdown"` fits terminals; `"lock"` fits workstations.                             |
 | `usb_removed_grace_seconds`| integer            | `0`         | `0..=300`                                                      | Cancellation window: reinserting the same serial cancels the action. | Protects against false triggers; set to `0` on terminals.                    |
 | `suspend_grace_seconds`    | integer            | `0`         | `0..=600`                                                      | Window after resume during which USB removal is ignored.     | Hubs often make noise during suspend; `30` seconds is a typical value.               |
-| `monitor_fail_mode`        | string             | `"strict"`  | `"strict"`, `"permissive"`                                     | Whether to propagate non-fatal `monitord` IPC errors to the calling code (`strict`) or swallow them with a WARN (`permissive`). | `DeviceGone`/`Unauthorized` are always fatal; `monitord` transport failures do not override a successful auth (see architecture.md §13). |
+| `monitor_fail_mode`        | string             | `"strict"`  | `"strict"`, `"permissive"`                                     | Whether to propagate non-fatal `monitord` IPC errors to the calling code (`strict`) or swallow them with a WARN (`permissive`). | `DeviceGone`/`Unauthorized` are always fatal. Strict mode currently rejects PKCS#11 authentication because native token-removal observation is not implemented. |
 
 > **Authorization (host + user) is described in the certificate itself
 > via X.509 v3 extensions** `pam_cert_host_binding` and
@@ -78,7 +78,10 @@ the example really validates through `ValidatedConfig::try_from`.
 
 With `"hook"`, the `[monitor]` section must contain
 `on_usb_removed_hook_path = "/absolute/path"`. The validator refuses to
-load the config when `on_usb_removed = "hook"` and no `hook_path` is set.
+load the config when `on_usb_removed = "hook"` and no `hook_path` is set,
+or when the executable or any parent directory is not root-controlled.
+The path is checked again immediately before execution; the hook receives a
+minimal environment with a fixed system `PATH`.
 
 ### The `[monitor]` section
 
@@ -337,7 +340,7 @@ set of `host_id`s.
 | Field              | Type         | Default | Allowed values             | Effect                                                 | Security implication                                                  |
 |--------------------|--------------|---------|-----------------------------|--------------------------------------------------------|------------------------------------------------------------------------|
 | `when_host_id_in`  | list of strings | —     | list of `host_id`s          | On which machines to apply the override.                | Must be non-empty.                                                     |
-| `anchors`          | list of paths | `[]`   | PEM files                   | Which trust roots to use instead of the main ones.      | Narrows trust on specific machines.                                    |
+| `anchors`          | list of paths | —      | `≥ 1` PEM file              | Which trust roots to use instead of the main ones.      | Required and non-empty; narrows trust on specific machines.             |
 | `intermediates`    | list of paths | `[]`   | PEM files                   | Which intermediates to use.                             | Likewise.                                                              |
 
 ### Worked example: a minimal valid configuration
@@ -394,13 +397,16 @@ Details and ready-made `openssl.cnf` recipes are in
 
 ## Typical scenarios
 
-### 3.1 Terminal — offline, CRL with TTL, USB required
+### 3.1 Terminal — offline, CRL with TTL, PKCS#11 without continuous presence
 
-Properties: the machine is in a metal enclosure, no Internet, the key is
-on a token, USB removal → immediate session termination (no grace).
+Properties: the machine is in a metal enclosure, no Internet, and the key is
+on a token. Native PKCS#11 removal observation is not implemented yet, so this
+profile is suitable only where bounded role/session TTL is an acceptable
+compensating control. Do not deploy it where token removal must immediately
+end the session.
 
 ```toml
-crypto_backend = "openssl"
+crypto_backend = "pkcs11_native"
 mode           = "pkcs11"
 pkcs11_module  = "/usr/lib/librtpkcs11ecp.so"
 pkcs11_max_pin_attempts = 3
@@ -410,7 +416,7 @@ usb_wait_seconds         = 5
 on_usb_removed           = "shutdown"   # terminal — power off
 usb_removed_grace_seconds = 0           # no cancellation
 suspend_grace_seconds    = 0
-monitor_fail_mode        = "strict"
+monitor_fail_mode        = "permissive" # required for PKCS#11 until native removal monitoring
 
 [trust]
 anchors = ["/etc/tessera/ca/terminal-ca.pem"]
@@ -444,8 +450,10 @@ level = "warn"
 Rationale for the choices:
 
 - `mode = "pkcs11"` + `librtpkcs11ecp.so`: a non-extractable key.
-- `on_usb_removed = "shutdown"`: a terminal must not stay powered on with
-  an unlocked session.
+- `monitor_fail_mode = "permissive"`: PKCS#11 token serials are not USB
+  block-device serials. Strict authentication is refused until monitord has a
+  native token-event source; `on_usb_removed` is therefore not an enforcement
+  boundary for this profile.
 - `usb_removed_grace_seconds = 0`: on a terminal there can be no "pulled
   it out and changed my mind".
 - `mode = "crl"` with `crl_max_age_hours = 72`: three days is a
@@ -460,7 +468,7 @@ Rationale for the choices:
 ### 3.2 Workstation in a protected segment — CRL, GOST token
 
 ```toml
-crypto_backend = "openssl"
+crypto_backend = "pkcs11_native"
 mode           = "pkcs11"
 pkcs11_module  = "/usr/lib/librtpkcs11ecp.so"
 pkcs11_token_label = "STAFF"
@@ -471,7 +479,7 @@ usb_wait_seconds         = 10
 on_usb_removed           = "lock"
 usb_removed_grace_seconds = 30
 suspend_grace_seconds    = 60
-monitor_fail_mode        = "strict"
+monitor_fail_mode        = "permissive" # required for PKCS#11 until native removal monitoring
 
 [trust]
 anchors = ["/etc/tessera/ca/staff-ca.pem"]

@@ -21,8 +21,8 @@ use crate::error::TrustError;
 use openssl::ssl::{SslConnector, SslMethod, SslStream};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Hard cap on the accepted OCSP response body size.
@@ -256,29 +256,108 @@ impl HostResolver for SystemResolver {
     }
 }
 
+const RESOLVER_WORKERS: usize = 2;
+const RESOLVER_QUEUE_CAPACITY: usize = 8;
+
+struct ResolverJob {
+    resolver: Arc<dyn HostResolver>,
+    host: String,
+    port: u16,
+    reply: mpsc::Sender<std::io::Result<Vec<SocketAddr>>>,
+}
+
+/// Fixed-size blocking resolver pool.
+///
+/// Platform DNS/NSS calls are not cancellable. Bounding both workers and the
+/// pending queue ensures a wedged backend can consume only a fixed amount of
+/// process memory and native threads; later requests fail closed instead of
+/// spawning an unbounded number of detached workers.
+struct ResolverPool {
+    jobs: SyncSender<ResolverJob>,
+}
+
+impl ResolverPool {
+    fn new(worker_count: usize, queue_capacity: usize) -> std::io::Result<Self> {
+        if worker_count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resolver worker count must be non-zero",
+            ));
+        }
+        let (jobs, receiver) = mpsc::sync_channel::<ResolverJob>(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("ocsp-resolver-{index}"))
+                .spawn(move || loop {
+                    let job = {
+                        let Ok(guard) = receiver.lock() else {
+                            return;
+                        };
+                        match guard.recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        }
+                    };
+                    let result = job.resolver.resolve(&job.host, job.port);
+                    drop(job.reply.send(result));
+                })?;
+        }
+        Ok(Self { jobs })
+    }
+
+    fn submit(
+        &self,
+        resolver: Arc<dyn HostResolver>,
+        host: String,
+        port: u16,
+    ) -> Result<mpsc::Receiver<std::io::Result<Vec<SocketAddr>>>, TrustError> {
+        let (reply, receiver) = mpsc::channel();
+        let job = ResolverJob {
+            resolver,
+            host,
+            port,
+            reply,
+        };
+        match self.jobs.try_send(job) {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(_)) => Err(TrustError::OcspTransport {
+                reason: "resolver capacity exhausted".to_string(),
+            }),
+            Err(TrySendError::Disconnected(_)) => Err(TrustError::OcspTransport {
+                reason: "resolver worker pool is unavailable".to_string(),
+            }),
+        }
+    }
+}
+
+fn system_resolver_pool() -> Result<&'static ResolverPool, TrustError> {
+    static POOL: OnceLock<Result<ResolverPool, String>> = OnceLock::new();
+    match POOL.get_or_init(|| {
+        ResolverPool::new(RESOLVER_WORKERS, RESOLVER_QUEUE_CAPACITY)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(pool) => Ok(pool),
+        Err(reason) => Err(TrustError::OcspTransport {
+            reason: format!("initialize resolver worker pool: {reason}"),
+        }),
+    }
+}
+
 /// Resolves `url`'s host to socket addresses without exceeding `deadline`.
 ///
-/// The blocking resolver call runs on a detached thread and its result is
-/// awaited on a channel bounded by the remaining OCSP budget. If the
-/// deadline elapses first the resolution is abandoned — the late thread can
-/// finish and drop its result into a receiver that no longer exists — so a
-/// stuck resolver cannot pin the caller past `ocsp_timeout_seconds`.
+/// The blocking resolver call runs in a fixed-size worker pool and its result
+/// is awaited on a channel bounded by the remaining OCSP budget.
 fn resolve_within_budget(
     resolver: &Arc<dyn HostResolver>,
+    pool: &ResolverPool,
     host: &str,
     port: u16,
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, TrustError> {
     let budget = remaining(deadline)?;
-    let (tx, rx) = mpsc::channel();
-    let worker_resolver = Arc::clone(resolver);
-    let worker_host = host.to_string();
-    std::thread::spawn(move || {
-        let result = worker_resolver.resolve(&worker_host, port);
-        // A send failure means the deadline already elapsed and the receiver
-        // was dropped; the stale result is discarded on purpose.
-        drop(tx.send(result));
-    });
+    let rx = pool.submit(Arc::clone(resolver), host.to_owned(), port)?;
     match rx.recv_timeout(budget) {
         Ok(Ok(addrs)) => Ok(addrs),
         Ok(Err(e)) => Err(TrustError::OcspTransport {
@@ -295,10 +374,11 @@ fn connect(
     url: &OcspUrl,
     deadline: Instant,
     resolver: &Arc<dyn HostResolver>,
+    pool: &ResolverPool,
 ) -> Result<TcpStream, TrustError> {
     // Name resolution shares the single OCSP deadline with the socket
     // operations below: a wedged resolver cannot outlast the overall budget.
-    let addrs = resolve_within_budget(resolver, &url.host, url.port, deadline)?;
+    let addrs = resolve_within_budget(resolver, pool, &url.host, url.port, deadline)?;
     let mut last: Option<TrustError> = None;
     for addr in addrs {
         let budget = remaining(deadline)?;
@@ -325,8 +405,9 @@ fn open_transport(
     url: &OcspUrl,
     deadline: Instant,
     resolver: &Arc<dyn HostResolver>,
+    pool: &ResolverPool,
 ) -> Result<Transport, TrustError> {
-    let tcp = connect(url, deadline, resolver)?;
+    let tcp = connect(url, deadline, resolver, pool)?;
     set_timeouts(&tcp, deadline)?;
     match url.scheme {
         OcspScheme::Http => Ok(Transport::Plain(tcp)),
@@ -494,7 +575,8 @@ pub fn post_ocsp_request(
     timeout: Duration,
 ) -> Result<Vec<u8>, TrustError> {
     let resolver: Arc<dyn HostResolver> = Arc::new(SystemResolver);
-    post_ocsp_request_with(url, request_der, timeout, &resolver)
+    let pool = system_resolver_pool()?;
+    post_ocsp_request_with(url, request_der, timeout, &resolver, pool)
 }
 
 /// Runs the OCSP exchange against an injected [`HostResolver`].
@@ -506,9 +588,10 @@ fn post_ocsp_request_with(
     request_der: &[u8],
     timeout: Duration,
     resolver: &Arc<dyn HostResolver>,
+    pool: &ResolverPool,
 ) -> Result<Vec<u8>, TrustError> {
     let deadline = Instant::now() + timeout;
-    let mut transport = open_transport(url, deadline, resolver)?;
+    let mut transport = open_transport(url, deadline, resolver, pool)?;
 
     let head = format!(
         "POST {} HTTP/1.1\r\n\
@@ -570,12 +653,13 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::{
-        post_ocsp_request, post_ocsp_request_with, HostResolver, OcspScheme, OcspUrl,
+        post_ocsp_request, post_ocsp_request_with, HostResolver, OcspScheme, OcspUrl, ResolverPool,
         MAX_RESPONSE_BYTES,
     };
     use crate::error::TrustError;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -795,6 +879,17 @@ mod tests {
         }
     }
 
+    struct CountingWedgedResolver(Arc<AtomicUsize>);
+
+    impl HostResolver for CountingWedgedResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
     /// Returns a fixed address set immediately, bypassing the platform
     /// resolver so the success path can target the mock server.
     struct FixedResolver(Vec<SocketAddr>);
@@ -809,9 +904,16 @@ mod tests {
     fn wedged_resolver_times_out_within_budget() {
         let url = OcspUrl::parse("http://ocsp.example.org/").unwrap();
         let resolver: Arc<dyn HostResolver> = Arc::new(WedgedResolver);
+        let pool = ResolverPool::new(1, 1).unwrap();
         let start = Instant::now();
-        let err = post_ocsp_request_with(&url, b"request", Duration::from_millis(200), &resolver)
-            .unwrap_err();
+        let err = post_ocsp_request_with(
+            &url,
+            b"request",
+            Duration::from_millis(200),
+            &resolver,
+            &pool,
+        )
+        .unwrap_err();
         let elapsed = start.elapsed();
         assert!(matches!(err, TrustError::OcspTimeout), "got {err:?}");
         // The call must abort near the 200 ms budget rather than blocking on
@@ -819,6 +921,39 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "resolution should abort near the budget, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_wedged_resolutions_use_only_bounded_workers() {
+        let url = OcspUrl::parse("http://ocsp.example.org/").unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let resolver: Arc<dyn HostResolver> =
+            Arc::new(CountingWedgedResolver(Arc::clone(&started)));
+        let pool = ResolverPool::new(2, 1).unwrap();
+
+        for _ in 0..12 {
+            let err = post_ocsp_request_with(
+                &url,
+                b"request",
+                Duration::from_millis(20),
+                &resolver,
+                &pool,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    TrustError::OcspTimeout | TrustError::OcspTransport { .. }
+                ),
+                "got {err:?}"
+            );
+        }
+
+        let started = started.load(Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&started),
+            "wedged resolver calls must never exceed the fixed worker count"
         );
     }
 
@@ -837,7 +972,8 @@ mod tests {
         // mock server, then the normal connect/write/read flow runs.
         let url = OcspUrl::parse("http://ocsp.example.org/").unwrap();
         let resolver: Arc<dyn HostResolver> = Arc::new(FixedResolver(vec![addr]));
-        let got = post_ocsp_request_with(&url, b"request", TIMEOUT, &resolver).unwrap();
+        let pool = ResolverPool::new(1, 1).unwrap();
+        let got = post_ocsp_request_with(&url, b"request", TIMEOUT, &resolver, &pool).unwrap();
         assert_eq!(got, body);
     }
 

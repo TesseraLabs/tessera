@@ -574,6 +574,7 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             RawMode::Pkcs11 => Mode::Pkcs11,
         };
         validate_pkcs11_section(raw, mode)?;
+        let monitor = validate_monitor(raw, &raw.monitor, raw.monitor_fail_mode)?;
         if let Some(prompt) = raw.pkcs12_pin_prompt.as_deref() {
             validate_pin_prompt("pkcs12_pin_prompt", prompt)?;
         }
@@ -609,7 +610,7 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
                 RawMonitorFailMode::Strict => MonitorFailMode::Strict,
                 RawMonitorFailMode::Permissive => MonitorFailMode::Permissive,
             },
-            monitor: validate_monitor(raw, &raw.monitor, raw.monitor_fail_mode)?,
+            monitor,
             trust,
             trust_overrides: validate_trust_overrides(&raw.trust_override)?,
             host_identity,
@@ -1704,6 +1705,12 @@ fn validate_monitor(
                 ),
             });
         }
+        crate::privileged_path::validate_path(&path, crate::privileged_path::ExecTrust::Root)
+            .map_err(|source| Error::ConfigInvalid {
+                reason: format!(
+                    "monitor.on_usb_removed_hook_path is not root-controlled: {source}"
+                ),
+            })?;
         Some(path)
     } else {
         // Reject the field if it is set in a non-hook mode — it would

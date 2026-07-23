@@ -209,16 +209,26 @@ impl SessionRegistry {
         }
     }
 
-    /// Look up the active session for `uid`. Returns `None` when no session
-    /// is currently tracked for that uid, or when `uid == 0` (sentinel
-    /// for "no uid recorded").
+    /// Look up the active, unexpired session for `uid`.
+    ///
+    /// Returns `None` when no session is currently tracked, `uid == 0`
+    /// (sentinel for "no uid recorded"), or the session's absolute TTL has
+    /// elapsed. The expiry check is independent of the state-manager timer so
+    /// a slow registry fsync cannot briefly expose stale role authorization.
     pub fn find_by_uid(&self, uid: u32) -> Option<ActiveSession> {
         if uid == 0 {
             return None;
         }
         let g = self.inner.lock();
         let session_id = *g.by_uid.get(&uid)?;
-        g.by_id.get(&session_id).cloned()
+        let session = g.by_id.get(&session_id)?;
+        if session
+            .session_expiry
+            .is_some_and(|deadline| deadline <= SystemTime::now())
+        {
+            return None;
+        }
+        Some(session.clone())
     }
 
     /// Return every session whose `usb_serial` matches `serial`.

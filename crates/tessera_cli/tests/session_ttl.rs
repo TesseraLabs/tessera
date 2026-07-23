@@ -21,7 +21,8 @@ use std::time::{Duration, SystemTime};
 
 use tessera_cli::registry::{ActiveSession, RegistryStore, SessionRegistry};
 use tessera_cli::state::{
-    spawn_state_manager, ActionRequest, Event, IpcRequest, OnUsbRemoved, StateConfig,
+    spawn_state_manager, ActionRequest, CredentialMode, Event, IpcRequest, OnUsbRemoved,
+    StateConfig,
 };
 use tessera_cli::udev_query::AlwaysPresent;
 use tessera_proto::{ServerMessage, SessionTarget};
@@ -55,6 +56,7 @@ fn session(id: u128, opened_at: SystemTime, bounded_ttl_secs: Option<u64>) -> Ac
 struct Harness {
     event_tx: mpsc::UnboundedSender<Event>,
     action_rx: mpsc::UnboundedReceiver<ActionRequest>,
+    registry: SessionRegistry,
     shutdown: CancellationToken,
     _dir: tempfile::TempDir,
 }
@@ -65,6 +67,7 @@ fn spawn(registry: SessionRegistry) -> Harness {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (action_tx, action_rx) = mpsc::unbounded_channel();
     let cfg = StateConfig {
+        credential_mode: CredentialMode::Pkcs12,
         grace_seconds: 1,
         suspend_grace_seconds: 5,
         on_usb_removed: OnUsbRemoved::Logout,
@@ -73,7 +76,7 @@ fn spawn(registry: SessionRegistry) -> Harness {
     let shutdown = CancellationToken::new();
     let _h = spawn_state_manager(
         cfg,
-        registry,
+        registry.clone(),
         event_rx,
         action_tx,
         Arc::new(AlwaysPresent),
@@ -82,6 +85,7 @@ fn spawn(registry: SessionRegistry) -> Harness {
     Harness {
         event_tx,
         action_rx,
+        registry,
         shutdown,
         _dir: dir,
     }
@@ -133,6 +137,11 @@ async fn ttl_dispatches_exactly_one_expiry_action_after_deadline() {
         other => panic!("expected HandleSessionExpired, got {other:?}"),
     }
 
+    assert!(
+        h.registry.find_by_uid(1000).is_none(),
+        "expired role must be removed before its action is dispatched"
+    );
+
     // Exactly one — no duplicate for the same session.
     assert!(
         h.action_rx.try_recv().is_err(),
@@ -181,6 +190,11 @@ async fn startup_restore_expires_overdue_immediately_and_schedules_future() {
         }
         other => panic!("expected HandleSessionExpired, got {other:?}"),
     }
+
+    assert!(
+        h.registry.find_by_session_id(Uuid::from_u128(10)).is_none(),
+        "overdue restored session must be retired from the registry"
+    );
 
     // The future-dated session is scheduled, not fired immediately.
     assert!(

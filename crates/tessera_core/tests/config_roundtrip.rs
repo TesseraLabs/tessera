@@ -364,6 +364,33 @@ fn validated_config_rejects_hook_mode_without_hook_path() -> Result<(), Box<dyn 
     Ok(())
 }
 
+#[test]
+fn validated_config_rejects_non_root_controlled_monitor_hook(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let hook = dir.path().join("hook.sh");
+    std::fs::write(&hook, b"#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    let body = fixture_with_anchor(&anchor);
+    let injected = format!(
+        "{body}\n[monitor]\non_usb_removed = \"hook\"\non_usb_removed_hook_path = {:?}\n",
+        hook.to_string_lossy()
+    );
+    let raw: RawConfig = toml::from_str(&injected)?;
+
+    let err = ValidatedConfig::try_from(&raw).expect_err("user-controlled root hook must fail");
+
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("not root-controlled")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
 /// Replace the `[trust.revocation]` section body of the fixture.
 fn fixture_with_revocation(anchor: &Path, revocation_body: &str) -> String {
     fixture_with_anchor(anchor).replace(

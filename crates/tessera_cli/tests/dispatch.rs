@@ -30,6 +30,31 @@ struct FailingLogindActions {
     calls: parking_lot::Mutex<Vec<String>>,
 }
 
+#[derive(Debug, Default)]
+struct FailingPowerOffActions {
+    calls: parking_lot::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl LogindActionsTrait for FailingPowerOffActions {
+    async fn lock_session(&self, id: &str) -> anyhow::Result<()> {
+        self.calls.lock().push(format!("LockSession({id})"));
+        Ok(())
+    }
+    async fn terminate_session(&self, id: &str) -> anyhow::Result<()> {
+        self.calls.lock().push(format!("TerminateSession({id})"));
+        Ok(())
+    }
+    async fn power_off(&self) -> anyhow::Result<()> {
+        self.calls.lock().push("PowerOff".to_string());
+        anyhow::bail!("power-off failed")
+    }
+    async fn reboot(&self) -> anyhow::Result<()> {
+        self.calls.lock().push("Reboot".to_string());
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl LogindActionsTrait for FailingLogindActions {
     async fn lock_session(&self, id: &str) -> anyhow::Result<()> {
@@ -125,6 +150,47 @@ async fn shutdown_calls_poweroff() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let calls = recorder.calls.lock();
     assert_eq!(calls.last().map(String::as_str), Some("PowerOff"));
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn failing_shutdown_fails_closed_with_reboot() {
+    let recorder = Arc::new(FailingPowerOffActions::default());
+    let actions: Arc<dyn LogindActionsTrait> = recorder.clone();
+    let shutdown = CancellationToken::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let _h = spawn_action_runner(rx, actions, shutdown.clone());
+    tx.send(ActionRequest::HandleSessionExpired {
+        session: sample_logind_session("c8"),
+        action: OnUsbRemoved::Shutdown,
+    })
+    .expect("send");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let calls = recorder.calls.lock();
+    assert_eq!(
+        calls.as_slice(),
+        &["PowerOff".to_string(), "Reboot".to_string()]
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn unsafe_or_missing_root_hook_fails_closed_with_reboot() {
+    let recorder = Arc::new(RecordingActions::default());
+    let actions: Arc<dyn LogindActionsTrait> = recorder.clone();
+    let shutdown = CancellationToken::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let _h = spawn_action_runner(rx, actions, shutdown.clone());
+    tx.send(ActionRequest::HandleSessionExpired {
+        session: sample_logind_session("c9"),
+        action: OnUsbRemoved::Hook {
+            path: std::path::PathBuf::from("/definitely/not/a/tessera-hook"),
+        },
+    })
+    .expect("send");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let calls = recorder.calls.lock();
+    assert_eq!(calls.as_slice(), &["Reboot".to_string()]);
     shutdown.cancel();
 }
 

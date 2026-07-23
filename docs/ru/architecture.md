@@ -631,14 +631,12 @@ PAM-коды, которые получает стек; единственное
   cert-scope (`pam_cert_host_binding` / `pam_cert_user_binding`) и
   прочие auth-ошибки → `PAM_AUTH_ERR`; исчерпанный PIN-бюджет →
   `PAM_MAXTRIES`.
-- **Недоступность monitord не делает auth fail-closed** даже при
-  `monitor_fail_mode = "strict"`: фатальны (меняют вердикт) только
-  `DEVICE_GONE` и `UNAUTHORIZED`
-  (`crates/tessera_core/src/ipc/failmode.rs`); транспортные ошибки
-  IPC на auth-пути логируются как non-fatal — уведомление monitord
-  идёт после уже состоявшегося успеха аутентификации. `strict` /
-  `permissive` управляют лишь тем, пробрасывает ли обёртка
-  `FailModeWrapper` нефатальные ошибки IPC вызывающему коду.
+- Регистрация в monitord входит в вердикт аутентификации. При
+  `monitor_fail_mode = "strict"` транспортная ошибка IPC или отказ
+  регистрации закрывает вход: сессию не удалось поставить под enforcement
+  извлечения. При `permissive` обёртка `FailModeWrapper` поглощает
+  транспортные ошибки, а `DEVICE_GONE` и `UNAUTHORIZED` остаются фатальными
+  в любом режиме (`crates/tessera_core/src/ipc/failmode.rs`).
 
 ## 14. Журналирование `tracing` → syslog / journald
 

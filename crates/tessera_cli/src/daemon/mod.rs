@@ -27,7 +27,7 @@ use tessera_core::config::validated::OnUsbRemoved as CoreOnUsbRemoved;
 use crate::logind::LogindActions;
 use crate::logind::{LogindActionsTrait, NoopActions};
 use crate::registry::{RegistryStore, SessionRegistry};
-use crate::state::{spawn_state_manager, OnUsbRemoved, StateConfig};
+use crate::state::{spawn_state_manager, CredentialMode, OnUsbRemoved, StateConfig};
 use crate::udev_query::{AlwaysPresent, UdevQuery};
 use crate::{actions, logging, logind, notify, registry, server, shutdown, state, udev_monitor};
 
@@ -304,6 +304,10 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         }
     };
     let cfg = StateConfig {
+        credential_mode: match validated.mode {
+            tessera_core::config::validated::Mode::Pkcs12 => CredentialMode::Pkcs12,
+            tessera_core::config::validated::Mode::Pkcs11 => CredentialMode::Pkcs11,
+        },
         grace_seconds,
         suspend_grace_seconds,
         on_usb_removed,

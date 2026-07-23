@@ -143,6 +143,15 @@ pub enum FlowError {
     #[error("pkcs11 module path missing in config")]
     Pkcs11ModulePathMissingInConfig,
 
+    /// Strict continuous-presence monitoring cannot currently observe native
+    /// PKCS#11 token removal. Token serials are not USB block-device serials,
+    /// and treating them as such would reject every real token as
+    /// `DEVICE_GONE`. Refuse the strict combination explicitly until a native
+    /// PKCS#11 event monitor is available; permissive mode remains the
+    /// documented best-effort escape hatch.
+    #[error("strict continuous-presence monitoring is not supported for pkcs11 tokens")]
+    Pkcs11StrictPresenceUnsupported,
+
     /// A `pre_auth` hook returned a fatal error (executor failure or
     /// `on_failure = abort` policy hit a non-zero exit / timeout).
     #[error("pre_auth hook failed: {0}")]
@@ -214,6 +223,7 @@ impl FlowError {
     /// | `Pkcs11` (module load / wait / serial / config)        | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11OpensslEngineNotImplemented`                    | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11ModulePathMissingInConfig`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
+    /// | `Pkcs11StrictPresenceUnsupported`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `MaxTries` / `Pkcs11Acquire(PinLocked|MaxAttempts)`    | `PAM_MAXTRIES` (8)         |
     /// | `Conv` / `Pkcs11Acquire(Conv)` / `Pkcs11(PinIncorrect)`| `PAM_AUTH_ERR` (7)         |
     /// | `CertScope`                                            | `PAM_AUTH_ERR` (7)         |
@@ -233,6 +243,7 @@ impl FlowError {
             | Self::UsbSerialMissing
             | Self::Pkcs11OpensslEngineNotImplemented
             | Self::Pkcs11ModulePathMissingInConfig
+            | Self::Pkcs11StrictPresenceUnsupported
             | Self::Pkcs11(
                 Pkcs11Error::ModuleLoadFailed { .. }
                 | Pkcs11Error::InitFailed { .. }
@@ -506,20 +517,39 @@ where
         Mode::Pkcs12 => {
             authenticate_pkcs12(deps, io, pam_user, pam_service, session_id, prompt_pin)
         }
-        Mode::Pkcs11 => match deps.cfg.crypto_backend {
-            CryptoBackend::Pkcs11Native => {
-                let pkcs11_io = real_pkcs11_io(deps.cfg)?;
-                authenticate_pkcs11(
-                    deps,
-                    &pkcs11_io,
-                    pam_user,
-                    pam_service,
-                    session_id,
-                    prompt_pin,
-                )
+        Mode::Pkcs11 => {
+            ensure_pkcs11_presence_mode(deps.cfg)?;
+            match deps.cfg.crypto_backend {
+                CryptoBackend::Pkcs11Native => {
+                    let pkcs11_io = real_pkcs11_io(deps.cfg)?;
+                    authenticate_pkcs11(
+                        deps,
+                        &pkcs11_io,
+                        pam_user,
+                        pam_service,
+                        session_id,
+                        prompt_pin,
+                    )
+                }
+                CryptoBackend::Openssl => Err(FlowError::Pkcs11OpensslEngineNotImplemented),
             }
-            CryptoBackend::Openssl => Err(FlowError::Pkcs11OpensslEngineNotImplemented),
-        },
+        }
+    }
+}
+
+/// Refuse an authentication policy that promises PKCS#11 removal enforcement
+/// before a native token-event source exists.
+fn ensure_pkcs11_presence_mode(
+    cfg: &tessera_core::config::validated::ValidatedConfig,
+) -> Result<(), FlowError> {
+    if cfg.monitor.fail_mode == tessera_core::config::validated::MonitorFailMode::Strict {
+        tracing::error!(
+            target: "tessera.flow",
+            "strict monitoring requested for pkcs11, but native token-removal observation is unavailable; denying authentication"
+        );
+        Err(FlowError::Pkcs11StrictPresenceUnsupported)
+    } else {
+        Ok(())
     }
 }
 
@@ -1090,6 +1120,8 @@ where
     use tessera_core::token::pkcs11::{
         pkcs11_challenge_response, select_mechanism, FoundCertificate, FoundPrivateKey,
     };
+
+    ensure_pkcs11_presence_mode(deps.cfg)?;
 
     // Step 1 — pre_auth hooks (Stage 5). Same gate as the PKCS#12 path.
     //
@@ -2722,6 +2754,83 @@ level = "info"
             "got {err:?}"
         );
         assert_eq!(err.pam_code(), 9);
+    }
+
+    #[test]
+    fn dispatcher_rejects_strict_pkcs11_before_loading_module() {
+        let mut cfg = pkcs11_native_cfg();
+        cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
+        let verifier = build_verifier();
+        let mappings = vec![cn_mapping("alice", "alice")];
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+        let io = dummy_flow_io();
+
+        let err = authenticate(
+            deps,
+            &io,
+            "alice",
+            "ssh",
+            "sess-p11-strict-dispatch".into(),
+            |_| Ok(SecretString::from("unused")),
+        )
+        .expect_err("strict pkcs11 must fail before loading the provider");
+
+        assert!(matches!(err, FlowError::Pkcs11StrictPresenceUnsupported));
+        assert_eq!(err.pam_code(), 9);
+    }
+
+    #[test]
+    fn strict_pkcs11_presence_is_rejected_before_token_io() {
+        let mut cfg = pkcs11_native_cfg();
+        cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
+        let verifier = build_verifier();
+        let mappings = vec![cn_mapping("alice", "alice")];
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+        let stub = StubPkcs11Io::new();
+        *stub.on_wait.borrow_mut() = Some(Err(Pkcs11Error::TokenWaitTimeout { seconds: 1 }));
+
+        let err = authenticate_pkcs11::<NoopMountOps, _, _>(
+            deps,
+            &stub,
+            "alice",
+            "ssh",
+            "sess-p11-strict".into(),
+            |_| Ok(SecretString::from("unused")),
+        )
+        .expect_err("strict pkcs11 must fail before token I/O");
+
+        assert!(matches!(err, FlowError::Pkcs11StrictPresenceUnsupported));
+        assert_eq!(err.pam_code(), 9);
+        assert!(
+            stub.on_wait.borrow().is_some(),
+            "strict-mode rejection must happen before token discovery"
+        );
     }
 
     #[test]
