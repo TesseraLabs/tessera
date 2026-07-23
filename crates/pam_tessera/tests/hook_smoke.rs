@@ -33,19 +33,25 @@ use tessera_core::x509::Certificate;
 
 #[test]
 fn pre_auth_hook_runs_and_writes_marker_file() {
+    // A root hook is intentionally accepted only from a fully root-owned
+    // path. Non-root test processes cannot create such a fixture, so leave
+    // the positive end-to-end case to the Astra container (which runs as
+    // root); negative ownership cases are covered separately.
+    if !nix::unistd::Uid::effective().is_root() {
+        return;
+    }
+
     // 1. Fixture: pre-stage USB mountpoint and write a tiny pre_auth
     //    script that touches a marker file.
     let usb_tmp = stage_mount("leaf_rsa.p12", false);
 
     // The hook executor canonicalizes the script path and rejects it if the
-    // file or ANY canonical ancestor directory is world-writable (S_IWOTH).
-    // The system temp dir is 1777 on Linux, so a script under /tmp would be
-    // refused by that pre-exec security walk. CARGO_TARGET_TMPDIR lives under
-    // the build tree (target/tmp) whose ancestors are the checkout, owned by
-    // the build user and not world-writable, so a hook placed here passes the
-    // walk. tempfile creates the subdir 0o700 (neither group- nor
-    // world-writable), which the check also accepts.
-    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // file or ANY canonical ancestor directory is not root-owned or is
+    // writable by an untrusted party. GitHub mounts the checkout below /__w,
+    // which is owned by the runner uid even inside the root Astra container.
+    // Place the positive fixture below /root so the complete ancestor chain
+    // models a deployable privileged hook path.
+    let work = tempfile::tempdir_in("/root").unwrap();
     let marker = work.path().join("hook.log");
     let script = work.path().join("hook.sh");
     std::fs::write(
