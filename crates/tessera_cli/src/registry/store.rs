@@ -11,6 +11,9 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use tessera_core::mac::MacBackend;
 
 use super::ActiveSession;
 
@@ -47,16 +50,34 @@ pub enum RegistryLoadError {
 }
 
 /// On-disk store for the session registry.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RegistryStore {
     path: PathBuf,
+    backend: Arc<dyn MacBackend>,
+}
+
+impl std::fmt::Debug for RegistryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryStore")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RegistryStore {
     /// Construct a store rooted at `path`.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            backend: Arc::new(tessera_core::mac::StubBackend::new()),
+        }
+    }
+
+    /// Construct a store using the selected runtime enforcement backend.
+    #[must_use]
+    pub fn with_backend(path: PathBuf, backend: Arc<dyn MacBackend>) -> Self {
+        Self { path, backend }
     }
 
     /// Path to the persisted file.
@@ -119,12 +140,7 @@ impl RegistryStore {
 
         let bytes = serde_json::to_vec_pretty(snapshot)?;
 
-        #[cfg(feature = "astra-mac")]
-        let backend = tessera_mac_parsec::ParsecBackend::new();
-        #[cfg(not(feature = "astra-mac"))]
-        let backend = tessera_core::mac::backend::StubBackend::new();
-
-        crate::state::write_sessions_atomic(&self.path, &bytes, &backend)?;
+        crate::state::write_sessions_atomic(&self.path, &bytes, self.backend.as_ref())?;
 
         // fsync the parent directory so the rename is durable.
         let dir = File::open(parent)?;

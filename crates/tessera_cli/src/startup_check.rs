@@ -22,6 +22,7 @@
 use std::path::PathBuf;
 
 use tessera_core::config::ValidatedConfig;
+use tessera_core::mac::{MacBackend, MacError, MacRuntime};
 
 pub mod host_identity;
 pub mod mac_runtime;
@@ -171,12 +172,10 @@ pub struct StartupCheckOptions {
     /// host root".
     pub fs_root: Option<PathBuf>,
     /// Optional injected probe for kernel parsec presence. When `None`, the
-    /// real probe is used (via `astra-mac` FFI when compiled in, otherwise
-    /// always-absent on dev/host builds).
+    /// selected runtime plugin is probed.
     pub kernel_parsec_probe: Option<KernelParsecProbe>,
     /// Optional injected probe for the mandatory confidentiality control (МРД)
-    /// axis. When `None`, the real probe is used (via `astra-mac` FFI when
-    /// compiled in, otherwise `Unknown` on dev/host builds).
+    /// axis. When `None`, the selected runtime plugin is probed.
     pub mrd_probe: Option<MrdProbe>,
 }
 
@@ -199,52 +198,27 @@ pub enum KernelParsecState {
     /// `parsec_strict_mode() == 0`: kernel is up but МКЦ is administratively
     /// off (e.g. `parsec.mac=0` on a non-PARSEC kernel).
     Disabled,
-    /// FFI not compiled in (no `astra-mac` feature) or `parsec_strict_mode`
-    /// returned an unexpected value.
+    /// No active runtime plugin, or the plugin returned an unknown value.
     Unavailable,
 }
 
 /// Function pointer for injecting a kernel parsec probe.
 pub type KernelParsecProbe = fn() -> KernelParsecState;
 
-/// Production probe: calls into the real FFI when `astra-mac` is on,
-/// otherwise reports `Unavailable`.
+/// Legacy standalone probe. Runtime code probes the selected plugin directly.
 #[must_use]
 pub fn real_kernel_parsec_probe() -> KernelParsecState {
-    #[cfg(feature = "astra-mac")]
-    {
-        use tessera_core::mac::MacRuntime;
-        // Cheap, side-effect free; documented to be safe in any state.
-        match tessera_mac_parsec::probe_runtime() {
-            MacRuntime::Active => KernelParsecState::Active,
-            MacRuntime::Disabled => KernelParsecState::Disabled,
-            MacRuntime::Unavailable => KernelParsecState::Unavailable,
-        }
-    }
-    #[cfg(not(feature = "astra-mac"))]
-    {
-        KernelParsecState::Unavailable
-    }
+    KernelParsecState::Unavailable
 }
 
 /// Function pointer for injecting a mandatory-confidentiality-control (МРД)
 /// probe.
 pub type MrdProbe = fn() -> tessera_core::mac::MrdState;
 
-/// Production probe: calls into the real FFI when `astra-mac` is on,
-/// otherwise reports `Unknown` (the confidentiality axis is invisible to
-/// open builds).
+/// Legacy standalone probe. Runtime code probes the selected plugin directly.
 #[must_use]
 pub fn real_mrd_probe() -> tessera_core::mac::MrdState {
-    #[cfg(feature = "astra-mac")]
-    {
-        // Cheap, side-effect free; documented to be safe in any state.
-        tessera_mac_parsec::probe_mrd()
-    }
-    #[cfg(not(feature = "astra-mac"))]
-    {
-        tessera_core::mac::MrdState::Unknown
-    }
+    tessera_core::mac::MrdState::Unknown
 }
 
 /// Run the full startup-check pipeline.
@@ -254,21 +228,48 @@ pub fn real_mrd_probe() -> tessera_core::mac::MrdState {
 /// [`StartupCheckReport::has_errors`].
 #[must_use]
 pub fn run_startup_checks(cfg: &ValidatedConfig, opts: &StartupCheckOptions) -> StartupCheckReport {
+    let backend = tessera_core::plugin::load_enforcement_backend(cfg.mac.backend.as_deref(), "");
+    run_startup_checks_with_backend(cfg, opts, backend.as_ref())
+}
+
+/// Run the startup-check pipeline with an already loaded backend.
+///
+/// The daemon uses this form so the verified plugin instance is shared by
+/// startup probes, registry persistence, and listener labelling.
+#[must_use]
+pub fn run_startup_checks_with_backend(
+    cfg: &ValidatedConfig,
+    opts: &StartupCheckOptions,
+    backend: &dyn MacBackend,
+) -> StartupCheckReport {
     let mut report = StartupCheckReport::default();
 
     crate::startup_check::pam_stack::check(&opts.pam_d_root, &mut report);
 
-    let probe = opts.kernel_parsec_probe.unwrap_or(real_kernel_parsec_probe);
-    let kernel = probe();
+    let kernel = opts.kernel_parsec_probe.map_or_else(
+        || match backend.probe() {
+            MacRuntime::Active => KernelParsecState::Active,
+            MacRuntime::Disabled => KernelParsecState::Disabled,
+            MacRuntime::Unavailable => KernelParsecState::Unavailable,
+        },
+        |probe| probe(),
+    );
     mac_runtime::check(cfg, kernel, &mut report);
 
-    let mrd = opts.mrd_probe.unwrap_or(real_mrd_probe)();
+    let mrd = opts
+        .mrd_probe
+        .map_or_else(|| backend.probe_mrd(), |probe| probe());
     mrd::check(cfg, mrd, &mut report);
 
     trust::check_anchors(cfg, &mut report);
     trust::check_ca_dir_permissions(opts.fs_root.as_deref(), &mut report);
 
-    parsec_caps::check(cfg, kernel, &mut report);
+    let write_capability = match backend.check_write_capability() {
+        Ok(()) => Some(true),
+        Err(MacError::CapMissing) => Some(false),
+        Err(_) => None,
+    };
+    parsec_caps::check_with_capability(cfg, kernel, write_capability, &mut report);
 
     host_identity::check(cfg, opts.fs_root.as_deref(), &mut report);
 

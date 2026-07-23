@@ -91,7 +91,7 @@ See [../ru/changelog.md](../ru/changelog.md) (Russian).
   of an engineer's session.
 - A `[mac]` section in `config.toml` with the ternary `cert_integrity`
   policy (`required` / `optional` / `ignore`).
-- The `astra-mac` feature flag; a stub build for non-Astra hosts.
+- One open host; signed enforcement plugins are selected at runtime.
 
 ## Russian documentation
 

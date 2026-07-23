@@ -36,21 +36,10 @@ Depends:
 # subcommand is built.
 # polkitd: not invoked from the PAM module or daemon today, kept as
 # Suggests for future cert-management UI integration.
-# libpdp3 / libparsec-base3: required at runtime only when the binary is
-# built with the `astra-mac` feature; on non-Astra hosts (Debian/Ubuntu)
-# the package functions as a stub (postinst skips МКЦ setup). Both stay
-# as Recommends so apt on Astra still pulls them in, while standard
-# Debian/Ubuntu installs do not fail on a missing package. For an
-# Astra-specific deb build, promote these to hard Depends in the Astra
-# build script. `libparsec-base3` carries `parsec_capget` (verified on
-# Astra CI 2026-05-15, run 25903325006) — without it the astra-mac build
-# fails to link with `undefined symbol: parsec_capget`.
 Recommends:
  libgost-engine | gost-engine | libgost-astra,
  libpkcs11-helper1,
- librtpkcs11ecp,
- libpdp3 (>= 3.11+ci97~),
- libparsec-base3 (>= 3.11+ci97~)
+ librtpkcs11ecp
 Suggests:
  opensc,
  p11-kit,

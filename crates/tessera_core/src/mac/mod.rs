@@ -4,9 +4,8 @@
 //!
 //! The open core defines the [`MacBackend`] SPI, the no-op [`StubBackend`],
 //! the policy orchestrator, label algebra, and audit events. The real
-//! `libpdp`/parsec FFI enforcement backend (`ParsecBackend`) lives in the
-//! separate `tessera_mac_parsec` crate and is selected by callers behind
-//! the `astra-mac` feature.
+//! `libpdp`/parsec FFI enforcement backend lives in a separately delivered
+//! runtime plugin. The open host loads it through [`crate::plugin`].
 
 pub mod audit;
 pub mod backend;

@@ -21,10 +21,6 @@ gost-tests = ["tessera_core/gost-tests"]
 # Re-export of `tessera_core/pkcs11-tests` so `cargo test --workspace
 # --features pkcs11-tests` activates both crates' integration tests in lockstep.
 pkcs11-tests = ["tessera_core/pkcs11-tests"]
-# Enables МКЦ enforcement end-to-end: forwards `tessera_core/astra-mac`
-# (config validation + audit gating) and pulls in the closed
-# `tessera_mac_parsec` crate that provides the real libpdp `ParsecBackend`.
-astra-mac = ["tessera_core/astra-mac"]
 # Re-export of `tessera_core/mac-tests` so `--features mac-tests`
 # activates in-process MacBackend mocks across crates.
 mac-tests = ["tessera_core/mac-tests"]

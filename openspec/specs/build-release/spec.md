@@ -8,18 +8,23 @@ CI/CD, packaging и тестовая инфраструктура: что гар
 ## Requirements
 ### Requirement: CI matrix
 
-CI-пайплайн ДОЛЖЕН (MUST) гонять матрицу из двух таргетов:
+CI-пайплайн ДОЛЖЕН (MUST) собирать один открытый host в двух окружениях:
 
 | Таргет | Контейнер | Features | Тесты | Артефакт |
 |---|---|---|---|---|
-| ubuntu | ubuntu-22.04 | — (stub) | `cargo test --workspace` (debug) | stub .deb (НЕ для прода) |
-| astra | astra-builder (GHCR) | astra-mac | `cargo nextest run --workspace --features astra-mac` (debug) | релизный .deb |
+| ubuntu | ubuntu-22.04 | — | `cargo test --workspace` (debug) | open .deb |
+| astra | astra-builder (GHCR) | — | `cargo nextest run --workspace` (debug) | open .deb |
 
-Тесты ДОЛЖНЫ (MUST) гоняться в debug (release-тесты ~510s vs ~60s); `.deb` ДОЛЖЕН (MUST) всегда собираться в release+LTO через dpkg-buildpackage (release-only ошибки компиляции ловятся в PR). astra-job ДОЛЖНА (MUST) проверять реальные символы libpdp.
+Тесты ДОЛЖНЫ (MUST) гоняться в debug; `.deb` ДОЛЖЕН (MUST) собираться в
+release+LTO через dpkg-buildpackage. Обе ноги ДОЛЖНЫ (MUST) собирать фикстурный
+runtime-плагин и прогонять loader/ABI contract tests. Открытый `.deb` НЕ ДОЛЖЕН
+(MUST NOT) линковаться с libpdp. Official release CI ДОЛЖЕН (MUST) отвергать
+пустой `TESSERA_PLUGIN_PUBKEYS`, чтобы `.deb` всегда содержал явный trust store
+для подписанных runtime-плагинов.
 
 #### Scenario: PR-сборка
 - **WHEN** открыт PR
-- **THEN** гоняются обе ветки матрицы (ubuntu stub + astra astra-mac), тесты в debug, `.deb` собирается в release+LTO
+- **THEN** обе ноги собирают один host без enterprise feature, fixture-plugin tests зелёные, `.deb` собирается в release+LTO
 
 ### Requirement: Версионный guardrail
 
@@ -84,4 +89,3 @@ CI ДОЛЖЕН (MUST) гонять на каждом push/PR в main workflow `
 #### Scenario: PR с clippy-warning
 - **WHEN** PR вносит код с clippy-предупреждением (включая linux-only модули)
 - **THEN** job `clippy` падает (`-D warnings`), PR не мержится
-

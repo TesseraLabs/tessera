@@ -1,0 +1,16 @@
+[package]
+name = "tessera_test_plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Fixture enforcement plugin used by open-core CI."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tessera_core = { path = "../tessera_core", version = "0.4.0" }

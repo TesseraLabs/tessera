@@ -335,7 +335,7 @@ fn startup_check_pam_legacy_certauth_include_not_recognized() {
 #[test]
 fn startup_check_runtime_required_without_kernel_errors() {
     // The TOML validator rejects [mac].runtime = "required" when the binary
-    // is built without `astra-mac`, so we mutate the field directly after a
+    // has no selected plugin, so we mutate the field directly after a
     // valid load. The startup check itself doesn't care how the field was
     // populated — production builds with the feature ship `required` from
     // TOML, dev/test builds reach the same branch via this shortcut.
@@ -384,6 +384,30 @@ fn startup_check_runtime_auto_without_kernel_warns() {
     startup_check::mac_runtime::check(&cfg, KernelParsecState::Disabled, &mut report);
     assert_eq!(report.count(StartupCheckSeverity::Warn), 1);
     assert_eq!(report.records[0].check, "mac_runtime_auto_fallback");
+}
+
+#[test]
+fn startup_check_write_capability_comes_from_selected_backend() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let anchor = write_anchor(tmp.path(), "anchor.pem", FAKE_PEM);
+    let cfg_path = write_min_config(tmp.path(), anchor.to_str().unwrap(), "auto", "optional");
+    let cfg = load_cfg(&cfg_path);
+
+    for (capability, expected) in [
+        (Some(true), "parsec_cap_chmac_ok"),
+        (Some(false), "parsec_cap_chmac_missing"),
+        (None, "parsec_cap_chmac_unknown"),
+    ] {
+        let mut report = StartupCheckReport::default();
+        startup_check::parsec_caps::check_with_capability(
+            &cfg,
+            KernelParsecState::Active,
+            capability,
+            &mut report,
+        );
+        assert_eq!(report.records.len(), 1, "{report:#?}");
+        assert_eq!(report.records[0].check, expected);
+    }
 }
 
 // ---------------------------------------------------------------------------

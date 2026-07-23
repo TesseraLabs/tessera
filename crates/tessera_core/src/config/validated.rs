@@ -165,6 +165,8 @@ impl Default for FlyDmGreeterSection {
 /// Validated `[mac]` policy block.
 #[derive(Debug, Clone)]
 pub struct MacPolicy {
+    /// Explicit runtime enforcement plugin name. Absence selects the stub.
+    pub backend: Option<String>,
     /// Trinary policy for the X.509 `MAX_INTEGRITY` extension on the
     /// authenticating certificate. Default [`CertIntegrityMode::Optional`].
     pub cert_integrity: CertIntegrityMode,
@@ -182,6 +184,7 @@ pub struct MacPolicy {
 impl Default for MacPolicy {
     fn default() -> Self {
         Self {
+            backend: None,
             cert_integrity: CertIntegrityMode::Optional,
             fallback_max_integrity: None,
             warn_on_homedir_label_mismatch: true,
@@ -190,8 +193,7 @@ impl Default for MacPolicy {
     }
 }
 
-/// Runtime selection for the MAC backend (independent of the
-/// compile-time `astra-mac` feature).
+/// Runtime selection for the MAC backend.
 ///
 /// - [`MacRuntimeMode::Required`] — auth fails if the МКЦ kernel
 ///   subsystem is not present.
@@ -199,7 +201,7 @@ impl Default for MacPolicy {
 ///   reports МКЦ available; otherwise fall back to the no-op stub and
 ///   emit a `mac_runtime_fallback` audit event.
 /// - [`MacRuntimeMode::Disabled`] — always use the stub backend even
-///   when the binary is built with `astra-mac`.
+///   when a plugin is installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacRuntimeMode {
     /// Real backend required; fail-closed when kernel МКЦ missing.
@@ -855,6 +857,24 @@ fn parse_gravity(s: &str) -> Option<Gravity> {
 const MAC_CATEGORIES_HEX_MAX_LEN: usize = 16;
 
 fn validate_mac(raw: &RawMacPolicy) -> Result<MacPolicy, Error> {
+    let backend = raw
+        .backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            if name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                return Err(Error::ConfigInvalid {
+                    reason: "[mac].backend must match [a-z0-9-]{1,64}".into(),
+                });
+            }
+            Ok(name.to_owned())
+        })
+        .transpose()?;
     let cert_integrity = match raw.cert_integrity {
         Some(RawCertIntegrityMode::Required) => CertIntegrityMode::Required,
         Some(RawCertIntegrityMode::Ignore) => CertIntegrityMode::Ignore,
@@ -881,26 +901,15 @@ fn validate_mac(raw: &RawMacPolicy) -> Result<MacPolicy, Error> {
                     .into(),
         });
     }
-    // Fail-fast: stub builds (without `astra-mac`) cannot honour
-    // `cert_integrity = "required"` because there is no real backend
-    // to enforce the label.  Reject at config load so the operator sees
-    // the misconfiguration immediately rather than at first session.
-    #[cfg(not(feature = "astra-mac"))]
-    if matches!(cert_integrity, CertIntegrityMode::Required) {
+    // A hard runtime requirement without a selected backend can never
+    // succeed. A named-but-missing plugin remains a runtime/audit failure as
+    // required by the plugin-loading contract.
+    if backend.is_none()
+        && (matches!(runtime, MacRuntimeMode::Required)
+            || matches!(cert_integrity, CertIntegrityMode::Required))
+    {
         return Err(Error::ConfigInvalid {
-            reason:
-                "[mac].cert_integrity = \"required\" but binary built without `astra-mac` feature"
-                    .into(),
-        });
-    }
-    // Same fail-fast for `runtime = "required"` — a stub build can never
-    // satisfy a hard MAC requirement, so surface the misconfiguration at
-    // config load.
-    #[cfg(not(feature = "astra-mac"))]
-    if matches!(runtime, MacRuntimeMode::Required) {
-        return Err(Error::ConfigInvalid {
-            reason: "[mac].runtime = \"required\" but binary built without `astra-mac` feature"
-                .into(),
+            reason: "required MAC policy requires [mac].backend".into(),
         });
     }
     let fallback_max_integrity = raw
@@ -931,6 +940,7 @@ fn validate_mac(raw: &RawMacPolicy) -> Result<MacPolicy, Error> {
         })
         .transpose()?;
     Ok(MacPolicy {
+        backend,
         cert_integrity,
         fallback_max_integrity,
         warn_on_homedir_label_mismatch: raw.warn_on_homedir_label_mismatch.unwrap_or(true),

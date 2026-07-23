@@ -1,0 +1,37 @@
+name: notify enterprise
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notify-enterprise-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  open-core-main-updated:
+    if: github.repository == 'TesseraLabs/tessera'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Mint enterprise dispatch token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.TESSERA_CI_APP_ID }}
+          private-key: ${{ secrets.TESSERA_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: tessera-enterprise
+          permission-contents: write
+
+      - name: Dispatch lock update
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OPEN_CORE_SHA: ${{ github.sha }}
+        run: |
+          gh api --method POST \
+            repos/TesseraLabs/tessera-enterprise/dispatches \
+            -f event_type=open-core-main-updated \
+            -F "client_payload[open_core_sha]=$OPEN_CORE_SHA"

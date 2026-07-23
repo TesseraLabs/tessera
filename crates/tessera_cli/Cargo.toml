@@ -17,11 +17,6 @@ default = []
 # Pull in `testing` helpers (mock UdevQuery, in-process server) for use from
 # integration tests in this and dependent crates.
 test-support = []
-# Enables МКЦ enforcement for the monitord binary: forwards
-# `tessera_core/astra-mac` (config validation + audit gating) and pulls in
-# the closed `tessera_mac_parsec` crate that provides the real libpdp
-# `ParsecBackend` and kernel probes.
-astra-mac = ["tessera_core/astra-mac"]
 # Re-export of `tessera_core/mac-tests` for in-process MacBackend mocks.
 mac-tests = ["tessera_core/mac-tests"]
 

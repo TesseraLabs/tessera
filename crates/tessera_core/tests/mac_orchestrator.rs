@@ -36,6 +36,7 @@ fn ctx(service: &str) -> SessionContext {
 
 fn policy(mode: CertIntegrityMode) -> MacPolicy {
     MacPolicy {
+        backend: None,
         cert_integrity: mode,
         fallback_max_integrity: None,
         warn_on_homedir_label_mismatch: true,
@@ -130,6 +131,7 @@ fn optional_no_ext_uses_fallback_when_configured() {
     backend.expect_apply_session().returning(|_| Ok(()));
 
     let p = MacPolicy {
+        backend: None,
         cert_integrity: CertIntegrityMode::Optional,
         fallback_max_integrity: Some(fallback),
         warn_on_homedir_label_mismatch: false,

@@ -130,8 +130,15 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     // its severity level; if any check reported `Error`, refuse to start
     // so misconfigurations surface loudly in `systemctl status` instead of
     // silently degrading every subsequent auth.
+    let mac_backend: Arc<dyn tessera_core::mac::MacBackend> = Arc::from(
+        tessera_core::plugin::load_enforcement_backend(validated.mac.backend.as_deref(), ""),
+    );
     let startup_opts = crate::startup_check::StartupCheckOptions::default();
-    let report = crate::startup_check::run_startup_checks(&validated, &startup_opts);
+    let report = crate::startup_check::run_startup_checks_with_backend(
+        &validated,
+        &startup_opts,
+        mac_backend.as_ref(),
+    );
     report.log();
     if report.has_errors() {
         anyhow::bail!(
@@ -243,7 +250,7 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         "acquired daemon singleton lock"
     );
 
-    let store = RegistryStore::new(state_file_path);
+    let store = RegistryStore::with_backend(state_file_path, Arc::clone(&mac_backend));
     // Fail closed on a corrupt or unreadable registry rather than silently
     // starting empty: an empty registry would drop every active session and
     // its pending credential-removal action, defeating continuous-presence
@@ -410,7 +417,7 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         );
     }
 
-    let listener = server::bind_listener(&socket_path).await?;
+    let listener = server::bind_listener_with_backend(&socket_path, mac_backend.as_ref()).await?;
     let accept_event_tx = event_tx.clone();
     let accept_token = shutdown_tok.clone();
     // Plumb the validated `[monitor]` IPC knobs (idle timeout, connection

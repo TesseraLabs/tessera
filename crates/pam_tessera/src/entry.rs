@@ -88,9 +88,10 @@ impl RoleStageOwned {
 fn build_role_stage(
     pamh: *mut pam_sys::pam_handle_t,
     roles_cfg: &tessera_core::config::validated::RolesSection,
+    device_os: tessera_core::role::RoleOs,
     suffix_role: Option<tessera_core::role::RoleId>,
 ) -> Result<RoleStageOwned, i32> {
-    use tessera_core::role::{RoleDenyReason, RoleEnforce, RoleId, RoleOs, RoleStore, TrustMode};
+    use tessera_core::role::{RoleDenyReason, RoleEnforce, RoleId, RoleStore, TrustMode};
 
     let enforce = roles_cfg.enforce_mode();
     if enforce == RoleEnforce::Disabled {
@@ -146,15 +147,9 @@ fn build_role_stage(
         }
     };
 
-    // Load the on-device role store (standalone trust = filesystem perms).
-    // On Astra the device OS is astra; otherwise linux. We compile per-OS
-    // for the open build (linux); the orchestration of astra slices happens
-    // on the real device which is built with the astra-mac feature.
-    let device_os = if cfg!(feature = "astra-mac") {
-        RoleOs::Astra
-    } else {
-        RoleOs::Linux
-    };
+    // Load the on-device role store through the privileged-path validator.
+    // OS selection is runtime state now: the same open PAM binary serves
+    // Linux and Astra, with the Parsec plugin identifying the Astra contour.
     let store = match RoleStore::load_privileged(&roles_cfg.dir, device_os, TrustMode::Standalone) {
         Ok(s) => Some(s),
         Err(err) => {
@@ -490,7 +485,12 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // Open Question). Then load the on-device role store. The requested
         // role + store + enforce mode travel atomically through Deps so the
         // role is resolved together with cert verification (no swap window).
-        let role_stage = match build_role_stage(pamh, &wired.cfg.roles, requested_role) {
+        let device_os = if wired.cfg.mac.backend.as_deref() == Some("parsec") {
+            tessera_core::role::RoleOs::Astra
+        } else {
+            tessera_core::role::RoleOs::Linux
+        };
+        let role_stage = match build_role_stage(pamh, &wired.cfg.roles, device_os, requested_role) {
             Ok(s) => s,
             Err(rc) => return rc,
         };

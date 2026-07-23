@@ -62,18 +62,25 @@ pub enum ServerError {
 /// briefly expose the socket with world-accessible permissions between
 /// `bind` and `set_permissions`.
 pub async fn bind_listener(path: &Path) -> io::Result<UnixListener> {
+    bind_listener_with_backend(path, &tessera_core::mac::backend::StubBackend::new()).await
+}
+
+/// Bind the listener and label it through the selected runtime backend.
+///
+/// # Errors
+///
+/// Returns the same errors as [`bind_listener`].
+pub async fn bind_listener_with_backend(
+    path: &Path,
+    backend: &dyn MacBackend,
+) -> io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    #[cfg(feature = "astra-mac")]
-    let backend = tessera_mac_parsec::ParsecBackend::new();
-    #[cfg(not(feature = "astra-mac"))]
-    let backend = tessera_core::mac::backend::StubBackend::new();
-
     // Single labeled-bind code path: bind on per-PID temp, set 0660
     // perms, label via fd (TOCTOU-safe), then atomic rename into place.
-    let std_listener = bind_with_label(path, &backend)?;
+    let std_listener = bind_with_label(path, backend)?;
     std_listener.set_nonblocking(true)?;
     UnixListener::from_std(std_listener)
 }
@@ -89,7 +96,7 @@ pub async fn bind_listener(path: &Path) -> io::Result<UnixListener> {
 /// # Errors
 /// Returns I/O error on bind/permissions/rename, or a wrapped `MacError`
 /// when the label set fails.
-pub fn bind_with_label<B: MacBackend>(
+pub fn bind_with_label<B: MacBackend + ?Sized>(
     final_path: &Path,
     backend: &B,
 ) -> io::Result<std::os::unix::net::UnixListener> {

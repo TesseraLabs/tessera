@@ -38,7 +38,7 @@ pub fn check(cfg: &ValidatedConfig, kernel: KernelParsecState, report: &mut Star
         (MacRuntimeMode::Auto, KernelParsecState::Active) => {
             report.push(StartupCheckRecord::info(
                 "mac_runtime_auto_active",
-                "mac.runtime=auto: kernel parsec detected, using ParsecBackend",
+                "mac.runtime=auto: selected enforcement plugin is active",
             ));
         }
         (MacRuntimeMode::Auto, _) => {
@@ -51,7 +51,7 @@ pub fn check(cfg: &ValidatedConfig, kernel: KernelParsecState, report: &mut Star
         (MacRuntimeMode::Disabled, KernelParsecState::Active) => {
             report.push(StartupCheckRecord::info(
                 "mac_runtime_disabled_with_kernel",
-                "mac.runtime=disabled while kernel parsec is active; ParsecBackend will NOT be \
+                "mac.runtime=disabled while the enforcement plugin is active; it will NOT be \
                  used. To enable MAC enforcement, set runtime=required or auto.",
             ));
         }

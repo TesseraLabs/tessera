@@ -939,7 +939,7 @@ async fn handle_logind(
 /// Returns the underlying `io::Error` for any tempfile/write/sync/rename
 /// failure. Label failures are downgraded to a warning and do not
 /// propagate.
-pub fn write_sessions_atomic<B: MacBackend>(
+pub fn write_sessions_atomic<B: MacBackend + ?Sized>(
     final_path: &Path,
     bytes: &[u8],
     backend: &B,

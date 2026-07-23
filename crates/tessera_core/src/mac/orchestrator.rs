@@ -4,7 +4,7 @@
 //! session context.
 //!
 //! The orchestrator is feature-agnostic: it takes the backend by `&dyn`
-//! so the stub, the mock, and the real `ParsecBackend` all flow through
+//! so the stub, the mock, and a runtime plugin all flow through
 //! the same decision tree.
 
 use std::path::PathBuf;
@@ -178,6 +178,10 @@ pub fn apply_session_policy(
     // (2) probe runtime.
     let runtime = backend.probe();
     if runtime != MacRuntime::Active {
+        if role_mac_mask.is_some() {
+            audit::emit_mac_runtime_required(&format!("{runtime:?}"));
+            return Err(OrchestratorError::RuntimeRequired(runtime));
+        }
         match policy.cert_integrity {
             CertIntegrityMode::Required => {
                 audit::emit_mac_runtime_required(&format!("{runtime:?}"));

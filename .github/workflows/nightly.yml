@@ -53,6 +53,7 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
       CARGO_PROFILE_RELEASE_LTO: "thin"
+      TESSERA_PLUGIN_PUBKEYS: ${{ vars.TESSERA_PLUGIN_PUBKEYS }}
     container:
       image: ${{ matrix.target.container }}
       credentials:
@@ -104,6 +105,23 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Verify trusted plugin keys are configured
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${TESSERA_PLUGIN_PUBKEYS//[[:space:]]/}" ]; then
+              echo "::error::Set repository variable TESSERA_PLUGIN_PUBKEYS to the trusted Ed25519 public key list."
+              exit 1
+          fi
+          IFS=',' read -ra keys <<< "$TESSERA_PLUGIN_PUBKEYS"
+          for key in "${keys[@]}"; do
+              key="${key//[[:space:]]/}"
+              if ! [[ "$key" =~ ^[0-9a-fA-F]{64}$ ]]; then
+                  echo "::error::Every TESSERA_PLUGIN_PUBKEYS item must be a 32-byte raw Ed25519 key (64 hex characters)."
+                  exit 1
+              fi
+          done
+
       - name: Cache cargo registry + target (Swatinem/rust-cache)
         # Отдельный shared-key: release-target nightly не должен
         # перетирать debug-кэш PR-пути build.yml (и наоборот).
@@ -116,6 +134,34 @@ jobs:
 
       - name: Configure sccache (compiler-level cache)
         uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Prepare release fixture signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/tessera-fixture-ed25519.pem"
+          openssl genpkey -algorithm Ed25519 -out "$key"
+          public_key="$(openssl pkey -in "$key" -pubout -outform DER \
+            | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          echo "TESSERA_PLUGIN_TEST_KEY=$key" >> "$GITHUB_ENV"
+          echo "TESSERA_PLUGIN_PUBKEYS=${TESSERA_PLUGIN_PUBKEYS},${public_key}" >> "$GITHUB_ENV"
+
+      - name: Build and sign runtime plugin fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p tessera_test_plugin --release
+          cp target/release/libtessera_test_plugin.so \
+             target/release/tessera_backend_fixture.so
+          openssl pkeyutl -sign -rawin -inkey "$TESSERA_PLUGIN_TEST_KEY" \
+            -in target/release/tessera_backend_fixture.so \
+            -out "$RUNNER_TEMP/tessera-fixture.sig.raw"
+          {
+            printf 'ed25519:'
+            od -An -tx1 "$RUNNER_TEMP/tessera-fixture.sig.raw" | tr -d ' \n'
+            printf '\n'
+          } > target/release/tessera_backend_fixture.so.sig
+          echo "TESSERA_TEST_PLUGIN=$GITHUB_WORKSPACE/target/release/tessera_backend_fixture.so" >> "$GITHUB_ENV"
 
       - name: Run tests (release profile)
         env:

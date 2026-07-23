@@ -21,13 +21,15 @@ Tessera интегрируется с МКЦ Astra Linux SE (Biba): X.509-сер
 | Политика (`[mac].cert_integrity` = required/optional/ignore; `[mac].runtime` = required/auto/disabled) | `mac/orchestrator.rs` |
 | Алгебра меток (level i8 + categories u64, DER-кодек) | `mac/label.rs` |
 | Audit-события `mac_*` / `integrity_*` (target `mac.audit`) | `mac/audit.rs` |
+| C ABI, проверка подписи и runtime loader backend-плагинов | `plugin/` |
 | Конфиг-секция `[mac]` | `config/` |
 
 Вся логика принятия решения открыта и аудируема.
 
 ## Что в коммерческой поставке
 
-Реальное применение меток к ядру (ParsecBackend: libpdp/libparsec FFI),
+Реальное применение меток к ядру (подписанный Parsec-плагин:
+libpdp/libparsec FFI),
 активация на strict-mode (capdb, systemd drop-in, PAMName), защита
 конфигурации МКЦ-метками и полная интеграционная документация — в составе
 коммерческого пакета (`tessera-enterprise`). Контакт — см.
@@ -35,12 +37,21 @@ Tessera интегрируется с МКЦ Astra Linux SE (Biba): X.509-сер
 
 ## Поведение открытой сборки
 
-- Backend всегда `StubBackend` (no-op enforcement).
-- `[mac].cert_integrity = "required"` или `[mac].runtime = "required"` —
-  **отвергаются на валидации конфига**: открытая сборка не имитирует
-  enforcement молча.
-- `optional` / `ignore` / `auto` / `disabled` — работают (политика
-  вычисляется, события эмитятся, метка не применяется).
+- Без `[mac].backend` используется `StubBackend` (no-op enforcement);
+  файлы из plugin-каталога не активируются автоматически.
+- При `backend = "parsec"` один и тот же открытый host ищет только
+  `/usr/lib/tessera/plugins/tessera_backend_parsec.so`, проверяет подпись,
+  ABI/kind/name и только затем вызывает `dlopen`.
+- `[mac].cert_integrity = "required"` или `[mac].runtime = "required"`
+  требуют явно заданного backend; отсутствие/отказ выбранного плагина
+  приводит к fail-closed, а не к имитации enforcement.
+- При `runtime = "auto"` отсутствие/отказ плагина даёт `StubBackend` и
+  audit-событие; роль с `mac_mask` при этом всё равно отклоняется.
+
+Официальная release-сборка вшивает raw Ed25519 public keys из
+`TESSERA_PLUGIN_PUBKEYS` (64 hex chars на ключ, через запятую). Detached-файл
+имеет формат `ed25519:<128 hex>` над точными байтами `.so`; release CI
+запрещает пустой trust store. В конфиге переключателя проверки подписи нет.
 
 ## Граница МКЦ / МРД
 

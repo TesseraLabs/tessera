@@ -574,16 +574,15 @@ Rationale:
 
 ## MAC integrity (Astra МКЦ, 0.3.0+)
 
-The `[mac]` section is optional. On a build without the `astra-mac`
-feature (Debian, Ubuntu, Astra without strict-mode) the presence of the
-section is not forbidden — but `cert_integrity = "required"` is rejected
-at config load: the stub backend cannot apply labels and must not
-silently pass an authentication that promised to apply them.
+The `[mac]` section is optional. The same open binary runs on
+Debian/Ubuntu/Astra. Real enforcement appears only when a signed runtime
+plugin is installed and explicitly selected with `backend`.
 
 ### Fields
 
 | Field                             | Type          | Default      | Description                                                                                                |
 |-----------------------------------|---------------|--------------|-----------------------------------------------------------------------------------------------------------|
+| `backend`                         | string        | —            | Explicit runtime plugin name, for example `"parsec"`. Absence selects `StubBackend`.                    |
 | `cert_integrity`                  | enum          | `"optional"` | One of `required` / `optional` / `ignore`. See below.                                                    |
 | `fallback_max_integrity.level`    | int (-128..127) | —          | The fallback label's level, when the `MAX_INTEGRITY` extension is absent and `cert_integrity = "optional"`. |
 | `fallback_max_integrity.categories` | string (hex or CSV) | —    | The category bitmask for the fallback. An empty string = `''B`.                                          |
@@ -606,32 +605,27 @@ silently pass an authentication that promised to apply them.
 
 ### `runtime` semantics (0.3.7+)
 
-The compile-time `astra-mac` feature decides **whether** the binary can
-link against libpdp. The `runtime` field decides **whether** the binary
-will actually use the real backend in the current process. This matters
-for a mixed fleet: the same `.deb` is installed on both MIC and non-MIC
-machines, and the behavior is controlled through `config.toml`.
+`backend` selects a separate signed shared library; `runtime` defines how
+it is used. The open host verifies signature and ABI before `dlopen`/`init`.
+Additional files are never auto-activated.
 
-- **`required`** — a `ParsecBackend` + an active MIC kernel
-  (`parsec_strict_mode() == 1`) are mandatory. If the kernel is not
-  active, authentication is rejected with a `mac_runtime_required` event
-  (ERROR). Requires a binary built with `astra-mac` — otherwise the
-  config is rejected at startup.
-- **`auto`** *(default)* — at session start `parsec_strict_mode` is
-  probed; if active — the real `ParsecBackend`, otherwise a fallback to
+- **`required`** — the selected plugin and its runtime are mandatory.
+  Missing files, bad signature/ABI/init, or an inactive runtime fail closed
+  with `plugin_rejected`/`mac_runtime_required`.
+- **`auto`** *(default)* — an active selected plugin is used; otherwise
+  the host falls back to
   `StubBackend` with a one-time `mac_runtime_fallback` event (WARN).
   Suitable for dev machines and a mixed fleet.
-- **`disabled`** — always `StubBackend`, even if the binary is built with
-  `astra-mac`. Used on terminals without a MIC kernel to guarantee that
-  `pdp_*` is never called. A `mac_runtime_disabled` event is logged (INFO).
+- **`disabled`** — always `StubBackend`, even when a plugin is installed.
+  Plugin callbacks are not invoked. `mac_runtime_disabled` is logged (INFO).
 
 Config validation:
 
 - `runtime = "disabled"` + `cert_integrity = "required"` is rejected at
   startup (logically incompatible: the stub cannot read or set the label
   that the cert policy requires).
-- `runtime = "required"` in a binary without `astra-mac` is rejected at
-  startup.
+- `runtime = "required"` or `cert_integrity = "required"` without
+  `backend` is rejected at startup.
 
 ### The effective label
 
@@ -651,6 +645,7 @@ after the intersection, `effective.level < cert.level`, a
 
 ```toml
 [mac]
+backend = "parsec"
 cert_integrity = "optional"
 
 [mac.fallback_max_integrity]

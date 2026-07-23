@@ -605,16 +605,15 @@ level = "debug"
 
 ## MAC integrity (Astra МКЦ, 0.3.0+)
 
-Секция `[mac]` опциональна. На сборке без feature `astra-mac` (Debian,
-Ubuntu, Astra без strict-mode) присутствие секции не запрещено — но
-`cert_integrity = "required"` отвергается на этапе загрузки конфига:
-stub-бэкенд не может применить метки и не должен молча пропускать
-аутентификацию, которая обязалась их применять.
+Секция `[mac]` опциональна. Один и тот же открытый бинарь работает на
+Debian/Ubuntu/Astra. Реальный enforcement появляется только при установке
+подписанного runtime-плагина и его явном выборе полем `backend`.
 
 ### Поля
 
 | Поле                              | Тип           | По умолчанию | Описание                                                                                                  |
 |-----------------------------------|---------------|--------------|-----------------------------------------------------------------------------------------------------------|
+| `backend`                         | string        | —            | Имя явно выбранного runtime-плагина, например `"parsec"`. Нет поля — `StubBackend`.                       |
 | `cert_integrity`                  | enum          | `"optional"` | Один из `required` / `optional` / `ignore`. См. ниже.                                                     |
 | `fallback_max_integrity.level`    | int (-128..127) | —          | Уровень fallback-метки, если расширение `MAX_INTEGRITY` отсутствует и `cert_integrity = "optional"`.       |
 | `fallback_max_integrity.categories` | string (hex или CSV) | —    | Битовая маска категорий для fallback. Пустая строка = `''B`.                                              |
@@ -638,24 +637,19 @@ stub-бэкенд не может применить метки и не долж
 
 ### Семантика `runtime` (0.3.7+)
 
-Compile-time feature `astra-mac` решает, **может ли** бинарь линковаться
-с libpdp. Поле `runtime` решает, **будет ли** бинарь действительно
-использовать настоящий backend в текущем процессе. Это важно для
-смешанного парка: один и тот же `.deb` ставится и на машины с МКЦ,
-и без, а поведение управляется через `config.toml`.
+Поле `backend` выбирает отдельную подписанную `.so`, а `runtime` задаёт
+политику её использования. Открытый host проверяет подпись и ABI до
+`dlopen`/`init`; лишние плагины не активируются автоматически.
 
-- **`required`** — обязателен `ParsecBackend` + активное МКЦ-ядро
-  (`parsec_strict_mode() == 1`). Если ядро не активно, аутентификация
-  отклоняется с событием `mac_runtime_required` (ERROR). Требует
-  собранный с `astra-mac` бинарь — иначе конфиг отвергается на старте.
-- **`auto`** *(default)* — на старте сессии пробуется
-  `parsec_strict_mode`; если активен — настоящий `ParsecBackend`, иначе
-  fallback на `StubBackend` с одноразовым событием
+- **`required`** — выбранный plugin и его runtime обязательны. Если `.so`
+  отсутствует, не проходит подпись/ABI/init либо runtime не активен,
+  аутентификация отклоняется с `plugin_rejected`/`mac_runtime_required`.
+- **`auto`** *(default)* — если выбранный plugin загружен и активен, он
+  используется; иначе fallback на `StubBackend` с событием
   `mac_runtime_fallback` (WARN). Подходит для дев-машин и смешанного
   парка.
-- **`disabled`** — всегда `StubBackend`, даже если бинарь собран с
-  `astra-mac`. Используется на терминалах без МКЦ-ядра, чтобы
-  гарантированно не вызывать `pdp_*`. Логируется событие
+- **`disabled`** — всегда `StubBackend`, даже если plugin установлен.
+  Гарантирует, что его callbacks не вызываются. Логируется событие
   `mac_runtime_disabled` (INFO).
 
 Валидация конфига:
@@ -663,8 +657,8 @@ Compile-time feature `astra-mac` решает, **может ли** бинарь 
 - `runtime = "disabled"` + `cert_integrity = "required"` отвергается
   на старте (логически несовместимо: stub не может прочитать или
   выставить метку, которую требует cert-политика).
-- `runtime = "required"` в бинаре без `astra-mac` отвергается на
-  старте.
+- `runtime = "required"` или `cert_integrity = "required"` без поля
+  `backend` отвергается на старте.
 
 ### Эффективная метка
 
@@ -684,6 +678,7 @@ caps.level)`; категории — `cert.categories & caps.categories`. Есл
 
 ```toml
 [mac]
+backend = "parsec"
 cert_integrity = "optional"
 
 [mac.fallback_max_integrity]

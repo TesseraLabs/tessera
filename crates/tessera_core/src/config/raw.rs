@@ -622,6 +622,10 @@ const fn default_hook_timeout() -> u64 {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawMacPolicy {
+    /// Explicit runtime enforcement plugin name, for example `parsec`.
+    /// Absence selects the built-in [`crate::mac::StubBackend`].
+    #[serde(default)]
+    pub backend: Option<String>,
     /// Trinary policy for the X.509 `MAX_INTEGRITY` extension on the
     /// authenticating certificate (`required` | `optional` | `ignore`).
     #[serde(default)]
@@ -635,18 +639,15 @@ pub struct RawMacPolicy {
     /// with the user's `$HOME` label at session-open time. Default `true`.
     #[serde(default)]
     pub warn_on_homedir_label_mismatch: Option<bool>,
-    /// Runtime selection for the MAC backend (independent of the
-    /// compile-time `astra-mac` feature). Default `auto`.
+    /// Runtime selection for the MAC backend. Default `auto`.
     ///
     /// - `required` — fail authentication if the kernel МКЦ subsystem is
-    ///   not present. Requires the binary to be built with the
-    ///   `astra-mac` feature.
-    /// - `auto` — use the real `ParsecBackend` when the kernel МКЦ
-    ///   subsystem is available, otherwise fall back to the no-op
+    ///   not present.
+    /// - `auto` — use the selected plugin when its runtime is available,
+    ///   otherwise fall back to the no-op
     ///   `StubBackend` (with a `mac_runtime_fallback` audit event).
-    /// - `disabled` — always use the no-op `StubBackend`, even when the
-    ///   binary was built with the `astra-mac` feature. Used on Astra SE
-    ///   hosts where МКЦ is intentionally turned off.
+    /// - `disabled` — always use the no-op `StubBackend`, even when a plugin
+    ///   is installed. Used on Astra SE hosts where МКЦ is intentionally off.
     #[serde(default)]
     pub runtime: Option<RawMacRuntimeMode>,
 }

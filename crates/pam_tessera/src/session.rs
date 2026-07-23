@@ -8,81 +8,54 @@
 use tessera_core::config::validated::MacRuntimeMode;
 use tessera_core::config::ValidatedConfig;
 use tessera_core::ipc::{ConnectPerCall, FailModeWrapper, MonitorClient, MonitorClientFactory};
-#[cfg(feature = "astra-mac")]
 use tessera_core::mac::audit::{
     emit_mac_runtime_required, emit_runtime_disabled, emit_runtime_fallback,
 };
 use tessera_core::mac::backend::MacBackend;
-#[cfg(feature = "astra-mac")]
 use tessera_core::mac::backend::MacRuntime;
 use tessera_core::mac::backend::StubBackend;
 use tessera_core::mac::orchestrator::{apply_session_policy, OrchestratorError, SessionContext};
 use tessera_core::pam_data::AuthContext;
 use tessera_core::x509::CertIdent;
-#[cfg(feature = "astra-mac")]
-use tessera_mac_parsec::ParsecBackend;
 
 /// `PAM_AUTH_ERR` — same numeric value as in `entry.rs`.
 const PAM_AUTH_ERR: i32 = 7;
 /// `PAM_SESSION_ERR` — keep in lock-step with `entry.rs`.
 const PAM_SESSION_ERR: i32 = 14;
 
-// Planned (openspec/changes/backend-plugins/): the compile-time `astra-mac`
-// dispatch below is replaced by runtime loading of signed enforcement plugins
-// from /usr/lib/tessera/plugins, selected via `[mac] backend = "<name>"`;
-// StubBackend stays the default when no plugin is configured or valid.
-/// Build the active backend, honouring `[mac].runtime` at runtime
-/// (independent of the compile-time `astra-mac` feature).
+/// Build the active backend from the explicitly selected runtime plugin.
 ///
-/// Selection matrix (a — compile-time astra-mac feature, k — kernel МКЦ
-/// active per `parsec_strict_mode`):
+/// Selection matrix (`p` — selected plugin loaded and active):
 ///
-/// | runtime    | a=no             | a=yes, k=no                       | a=yes, k=yes |
-/// |------------|------------------|-----------------------------------|--------------|
-/// | required   | rejected at cfg  | `Err(PAM_AUTH_ERR)` (fail-closed) | Parsec       |
-/// | auto       | Stub             | Stub + `mac_runtime_fallback`     | Parsec       |
-/// | disabled   | Stub             | Stub + `mac_runtime_disabled`     | Stub + log   |
+/// | runtime    | p=no                                | p=yes  |
+/// |------------|-------------------------------------|--------|
+/// | required   | `Err(PAM_AUTH_ERR)` (fail-closed)   | plugin |
+/// | auto       | Stub + `mac_runtime_fallback`       | plugin |
+/// | disabled   | Stub + `mac_runtime_disabled`       | Stub   |
 ///
-/// Returns `Err(PAM_AUTH_ERR)` only in the `required` + kernel-missing
-/// combination; everything else degrades to a working backend.
-#[cfg_attr(not(feature = "astra-mac"), allow(clippy::unnecessary_wraps))]
-fn build_backend(mac_runtime: MacRuntimeMode) -> Result<Box<dyn MacBackend>, i32> {
-    #[cfg(feature = "astra-mac")]
-    {
-        match mac_runtime {
-            MacRuntimeMode::Disabled => {
-                emit_runtime_disabled();
-                Ok(Box::new(StubBackend::new()))
-            }
-            MacRuntimeMode::Required => {
-                let backend = ParsecBackend::new();
-                if matches!(backend.probe(), MacRuntime::Active) {
-                    Ok(Box::new(backend))
-                } else {
-                    emit_mac_runtime_required("kernel parsec subsystem not active");
-                    Err(PAM_AUTH_ERR)
-                }
-            }
-            MacRuntimeMode::Auto => {
-                let backend = ParsecBackend::new();
-                if matches!(backend.probe(), MacRuntime::Active) {
-                    Ok(Box::new(backend))
-                } else {
-                    emit_runtime_fallback(
-                        "kernel parsec subsystem not active (parsec_strict_mode != 1)",
-                    );
-                    Ok(Box::new(StubBackend::new()))
-                }
-            }
-        }
+/// Returns `Err(PAM_AUTH_ERR)` only in the `required` + inactive combination.
+fn build_backend(
+    mac_runtime: MacRuntimeMode,
+    plugin_name: Option<&str>,
+) -> Result<Box<dyn MacBackend>, i32> {
+    if matches!(mac_runtime, MacRuntimeMode::Disabled) {
+        emit_runtime_disabled();
+        return Ok(Box::new(StubBackend::new()));
     }
-    #[cfg(not(feature = "astra-mac"))]
-    {
-        // Stub-only builds always use the stub backend. `runtime = "required"`
-        // is rejected by validate_mac() in this configuration, so we should
-        // only see `Auto` or `Disabled` here.
-        let _ = mac_runtime;
-        Ok(Box::new(StubBackend::new()))
+    let backend = tessera_core::plugin::load_enforcement_backend(plugin_name, "");
+    if matches!(backend.probe(), MacRuntime::Active) {
+        return Ok(backend);
+    }
+    match mac_runtime {
+        MacRuntimeMode::Required => {
+            emit_mac_runtime_required("selected enforcement plugin is not active");
+            Err(PAM_AUTH_ERR)
+        }
+        MacRuntimeMode::Auto => {
+            emit_runtime_fallback("selected enforcement plugin is not active");
+            Ok(Box::new(StubBackend::new()))
+        }
+        MacRuntimeMode::Disabled => Ok(Box::new(StubBackend::new())),
     }
 }
 
@@ -102,7 +75,7 @@ pub fn run_open_session_pipeline(
     ctx: &AuthContext,
     pam_user: &str,
 ) -> Result<(), i32> {
-    let backend = build_backend(cfg.mac.runtime)?;
+    let backend = build_backend(cfg.mac.runtime, cfg.mac.backend.as_deref())?;
     // Build a production monitor client matching `di::wire`'s policy so we
     // can pair the `open_session` registered during `pam_sm_authenticate`
     // with a `close_session` on MAC denial. Without this, a session whose
