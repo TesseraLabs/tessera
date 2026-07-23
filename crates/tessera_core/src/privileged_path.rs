@@ -516,6 +516,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
+    const TRUSTED_SYSTEM_FILE: &str = "/usr/bin/true";
+
     /// True when the test process is running as root, in which case the
     /// "owned by a non-root uid" rejection cases cannot be asserted (root owns
     /// nothing the tests can create as a non-root uid). Such cases are skipped.
@@ -614,7 +616,7 @@ mod tests {
     /// yields a usable descriptor.
     #[test]
     fn root_owned_system_binary_is_accepted() {
-        let candidate = Path::new("/bin/sh");
+        let candidate = Path::new(TRUSTED_SYSTEM_FILE);
         if !candidate.exists() {
             return;
         }
@@ -623,9 +625,12 @@ mod tests {
                 assert!(validated.canonical().is_absolute());
                 let _fd = validated.into_descriptor();
             }
-            // Extremely unusual permissions on a host's /bin/sh should not fail
-            // the suite; the security-relevant assertions are the rejections.
-            Err(err) => panic!("expected /bin/sh to validate under Root trust: {err:?}"),
+            // Extremely unusual permissions on a host's system binary should
+            // not fail the suite; the security-relevant assertions are the
+            // rejections.
+            Err(err) => {
+                panic!("expected {TRUSTED_SYSTEM_FILE} to validate under Root trust: {err:?}")
+            }
         }
     }
 
@@ -638,7 +643,7 @@ mod tests {
 
     #[test]
     fn validate_directory_rejects_regular_file_leaf() {
-        let candidate = Path::new("/bin/sh");
+        let candidate = Path::new(TRUSTED_SYSTEM_FILE);
         if !candidate.exists() {
             return;
         }
@@ -649,7 +654,7 @@ mod tests {
 
     #[test]
     fn read_file_uses_validated_root_owned_inode() {
-        let candidate = Path::new("/bin/sh");
+        let candidate = Path::new(TRUSTED_SYSTEM_FILE);
         if !candidate.exists() {
             return;
         }

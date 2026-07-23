@@ -511,9 +511,9 @@ mod tests {
         );
     }
 
-    /// End-to-end exercise of the no-alloc child path. Forks a real
-    /// `/bin/true` (root-owned) and confirms `exit_code == 0` with the
-    /// rewired pre-built groups path active.
+    /// End-to-end exercise of the no-alloc child path. Forks a real,
+    /// root-owned `true` binary and confirms `exit_code == 0` with the rewired
+    /// pre-built groups path active.
     #[cfg(target_os = "linux")]
     #[test]
     fn fork_exec_runs_true_with_no_alloc_child_path() {
@@ -523,7 +523,10 @@ mod tests {
 
         let hook = HookConfig {
             stage: HookStage::PreAuth,
-            command: vec!["/bin/true".to_string()],
+            // Debian and Ubuntu merge `/bin` into `/usr/bin` through a
+            // symlink. Use the canonical path because privileged execution
+            // deliberately rejects every symlink component.
+            command: vec!["/usr/bin/true".to_string()],
             timeout: Duration::from_secs(5),
             on_failure: OnFailure::Warn,
             run_as: RunAs::Root,
@@ -532,7 +535,7 @@ mod tests {
         let vars = HookVars::empty();
         let exec = ForkExecExecutor::new();
         let outcome = exec.execute(&hook, &vars).expect("fork+exec succeeds");
-        assert_eq!(outcome.exit_code, 0, "/bin/true exits 0");
+        assert_eq!(outcome.exit_code, 0, "/usr/bin/true exits 0");
         assert!(!outcome.killed_by_timeout);
     }
 
