@@ -21,6 +21,7 @@ use tessera_core::hooks::{
     apply_on_failure, ForkExecExecutor, HookConfig, HookError, HookExecutor, HookStage, HookVars,
     OnFailure, RunAs,
 };
+use tessera_core::privileged_path::PrivilegedPathError;
 
 const ECHO: &str = "/usr/bin/echo";
 const FALSE: &str = "/usr/bin/false";
@@ -100,7 +101,8 @@ fn nonexistent_command_is_rejected_before_exec() {
     // whose path (or any ancestor) does not exist cannot be canonicalized, so
     // the executor fails closed with CommandUnusable rather than forking and
     // letting execve surface a 127 exit. Rejecting an unresolvable hook path up
-    // front is the intended fail-closed behavior.
+    // front is the intended fail-closed behavior. The privileged-path
+    // validator preserves the concrete path error under `CommandUnsafe`.
     let executor = ForkExecExecutor::new();
     let hook = make_hook(
         HookStage::PreAuth,
@@ -113,7 +115,12 @@ fn nonexistent_command_is_rejected_before_exec() {
         &HookVars::empty().with_pam_user("u").with_pam_service("s"),
     );
     assert!(
-        matches!(res, Err(HookError::CommandUnusable { .. })),
+        matches!(
+            res,
+            Err(HookError::CommandUnsafe(
+                PrivilegedPathError::Unresolvable { .. }
+            ))
+        ),
         "unresolvable hook path must be rejected before exec, got {res:?}"
     );
 }
