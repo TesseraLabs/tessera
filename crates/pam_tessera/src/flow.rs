@@ -117,6 +117,14 @@ pub enum FlowError {
     #[error("cert scope: {0}")]
     CertScope(#[from] HostBindingError),
 
+    /// A present `MAX_INTEGRITY` certificate extension was malformed.
+    ///
+    /// Treating this as absence would let optional MAC policy apply a broader
+    /// fallback ceiling. Both credential backends therefore reject it before
+    /// role/delegation/session policy.
+    #[error("malformed MAX_INTEGRITY certificate extension: {0}")]
+    MaxIntegrityMalformed(#[source] tessera_core::x509::max_integrity_ext::MaxIntegrityExtError),
+
     /// An internal invariant broke (e.g. `PAM_SET_DATA` failed).
     #[error("internal: {0}")]
     Internal(&'static str),
@@ -227,6 +235,7 @@ impl FlowError {
     /// | `MaxTries` / `Pkcs11Acquire(PinLocked|MaxAttempts)`    | `PAM_MAXTRIES` (8)         |
     /// | `Conv` / `Pkcs11Acquire(Conv)` / `Pkcs11(PinIncorrect)`| `PAM_AUTH_ERR` (7)         |
     /// | `CertScope`                                            | `PAM_AUTH_ERR` (7)         |
+    /// | `MaxIntegrityMalformed`                                | `PAM_PERM_DENIED` (6)      |
     /// | `Pkcs12` / `Crypto` / `Trust`                          | `PAM_PERM_DENIED` (6)      |
     /// | `Mapping` / `MonitorRegistration`                      | `PAM_PERM_DENIED` (6)      |
     /// | other `Pkcs11(...)` / `Pkcs11Acquire(Pkcs11)`          | `PAM_AUTH_ERR` (7)         |
@@ -265,6 +274,7 @@ impl FlowError {
             | Self::Crypto(_)
             | Self::Trust(_)
             | Self::Mapping(_)
+            | Self::MaxIntegrityMalformed(_)
             | Self::RoleDenied(_)
             | Self::DelegationDenied(_)
             | Self::MonitorRegistration(_) => 6,
@@ -838,17 +848,7 @@ where
     let verified_leaf = verified.verified_leaf();
     let cert_ident_value = tessera_core::x509::CertIdent::from(&verified_leaf);
     let cert_max_integrity =
-        match tessera_core::x509::max_integrity_ext::extract_max_integrity(&verified_leaf) {
-            Ok(label) => label,
-            Err(e) => {
-                tessera_core::mac::audit::emit_cert_ext_parse_failed(
-                    pam_user,
-                    &cert_ident_value,
-                    &e.to_string(),
-                );
-                None
-            }
-        };
+        extract_cert_max_integrity(&verified_leaf, pam_user, &cert_ident_value)?;
     let cert_ident = Some(cert_ident_value);
     let home_dir = resolve_home_dir(pam_user);
 
@@ -1228,17 +1228,7 @@ where
     let verified_leaf = verified.verified_leaf();
     let cert_ident_value = tessera_core::x509::CertIdent::from(&verified_leaf);
     let cert_max_integrity =
-        match tessera_core::x509::max_integrity_ext::extract_max_integrity(&verified_leaf) {
-            Ok(label) => label,
-            Err(e) => {
-                tessera_core::mac::audit::emit_cert_ext_parse_failed(
-                    pam_user,
-                    &cert_ident_value,
-                    &e.to_string(),
-                );
-                None
-            }
-        };
+        extract_cert_max_integrity(&verified_leaf, pam_user, &cert_ident_value)?;
     let cert_ident = Some(cert_ident_value);
     let home_dir = resolve_home_dir(pam_user);
 
@@ -1852,6 +1842,27 @@ fn resolve_role_stage(
     Ok(Some(payload))
 }
 
+/// Extract `MAX_INTEGRITY` without collapsing a malformed present extension
+/// into the optional/absent state.
+///
+/// Both credential backends call this shared chokepoint before role,
+/// delegation, and session policy. The parse failure is audited once and
+/// returned fail-closed.
+fn extract_cert_max_integrity(
+    verified_leaf: &tessera_core::x509::VerifiedX509,
+    pam_user: &str,
+    cert_ident: &tessera_core::x509::CertIdent,
+) -> Result<Option<tessera_core::mac::IntegrityLabel>, FlowError> {
+    tessera_core::x509::max_integrity_ext::extract_max_integrity(verified_leaf).map_err(|error| {
+        tessera_core::mac::audit::emit_cert_ext_parse_failed(
+            pam_user,
+            cert_ident,
+            &error.to_string(),
+        );
+        FlowError::MaxIntegrityMalformed(error)
+    })
+}
+
 /// Live delegation-envelope enforcement (tags-delegation §4, wired in §5).
 ///
 /// Runs AFTER trust verification and role resolution on BOTH auth paths. For
@@ -1890,10 +1901,10 @@ fn enforce_delegation_stage(
 
     // Whether this chain is envelope-scoped (any CA carries
     // delegation_constraints). A malformed/mis-placed extension is itself
-    // fail-closed here. For a non-envelope (per-host) chain the delegation
-    // ceilings do not apply, so a malformed *non-critical* leaf max_integrity
-    // is tolerated exactly as before; for an envelope-scoped chain it must
-    // fail closed (the leaf level is a security ceiling input — see below).
+    // fail-closed here. Production authentication has already rejected a
+    // malformed leaf `MAX_INTEGRITY` through `extract_cert_max_integrity`; the
+    // scoped re-check below remains defense-in-depth for direct/internal
+    // callers.
     let scoped = match tessera_core::trust::chain_carries_constraints(&chain) {
         Ok(s) => s,
         Err(err) => {
@@ -3813,5 +3824,80 @@ level = "info"
         let info = sample_open_session_info("sess-p11-perm");
         register_session_or_deny(&monitor, &info)
             .expect("permissive monitor failure must not block the pkcs11 session");
+    }
+
+    #[cfg(feature = "mac-tests")]
+    fn malformed_max_integrity_leaf() -> tessera_core::x509::VerifiedX509 {
+        use openssl::asn1::{Asn1Integer, Asn1Object, Asn1OctetString, Asn1Time};
+        use openssl::bn::BigNum;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::rsa::Rsa;
+        use openssl::x509::extension::BasicConstraints;
+        use openssl::x509::{X509Builder, X509Extension, X509NameBuilder};
+
+        let key = PKey::from_rsa(Rsa::generate(2048).expect("rsa")).expect("pkey");
+        let mut name = X509NameBuilder::new().expect("name builder");
+        name.append_entry_by_text("CN", "malformed-max-integrity")
+            .expect("subject CN");
+        let name = name.build();
+        let mut cert = X509Builder::new().expect("cert builder");
+        cert.set_version(2).expect("version");
+        let serial = BigNum::from_u32(1).expect("serial");
+        cert.set_serial_number(&Asn1Integer::from_bn(&serial).expect("asn1 serial"))
+            .expect("set serial");
+        cert.set_subject_name(&name).expect("subject");
+        cert.set_issuer_name(&name).expect("issuer");
+        cert.set_pubkey(&key).expect("pubkey");
+        cert.set_not_before(&Asn1Time::days_from_now(0).expect("not before"))
+            .expect("set not before");
+        cert.set_not_after(&Asn1Time::days_from_now(365).expect("not after"))
+            .expect("set not after");
+        cert.append_extension(
+            BasicConstraints::new()
+                .critical()
+                .ca()
+                .build()
+                .expect("basic constraints"),
+        )
+        .expect("append basic constraints");
+
+        // SEQUENCE claims five body bytes but contains only three.
+        let malformed_der = [0x30_u8, 0x05, 0x02, 0x01, 0x02];
+        let oid = Asn1Object::from_str(tessera_core::x509::oids::MAX_INTEGRITY_OID).expect("OID");
+        let octets = Asn1OctetString::new_from_bytes(&malformed_der).expect("octets");
+        let extension =
+            X509Extension::new_from_der(&oid, false, &octets).expect("MAX_INTEGRITY extension");
+        cert.append_extension(extension)
+            .expect("append MAX_INTEGRITY");
+        cert.sign(&key, MessageDigest::sha256()).expect("sign");
+        tessera_core::x509::VerifiedX509::from_trusted_for_test(cert.build())
+    }
+
+    #[cfg(feature = "mac-tests")]
+    fn assert_malformed_max_integrity_denied_for_backend(backend: &str) {
+        let cert = malformed_max_integrity_leaf();
+        let ident = tessera_core::x509::CertIdent::from(&cert);
+
+        let error = extract_cert_max_integrity(&cert, "alice", &ident)
+            .expect_err("malformed MAX_INTEGRITY must fail closed");
+
+        assert!(
+            matches!(error, FlowError::MaxIntegrityMalformed(_)),
+            "{backend}: unexpected error: {error:?}"
+        );
+        assert_eq!(error.pam_code(), 6, "{backend}");
+    }
+
+    #[cfg(feature = "mac-tests")]
+    #[test]
+    fn pkcs12_malformed_max_integrity_fails_closed() {
+        assert_malformed_max_integrity_denied_for_backend("pkcs12");
+    }
+
+    #[cfg(feature = "mac-tests")]
+    #[test]
+    fn pkcs11_malformed_max_integrity_fails_closed() {
+        assert_malformed_max_integrity_denied_for_backend("pkcs11");
     }
 }

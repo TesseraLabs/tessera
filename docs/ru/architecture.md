@@ -257,7 +257,8 @@ flowchart LR
     run --> sessions["sessions/sid/"]
     run --> state[sessions.json]
     run --> lock[daemon.lock]
-    var["/var/lib/tessera/"] --> wp["wallpaper.orig.jpg"]
+    var["/var/lib/tessera/ (root-owned policy)"] --> daemon["daemon/ (tessera-owned state)"]
+    daemon --> wp["wallpaper.orig.jpg"]
 ```
 
 | Путь                                         | Кто пишет                | Кто читает                     | Права                  |
@@ -267,11 +268,15 @@ flowchart LR
 | `/run/tessera/monitord.sock`            | monitord                 | cdylib                         | `0660 tessera:tessera` |
 | `/run/tessera/sessions/<sid>/`          | cdylib                   | удаляет MountGuard на drop     | `0700 root:root`       |
 | `/run/tessera/sessions.json`            | monitord                 | monitord (между перезапусками демона в пределах boot; tmpfs, эфемерный) | `0600 tessera:tessera` |
-| `/run/tessera/daemon.lock`              | monitord (flock-singleton; рядом с `sessions.json`, fallback `/var/lib/tessera/`) | monitord | —             |
+| `/run/tessera/daemon.lock`              | monitord (flock-singleton; рядом с `sessions.json`, fallback `/var/lib/tessera/daemon/`) | monitord | —             |
+| `/var/lib/tessera/roles/*.toml`, `/var/lib/tessera/tags.toml` | администратор | cdylib | root-owned; весь путь без group/world write |
+| `/var/lib/tessera/daemon/wallpaper.orig.jpg` | monitord | monitord | состояние демона под `0750 tessera:tessera` |
 | `/var/cache/tessera/ocsp/*.der`         | cdylib (auth-путь, OCSP-кэш) | cdylib (с ре-верификацией перед использованием) | `0640 root:root` (каталог `0750 root:root`) |
 
-`/run/tessera/` и `/var/lib/tessera/` создаются systemd
-через директивы `RuntimeDirectory` и `StateDirectory` юнита
+`/run/tessera/` и `/var/lib/tessera/daemon/` создаются systemd
+через директивы `RuntimeDirectory` и вложенную `StateDirectory` юнита.
+Сам `/var/lib/tessera/` пакет оставляет `0750 root:tessera`, поэтому
+непривилегированный демон не может подменить доверенные роли и теги.
 (см. [`tessera.service`](../../dist/systemd/tessera.service)
 и [`dist/tmpfiles/tessera.conf`](../../dist/tmpfiles/tessera.conf)).
 `/var/cache/tessera/ocsp/` создаёт postinst пакета

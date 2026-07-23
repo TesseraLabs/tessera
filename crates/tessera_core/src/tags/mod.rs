@@ -20,5 +20,6 @@ pub mod source;
 
 pub use schema::{parse_tags, DeviceTags, TagsSchemaError, MAX_TAGS_BYTES};
 pub use source::{
-    load_managed, load_standalone, load_standalone_optional, TagsSourceError, DEFAULT_TAGS_FILE,
+    load_managed, load_standalone, load_standalone_optional, load_standalone_optional_privileged,
+    load_standalone_privileged, TagsSourceError, DEFAULT_TAGS_FILE,
 };

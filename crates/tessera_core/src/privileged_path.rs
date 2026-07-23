@@ -18,16 +18,18 @@
 //! * A component may be group-writable only when its owning group is root or
 //!   the account the path will be used as.
 //!
-//! [`validate_path`] resolves symlinks up front (so the walk sees exactly the
-//! tree the kernel would resolve), walks it, then re-opens the leaf with
-//! `O_NOFOLLOW` and re-checks the opened inode. The returned [`ValidatedPath`]
-//! hands back the open descriptor so a caller can act on *exactly* the inode
-//! that was validated — reopening it for a read, or (on Linux) `fexecve`-ing it
-//! — instead of re-resolving the path and racing a swap in between.
+//! [`validate_path`] rejects every symlink in the supplied path, validates the
+//! original component chain, canonicalizes and walks it again, then re-opens
+//! the leaf with `O_NOFOLLOW` and re-checks the opened inode. The returned
+//! [`ValidatedPath`] hands back the open descriptor so a caller can act on
+//! *exactly* the inode that was validated — reopening it for a read, or (on
+//! Linux) `fexecve`-ing it — instead of re-resolving the path and racing a swap
+//! in between.
 
+use std::io::Read as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// `S_IWOTH` — write permission for "other". Never acceptable on a privileged
 /// path: it lets any local user rewrite the component.
@@ -69,6 +71,11 @@ pub enum ExecTrust {
 pub struct ValidatedPath {
     canonical: PathBuf,
     descriptor: OwnedFd,
+    trust: ExecTrust,
+    device: u64,
+    inode: u64,
+    is_file: bool,
+    is_dir: bool,
 }
 
 impl ValidatedPath {
@@ -90,6 +97,49 @@ impl ValidatedPath {
     pub fn into_descriptor(self) -> OwnedFd {
         self.descriptor
     }
+
+    /// Open the validated regular file for reading and verify that the newly
+    /// opened descriptor still refers to the inode captured by
+    /// [`validate_file`].
+    ///
+    /// The canonical path's ancestors have already passed the ownership walk,
+    /// and the final component is opened with `O_NOFOLLOW`. The post-open
+    /// `(st_dev, st_ino)` comparison closes the remaining check/use window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrivilegedPathError::NotRegularFile`] when this guard was
+    /// created for a non-file path, or a path-validation error when the file
+    /// cannot be opened safely or changed after validation.
+    pub fn open_readonly(&self) -> Result<std::fs::File, PrivilegedPathError> {
+        if !self.is_file {
+            return Err(PrivilegedPathError::NotRegularFile {
+                path: self.canonical.clone(),
+            });
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file =
+            opts.open(&self.canonical)
+                .map_err(|source| PrivilegedPathError::Unresolvable {
+                    path: self.canonical.clone(),
+                    source,
+                })?;
+        let meta = file
+            .metadata()
+            .map_err(|source| PrivilegedPathError::Stat {
+                path: self.canonical.clone(),
+                source,
+            })?;
+        check_component(&self.canonical, &meta, self.trust)?;
+        if meta.dev() != self.device || meta.ino() != self.inode {
+            return Err(PrivilegedPathError::InodeChanged {
+                path: self.canonical.clone(),
+            });
+        }
+        Ok(file)
+    }
 }
 
 /// Failure to validate a path for privileged execution or opening.
@@ -101,6 +151,21 @@ pub enum PrivilegedPathError {
     #[error("path is not absolute: {path:?}")]
     NotAbsolute {
         /// The offending path.
+        path: PathBuf,
+    },
+    /// The supplied path contains a `..` component, so it does not describe a
+    /// single unambiguous ancestor chain.
+    #[error("path contains a parent-directory component: {path:?}")]
+    NotNormalized {
+        /// The offending path.
+        path: PathBuf,
+    },
+    /// Symlinks are forbidden in privileged paths, even when their current
+    /// target is itself trusted: an unprivileged link owner could otherwise
+    /// select which root-controlled input is consumed.
+    #[error("symlink component is not allowed in privileged path: {path:?}")]
+    SymlinkNotAllowed {
+        /// The offending symlink component.
         path: PathBuf,
     },
     /// The path could not be canonicalized: a component is missing, is not a
@@ -147,16 +212,39 @@ pub enum PrivilegedPathError {
         /// The leaf path that changed underfoot.
         path: PathBuf,
     },
+    /// A caller required a regular file but the validated leaf has a
+    /// different type.
+    #[error("{path:?} is not a regular file")]
+    NotRegularFile {
+        /// The offending leaf.
+        path: PathBuf,
+    },
+    /// A caller required a directory but the validated leaf has a different
+    /// type.
+    #[error("{path:?} is not a directory")]
+    NotDirectory {
+        /// The offending leaf.
+        path: PathBuf,
+    },
+    /// Reading a validated file failed.
+    #[error("cannot read validated file {path:?}: {source}")]
+    Read {
+        /// The file being read.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Validate that `path` and every canonical ancestor satisfy `trust`, returning
 /// a descriptor to the validated leaf inode.
 ///
-/// The path is canonicalized first, so the walk and the descriptor both refer
-/// to the real, symlink-free tree the kernel would resolve — a symlinked
-/// component cannot hide its true parents from the permission walk. The leaf is
-/// then reopened `O_NOFOLLOW` and re-checked against the freshly `fstat`ed
-/// inode, closing the window between the walk and the open.
+/// The original path is walked first and any symlink or `..` component is
+/// rejected. It is then canonicalized and walked again, so both the caller's
+/// namespace path and the resolved tree must satisfy the ownership policy. The
+/// leaf is finally reopened `O_NOFOLLOW` and re-checked against the freshly
+/// `fstat`ed inode, closing the window between the walk and the open.
 ///
 /// # Errors
 ///
@@ -188,9 +276,11 @@ pub fn validate_path(path: &Path, trust: ExecTrust) -> Result<ValidatedPath, Pri
             source,
         })?;
 
-    // Walk the leaf and every ancestor. `symlink_metadata` never follows a
-    // symlink; on a canonical path there are none, but using the non-following
-    // stat keeps the check honest even if the tree mutates mid-walk.
+    validate_original_components(path, trust)?;
+
+    // Walk the canonical leaf and every ancestor. `symlink_metadata` never
+    // follows a symlink; on a canonical path there are none, but using the
+    // non-following stat keeps the check honest if the tree mutates mid-walk.
     let leaf_meta =
         std::fs::symlink_metadata(&canonical).map_err(|source| PrivilegedPathError::Stat {
             path: canonical.clone(),
@@ -229,6 +319,118 @@ pub fn validate_path(path: &Path, trust: ExecTrust) -> Result<ValidatedPath, Pri
     Ok(ValidatedPath {
         canonical,
         descriptor: OwnedFd::from(file),
+        trust,
+        device: opened_meta.dev(),
+        inode: opened_meta.ino(),
+        is_file: opened_meta.is_file(),
+        is_dir: opened_meta.is_dir(),
+    })
+}
+
+/// Reject ambiguous resolution and validate the exact component chain supplied
+/// by the caller before canonical resolution is trusted.
+fn validate_original_components(path: &Path, trust: ExecTrust) -> Result<(), PrivilegedPathError> {
+    let mut current = PathBuf::from("/");
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => current.push(name),
+            Component::ParentDir => {
+                return Err(PrivilegedPathError::NotNormalized {
+                    path: path.to_path_buf(),
+                });
+            }
+            Component::Prefix(_) => {
+                return Err(PrivilegedPathError::NotAbsolute {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+        let meta =
+            std::fs::symlink_metadata(&current).map_err(|source| PrivilegedPathError::Stat {
+                path: current.clone(),
+                source,
+            })?;
+        if meta.file_type().is_symlink() {
+            return Err(PrivilegedPathError::SymlinkNotAllowed {
+                path: current.clone(),
+            });
+        }
+        components.push((current.clone(), meta));
+    }
+    for (component, meta) in components {
+        check_component(&component, &meta, trust)?;
+    }
+    Ok(())
+}
+
+/// Validate a root- or user-trusted path and require a regular-file leaf.
+///
+/// # Errors
+///
+/// Returns the same failures as [`validate_path`], plus
+/// [`PrivilegedPathError::NotRegularFile`] for non-file leaves.
+pub fn validate_file(path: &Path, trust: ExecTrust) -> Result<ValidatedPath, PrivilegedPathError> {
+    let validated = validate_path(path, trust)?;
+    if !validated.is_file {
+        return Err(PrivilegedPathError::NotRegularFile {
+            path: validated.canonical.clone(),
+        });
+    }
+    Ok(validated)
+}
+
+/// Validate a root- or user-trusted path and require a directory leaf.
+///
+/// # Errors
+///
+/// Returns the same failures as [`validate_path`], plus
+/// [`PrivilegedPathError::NotDirectory`] for non-directory leaves.
+pub fn validate_directory(
+    path: &Path,
+    trust: ExecTrust,
+) -> Result<ValidatedPath, PrivilegedPathError> {
+    let validated = validate_path(path, trust)?;
+    if !validated.is_dir {
+        return Err(PrivilegedPathError::NotDirectory {
+            path: validated.canonical.clone(),
+        });
+    }
+    Ok(validated)
+}
+
+/// Read a regular file only after its complete path passes the requested
+/// privileged ownership policy.
+///
+/// # Errors
+///
+/// Returns a path-validation error when the file or an ancestor is untrusted,
+/// the leaf is not a regular file, the inode changes, or the read fails.
+pub fn read_file(path: &Path, trust: ExecTrust) -> Result<Vec<u8>, PrivilegedPathError> {
+    let validated = validate_file(path, trust)?;
+    let mut file = validated.open_readonly()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| PrivilegedPathError::Read {
+            path: validated.canonical.clone(),
+            source,
+        })?;
+    Ok(bytes)
+}
+
+/// Read a UTF-8 text file only after its complete path passes the requested
+/// privileged ownership policy.
+///
+/// # Errors
+///
+/// Returns a path-validation error when the file is untrusted, changes during
+/// opening, cannot be read, or is not valid UTF-8.
+pub fn read_to_string(path: &Path, trust: ExecTrust) -> Result<String, PrivilegedPathError> {
+    let bytes = read_file(path, trust)?;
+    String::from_utf8(bytes).map_err(|source| PrivilegedPathError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
     })
 }
 
@@ -343,6 +545,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn symlink_leaf_is_rejected_even_when_target_is_root_controlled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("trusted");
+        std::os::unix::fs::symlink("/bin/sh", &link).expect("symlink");
+        let err = validate_path(&link, ExecTrust::Root)
+            .expect_err("privileged symlinks must be rejected");
+        assert!(
+            matches!(err, PrivilegedPathError::SymlinkNotAllowed { .. }),
+            "{err:?}"
+        );
+    }
+
     /// SEC-004 core: a `0755` executable and its parent owned by a non-root uid
     /// must be rejected for a root-privilege path, because that owner could
     /// rewrite it before root runs it.
@@ -369,6 +584,7 @@ mod tests {
                 err,
                 PrivilegedPathError::UntrustedOwner { .. }
                     | PrivilegedPathError::UntrustedWritable { .. }
+                    | PrivilegedPathError::SymlinkNotAllowed { .. }
             ),
             "{err:?}"
         );
@@ -411,5 +627,34 @@ mod tests {
             // the suite; the security-relevant assertions are the rejections.
             Err(err) => panic!("expected /bin/sh to validate under Root trust: {err:?}"),
         }
+    }
+
+    #[test]
+    fn validate_file_rejects_directory_leaf() {
+        let err = validate_file(Path::new("/"), ExecTrust::Root)
+            .expect_err("directory must not validate as a regular file");
+        assert!(matches!(err, PrivilegedPathError::NotRegularFile { .. }));
+    }
+
+    #[test]
+    fn validate_directory_rejects_regular_file_leaf() {
+        let candidate = Path::new("/bin/sh");
+        if !candidate.exists() {
+            return;
+        }
+        let err = validate_directory(candidate, ExecTrust::Root)
+            .expect_err("regular file must not validate as a directory");
+        assert!(matches!(err, PrivilegedPathError::NotDirectory { .. }));
+    }
+
+    #[test]
+    fn read_file_uses_validated_root_owned_inode() {
+        let candidate = Path::new("/bin/sh");
+        if !candidate.exists() {
+            return;
+        }
+        let bytes =
+            read_file(candidate, ExecTrust::Root).expect("root-owned system file must be readable");
+        assert!(!bytes.is_empty());
     }
 }

@@ -63,9 +63,10 @@ pkcs11_slot_wait_seconds = 10
 # pkcs12_pin_prompt   = "Пароль PKCS#12: "
 
 # --- gost-engine -------------------------------------------------------------
-# Path to the gost-engine .so. When omitted, the engine is resolved by id
-# "gost" from the system OpenSSL engine search path. Only meaningful with
-# crypto_backend = "openssl".
+# Absolute path to the gost-engine .so. Required when the OpenSSL signature
+# allow-list contains GOST: implicit OPENSSL_ENGINES lookup is rejected.
+# The file and every ancestor must be root-owned and non-group/world-writable.
+# Only meaningful with crypto_backend = "openssl".
 # gost_engine_path = "/usr/lib/x86_64-linux-gnu/engines-1.1/gost.so"
 
 # --- USB monitor -------------------------------------------------------------
@@ -294,7 +295,7 @@ level = "info"
 [fly_dm_greeter]
 update_wallpaper = false
 # wallpaper_target     = "/usr/share/wallpapers/fly-default-light.jpg"
-# wallpaper_backup     = "/var/lib/tessera/wallpaper.orig.jpg"
+# wallpaper_backup     = "/var/lib/tessera/daemon/wallpaper.orig.jpg"
 # wallpaper_font       = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # wallpaper_font_size  = 64
 # wallpaper_text_color = "#000000"

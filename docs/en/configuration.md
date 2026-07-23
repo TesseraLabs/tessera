@@ -42,7 +42,7 @@ the example really validates through `ValidatedConfig::try_from`.
 |----------------------------|--------------------|-------------|----------------------------------------------------------------|---------------------------------------------------------------|--------------------------------------------------------------------------------------|
 | `crypto_backend`           | string             | —           | `"openssl"`, `"pkcs11_native"`                                 | Which backend computes signatures and hashes.                | `"openssl"` is required for GOST via `gost-engine`.                                  |
 | `mode`                     | string             | —           | `"pkcs12"`, `"pkcs11"`                                         | Where the user's key lives.                                   | `"pkcs11"` — non-extractable key; `"pkcs12"` — software protection.                  |
-| `pkcs11_module`            | path               | —           | absolute path to a `.so`                                       | Which PKCS#11 module is used.                                 | Required when `mode = "pkcs11"`.                                                     |
+| `pkcs11_module`            | path               | —           | absolute path to a `.so`                                       | Which PKCS#11 module is used.                                 | Required when `mode = "pkcs11"`; the file and every ancestor must be root-controlled. |
 | `pkcs11_token_label`       | string             | `None`      | `≤ 64` bytes, no NUL                                           | Filter by the token's `CKA_LABEL`.                           | Guards against accidentally selecting someone else's token on the machine.          |
 | `pkcs11_object_label`      | string             | `None`      | `≤ 64` bytes, no NUL                                           | Filter by the object's `CKA_LABEL` (cert/privkey).           | Likewise, protection against selecting the wrong object.                             |
 | `pkcs11_max_pin_attempts`  | integer            | `3`         | `1..=5`                                                        | How many times the module offers to enter the PIN.           | Too many → anti-paranoia; too few → poor UX.                                         |
@@ -52,7 +52,7 @@ the example really validates through `ValidatedConfig::try_from`.
 | `pkcs11_allow_extractable_keys` | boolean       | `false`     | `true`, `false`                                                | Whether to accept keys with `CKA_EXTRACTABLE = TRUE`.        | `false` (default) — reject (fail-closed): an extractable key breaks the invariant of mode B. `true` — only `pkcs11_extractable_key` WARN; enable deliberately. |
 | `pkcs12_path_pattern`      | string             | `"certs/user.p12"` | path relative to the USB mountpoint, optional `${user}` | Where to look for the `.p12` on the USB media (supports `${user}`). | Relative path only; `..`/`.` segments and absolute paths are rejected by the validator. |
 | `pkcs12_pin_prompt`        | string             | `"Smart-card PIN: "` | UTF-8, non-empty, `≤ 128` bytes                     | Prompt text for the `.p12` password.                         | UX localization.                                                                    |
-| `gost_engine_path`         | path               | `None`      | absolute path to a `.so`                                       | Explicit path to `gost-engine`. By default, lookup by id.    | `None` — the engine is looked up via `OPENSSL_ENGINES`.                              |
+| `gost_engine_path`         | path               | `None`      | absolute path to a `.so`                                       | Explicit path to `gost-engine`; required when OpenSSL allows GOST signatures. | Implicit `OPENSSL_ENGINES` lookup is rejected; the file and every ancestor must be root-controlled. |
 | `usb_wait_seconds`         | integer            | `10`        | `0..=300`                                                      | How many seconds to wait for the USB media.                  | UX. At `0` — fail-fast.                                                              |
 | `usb_allowed_devices`      | array of strings   | `[]`        | `"vid:pid"` strings, 4 hex digits each (lsusb format), e.g. `["0951:1666"]` | Allow-list of USB devices treated as `.p12` media; empty/absent = any USB block device. | Hygiene against accidental/foreign flash drives, NOT a trust boundary: VID/PID are forgeable, trust comes only from decrypting the `.p12` + chain validation. |
 | `max_usb_partitions`       | integer            | `8`         | `1..=64`                                                       | Maximum number of partitions scanned when searching for the `.p12`. | DoS protection: a physical attacker cannot force a huge number of mount/umount operations. |
@@ -66,6 +66,12 @@ the example really validates through `ValidatedConfig::try_from`.
 > `pam_cert_user_binding`. This file contains only trust + identity +
 > monitor + hooks; see [cert-issuance.md](cert-issuance.md) for issuing
 > certificates with the required extensions.
+
+The PAM authentication entry point validates its configuration and every
+configured trust anchor, intermediate, CRL, PKCS#11 module, and GOST engine
+as a regular root-owned file beneath root-owned, non-group/world-writable
+directories. Unsafe paths fail authentication before native code or trust
+material is loaded.
 
 #### Values of `on_usb_removed`
 
@@ -217,7 +223,7 @@ extension).
 | Field                        | Type   | Default                  | Allowed values                   | Effect                                                                 | Security implication                                                  |
 |------------------------------|--------|--------------------------|---------------------------------|--------------------------------------------------------------------------|------------------------------------------------------------------------|
 | `enforce`                    | string | `"false"`                | `"false"`, `"warn"`, `"require"` | Migration stage of role enforcement.                                   | `"false"` — roles are not checked (v0.3.19 behavior); `"require"` — full fail-closed. |
-| `dir`                        | path   | `/var/lib/tessera/roles` | absolute path to a directory     | Role-store directory (`<role>.toml` slices).                            | `root:root`, directory `0755`, files `0644`.                          |
+| `dir`                        | path   | `/var/lib/tessera/roles` | absolute path to a directory     | Role-store directory (`<role>.toml` slices).                            | Standalone loads enforce `root:root` on the directory, every slice, and all ancestors; no group/world write. |
 | `default_session_ttl_seconds`| integer| `43200` (12 h)           | seconds                          | Session TTL when neither the credential nor the role sets one.          | No unbounded session arises — the ceiling is always finite.          |
 
 **`enforce` semantics:**
@@ -251,7 +257,7 @@ envelope with a group constraint on an untagged device is rejected.
 |-----------|---------|--------------|-------------------------|------------------------------------------------------------------------|--------------------------------------------------------------|
 | `enforce` | boolean | `false`      | `true`/`false`          | Whether to read the tag source. `false` — a device with no applied tags. | Group delegations on an untagged device are rejected anyway (fail-closed). |
 | `mode`    | string  | `standalone` | `standalone`, `managed` | Trust model of the source: a tags file or a signed `manifest.toml`.    | `managed` requires a signed manifest.                       |
-| `source`  | path    | `/var/lib/tessera/tags.toml` (standalone) / role-store directory (managed) | absolute path | The tags file or the directory with the manifest. | The permissions on the source file are part of the trust boundary. |
+| `source`  | path    | `/var/lib/tessera/tags.toml` (standalone) / role-store directory (managed) | absolute path | The tags file or the directory with the manifest. | Standalone loads enforce a root-owned, non-group/world-writable file and complete ancestor path. |
 
 ### The `[[hooks]]` section
 
@@ -312,9 +318,9 @@ PAM_TEXT_INFO is not forwarded to the UI.
 |-------------------------|--------|---------------------------------------------------------------|--------------------------------------------------------------------------|
 | `update_wallpaper`      | bool   | `false`                                                       | Enable the wallpaper writer.                                             |
 | `wallpaper_target`      | path   | `/usr/share/wallpapers/fly-default-light.jpg`                 | The JPG that the daemon repaints.                                       |
-| `wallpaper_backup`      | path   | `/var/lib/tessera/wallpaper.orig.jpg`                    | Where the one-time original of the source is saved.                     |
+| `wallpaper_backup`      | path   | `/var/lib/tessera/daemon/wallpaper.orig.jpg`             | Where the one-time original of the source is saved.                     |
 | `wallpaper_font`        | path   | `/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf`        | The TrueType font used for rendering.                                   |
-| `wallpaper_font_size`   | int    | `64`                                                          | Font size in points.                                                    |
+| `wallpaper_font_size`   | int    | `64`                                                          | Font size in points (`1..=512`).                                        |
 | `wallpaper_text_color`  | string | `"#000000"`                                                   | Color in hex (`#RRGGBB`).                                               |
 | `wallpaper_gravity`     | enum   | `"south"`                                                     | `north` / `south` / `east` / `west` / `center` — the positioning anchor. |
 | `wallpaper_offset_x`    | int    | `0`                                                           | Horizontal offset in pixels from the gravity anchor.                    |
@@ -589,13 +595,14 @@ silently pass an authentication that promised to apply them.
 - **`required`** — the certificate must contain `MAX_INTEGRITY`. If the
   extension is absent or the DER is broken, authentication is rejected
   (`mac_required_no_label` / `mac_parse_failed`).
-- **`optional`** — the extension is applied when present. If it is absent:
+- **`optional`** — the extension is applied when present. A present malformed
+  extension rejects authentication; only genuine absence may use the fallback:
   - `[mac.fallback_max_integrity]` is present → the fallback is applied;
   - no fallback → the labeling step is skipped (`mac_label_skipped` is
     logged).
-- **`ignore`** — the extension is parsed for diagnostics
-  (`mac_label_parsed`) but not applied. Safe for migrating a fleet of
-  machines without runtime MIC.
+- **`ignore`** — a valid extension is parsed for diagnostics
+  (`mac_label_parsed`) but not applied; malformed DER still rejects
+  authentication. Safe for migrating a fleet of machines without runtime MIC.
 
 ### `runtime` semantics (0.3.7+)
 

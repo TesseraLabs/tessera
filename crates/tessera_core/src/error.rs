@@ -32,6 +32,16 @@ pub enum Error {
         /// Reason.
         reason: String,
     },
+    /// A file consumed by a privileged authentication path failed the
+    /// root-ownership and path-integrity policy.
+    #[error("{context}: {source}")]
+    PrivilegedPath {
+        /// What configuration input was being validated.
+        context: String,
+        /// Underlying ownership, mode, type, or race failure.
+        #[source]
+        source: crate::privileged_path::PrivilegedPathError,
+    },
     /// `gost_engine_path` does not point to a readable file.
     #[error("gost_engine_path {path:?} is not a readable file: {source}")]
     GostEnginePathUnreadable {

@@ -156,7 +156,6 @@ fn self_check_pkcs11(cfg: &ValidatedConfig) -> Result<(), SelfCheckError> {
 mod tests {
     use super::*;
     use crate::config::raw::RawConfig;
-    use crate::gost::engine;
 
     fn fixture(extra_top: &str, anchor_path: &std::path::Path) -> ValidatedConfig {
         let original = include_str!("../tests/fixtures/full_valid.toml");
@@ -207,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn self_check_fails_with_gost_unavailable_when_gost_oids_required() {
+    fn config_rejects_gost_allowlist_without_explicit_engine_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let anchor = write_pem_anchor(dir.path());
         // Inject a GOST OID into the trust whitelist via raw mutation:
@@ -225,22 +224,12 @@ mod tests {
             "allowed_signature_algorithms = [\"1.2.643.7.1.1.3.2\"]",
         );
         let raw: RawConfig = toml::from_str(&body).expect("parse");
-        let cfg = ValidatedConfig::try_from(&raw).expect("validate");
-        assert!(cfg.needs_gost());
-
-        let res = self_check(&cfg);
-        if engine::is_available() {
-            // CARGO_GOST_TESTS / real engine present.
-            match res {
-                Ok(()) => {}
-                Err(e) => panic!("expected ok with engine loaded: {e:?}"),
-            }
-        } else {
-            match res {
-                Err(SelfCheckError::GostEngineUnavailable(_)) => {}
-                Ok(()) => panic!("self_check passed without engine"),
-                Err(other) => panic!("unexpected error: {other:?}"),
-            }
-        }
+        let err = ValidatedConfig::try_from(&raw)
+            .expect_err("GOST allow-list must require an explicit engine path");
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref reason }
+                if reason.contains("gost_engine_path is required")),
+            "unexpected error: {err:?}"
+        );
     }
 }

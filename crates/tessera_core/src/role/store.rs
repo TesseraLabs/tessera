@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::audit;
 use super::manifest::{self, ManifestError, MANIFEST_FILENAME};
@@ -76,6 +76,10 @@ pub enum RoleStoreError {
     /// Managed-bundle manifest verification failed (fail-closed).
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// A standalone policy directory or slice failed the root-controlled path
+    /// policy.
+    #[error("standalone role-store path is not root-controlled: {0}")]
+    UntrustedPath(#[from] crate::privileged_path::PrivilegedPathError),
 }
 
 impl RoleStore {
@@ -101,7 +105,29 @@ impl RoleStore {
     pub fn load(dir: &Path, device_os: RoleOs, trust: TrustMode) -> Result<Self, RoleStoreError> {
         match trust {
             TrustMode::Managed => Err(RoleStoreError::ManagedRequiresManifest),
-            TrustMode::Standalone => Self::load_slices(dir, device_os),
+            TrustMode::Standalone => Self::load_slices(dir, device_os, false),
+        }
+    }
+
+    /// Load a standalone role base for use by a root authentication path.
+    ///
+    /// This has the same schema and per-slice behaviour as [`Self::load`], but
+    /// additionally requires the directory, every slice, and every ancestor
+    /// to be root-owned and non-writable by group/other. A path-integrity
+    /// failure rejects the whole base rather than skipping the affected slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoleStoreError::UntrustedPath`] for an unsafe path, plus the
+    /// standalone load errors documented by [`Self::load`].
+    pub fn load_privileged(
+        dir: &Path,
+        device_os: RoleOs,
+        trust: TrustMode,
+    ) -> Result<Self, RoleStoreError> {
+        match trust {
+            TrustMode::Managed => Err(RoleStoreError::ManagedRequiresManifest),
+            TrustMode::Standalone => Self::load_slices(dir, device_os, true),
         }
     }
 
@@ -160,15 +186,29 @@ impl RoleStore {
     }
 
     /// Standalone slice iteration (shared by [`Self::load`]).
-    fn load_slices(dir: &Path, device_os: RoleOs) -> Result<Self, RoleStoreError> {
-        let entries = fs::read_dir(dir).map_err(|e| RoleStoreError::Io {
-            path: dir.display().to_string(),
+    fn load_slices(
+        dir: &Path,
+        device_os: RoleOs,
+        privileged: bool,
+    ) -> Result<Self, RoleStoreError> {
+        let load_dir: PathBuf = if privileged {
+            crate::privileged_path::validate_directory(
+                dir,
+                crate::privileged_path::ExecTrust::Root,
+            )?
+            .canonical()
+            .to_path_buf()
+        } else {
+            dir.to_path_buf()
+        };
+        let entries = fs::read_dir(&load_dir).map_err(|e| RoleStoreError::Io {
+            path: load_dir.display().to_string(),
             reason: e.to_string(),
         })?;
         let mut roles: HashMap<RoleId, RoleSlice> = HashMap::new();
         for entry in entries {
             let entry = entry.map_err(|e| RoleStoreError::Io {
-                path: dir.display().to_string(),
+                path: load_dir.display().to_string(),
                 reason: e.to_string(),
             })?;
             let path = entry.path();
@@ -197,11 +237,15 @@ impl RoleStore {
                 );
                 continue;
             };
-            let bytes = match fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    audit::emit_role_slice_invalid(&path.display().to_string(), &e.to_string());
-                    continue;
+            let bytes = if privileged {
+                crate::privileged_path::read_file(&path, crate::privileged_path::ExecTrust::Root)?
+            } else {
+                match fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        audit::emit_role_slice_invalid(&path.display().to_string(), &e.to_string());
+                        continue;
+                    }
                 }
             };
             match parse_slice(&bytes, stem, device_os) {
@@ -380,5 +424,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Managed).unwrap_err();
         assert!(matches!(err, RoleStoreError::ManagedRequiresManifest));
+    }
+
+    #[test]
+    fn privileged_standalone_rejects_untrusted_temp_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        write_slice(&dir, "oper", 1, "linux");
+
+        let err = RoleStore::load_privileged(dir.path(), RoleOs::Linux, TrustMode::Standalone)
+            .expect_err("temporary user-controlled role base must be rejected");
+
+        assert!(matches!(err, RoleStoreError::UntrustedPath(_)));
     }
 }

@@ -46,8 +46,9 @@ pub struct RawConfig {
     pub pkcs12_pin_prompt: Option<String>,
     /// Optional path to the gost-engine `.so` file.
     ///
-    /// When `None`, the engine is resolved by id `"gost"` from the system's
-    /// default engine search path.  When `Some`, it must point to a readable
+    /// Configuration validation requires this to be set whenever the OpenSSL
+    /// backend allows GOST signatures, preventing inherited engine search
+    /// paths from selecting native code. When set, it must point to a readable
     /// file (validated in [`crate::config::ValidatedConfig`]).
     #[serde(default)]
     pub gost_engine_path: Option<PathBuf>,
@@ -248,7 +249,7 @@ pub struct RawFlyDmGreeter {
     /// copies `wallpaper_target` → `wallpaper_backup` exactly once,
     /// then always re-renders from the backup. Kept outside
     /// `/usr/share/wallpapers/` so an apt upgrade of `fly-qdm` cannot
-    /// trample it. Default `/var/lib/tessera/wallpaper.orig.jpg`.
+    /// trample it. Default `/var/lib/tessera/daemon/wallpaper.orig.jpg`.
     #[serde(default)]
     pub wallpaper_backup: Option<String>,
     /// Absolute path to a TrueType font file used to render the banner.

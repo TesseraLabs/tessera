@@ -213,7 +213,7 @@ Ansible-выкатка, troubleshooting.
 ### 4.1 Что бэкапить
 
 - `/etc/tessera/` (config, ca/, crl/);
-- `/var/lib/tessera/` (если есть persistent state);
+- `/var/lib/tessera/` (root-owned policy/enrollment material и persistent state демона);
 - `/etc/pam.d/` (с резервными копиями `.bak.*`).
 
 ### 4.2 Что НЕ бэкапить
@@ -417,8 +417,10 @@ sudo journalctl -t pam_tessera | grep -E 'role_(deny|session_open)' | grep alice
 обнуляется при перезагрузке — так и задумано: sshd/login/sudo-процессы,
 держащие эти сессии, всё равно умирают при reboot. Singleton-замок
 `daemon.lock` живёт рядом с `sessions.json` (fallback —
-`/var/lib/tessera/`); постоянное состояние — wallpaper-backup в
-`/var/lib/tessera/`.
+`/var/lib/tessera/daemon/`); постоянное состояние демона —
+wallpaper-backup в `/var/lib/tessera/daemon/`. Родитель
+`/var/lib/tessera/` остаётся root-owned, потому что в нём также лежат
+доверенные роли, теги и enrollment material.
 
 ## 8. Экстренный контакт
 

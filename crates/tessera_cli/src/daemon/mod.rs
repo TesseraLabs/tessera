@@ -207,11 +207,11 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     //
     // Замок кладётся рядом с файлом состояния; каталог создаётся при
     // необходимости (демон может стартовать раньше tmpfiles.d); фолбэк
-    // /var/lib/tessera/daemon.lock — для патологического случая пути без
-    // родителя. `lock_path` вычисляем ДО `RegistryStore::new`, который
+    // /var/lib/tessera/daemon/daemon.lock — для патологического случая пути
+    // без родителя. `lock_path` вычисляем ДО `RegistryStore::new`, который
     // забирает `state_file_path` во владение.
     let lock_path = state_file_path.parent().map_or_else(
-        || PathBuf::from("/var/lib/tessera/daemon.lock"),
+        || PathBuf::from("/var/lib/tessera/daemon/daemon.lock"),
         |dir| dir.join("daemon.lock"),
     );
     if let Some(lock_dir) = lock_path.parent() {

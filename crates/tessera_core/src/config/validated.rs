@@ -149,7 +149,7 @@ impl Default for FlyDmGreeterSection {
         Self {
             update_wallpaper: false,
             wallpaper_target: PathBuf::from("/usr/share/wallpapers/fly-default-light.jpg"),
-            wallpaper_backup: PathBuf::from("/var/lib/tessera/wallpaper.orig.jpg"),
+            wallpaper_backup: PathBuf::from("/var/lib/tessera/daemon/wallpaper.orig.jpg"),
             wallpaper_font: PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
             wallpaper_font_size: 64,
             wallpaper_text_color: [0, 0, 0, 255],
@@ -578,7 +578,7 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
         if let Some(prompt) = raw.pkcs12_pin_prompt.as_deref() {
             validate_pin_prompt("pkcs12_pin_prompt", prompt)?;
         }
-        Ok(Self {
+        let validated = Self {
             crypto_backend,
             mode,
             pkcs11_module: raw.pkcs11_module.clone(),
@@ -621,7 +621,16 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             fly_dm_greeter: validate_fly_dm_greeter(raw.fly_dm_greeter.as_ref())?,
             roles: validate_roles(&raw.roles)?,
             tags: validate_tags(&raw.tags, &raw.roles)?,
-        })
+        };
+        if validated.needs_gost() && validated.gost_engine_path.is_none() {
+            return Err(Error::ConfigInvalid {
+                reason: "gost_engine_path is required when the OpenSSL backend allows GOST \
+                         signatures; implicit engine lookup may honor an inherited \
+                         OPENSSL_ENGINES path"
+                    .into(),
+            });
+        }
+        Ok(validated)
     }
 }
 
@@ -722,6 +731,9 @@ fn fly_dm_absolute_path(
 }
 
 fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeterSection, Error> {
+    const MAX_WALLPAPER_FONT_SIZE: u32 = 512;
+    const MAX_WALLPAPER_TEMPLATE_BYTES: usize = 1024;
+
     let defaults = FlyDmGreeterSection::default();
     let Some(raw) = raw else {
         return Ok(defaults);
@@ -765,10 +777,25 @@ fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeter
     let wallpaper_font_size = raw
         .wallpaper_font_size
         .unwrap_or(defaults.wallpaper_font_size);
-    if wallpaper_font_size == 0 {
+    if !(1..=MAX_WALLPAPER_FONT_SIZE).contains(&wallpaper_font_size) {
         return Err(Error::ConfigInvalid {
-            reason: "fly_dm_greeter.wallpaper_font_size must be > 0".into(),
+            reason: format!(
+                "fly_dm_greeter.wallpaper_font_size must be in 1..={MAX_WALLPAPER_FONT_SIZE}"
+            ),
         });
+    }
+
+    let template_ru = raw.template_ru.clone().unwrap_or(defaults.template_ru);
+    let template_en = raw.template_en.clone().unwrap_or(defaults.template_en);
+    for (field, template) in [("template_ru", &template_ru), ("template_en", &template_en)] {
+        if template.len() > MAX_WALLPAPER_TEMPLATE_BYTES {
+            return Err(Error::ConfigInvalid {
+                reason: format!(
+                    "fly_dm_greeter.{field} must be at most \
+                     {MAX_WALLPAPER_TEMPLATE_BYTES} bytes"
+                ),
+            });
+        }
     }
 
     Ok(FlyDmGreeterSection {
@@ -785,8 +812,8 @@ fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeter
         wallpaper_offset_y: raw
             .wallpaper_offset_y
             .unwrap_or(defaults.wallpaper_offset_y),
-        template_ru: raw.template_ru.clone().unwrap_or(defaults.template_ru),
-        template_en: raw.template_en.clone().unwrap_or(defaults.template_en),
+        template_ru,
+        template_en,
     })
 }
 
@@ -1549,6 +1576,16 @@ fn validate_pkcs11_section(raw: &RawConfig, mode: Mode) -> Result<(), Error> {
             reason: "pkcs11_module is required when mode = \"pkcs11\"".to_owned(),
         });
     }
+    if let Some(path) = raw.pkcs11_module.as_ref() {
+        if !path.is_absolute() {
+            return Err(Error::ConfigInvalid {
+                reason: format!(
+                    "pkcs11_module must be an absolute path (got {})",
+                    path.display()
+                ),
+            });
+        }
+    }
     if let Some(label) = raw.pkcs11_token_label.as_deref() {
         validate_pkcs11_label("pkcs11_token_label", label)?;
     }
@@ -1791,6 +1828,14 @@ fn validate_gost_engine_path(
     if !matches!(crypto_backend, CryptoBackend::Openssl) {
         return Err(Error::GostEnginePathRequiresOpenssl);
     }
+    if !path.is_absolute() {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "gost_engine_path must be an absolute path (got {})",
+                path.display()
+            ),
+        });
+    }
     let metadata = std::fs::metadata(path).map_err(|source| Error::GostEnginePathUnreadable {
         path: path.clone(),
         source,
@@ -2007,7 +2052,7 @@ mod tests {
         );
         assert_eq!(
             s.wallpaper_backup,
-            PathBuf::from("/var/lib/tessera/wallpaper.orig.jpg")
+            PathBuf::from("/var/lib/tessera/daemon/wallpaper.orig.jpg")
         );
         assert_eq!(s.wallpaper_gravity, Gravity::South);
         assert_eq!(s.wallpaper_font_size, 64);
@@ -2094,6 +2139,28 @@ mod tests {
             Error::ConfigInvalid { reason } => assert!(reason.contains("wallpaper_gravity")),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fly_dm_greeter_rejects_excessive_font_size() {
+        let raw = RawFlyDmGreeter {
+            wallpaper_font_size: Some(513),
+            ..Default::default()
+        };
+        let err = validate_fly_dm_greeter(Some(&raw)).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { ref reason }
+                if reason.contains("wallpaper_font_size")));
+    }
+
+    #[test]
+    fn fly_dm_greeter_rejects_excessive_template() {
+        let raw = RawFlyDmGreeter {
+            template_en: Some("x".repeat(1025)),
+            ..Default::default()
+        };
+        let err = validate_fly_dm_greeter(Some(&raw)).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { ref reason }
+                if reason.contains("template_en")));
     }
 
     // ---- [roles] section (task 4.3) ---------------------------------------

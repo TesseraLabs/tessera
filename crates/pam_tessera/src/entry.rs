@@ -155,7 +155,7 @@ fn build_role_stage(
     } else {
         RoleOs::Linux
     };
-    let store = match RoleStore::load(&roles_cfg.dir, device_os, TrustMode::Standalone) {
+    let store = match RoleStore::load_privileged(&roles_cfg.dir, device_os, TrustMode::Standalone) {
         Ok(s) => Some(s),
         Err(err) => {
             // Under `require` a store that cannot be loaded is fail-closed
@@ -198,14 +198,14 @@ fn build_device_tags(
     roles_cfg: &tessera_core::config::validated::RolesSection,
 ) -> tessera_core::tags::DeviceTags {
     use tessera_core::config::validated::TagsMode;
-    use tessera_core::tags::{load_standalone_optional, DeviceTags};
+    use tessera_core::tags::{load_standalone_optional_privileged, DeviceTags};
 
     let _ = roles_cfg; // reserved for managed-mode wiring (see below)
     if !tags_cfg.enforce {
         return DeviceTags::empty();
     }
     match tags_cfg.mode {
-        TagsMode::Standalone => match load_standalone_optional(&tags_cfg.source) {
+        TagsMode::Standalone => match load_standalone_optional_privileged(&tags_cfg.source) {
             Ok(tags) => tags,
             Err(err) => {
                 tracing::error!(
@@ -358,7 +358,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
-        let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
+        let cfg = match tessera_core::config::load_privileged_validated_config(&cfg_path) {
             Ok(c) => c,
             Err(err) => {
                 tracing::error!(target: "tessera.auth", error = %err, "config load failed");
@@ -630,7 +630,7 @@ pub unsafe extern "C" fn pam_sm_open_session(
         // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
-        let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
+        let cfg = match tessera_core::config::load_privileged_validated_config(&cfg_path) {
             Ok(c) => c,
             Err(err) => {
                 tracing::error!(target: "tessera.session", error = %err, "config load failed");
@@ -743,7 +743,7 @@ pub unsafe extern "C" fn pam_sm_close_session(
         // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
-        let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
+        let cfg = match tessera_core::config::load_privileged_validated_config(&cfg_path) {
             Ok(c) => c,
             Err(err) => {
                 tracing::error!(target: "tessera.session", error = %err, "config load failed (close)");

@@ -90,7 +90,7 @@ sudo systemctl restart tessera
 [fly_dm_greeter]
 update_wallpaper      = true
 wallpaper_target      = "/usr/share/wallpapers/fly-default-light.jpg"
-wallpaper_backup      = "/var/lib/tessera/wallpaper.orig.jpg"
+wallpaper_backup      = "/var/lib/tessera/daemon/wallpaper.orig.jpg"
 wallpaper_font        = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 wallpaper_font_size   = 64
 wallpaper_text_color  = "#000000"

@@ -6,6 +6,9 @@ set -e
 CONFIG_DIR=/etc/tessera
 CACHE_DIR=/var/cache/tessera/ocsp
 STATE_DIR=/var/lib/tessera
+DAEMON_STATE_DIR="$STATE_DIR/daemon"
+OLD_WALLPAPER_BACKUP="$STATE_DIR/wallpaper.orig.jpg"
+WALLPAPER_BACKUP="$DAEMON_STATE_DIR/wallpaper.orig.jpg"
 
 case "$1" in
     configure)
@@ -47,7 +50,20 @@ case "$1" in
 
         mkdir -p "$STATE_DIR"
         chmod 0750 "$STATE_DIR"
-        chown tessera:tessera "$STATE_DIR"
+        chown root:tessera "$STATE_DIR"
+        mkdir -p "$DAEMON_STATE_DIR"
+        chmod 0750 "$DAEMON_STATE_DIR"
+        chown tessera:tessera "$DAEMON_STATE_DIR"
+        # Preserve the one-time pristine wallpaper backup across the move to
+        # the daemon-only state directory. Never migrate a symlink from the
+        # formerly daemon-owned parent through a root maintainer script.
+        if [ -f "$OLD_WALLPAPER_BACKUP" ] && \
+           [ ! -L "$OLD_WALLPAPER_BACKUP" ] && \
+           [ ! -e "$WALLPAPER_BACKUP" ]; then
+            mv "$OLD_WALLPAPER_BACKUP" "$WALLPAPER_BACKUP"
+            chmod 0640 "$WALLPAPER_BACKUP"
+            chown tessera:tessera "$WALLPAPER_BACKUP"
+        fi
 
         # 0.3.0 migration: sessions registry moved from /var/lib to /run tmpfs.
         # Remove stale file from previous installs if present.
@@ -105,14 +121,16 @@ case "$1" in
             fi
             echo "  - integrity ilevel raised to 63 on config files (write requires CAP_MAC_ADMIN)" >&2
 
-            # State dir (host_id, caches) must be MAC-readable by
-            # the tessera daemon at any clearance the active user holds.
+            # State dirs must be MAC-readable at any clearance the active
+            # user holds. The root-owned parent contains trusted policy and
+            # enrollment state; only $DAEMON_STATE_DIR is daemon-writable.
             # NOTE: sessions.json now lives in /run/tessera/ (tmpfs);
             # the RuntimeDirectory= unit setting creates the parent at boot
             # with `iinh` inherited via systemd's runtime-dir handling.
-            # daemon.lock in $STATE_DIR is the daemon's write target — keep
-            # its ilevel at default (0), only the dir gets `iinh`.
+            # daemon.lock in $DAEMON_STATE_DIR is a daemon write target —
+            # keep its ilevel at default (0), only the dirs get `iinh`.
             pdpl-file ":::iinh" "$STATE_DIR" || true
+            pdpl-file ":::iinh" "$DAEMON_STATE_DIR" || true
             pdpl-file ":::iinh" "$CACHE_DIR" || true
 
             # host_id is rebind-protected: once written by host_identity probe

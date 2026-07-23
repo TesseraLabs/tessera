@@ -203,7 +203,7 @@ All incidents and troubleshooting are moved into a single reference —
 ### 4.1 What to back up
 
 - `/etc/tessera/` (config, ca/, crl/);
-- `/var/lib/tessera/` (if there is persistent state);
+- `/var/lib/tessera/` (root-owned policy/enrollment material and persistent daemon state);
 - `/etc/pam.d/` (with the `.bak.*` backup copies).
 
 ### 4.2 What NOT to back up
@@ -348,8 +348,11 @@ rollback procedure is described in
 (`/run/tessera/sessions.json`, `RuntimeDirectory=`). It is volatile
 across reboot — this is by design: the sshd/login/sudo processes holding
 these sessions die on reboot anyway. The singleton lock `daemon.lock`
-lives next to `sessions.json` (fallback — `/var/lib/tessera/`); the
-persistent state is the wallpaper backup in `/var/lib/tessera/`.
+lives next to `sessions.json` (fallback —
+`/var/lib/tessera/daemon/`); the daemon's persistent state is the
+wallpaper backup in `/var/lib/tessera/daemon/`. The parent
+`/var/lib/tessera/` remains root-owned because it also contains trusted
+roles, tags, and enrollment material.
 
 ## 8. Emergency contact
 
