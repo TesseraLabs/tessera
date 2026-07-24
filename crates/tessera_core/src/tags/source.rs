@@ -54,6 +54,9 @@ pub enum TagsSourceError {
     /// Fail-closed: no tags applied, previous set retained by the caller.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// A standalone source failed the root-controlled path policy.
+    #[error("standalone device-tags path is not root-controlled: {0}")]
+    UntrustedPath(#[from] crate::privileged_path::PrivilegedPathError),
 }
 
 /// Extract the validated device-tags from a *verified* managed manifest.
@@ -120,14 +123,50 @@ pub fn load_managed(
 /// [`TagsSourceError::Missing`] if absent, [`TagsSourceError::Io`] on a read
 /// error, [`TagsSourceError::Schema`] if the file is malformed.
 pub fn load_standalone(path: &Path) -> Result<DeviceTags, TagsSourceError> {
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(TagsSourceError::Missing),
-        Err(e) => {
-            return Err(TagsSourceError::Io {
-                path: path.display().to_string(),
-                reason: e.to_string(),
-            })
+    load_standalone_inner(path, false)
+}
+
+/// Load standalone device tags for use by a root authentication path.
+///
+/// The file and every ancestor must be root-owned and non-writable by
+/// group/other. A present source that fails this policy is rejected
+/// fail-closed.
+///
+/// # Errors
+///
+/// Returns [`TagsSourceError::Missing`] when absent,
+/// [`TagsSourceError::UntrustedPath`] for an unsafe path, or the parse/I/O
+/// failures documented by [`load_standalone`].
+pub fn load_standalone_privileged(path: &Path) -> Result<DeviceTags, TagsSourceError> {
+    load_standalone_inner(path, true)
+}
+
+fn load_standalone_inner(path: &Path, privileged: bool) -> Result<DeviceTags, TagsSourceError> {
+    let bytes = if privileged {
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(TagsSourceError::Missing);
+            }
+            Err(e) => {
+                return Err(TagsSourceError::Io {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                });
+            }
+            Ok(_) => {
+                crate::privileged_path::read_file(path, crate::privileged_path::ExecTrust::Root)?
+            }
+        }
+    } else {
+        match fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(TagsSourceError::Missing),
+            Err(e) => {
+                return Err(TagsSourceError::Io {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })
+            }
         }
     };
     parse_tags(&bytes).map_err(|e| {
@@ -148,6 +187,23 @@ pub fn load_standalone(path: &Path) -> Result<DeviceTags, TagsSourceError> {
 /// file is present but malformed.
 pub fn load_standalone_optional(path: &Path) -> Result<DeviceTags, TagsSourceError> {
     match load_standalone(path) {
+        Ok(tags) => Ok(tags),
+        Err(TagsSourceError::Missing) => Ok(DeviceTags::empty()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Privileged counterpart of [`load_standalone_optional`].
+///
+/// A missing file still yields an empty set, while an existing file must pass
+/// the full root-controlled path policy.
+///
+/// # Errors
+///
+/// Returns [`TagsSourceError::UntrustedPath`] for an unsafe present source, or
+/// the parse/I/O errors documented by [`load_standalone_privileged`].
+pub fn load_standalone_optional_privileged(path: &Path) -> Result<DeviceTags, TagsSourceError> {
+    match load_standalone_privileged(path) {
         Ok(tags) => Ok(tags),
         Err(TagsSourceError::Missing) => Ok(DeviceTags::empty()),
         Err(e) => Err(e),
@@ -359,5 +415,17 @@ mod tests {
             load_standalone_optional(&path),
             Err(TagsSourceError::Schema(_))
         ));
+    }
+
+    #[test]
+    fn privileged_standalone_rejects_untrusted_temp_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tags.toml");
+        fs::write(&path, b"[tags]\nregion = \"north\"\n").unwrap();
+
+        let err = load_standalone_privileged(&path)
+            .expect_err("temporary user-controlled tags file must be rejected");
+
+        assert!(matches!(err, TagsSourceError::UntrustedPath(_)));
     }
 }

@@ -16,6 +16,7 @@ const LEAF: &[u8] = include_bytes!("fixtures/leaf_rsa.pem");
 const INT: &[u8] = include_bytes!("fixtures/int.pem");
 const INT_KEY: &[u8] = include_bytes!("fixtures/int.key");
 const CA: &[u8] = include_bytes!("fixtures/ca.pem");
+const CA_KEY: &[u8] = include_bytes!("fixtures/ca.key");
 const CRL_VALID: &[u8] = include_bytes!("fixtures/crl_valid.pem");
 const CRL_FOREIGN: &[u8] = include_bytes!("fixtures/crl_foreign.pem");
 
@@ -74,8 +75,16 @@ fn sha256_rsa_alg_id() -> Vec<u8> {
 /// Builds a minimal v1 CRL DER *without* a `nextUpdate` field (openssl's CLI
 /// cannot emit one), signed by the intermediate CA key from the fixtures.
 fn crl_without_next_update() -> Crl {
-    let int = Certificate::from_pem(INT).unwrap();
-    let issuer_der = int.x509().subject_name().to_der().unwrap();
+    crl_without_next_update_signed_by(INT, INT_KEY)
+}
+
+/// Builds a minimal v1 CRL DER *without* a `nextUpdate` field, whose issuer DN
+/// and signing key are taken from `issuer_pem` / `issuer_key_pem`. Lets a test
+/// cover more than one issuer in a chain (e.g. both the leaf's and the
+/// intermediate's issuer) with unverifiable-freshness CRLs.
+fn crl_without_next_update_signed_by(issuer_pem: &[u8], issuer_key_pem: &[u8]) -> Crl {
+    let issuer = Certificate::from_pem(issuer_pem).unwrap();
+    let issuer_der = issuer.x509().subject_name().to_der().unwrap();
 
     let mut tbs_content = sha256_rsa_alg_id();
     tbs_content.extend_from_slice(&issuer_der);
@@ -83,7 +92,7 @@ fn crl_without_next_update() -> Crl {
     tbs_content.extend_from_slice(b"\x17\x0d250101000000Z");
     let tbs = der_seq(&tbs_content);
 
-    let pkey = openssl::pkey::PKey::private_key_from_pem(INT_KEY).unwrap();
+    let pkey = openssl::pkey::PKey::private_key_from_pem(issuer_key_pem).unwrap();
     let mut signer =
         openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), &pkey).unwrap();
     signer.update(&tbs).unwrap();
@@ -156,9 +165,11 @@ fn parses_crl_metadata() {
 
 #[test]
 fn passes_unrevoked_chain() {
-    // Also exercises the in-path CRL signature verification: crl_valid.pem is
-    // genuinely signed by the intermediate present in the chain.
-    let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
+    // Pure crl mode requires every non-anchor cert to be covered: crl_valid.pem
+    // (intermediate-signed) covers the leaf and crl_foreign.pem (root-signed)
+    // covers the intermediate. Also exercises in-path CRL signature
+    // verification, since both CRLs' issuers are present in the chain.
+    let store = CrlStore::from_pems(&[CRL_VALID, CRL_FOREIGN]).unwrap();
     check_revocation(&chain(LEAF), &store, &strict_cfg(), SystemTime::now()).unwrap();
 }
 
@@ -179,9 +190,13 @@ fn rejects_revoked_cert() {
 }
 
 #[test]
-fn empty_store_is_noop() {
+fn empty_store_fails_closed() {
+    // In pure crl mode an empty store covers no certificate, so a chain with
+    // non-anchor certs cannot have its revocation status determined and must
+    // fail closed rather than authenticate.
     let store = CrlStore::empty();
-    check_revocation(&chain(LEAF), &store, &strict_cfg(), SystemTime::now()).unwrap();
+    let err = check_revocation(&chain(LEAF), &store, &strict_cfg(), SystemTime::now()).unwrap_err();
+    assert!(matches!(err, TrustError::CrlNotCovered(_)), "{err:?}");
 }
 
 #[test]
@@ -189,10 +204,21 @@ fn foreign_issuer_crl_does_not_revoke_matching_serial() {
     // crl_foreign.pem is signed by the *root* CA but lists serial 0x99 as
     // revoked.  revoked_leaf.pem is issued by the *intermediate* and also
     // carries serial 0x99.  Because the CRL issuer DN (root) does not match
-    // the certificate issuer DN (intermediate), RFC 5280 § 6.3.3 says the
-    // CRL is out of scope and must not revoke the leaf.
+    // the leaf's issuer DN (intermediate), RFC 5280 § 6.3.3 says the CRL is out
+    // of scope for the leaf and must not revoke it. In pure crl mode the leaf
+    // is then left with no in-scope CRL, so the verdict is "uncovered" (fail
+    // closed) — decisively not a false Revoked from the out-of-scope CRL.
     let store = CrlStore::from_pems(&[CRL_FOREIGN]).unwrap();
-    check_revocation(&chain(REVOKED), &store, &strict_cfg(), SystemTime::now()).unwrap();
+    let leaf_serial = Certificate::from_pem(REVOKED)
+        .unwrap()
+        .serial_hex()
+        .to_lowercase();
+    let err =
+        check_revocation(&chain(REVOKED), &store, &strict_cfg(), SystemTime::now()).unwrap_err();
+    match err {
+        TrustError::CrlNotCovered(serial) => assert_eq!(serial, leaf_serial),
+        other => panic!("expected CrlNotCovered for the leaf, got {other:?}"),
+    }
 }
 
 // --- freshness (nextUpdate / crl_max_age) -----------------------------------
@@ -211,8 +237,11 @@ fn strict_rejects_expired_crl() {
 fn lenient_skips_expired_crl() {
     let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
     let future = SystemTime::now() + Duration::from_secs(11 * 365 * 24 * 3600);
-    // No error: lenient mode logs and continues.
-    check_revocation(&chain(LEAF), &store, &lenient_cfg(), future).unwrap();
+    // Lenient mode does not treat the stale CRL as a hard error, but skipping
+    // it leaves the leaf with no fresh in-scope CRL. In pure crl mode an
+    // undeterminable status fails closed as uncovered.
+    let err = check_revocation(&chain(LEAF), &store, &lenient_cfg(), future).unwrap_err();
+    assert!(matches!(err, TrustError::CrlNotCovered(_)), "{err:?}");
 }
 
 #[test]
@@ -239,16 +268,22 @@ fn lenient_skips_crl_older_than_max_age() {
         crl_max_age: Some(Duration::from_secs(3600)),
         ..lenient_cfg()
     };
-    // No error: lenient mode logs and continues — even a revoked serial is
-    // not consulted because the stale CRL is skipped entirely.
-    check_revocation(&chain(REVOKED), &store, &cfg, now).unwrap();
+    // Lenient mode skips the stale CRL rather than erroring on staleness, but
+    // the skip leaves the leaf uncovered; pure crl mode then fails closed. The
+    // revoked serial is never consulted — the point is that a stale CRL cannot
+    // silently pass the chain either.
+    let err = check_revocation(&chain(REVOKED), &store, &cfg, now).unwrap_err();
+    assert!(matches!(err, TrustError::CrlNotCovered(_)), "{err:?}");
 }
 
 #[test]
 fn crl_within_max_age_passes() {
     let crl = Crl::from_pem(CRL_VALID).unwrap();
     let now = crl.this_update() + Duration::from_secs(1800);
-    let store = CrlStore::from_pems(&[CRL_VALID]).unwrap();
+    // Both non-anchor certs must be covered by a fresh CRL: the
+    // intermediate-signed CRL (for the leaf) and the root-signed CRL (for the
+    // intermediate). Both are well within the 1h max age at `now`.
+    let store = CrlStore::from_pems(&[CRL_VALID, CRL_FOREIGN]).unwrap();
     let cfg = RevocationConfig {
         crl_max_age: Some(Duration::from_secs(3600)),
         ..strict_cfg()
@@ -274,7 +309,13 @@ fn max_age_bounds_crl_without_next_update() {
 fn no_next_update_and_no_max_age_warns_but_does_not_fail() {
     // Documented behaviour: freshness is unverifiable, so a warning is
     // logged on target tessera.crl, but authentication is not refused.
-    let store = CrlStore::from_crls(vec![crl_without_next_update()]);
+    // Both non-anchor certs are covered so the chain is not refused for lack
+    // of coverage: the intermediate-signed CRL covers the leaf and the
+    // root-signed CRL covers the intermediate.
+    let store = CrlStore::from_crls(vec![
+        crl_without_next_update(),
+        crl_without_next_update_signed_by(CA, CA_KEY),
+    ]);
     let (result, logs) = capture_warnings(|| {
         check_revocation(&chain(LEAF), &store, &strict_cfg(), SystemTime::now())
     });

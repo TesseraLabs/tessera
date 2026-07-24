@@ -91,7 +91,7 @@
   сессии инженера.
 - Секция `[mac]` в `config.toml` с тринарной политикой
   `cert_integrity` (`required` / `optional` / `ignore`).
-- Feature-флаг `astra-mac`; stub-сборка для не-Astra хостов.
+- Один открытый host; подписанные enforcement-плагины выбираются в runtime.
 
 ## English documentation
 

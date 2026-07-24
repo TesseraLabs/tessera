@@ -24,12 +24,15 @@ User=tessera
 Group=tessera
 RuntimeDirectory=tessera
 RuntimeDirectoryMode=0750
-StateDirectory=tessera
+# Keep /var/lib/tessera itself root-owned: it contains trusted roles, tags,
+# CRLs, and enrollment state. Only this daemon-specific leaf is writable by
+# the unprivileged service account.
+StateDirectory=tessera/daemon
 StateDirectoryMode=0750
 CacheDirectory=tessera
 CacheDirectoryMode=0750
 ProtectSystem=strict
-ReadWritePaths=/run/tessera /var/cache/tessera /var/lib/tessera
+ReadWritePaths=/run/tessera /var/cache/tessera /var/lib/tessera/daemon
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes

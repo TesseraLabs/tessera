@@ -30,12 +30,17 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use ab_glyph::{point, Font, FontArc, PxScale, ScaleFont};
+use ab_glyph_rasterizer::{point, Point, Rasterizer};
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+use skrifa::instance::{LocationRef, Size};
+use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::{FontRef, MetadataProvider};
 use tempfile::NamedTempFile;
 
 use tessera_core::config::validated::{FlyDmGreeterSection, Gravity};
 use tessera_core::host_identity::ResolvedHostId;
+
+const MAX_TEXT_RASTER_PIXELS: u64 = 16 * 1024 * 1024;
 
 /// Errors produced by [`update`]. The daemon log-and-continues on any of
 /// these — a broken wallpaper must not block authentication.
@@ -68,11 +73,17 @@ pub enum WriterError {
         #[source]
         source: image::ImageError,
     },
-    /// `ab_glyph` could not parse the configured font.
+    /// `skrifa` could not parse the configured font.
     #[error("font load failed for {path}: {reason}")]
     FontLoad {
         /// Path of the offending font file.
         path: PathBuf,
+        /// Human-readable cause.
+        reason: String,
+    },
+    /// Parsed font metrics or outlines cannot be rendered safely.
+    #[error("font rendering failed: {reason}")]
+    FontRender {
         /// Human-readable cause.
         reason: String,
     },
@@ -154,7 +165,7 @@ pub fn update(
 
     let font_bytes = fs::read(&cfg.wallpaper_font)
         .map_err(|e| WriterError::io(cfg.wallpaper_font.clone(), e))?;
-    let font = FontArc::try_from_vec(font_bytes).map_err(|e| WriterError::FontLoad {
+    let font = FontRef::new(&font_bytes).map_err(|e| WriterError::FontLoad {
         path: cfg.wallpaper_font.clone(),
         reason: e.to_string(),
     })?;
@@ -176,7 +187,7 @@ pub fn update(
         cfg.wallpaper_offset_x,
         cfg.wallpaper_offset_y,
         cfg.wallpaper_text_color,
-    );
+    )?;
 
     let dyn_img = DynamicImage::ImageRgba8(rgba);
     let target_parent = parent_dir(&cfg.wallpaper_target);
@@ -293,29 +304,44 @@ fn substitute(template: &str, resolved: &ResolvedHostId, hostname: &str) -> Stri
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    font: &FontArc,
+    font: &FontRef<'_>,
     size: f32,
     text: &str,
     gravity: Gravity,
     offset_x: i32,
     offset_y: i32,
     color: [u8; 4],
-) {
-    let scale = PxScale::from(size);
-    let scaled = font.as_scaled(scale);
-    let glyphs: Vec<_> = text.chars().map(|c| scaled.scaled_glyph(c)).collect();
+) -> Result<(), WriterError> {
+    let size = Size::new(size);
+    let location = LocationRef::default();
+    let charmap = font.charmap();
+    let glyphs: Vec<_> = text
+        .chars()
+        .map(|character| {
+            charmap
+                .map(character)
+                .unwrap_or_else(|| skrifa::GlyphId::new(0))
+        })
+        .collect();
+    let glyph_metrics = font.glyph_metrics(size, location);
+    let font_metrics = font.metrics(size, location);
 
-    let mut text_width = 0.0f32;
-    let mut last: Option<ab_glyph::GlyphId> = None;
-    for g in &glyphs {
-        if let Some(prev) = last {
-            text_width += scaled.kern(prev, g.id);
-        }
-        text_width += scaled.h_advance(g.id);
-        last = Some(g.id);
-    }
-    let ascent = scaled.ascent();
-    let descent = scaled.descent();
+    // `skrifa` intentionally sits below text shaping. The banner contains a
+    // fixed, short device identifier, so nominal cmap mapping plus horizontal
+    // advances is sufficient here and avoids retaining the unmaintained
+    // `ttf-parser` dependency through a higher-level layout crate.
+    let mut advance_cursor = 0.0_f32;
+    let positioned_glyphs: Vec<_> = glyphs
+        .into_iter()
+        .map(|glyph_id| {
+            let positioned = (glyph_id, advance_cursor);
+            advance_cursor += glyph_metrics.advance_width(glyph_id).unwrap_or_default();
+            positioned
+        })
+        .collect();
+    let text_width = advance_cursor;
+    let ascent = font_metrics.ascent;
+    let descent = font_metrics.descent;
     let text_height = ascent - descent;
 
     let (img_w, img_h) = (img.width(), img.height());
@@ -346,39 +372,167 @@ fn draw_text(
         Gravity::North => anchor_y + offset_y as f32,
     };
 
-    let mut cursor_x = start_x;
-    let mut last: Option<ab_glyph::GlyphId> = None;
-    for g in glyphs {
-        let id = g.id;
-        if let Some(prev) = last {
-            cursor_x += scaled.kern(prev, id);
+    // Rasterize in a tight local text box. Feeding negative image-space
+    // coordinates directly to `ab_glyph_rasterizer` can underflow its
+    // scanline indices when centered text is wider than a tiny test/source
+    // image. Glyph bounds give us an always-positive local coordinate system;
+    // clipping happens only when the alpha mask is composited onto the image.
+    let mut min_x = 0.0_f32;
+    let mut max_x = text_width;
+    let mut min_y = descent;
+    let mut max_y = ascent;
+    for (glyph_id, cursor) in &positioned_glyphs {
+        if let Some(bounds) = glyph_metrics.bounds(*glyph_id) {
+            min_x = min_x.min(*cursor + bounds.x_min);
+            max_x = max_x.max(*cursor + bounds.x_max);
+            min_y = min_y.min(bounds.y_min);
+            max_y = max_y.max(bounds.y_max);
         }
-        last = Some(id);
-        let advance = scaled.h_advance(id);
+    }
+    let width_span = (max_x - min_x).ceil();
+    let height_span = (max_y - min_y).ceil();
+    let (raster_width, raster_height) = checked_raster_dimensions(width_span, height_span)?;
+    let mut rasterizer = Rasterizer::new(raster_width, raster_height);
+    let outlines = font.outline_glyphs();
+    for (glyph_id, cursor) in positioned_glyphs {
+        if let Some(outline) = outlines.get(glyph_id) {
+            let mut pen = RasterPen::new(&mut rasterizer, cursor - min_x + 1.0, max_y + 1.0);
+            outline
+                .draw(
+                    DrawSettings::unhinted(size, LocationRef::default()),
+                    &mut pen,
+                )
+                .map_err(|error| WriterError::FontRender {
+                    reason: format!("font outline could not be drawn: {error:?}"),
+                })?;
+        }
+    }
 
-        let mut positioned = g;
-        positioned.position = point(cursor_x, start_y);
-        if let Some(outlined) = font.outline_glyph(positioned) {
-            let bb = outlined.px_bounds();
-            outlined.draw(|x, y, v| {
-                let px = bb.min.x as i32 + x as i32;
-                let py = bb.min.y as i32 + y as i32;
-                if px >= 0 && py >= 0 && (px as u32) < img_w && (py as u32) < img_h {
-                    let alpha_f = v * (color[3] as f32 / 255.0);
-                    let alpha = (alpha_f.clamp(0.0, 1.0) * 255.0) as u8;
-                    if alpha > 0 {
-                        let pixel = img.get_pixel_mut(px as u32, py as u32);
-                        let inv = 255 - alpha as u16;
-                        let a = alpha as u16;
-                        pixel[0] = ((color[0] as u16 * a + pixel[0] as u16 * inv) / 255) as u8;
-                        pixel[1] = ((color[1] as u16 * a + pixel[1] as u16 * inv) / 255) as u8;
-                        pixel[2] = ((color[2] as u16 * a + pixel[2] as u16 * inv) / 255) as u8;
-                        pixel[3] = 255;
-                    }
-                }
-            });
+    rasterizer.for_each_pixel_2d(|x, y, coverage| {
+        let image_x = (start_x + min_x - 1.0) as i32 + x as i32;
+        let image_y = (start_y - max_y - 1.0) as i32 + y as i32;
+        if image_x < 0 || image_y < 0 || image_x >= img_w as i32 || image_y >= img_h as i32 {
+            return;
         }
-        cursor_x += advance;
+        let alpha_f = coverage * (color[3] as f32 / 255.0);
+        let alpha = (alpha_f.clamp(0.0, 1.0) * 255.0) as u8;
+        if alpha == 0 {
+            return;
+        }
+        let pixel = img.get_pixel_mut(image_x as u32, image_y as u32);
+        let inv = 255 - alpha as u16;
+        let a = alpha as u16;
+        pixel[0] = ((color[0] as u16 * a + pixel[0] as u16 * inv) / 255) as u8;
+        pixel[1] = ((color[1] as u16 * a + pixel[1] as u16 * inv) / 255) as u8;
+        pixel[2] = ((color[2] as u16 * a + pixel[2] as u16 * inv) / 255) as u8;
+        pixel[3] = 255;
+    });
+    Ok(())
+}
+
+fn checked_raster_dimensions(
+    width_span: f32,
+    height_span: f32,
+) -> Result<(usize, usize), WriterError> {
+    if !width_span.is_finite() || !height_span.is_finite() || width_span < 0.0 || height_span < 0.0
+    {
+        return Err(WriterError::FontRender {
+            reason: "font produced non-finite or inverted glyph bounds".to_string(),
+        });
+    }
+    let raster_width = (width_span as u64).checked_add(2);
+    let raster_height = (height_span as u64).checked_add(2);
+    let Some((raster_width, raster_height)) = raster_width.zip(raster_height) else {
+        return Err(WriterError::FontRender {
+            reason: "font produced glyph bounds that exceed addressable memory".to_string(),
+        });
+    };
+    if raster_width
+        .checked_mul(raster_height)
+        .is_none_or(|pixels| pixels > MAX_TEXT_RASTER_PIXELS)
+    {
+        return Err(WriterError::FontRender {
+            reason: format!(
+                "text raster {raster_width}x{raster_height} exceeds \
+                 the {MAX_TEXT_RASTER_PIXELS}-pixel safety limit"
+            ),
+        });
+    }
+    let width = usize::try_from(raster_width).map_err(|_| WriterError::FontRender {
+        reason: "text raster width is not addressable on this platform".to_string(),
+    })?;
+    let height = usize::try_from(raster_height).map_err(|_| WriterError::FontRender {
+        reason: "text raster height is not addressable on this platform".to_string(),
+    })?;
+    Ok((width, height))
+}
+
+/// Adapter from `skrifa`'s outline callbacks (font coordinates, Y-up) to the
+/// coverage rasterizer (image coordinates, Y-down).
+struct RasterPen<'a> {
+    rasterizer: &'a mut Rasterizer,
+    offset_x: f32,
+    baseline_y: f32,
+    current: Option<Point>,
+    contour_start: Option<Point>,
+}
+
+impl<'a> RasterPen<'a> {
+    fn new(rasterizer: &'a mut Rasterizer, offset_x: f32, baseline_y: f32) -> Self {
+        Self {
+            rasterizer,
+            offset_x,
+            baseline_y,
+            current: None,
+            contour_start: None,
+        }
+    }
+
+    fn image_point(&self, x: f32, y: f32) -> Point {
+        point(self.offset_x + x, self.baseline_y - y)
+    }
+}
+
+impl OutlinePen for RasterPen<'_> {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let next = self.image_point(x, y);
+        self.current = Some(next);
+        self.contour_start = Some(next);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let next = self.image_point(x, y);
+        if let Some(current) = self.current {
+            self.rasterizer.draw_line(current, next);
+        }
+        self.current = Some(next);
+    }
+
+    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
+        let control = self.image_point(cx0, cy0);
+        let next = self.image_point(x, y);
+        if let Some(current) = self.current {
+            self.rasterizer.draw_quad(current, control, next);
+        }
+        self.current = Some(next);
+    }
+
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        let control0 = self.image_point(cx0, cy0);
+        let control1 = self.image_point(cx1, cy1);
+        let next = self.image_point(x, y);
+        if let Some(current) = self.current {
+            self.rasterizer
+                .draw_cubic(current, control0, control1, next);
+        }
+        self.current = Some(next);
+    }
+
+    fn close(&mut self) {
+        if let (Some(current), Some(start)) = (self.current, self.contour_start) {
+            self.rasterizer.draw_line(current, start);
+        }
+        self.current = self.contour_start;
     }
 }
 
@@ -565,7 +719,7 @@ mod tests {
             return;
         };
         let bytes = fs::read(&font_path).expect("read font");
-        let font = FontArc::try_from_vec(bytes).expect("parse font");
+        let font = FontRef::new(&bytes).expect("parse font");
         let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> =
             ImageBuffer::from_pixel(200, 80, Rgba([255, 255, 255, 255]));
         draw_text(
@@ -577,11 +731,36 @@ mod tests {
             0,
             4,
             [0, 0, 0, 255],
-        );
+        )
+        .expect("draw text");
         let dark = img
             .pixels()
             .filter(|p| p[0] < 200 && p[1] < 200 && p[2] < 200)
             .count();
         assert!(dark > 10, "expected some dark text pixels, got {dark}");
+    }
+
+    #[test]
+    fn draw_text_rejects_excessive_raster_allocation() {
+        let Some(font_path) = find_test_font() else {
+            eprintln!("skipping: no test font on this host");
+            return;
+        };
+        let bytes = fs::read(&font_path).expect("read font");
+        let font = FontRef::new(&bytes).expect("parse font");
+        let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(10, 10, Rgba([255, 255, 255, 255]));
+        let err = draw_text(
+            &mut img,
+            &font,
+            512.0,
+            &"W".repeat(1_000),
+            Gravity::Center,
+            0,
+            0,
+            [0, 0, 0, 255],
+        )
+        .expect_err("oversized text raster must be rejected before allocation");
+        assert!(matches!(err, WriterError::FontRender { .. }));
     }
 }

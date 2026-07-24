@@ -11,20 +11,73 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use tessera_core::mac::MacBackend;
 
 use super::ActiveSession;
 
+/// Failure loading the persisted session registry at startup.
+///
+/// A missing file is NOT an error (it deserialises to an empty registry —
+/// a fresh host). Corruption and other I/O failures are surfaced so the
+/// daemon can refuse to start rather than silently continue with an empty
+/// registry: an empty registry drops every active session and its future
+/// credential-removal action, which is exactly the fail-open outcome the
+/// enforcement path exists to prevent.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryLoadError {
+    /// The registry file exists but could not be read.
+    #[error("read session registry {path}: {source}")]
+    Read {
+        /// Registry path that failed to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// The registry file exists and was read, but its contents are not
+    /// valid registry JSON. Treated as fail-closed rather than reset to
+    /// empty so active sessions are not silently lost.
+    #[error("session registry {path} is corrupt: {source}")]
+    Corrupt {
+        /// Registry path that failed to parse.
+        path: PathBuf,
+        /// Underlying deserialisation error.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
 /// On-disk store for the session registry.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RegistryStore {
     path: PathBuf,
+    backend: Arc<dyn MacBackend>,
+}
+
+impl std::fmt::Debug for RegistryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryStore")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RegistryStore {
     /// Construct a store rooted at `path`.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            backend: Arc::new(tessera_core::mac::StubBackend::new()),
+        }
+    }
+
+    /// Construct a store using the selected runtime enforcement backend.
+    #[must_use]
+    pub fn with_backend(path: PathBuf, backend: Arc<dyn MacBackend>) -> Self {
+        Self { path, backend }
     }
 
     /// Path to the persisted file.
@@ -35,29 +88,30 @@ impl RegistryStore {
 
     /// Load existing sessions from disk.
     ///
-    /// A missing file or a corrupt JSON body is treated as "empty registry"
-    /// and logged as WARN — we do not propagate the error so that the daemon
-    /// can still start with a fresh registry after a crash.
+    /// A missing file deserialises to an empty registry (a fresh host).
+    /// A present-but-corrupt file, or any other read failure, is reported so
+    /// the caller can fail closed: silently resetting a corrupt registry to
+    /// empty would drop every active session and its pending credential-
+    /// removal action across a daemon restart.
     ///
     /// # Errors
     ///
-    /// Returns the underlying `io::Error` only for non-`NotFound` IO failures.
-    pub fn load(&self) -> io::Result<Vec<ActiveSession>> {
+    /// Returns [`RegistryLoadError::Read`] for a non-`NotFound` I/O failure
+    /// and [`RegistryLoadError::Corrupt`] when the file body is not valid
+    /// registry JSON.
+    pub fn load(&self) -> Result<Vec<ActiveSession>, RegistryLoadError> {
         match std::fs::read(&self.path) {
-            Ok(bytes) => match serde_json::from_slice::<Vec<ActiveSession>>(&bytes) {
-                Ok(v) => Ok(v),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "tessera.monitord",
-                        error = %e,
-                        path = ?self.path,
-                        "sessions.json corrupt, starting empty"
-                    );
-                    Ok(Vec::new())
+            Ok(bytes) => serde_json::from_slice::<Vec<ActiveSession>>(&bytes).map_err(|source| {
+                RegistryLoadError::Corrupt {
+                    path: self.path.clone(),
+                    source,
                 }
-            },
+            }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
+            Err(source) => Err(RegistryLoadError::Read {
+                path: self.path.clone(),
+                source,
+            }),
         }
     }
 
@@ -86,12 +140,7 @@ impl RegistryStore {
 
         let bytes = serde_json::to_vec_pretty(snapshot)?;
 
-        #[cfg(feature = "astra-mac")]
-        let backend = tessera_mac_parsec::ParsecBackend::new();
-        #[cfg(not(feature = "astra-mac"))]
-        let backend = tessera_core::mac::backend::StubBackend::new();
-
-        crate::state::write_sessions_atomic(&self.path, &bytes, &backend)?;
+        crate::state::write_sessions_atomic(&self.path, &bytes, self.backend.as_ref())?;
 
         // fsync the parent directory so the rename is durable.
         let dir = File::open(parent)?;

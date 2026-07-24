@@ -21,11 +21,6 @@ export CARGO_PROFILE_RELEASE_LTO = thin
 export LC_ALL = C.UTF-8
 export TZ = UTC
 
-# Optional extra cargo flags forwarded from the environment, e.g.
-# `DEB_CARGO_EXTRA_OPTIONS="--features astra-mac"` for Astra MAC builds.
-# Defaults to empty so the standard (stub) build path is unaffected.
-DEB_CARGO_EXTRA_OPTIONS ?=
-
 %:
 	dh $@
 
@@ -37,8 +32,8 @@ override_dh_auto_clean:
 	rm -rf target debian/cargo_home
 
 override_dh_auto_build:
-	cargo build --release --workspace --offline $(DEB_CARGO_EXTRA_OPTIONS) \
-		|| cargo build --release --workspace $(DEB_CARGO_EXTRA_OPTIONS)
+	cargo build --release --workspace --locked --offline \
+		|| cargo build --release --workspace --locked
 
 override_dh_auto_install:
 	# Place the cdylib at the canonical PAM module path with the expected

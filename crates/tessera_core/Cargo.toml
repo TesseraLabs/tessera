@@ -24,15 +24,8 @@ gost-tests = []
 # but no module is available at runtime (e.g. on macOS dev hosts), each test
 # prints `skipped: ...` and returns `Ok`.
 pkcs11-tests = []
-# Toggles МКЦ enforcement behaviour in the open core: config validation
-# accepts `required` [mac] policies and audit/test cfg-gates activate. The
-# real libpdp FFI now lives in the `tessera_mac_parsec` crate; this
-# feature no longer links any native library. Required for Astra deb build
-# (alongside the parsec crate, wired up by the `pam_tessera`/`tessera_cli`
-# `astra-mac` features).
-astra-mac = []
 # Enables in-process MacBackend mock for unit tests on dev hosts without
-# libpdp. Independent of astra-mac.
+# libpdp.
 mac-tests = ["dep:mockall"]
 
 [dependencies]
@@ -62,6 +55,7 @@ parking_lot = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 mockall = { workspace = true, optional = true }
+libloading = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev = { workspace = true }

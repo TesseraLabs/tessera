@@ -241,7 +241,8 @@ flowchart LR
     run --> sessions["sessions/sid/"]
     run --> state[sessions.json]
     run --> lock[daemon.lock]
-    var["/var/lib/tessera/"] --> wp["wallpaper.orig.jpg"]
+    var["/var/lib/tessera/ (root-owned policy)"] --> daemon["daemon/ (tessera-owned state)"]
+    daemon --> wp["wallpaper.orig.jpg"]
 ```
 
 | Path                                         | Written by               | Read by                        | Permissions            |
@@ -251,11 +252,15 @@ flowchart LR
 | `/run/tessera/monitord.sock`            | monitord                 | cdylib                         | `0660 root:tessera` |
 | `/run/tessera/sessions/<sid>/`          | cdylib                   | removed by MountGuard on drop  | `0700 root:root`       |
 | `/run/tessera/sessions.json`            | monitord                 | monitord (between daemon restarts within a boot; tmpfs, volatile) | `0600 tessera:tessera` |
-| `/run/tessera/daemon.lock`              | monitord (flock singleton; next to `sessions.json`, fallback `/var/lib/tessera/`) | monitord | —             |
+| `/run/tessera/daemon.lock`              | monitord (flock singleton; next to `sessions.json`, fallback `/var/lib/tessera/daemon/`) | monitord | —             |
+| `/var/lib/tessera/roles/*.toml`, `/var/lib/tessera/tags.toml` | administrator | cdylib | root-owned; no group/world write on the complete path |
+| `/var/lib/tessera/daemon/wallpaper.orig.jpg` | monitord | monitord | daemon state under `0750 tessera:tessera` |
 | `/var/cache/tessera/ocsp/*.der`         | cdylib (auth path, OCSP cache) | cdylib (with re-verification before use) | `0640 root:root` (directory `0750 root:root`) |
 
-`/run/tessera/` and `/var/lib/tessera/` are created by systemd
-through the `RuntimeDirectory` and `StateDirectory` directives of the unit
+`/run/tessera/` and `/var/lib/tessera/daemon/` are created by systemd
+through the `RuntimeDirectory` and nested `StateDirectory` directives of the unit.
+The package keeps `/var/lib/tessera/` itself `0750 root:tessera`, so the
+unprivileged daemon cannot replace the trusted role/tag trees.
 (see [`tessera.service`](../../dist/systemd/tessera.service)
 and [`dist/tmpfiles/tessera.conf`](../../dist/tmpfiles/tessera.conf)).
 `/var/cache/tessera/ocsp/` is created by the package's postinst
@@ -584,14 +589,12 @@ Principles:
   mapping) → `PAM_PERM_DENIED`; cert-scope failures
   (`pam_cert_host_binding` / `pam_cert_user_binding`) and other auth errors →
   `PAM_AUTH_ERR`; an exhausted PIN budget → `PAM_MAXTRIES`.
-- **Monitord being unavailable does not make auth fail-closed**, even with
-  `monitor_fail_mode = "strict"`: only `DEVICE_GONE` and `UNAUTHORIZED` are
-  fatal (they change the verdict)
-  (`crates/tessera_core/src/ipc/failmode.rs`); IPC transport errors on the
-  auth path are logged as non-fatal — the notification to monitord happens
-  after an authentication success that has already occurred. `strict` /
-  `permissive` control only whether the `FailModeWrapper` wrapper propagates
-  non-fatal IPC errors to the calling code.
+- Monitord registration is part of the authentication verdict. With
+  `monitor_fail_mode = "strict"`, an IPC transport or registration failure
+  denies the login because the session could not be placed under removal
+  enforcement. With `permissive`, the `FailModeWrapper` absorbs transport
+  failures, while `DEVICE_GONE` and `UNAUTHORIZED` remain fatal in every
+  mode (`crates/tessera_core/src/ipc/failmode.rs`).
 
 ## 14. Logging: `tracing` → syslog / journald
 

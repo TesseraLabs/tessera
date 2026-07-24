@@ -32,6 +32,16 @@ pub enum Error {
         /// Reason.
         reason: String,
     },
+    /// A file consumed by a privileged authentication path failed the
+    /// root-ownership and path-integrity policy.
+    #[error("{context}: {source}")]
+    PrivilegedPath {
+        /// What configuration input was being validated.
+        context: String,
+        /// Underlying ownership, mode, type, or race failure.
+        #[source]
+        source: crate::privileged_path::PrivilegedPathError,
+    },
     /// `gost_engine_path` does not point to a readable file.
     #[error("gost_engine_path {path:?} is not a readable file: {source}")]
     GostEnginePathUnreadable {
@@ -105,6 +115,16 @@ pub enum HostIdentityError {
     /// Command timed out.
     #[error("host identity command timed out")]
     CommandTimeout,
+    /// The custom command path failed the privileged-execution ownership and
+    /// integrity walk (not root-owned, group/other-writable, or swapped).
+    /// Fail closed: a command root could be tricked into running as a
+    /// non-root-controlled binary is refused rather than executed.
+    #[error("host identity command failed path validation: {source}")]
+    CommandUntrusted {
+        /// Underlying validation failure.
+        #[source]
+        source: crate::privileged_path::PrivilegedPathError,
+    },
     /// Command missing.
     #[error("custom command is not configured")]
     CommandNotConfigured,
@@ -183,6 +203,15 @@ pub enum HookValidationError {
     /// Timeout is invalid.
     #[error("hook timeout must be in 1..=120")]
     InvalidTimeout,
+    /// `run_as` names an identity the module cannot map to a concrete UID.
+    /// Only `root` and `user` (the authenticating PAM user) are recognized;
+    /// anything else — a typo, or an account name the module does not resolve —
+    /// is rejected rather than silently amplified to root.
+    #[error("invalid run_as {value:?}: expected \"root\" or \"user\"")]
+    InvalidRunAs {
+        /// The unrecognized value from config.
+        value: String,
+    },
     /// Template error.
     #[error("{reason}")]
     Template {
@@ -377,6 +406,42 @@ pub enum TrustError {
     PinningHashInvalid {
         /// Entry.
         entry: String,
+    },
+    /// A `[[trust_override]]` entry lists no anchors. An override replaces the
+    /// global trust anchors for the hosts it names; an empty replacement would
+    /// either silently widen trust back to the global set or leave the verifier
+    /// with no anchors at all. Both defeat the purpose of narrowing trust, so
+    /// the entry is rejected at configuration time.
+    #[error(
+        "trust_override.anchors must not be empty: an override that narrows trust \
+         to no anchor cannot be satisfied; give it at least one anchor or remove it"
+    )]
+    TrustOverrideAnchorsEmpty,
+    /// Two `[[trust_override]]` entries both claim the same host id. The
+    /// applicable anchor set would be ambiguous for that host at runtime, so
+    /// the overlap is rejected at configuration time rather than resolved by
+    /// silently picking one entry.
+    #[error(
+        "trust_override.when_host_id_in overlap: host id {host_id:?} appears in more \
+         than one [[trust_override]] entry; each host may match at most one override"
+    )]
+    TrustOverrideHostIdOverlap {
+        /// The normalized host id claimed by more than one override.
+        host_id: String,
+    },
+    /// A `[[trust_override]]` entry lists a host id that is empty once
+    /// normalized (e.g. only whitespace or colons). The runtime host-id
+    /// resolver rejects an empty normalized id, so such a candidate can never
+    /// match a real host: the override would silently never fire and the host
+    /// would fall back to the broader global anchors — the opposite of the
+    /// narrowing the operator intended. Reject it at load time.
+    #[error(
+        "trust_override.when_host_id_in contains {raw:?}, which is empty after \
+         normalization and can never match a host; remove it or give a real host id"
+    )]
+    TrustOverrideHostIdEmpty {
+        /// The offending raw host id as written in the config.
+        raw: String,
     },
 }
 

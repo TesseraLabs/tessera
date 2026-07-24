@@ -26,6 +26,8 @@ fn sample(usb: Option<&str>) -> SessionOpenPayload {
         pam_service: "s".into(),
         target: SessionTarget::logind("c1"),
         usb_serial: usb.map(str::to_string),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "cn".into(),
@@ -35,6 +37,7 @@ fn sample(usb: Option<&str>) -> SessionOpenPayload {
         uid: 0,
         role: None,
         role_version: None,
+        session_expiry: None,
     }
 }
 

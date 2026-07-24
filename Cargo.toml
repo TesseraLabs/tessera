@@ -7,6 +7,7 @@ members = [
     "crates/tessera_proto",
     "crates/pam_tessera",
     "crates/tessera_cli",
+    "crates/tessera_test_plugin",
 ]
 
 [workspace.package]
@@ -73,10 +74,16 @@ p384 = "0.13"
 # AES-CBC) used to decrypt operator keys and to generate encrypted fixtures in
 # tests. Native-only, behind the `file` feature.
 pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
-# Pure-Rust RSA (MIT OR Apache-2.0), verification-only in the issuer: checks a
-# CSR's PKCS#1 v1.5 / SHA-256 self-signature (proof of possession). No key
-# generation or signing, so no RNG is pulled into the wasm core.
-rsa = { version = "0.9", default-features = false, features = ["std"] }
+# Hardened pure-Rust RSA fork (MIT OR Apache-2.0), kept under the local crate
+# name `rsa` so issuer code retains the upstream-compatible API. `sad-rsa`
+# incorporates RustCrypto's `crypto-bigint` migration and padding hardening to
+# mitigate Marvin (RUSTSEC-2023-0071); it is not claimed to make every RSA path
+# fully constant-time. Pin exactly: upgrades of this security-critical fork
+# require an explicit review. Encoding is needed for CSR SPKI and PKCS#8 keys.
+rsa = { package = "sad-rsa", version = "=0.2.3", default-features = false, features = [
+    "encoding",
+    "std",
+] }
 # Native-only signing adapters for the issuer tooling (behind feature flags).
 # ureq drives Vault Transit signing; base64 (de)serialises DER on the JSON
 # boundaries.
@@ -94,6 +101,7 @@ base64 = "0.22"
 # (p256/rsa) pulls `getrandom`, which needs the `js` feature on
 # `wasm32-unknown-unknown`. Native targets never use this.
 getrandom = "0.2"
+libloading = "0.9"
 
 [profile.dev]
 panic = "unwind"

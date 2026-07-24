@@ -52,8 +52,8 @@ pub enum RoleDenyReason {
     /// The requested role is not a member of the certificate's
     /// `allowed_roles` list.
     NotCovered,
-    /// The resolved role payload needs an enforcement backend that this
-    /// build does not provide (open build: `mac_mask` without `ParsecBackend`,
+    /// The resolved role payload needs an enforcement backend that the
+    /// runtime does not provide (`mac_mask` without an active plugin or
     /// `selinux` without the `SELinux` adapter).
     BackendUnavailable,
     /// The role's MAC mask exceeds the certificate's integrity ceiling
@@ -290,25 +290,18 @@ pub fn bounded_ttl(
     ttl
 }
 
-/// Whether this build can enforce the slice's payload.
+/// Whether the host can potentially enforce the slice's payload.
 ///
-/// Open build (no `astra-mac` feature, no `SELinux` adapter) cannot enforce a
-/// `mac_mask` or a `selinux` context. Such a role MUST be denied explicitly
-/// rather than have its privileges silently narrowed. A role whose payload
-/// is fully covered by available backends (groups / sudo / limits) works in
-/// the open build.
+/// A `mac_mask` is accepted into the session snapshot because enforcement
+/// availability is now decided by the runtime plugin. The MAC orchestrator
+/// denies it fail-closed when the selected backend is absent or inactive.
 ///
-/// The `astra-mac` feature gates `mac_mask`. `SELinux` has no compile-time
-/// feature in the open build, so `selinux` is always unavailable here; when
-/// the commercial adapter lands it will relax this with its own gate.
+/// `SELinux` has no runtime adapter yet and remains unavailable.
 #[must_use]
 pub fn payload_backend_available(slice: &RoleSlice) -> bool {
     let Some(payload) = slice.payload.as_ref() else {
         return true;
     };
-    if payload.mac_mask.is_some() && !cfg!(feature = "astra-mac") {
-        return false;
-    }
     if payload.selinux.is_some() {
         // SELinux enforcement is a commercial adapter; the open build parses
         // the section but cannot apply it. No compile-time feature exists in
@@ -582,24 +575,14 @@ mod tests {
     }
 
     #[test]
-    fn fix_mac_mask_role_denies_backend_unavailable_on_stub() {
-        // mac_mask is an astra payload; open (stub) build cannot enforce it.
+    fn fix_mac_mask_role_is_deferred_to_runtime_backend() {
+        // Session fixing preserves the request; the MAC orchestrator later
+        // denies it if no runtime enforcement plugin is active.
         let doc = "role = \"hi\"\nversion = 1\nos = \"astra\"\nname = \"hi\"\nlevel = 5\n\
                    [payload]\nmac_mask = \"0xff\"\n";
         let slice = parse_slice(doc.as_bytes(), "hi", RoleOs::Astra).unwrap();
-        let res = SessionRolePayload::fix(&slice, None, Duration::from_secs(43200));
-        // In the open build (no astra-mac feature) this denies; with the
-        // feature it succeeds. Assert per build so the test holds either way.
-        if cfg!(feature = "astra-mac") {
-            let fixed = res.unwrap();
-            assert_eq!(fixed.mac_mask, Some(0xff));
-        } else {
-            assert_eq!(res.unwrap_err(), SessionFixError::BackendUnavailable);
-            assert_eq!(
-                SessionFixError::BackendUnavailable.deny_reason(),
-                RoleDenyReason::BackendUnavailable
-            );
-        }
+        let fixed = SessionRolePayload::fix(&slice, None, Duration::from_secs(43200)).unwrap();
+        assert_eq!(fixed.mac_mask, Some(0xff));
     }
 
     #[test]

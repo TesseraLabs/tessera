@@ -285,7 +285,7 @@ fn verify_rsa_pkcs1_sha256(
     // Refuse a modulus below the strength floor before spending a verification:
     // a weak key must never back an issued leaf, regardless of whether its
     // self-signature checks out.
-    let bits = key.n().bits() as u64;
+    let bits = u64::from(key.n().bits());
     if bits < MIN_RSA_KEY_BITS {
         return Err(IssueError::CsrWeakRsaKey {
             bits,

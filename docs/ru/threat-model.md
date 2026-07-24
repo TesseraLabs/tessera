@@ -521,7 +521,10 @@ root-of-trust), а не модуля аутентификации.
   `/run/tessera/` (tmpfs).
 - **9.2.5** postinst накладывает `chattr +i` на `host_id` после
   первой записи, сам файл лежит в каталоге `/var/lib/tessera/`
-  (0750 tessera:tessera, см. `debian/postinst`).
+  (`0750 root:tessera`, см. `debian/postinst`). Writable-state демона
+  изолирован в `/var/lib/tessera/daemon/` (`0750 tessera:tessera`),
+  поэтому компрометация демона не позволяет подменить доверенные роли
+  или теги через их родительский каталог.
 
 ### 9.3 Открытые риски
 

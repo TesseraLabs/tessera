@@ -149,7 +149,7 @@ impl Default for FlyDmGreeterSection {
         Self {
             update_wallpaper: false,
             wallpaper_target: PathBuf::from("/usr/share/wallpapers/fly-default-light.jpg"),
-            wallpaper_backup: PathBuf::from("/var/lib/tessera/wallpaper.orig.jpg"),
+            wallpaper_backup: PathBuf::from("/var/lib/tessera/daemon/wallpaper.orig.jpg"),
             wallpaper_font: PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
             wallpaper_font_size: 64,
             wallpaper_text_color: [0, 0, 0, 255],
@@ -165,6 +165,8 @@ impl Default for FlyDmGreeterSection {
 /// Validated `[mac]` policy block.
 #[derive(Debug, Clone)]
 pub struct MacPolicy {
+    /// Explicit runtime enforcement plugin name. Absence selects the stub.
+    pub backend: Option<String>,
     /// Trinary policy for the X.509 `MAX_INTEGRITY` extension on the
     /// authenticating certificate. Default [`CertIntegrityMode::Optional`].
     pub cert_integrity: CertIntegrityMode,
@@ -182,6 +184,7 @@ pub struct MacPolicy {
 impl Default for MacPolicy {
     fn default() -> Self {
         Self {
+            backend: None,
             cert_integrity: CertIntegrityMode::Optional,
             fallback_max_integrity: None,
             warn_on_homedir_label_mismatch: true,
@@ -190,8 +193,7 @@ impl Default for MacPolicy {
     }
 }
 
-/// Runtime selection for the MAC backend (independent of the
-/// compile-time `astra-mac` feature).
+/// Runtime selection for the MAC backend.
 ///
 /// - [`MacRuntimeMode::Required`] — auth fails if the МКЦ kernel
 ///   subsystem is not present.
@@ -199,7 +201,7 @@ impl Default for MacPolicy {
 ///   reports МКЦ available; otherwise fall back to the no-op stub and
 ///   emit a `mac_runtime_fallback` audit event.
 /// - [`MacRuntimeMode::Disabled`] — always use the stub backend even
-///   when the binary is built with `astra-mac`.
+///   when a plugin is installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacRuntimeMode {
     /// Real backend required; fail-closed when kernel МКЦ missing.
@@ -574,10 +576,11 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             RawMode::Pkcs11 => Mode::Pkcs11,
         };
         validate_pkcs11_section(raw, mode)?;
+        let monitor = validate_monitor(raw, &raw.monitor, raw.monitor_fail_mode)?;
         if let Some(prompt) = raw.pkcs12_pin_prompt.as_deref() {
             validate_pin_prompt("pkcs12_pin_prompt", prompt)?;
         }
-        Ok(Self {
+        let validated = Self {
             crypto_backend,
             mode,
             pkcs11_module: raw.pkcs11_module.clone(),
@@ -609,13 +612,9 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
                 RawMonitorFailMode::Strict => MonitorFailMode::Strict,
                 RawMonitorFailMode::Permissive => MonitorFailMode::Permissive,
             },
-            monitor: validate_monitor(raw, &raw.monitor, raw.monitor_fail_mode)?,
+            monitor,
             trust,
-            trust_overrides: raw
-                .trust_override
-                .iter()
-                .map(validate_trust_override)
-                .collect::<Result<Vec<_>, _>>()?,
+            trust_overrides: validate_trust_overrides(&raw.trust_override)?,
             host_identity,
             user_mappings,
             logging,
@@ -624,7 +623,16 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             fly_dm_greeter: validate_fly_dm_greeter(raw.fly_dm_greeter.as_ref())?,
             roles: validate_roles(&raw.roles)?,
             tags: validate_tags(&raw.tags, &raw.roles)?,
-        })
+        };
+        if validated.needs_gost() && validated.gost_engine_path.is_none() {
+            return Err(Error::ConfigInvalid {
+                reason: "gost_engine_path is required when the OpenSSL backend allows GOST \
+                         signatures; implicit engine lookup may honor an inherited \
+                         OPENSSL_ENGINES path"
+                    .into(),
+            });
+        }
+        Ok(validated)
     }
 }
 
@@ -725,6 +733,9 @@ fn fly_dm_absolute_path(
 }
 
 fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeterSection, Error> {
+    const MAX_WALLPAPER_FONT_SIZE: u32 = 512;
+    const MAX_WALLPAPER_TEMPLATE_BYTES: usize = 1024;
+
     let defaults = FlyDmGreeterSection::default();
     let Some(raw) = raw else {
         return Ok(defaults);
@@ -768,10 +779,25 @@ fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeter
     let wallpaper_font_size = raw
         .wallpaper_font_size
         .unwrap_or(defaults.wallpaper_font_size);
-    if wallpaper_font_size == 0 {
+    if !(1..=MAX_WALLPAPER_FONT_SIZE).contains(&wallpaper_font_size) {
         return Err(Error::ConfigInvalid {
-            reason: "fly_dm_greeter.wallpaper_font_size must be > 0".into(),
+            reason: format!(
+                "fly_dm_greeter.wallpaper_font_size must be in 1..={MAX_WALLPAPER_FONT_SIZE}"
+            ),
         });
+    }
+
+    let template_ru = raw.template_ru.clone().unwrap_or(defaults.template_ru);
+    let template_en = raw.template_en.clone().unwrap_or(defaults.template_en);
+    for (field, template) in [("template_ru", &template_ru), ("template_en", &template_en)] {
+        if template.len() > MAX_WALLPAPER_TEMPLATE_BYTES {
+            return Err(Error::ConfigInvalid {
+                reason: format!(
+                    "fly_dm_greeter.{field} must be at most \
+                     {MAX_WALLPAPER_TEMPLATE_BYTES} bytes"
+                ),
+            });
+        }
     }
 
     Ok(FlyDmGreeterSection {
@@ -788,8 +814,8 @@ fn validate_fly_dm_greeter(raw: Option<&RawFlyDmGreeter>) -> Result<FlyDmGreeter
         wallpaper_offset_y: raw
             .wallpaper_offset_y
             .unwrap_or(defaults.wallpaper_offset_y),
-        template_ru: raw.template_ru.clone().unwrap_or(defaults.template_ru),
-        template_en: raw.template_en.clone().unwrap_or(defaults.template_en),
+        template_ru,
+        template_en,
     })
 }
 
@@ -831,6 +857,24 @@ fn parse_gravity(s: &str) -> Option<Gravity> {
 const MAC_CATEGORIES_HEX_MAX_LEN: usize = 16;
 
 fn validate_mac(raw: &RawMacPolicy) -> Result<MacPolicy, Error> {
+    let backend = raw
+        .backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            if name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                return Err(Error::ConfigInvalid {
+                    reason: "[mac].backend must match [a-z0-9-]{1,64}".into(),
+                });
+            }
+            Ok(name.to_owned())
+        })
+        .transpose()?;
     let cert_integrity = match raw.cert_integrity {
         Some(RawCertIntegrityMode::Required) => CertIntegrityMode::Required,
         Some(RawCertIntegrityMode::Ignore) => CertIntegrityMode::Ignore,
@@ -857,26 +901,15 @@ fn validate_mac(raw: &RawMacPolicy) -> Result<MacPolicy, Error> {
                     .into(),
         });
     }
-    // Fail-fast: stub builds (without `astra-mac`) cannot honour
-    // `cert_integrity = "required"` because there is no real backend
-    // to enforce the label.  Reject at config load so the operator sees
-    // the misconfiguration immediately rather than at first session.
-    #[cfg(not(feature = "astra-mac"))]
-    if matches!(cert_integrity, CertIntegrityMode::Required) {
+    // A hard runtime requirement without a selected backend can never
+    // succeed. A named-but-missing plugin remains a runtime/audit failure as
+    // required by the plugin-loading contract.
+    if backend.is_none()
+        && (matches!(runtime, MacRuntimeMode::Required)
+            || matches!(cert_integrity, CertIntegrityMode::Required))
+    {
         return Err(Error::ConfigInvalid {
-            reason:
-                "[mac].cert_integrity = \"required\" but binary built without `astra-mac` feature"
-                    .into(),
-        });
-    }
-    // Same fail-fast for `runtime = "required"` — a stub build can never
-    // satisfy a hard MAC requirement, so surface the misconfiguration at
-    // config load.
-    #[cfg(not(feature = "astra-mac"))]
-    if matches!(runtime, MacRuntimeMode::Required) {
-        return Err(Error::ConfigInvalid {
-            reason: "[mac].runtime = \"required\" but binary built without `astra-mac` feature"
-                .into(),
+            reason: "required MAC policy requires [mac].backend".into(),
         });
     }
     let fallback_max_integrity = raw
@@ -907,6 +940,7 @@ fn validate_mac(raw: &RawMacPolicy) -> Result<MacPolicy, Error> {
         })
         .transpose()?;
     Ok(MacPolicy {
+        backend,
         cert_integrity,
         fallback_max_integrity,
         warn_on_homedir_label_mismatch: raw.warn_on_homedir_label_mismatch.unwrap_or(true),
@@ -1343,11 +1377,63 @@ fn validate_pem(path: &PathBuf) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validate every `[[trust_override]]` entry and reject cross-entry ambiguity.
+///
+/// Each entry is validated in isolation by [`validate_trust_override`]. In
+/// addition, no host id may be claimed by more than one entry: a host that
+/// matched two overrides would have an ambiguous trust set at runtime. Because
+/// override matching normalizes host ids the same way the host-id hash is
+/// computed (see [`crate::host_identity::normalize_host_id`]), the overlap
+/// check compares normalized ids so that casing/spacing variants of the same
+/// host are caught here rather than colliding silently at authentication time.
+fn validate_trust_overrides(raw: &[RawTrustOverride]) -> Result<Vec<TrustOverride>, Error> {
+    let mut overrides = Vec::with_capacity(raw.len());
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    for entry in raw {
+        let validated = validate_trust_override(entry)?;
+        // Collect this entry's host ids in normalized form first so that
+        // redundant aliases within a single entry collapse quietly; only a
+        // clash with a *different* entry is an ambiguity worth rejecting.
+        let normalized: BTreeSet<String> = validated
+            .when_host_id_in
+            .iter()
+            .map(|h| crate::host_identity::normalize_host_id(h))
+            .collect();
+        for host in &normalized {
+            if claimed.contains(host) {
+                return Err(TrustError::TrustOverrideHostIdOverlap {
+                    host_id: host.clone(),
+                }
+                .into());
+            }
+        }
+        claimed.extend(normalized);
+        overrides.push(validated);
+    }
+    Ok(overrides)
+}
+
 fn validate_trust_override(raw: &RawTrustOverride) -> Result<TrustOverride, Error> {
     if raw.when_host_id_in.is_empty() {
         return Err(Error::ConfigInvalid {
             reason: "trust_override.when_host_id_in must be non-empty".to_string(),
         });
+    }
+    // A candidate that normalizes to the empty string (whitespace- or
+    // colon-only) can never match a host: the runtime resolver rejects an empty
+    // normalized id, so the override would silently never fire and the host
+    // would fall back to the broader global anchors. Reject it here to keep
+    // config validation consistent with the resolver.
+    for host in &raw.when_host_id_in {
+        if crate::host_identity::normalize_host_id(host).is_empty() {
+            return Err(TrustError::TrustOverrideHostIdEmpty { raw: host.clone() }.into());
+        }
+    }
+    // An override replaces the global anchors for the named hosts. An empty
+    // replacement anchor set cannot narrow trust — it would either fall back to
+    // global trust or yield an anchorless verifier — so reject it here.
+    if raw.anchors.is_empty() {
+        return Err(TrustError::TrustOverrideAnchorsEmpty.into());
     }
     for path in raw.anchors.iter().chain(raw.intermediates.iter()) {
         validate_pem(path)?;
@@ -1384,6 +1470,20 @@ fn validate_host_identity(raw: &RawHostIdentity) -> Result<HostIdentitySection, 
                     cmd.display()
                 ),
             });
+        }
+        // The custom command runs with the PAM host's root authority. If it is
+        // already installed on this host, reject it at startup when it is not
+        // root-controlled, so an attacker-owned helper is a hard configuration
+        // failure rather than a silent root-privileged execution. A command not
+        // yet present (config validated ahead of deployment) is deferred to the
+        // resolver, which re-validates immediately before every execution.
+        if cmd.exists() {
+            crate::privileged_path::validate_path(cmd, crate::privileged_path::ExecTrust::Root)
+                .map_err(|source| Error::ConfigInvalid {
+                    reason: format!(
+                        "host_identity.custom_command is not root-controlled: {source}"
+                    ),
+                })?;
         }
     }
     Ok(HostIdentitySection {
@@ -1485,6 +1585,16 @@ fn validate_pkcs11_section(raw: &RawConfig, mode: Mode) -> Result<(), Error> {
         return Err(Error::ConfigInvalid {
             reason: "pkcs11_module is required when mode = \"pkcs11\"".to_owned(),
         });
+    }
+    if let Some(path) = raw.pkcs11_module.as_ref() {
+        if !path.is_absolute() {
+            return Err(Error::ConfigInvalid {
+                reason: format!(
+                    "pkcs11_module must be an absolute path (got {})",
+                    path.display()
+                ),
+            });
+        }
     }
     if let Some(label) = raw.pkcs11_token_label.as_deref() {
         validate_pkcs11_label("pkcs11_token_label", label)?;
@@ -1642,6 +1752,12 @@ fn validate_monitor(
                 ),
             });
         }
+        crate::privileged_path::validate_path(&path, crate::privileged_path::ExecTrust::Root)
+            .map_err(|source| Error::ConfigInvalid {
+                reason: format!(
+                    "monitor.on_usb_removed_hook_path is not root-controlled: {source}"
+                ),
+            })?;
         Some(path)
     } else {
         // Reject the field if it is set in a non-hook mode — it would
@@ -1721,6 +1837,14 @@ fn validate_gost_engine_path(
     };
     if !matches!(crypto_backend, CryptoBackend::Openssl) {
         return Err(Error::GostEnginePathRequiresOpenssl);
+    }
+    if !path.is_absolute() {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "gost_engine_path must be an absolute path (got {})",
+                path.display()
+            ),
+        });
     }
     let metadata = std::fs::metadata(path).map_err(|source| Error::GostEnginePathUnreadable {
         path: path.clone(),
@@ -1938,7 +2062,7 @@ mod tests {
         );
         assert_eq!(
             s.wallpaper_backup,
-            PathBuf::from("/var/lib/tessera/wallpaper.orig.jpg")
+            PathBuf::from("/var/lib/tessera/daemon/wallpaper.orig.jpg")
         );
         assert_eq!(s.wallpaper_gravity, Gravity::South);
         assert_eq!(s.wallpaper_font_size, 64);
@@ -2025,6 +2149,28 @@ mod tests {
             Error::ConfigInvalid { reason } => assert!(reason.contains("wallpaper_gravity")),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fly_dm_greeter_rejects_excessive_font_size() {
+        let raw = RawFlyDmGreeter {
+            wallpaper_font_size: Some(513),
+            ..Default::default()
+        };
+        let err = validate_fly_dm_greeter(Some(&raw)).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { ref reason }
+                if reason.contains("wallpaper_font_size")));
+    }
+
+    #[test]
+    fn fly_dm_greeter_rejects_excessive_template() {
+        let raw = RawFlyDmGreeter {
+            template_en: Some("x".repeat(1025)),
+            ..Default::default()
+        };
+        let err = validate_fly_dm_greeter(Some(&raw)).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid { ref reason }
+                if reason.contains("template_en")));
     }
 
     // ---- [roles] section (task 4.3) ---------------------------------------
@@ -2115,6 +2261,102 @@ mod tests {
     fn roles_rejects_unknown_field() {
         let err = toml::from_str::<RawRoles>("enforce = \"warn\"\nbogus = 1\n").unwrap_err();
         assert!(err.to_string().contains("bogus") || err.to_string().contains("unknown"));
+    }
+
+    fn fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    #[test]
+    fn trust_override_empty_anchors_rejected() {
+        // An override replaces the global anchors for the named hosts. An empty
+        // anchor list would either silently widen trust back to the global set
+        // or produce an anchorless verifier that accepts nothing; either way it
+        // is a misconfiguration and must be rejected at load time.
+        let raw = RawTrustOverride {
+            when_host_id_in: vec!["ws-001.example.org".to_string()],
+            anchors: vec![],
+            intermediates: vec![],
+        };
+        let err = validate_trust_override(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::Trust(TrustError::TrustOverrideAnchorsEmpty)),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trust_override_whitespace_or_colon_only_host_id_rejected() {
+        // A host id that normalizes to the empty string (here colon+space)
+        // could never match a real host at runtime, so the override would
+        // silently never fire and the host would fall back to the broader
+        // global anchors. That is the opposite of the operator's narrowing
+        // intent, so it must be rejected at load time.
+        let anchor = fixtures_dir().join("ca.pem");
+        let raw = RawTrustOverride {
+            when_host_id_in: vec![": ".to_string()],
+            anchors: vec![anchor],
+            intermediates: vec![],
+        };
+        let err = validate_trust_override(&raw).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Trust(TrustError::TrustOverrideHostIdEmpty { .. })
+            ),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trust_override_overlapping_host_ids_rejected() {
+        // Two overrides that both claim the same (normalized) host id make the
+        // applicable trust set ambiguous at runtime. Reject the ambiguity at
+        // configuration time rather than pick one silently.
+        let anchor = fixtures_dir().join("ca.pem");
+        let anchor_site = fixtures_dir().join("ca_site.pem");
+        let overrides = vec![
+            RawTrustOverride {
+                when_host_id_in: vec!["WS-001.example.org".to_string()],
+                anchors: vec![anchor.clone()],
+                intermediates: vec![],
+            },
+            // Same host, different casing/spacing — collapses to the same
+            // normalized id and must be detected as an overlap.
+            RawTrustOverride {
+                when_host_id_in: vec![" ws-001.example.org ".to_string()],
+                anchors: vec![anchor_site],
+                intermediates: vec![],
+            },
+        ];
+        let err = validate_trust_overrides(&overrides).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Trust(TrustError::TrustOverrideHostIdOverlap { .. })
+            ),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trust_override_distinct_host_ids_accepted() {
+        let anchor = fixtures_dir().join("ca.pem");
+        let anchor_site = fixtures_dir().join("ca_site.pem");
+        let overrides = vec![
+            RawTrustOverride {
+                when_host_id_in: vec!["ws-001.example.org".to_string()],
+                anchors: vec![anchor],
+                intermediates: vec![],
+            },
+            RawTrustOverride {
+                when_host_id_in: vec!["ws-002.example.org".to_string()],
+                anchors: vec![anchor_site],
+                intermediates: vec![],
+            },
+        ];
+        let parsed = validate_trust_overrides(&overrides).expect("distinct hosts ok");
+        assert_eq!(parsed.len(), 2);
     }
 
     #[test]

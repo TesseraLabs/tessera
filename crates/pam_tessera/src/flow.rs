@@ -81,6 +81,18 @@ pub enum FlowError {
     #[error("invalid PKCS#12 envelope on USB: {0}")]
     P12Envelope(#[from] P12EnvelopeError),
 
+    /// The authenticating USB device exposes no stable descriptor serial,
+    /// so the daemon could never match a removal event against the session.
+    ///
+    /// Continuous-presence enforcement keys sessions by the USB serial; a
+    /// device with `serial = None` would authenticate but stay permanently
+    /// invisible to removal enforcement (fail-open loss of the presence
+    /// guarantee). Under strict monitoring we refuse it fail-closed,
+    /// mirroring the PKCS#11 path's `TokenSerialMissing`. Permissive
+    /// monitoring is the documented escape hatch (see [`authenticate_pkcs12`]).
+    #[error("usb device exposes no stable serial; cannot enforce continuous presence")]
+    UsbSerialMissing,
+
     /// PIN-retry loop exhausted its attempts.
     #[error("max PIN tries")]
     MaxTries,
@@ -104,6 +116,14 @@ pub enum FlowError {
     /// Cert scope (host/user binding extension) rejected the auth.
     #[error("cert scope: {0}")]
     CertScope(#[from] HostBindingError),
+
+    /// A present `MAX_INTEGRITY` certificate extension was malformed.
+    ///
+    /// Treating this as absence would let optional MAC policy apply a broader
+    /// fallback ceiling. Both credential backends therefore reject it before
+    /// role/delegation/session policy.
+    #[error("malformed MAX_INTEGRITY certificate extension: {0}")]
+    MaxIntegrityMalformed(#[source] tessera_core::x509::max_integrity_ext::MaxIntegrityExtError),
 
     /// An internal invariant broke (e.g. `PAM_SET_DATA` failed).
     #[error("internal: {0}")]
@@ -131,6 +151,15 @@ pub enum FlowError {
     #[error("pkcs11 module path missing in config")]
     Pkcs11ModulePathMissingInConfig,
 
+    /// Strict continuous-presence monitoring cannot currently observe native
+    /// PKCS#11 token removal. Token serials are not USB block-device serials,
+    /// and treating them as such would reject every real token as
+    /// `DEVICE_GONE`. Refuse the strict combination explicitly until a native
+    /// PKCS#11 event monitor is available; permissive mode remains the
+    /// documented best-effort escape hatch.
+    #[error("strict continuous-presence monitoring is not supported for pkcs11 tokens")]
+    Pkcs11StrictPresenceUnsupported,
+
     /// A `pre_auth` hook returned a fatal error (executor failure or
     /// `on_failure = abort` policy hit a non-zero exit / timeout).
     #[error("pre_auth hook failed: {0}")]
@@ -152,6 +181,15 @@ pub enum FlowError {
     /// message (envelope structure is not leaked pre-auth).
     #[error("delegation denied")]
     DelegationDenied(#[source] tessera_core::trust::DelegationError),
+
+    /// Strict monitoring was configured but the session could not be
+    /// registered with monitord. In permissive mode the `FailModeWrapper`
+    /// converts transport errors to success, so this variant is only reached
+    /// under `monitor_fail_mode = "strict"`: continuous-presence enforcement
+    /// (the lock/logout on token or USB removal) cannot be guaranteed for a
+    /// session the daemon never learned about, so authentication fails closed.
+    #[error("monitor session registration failed (strict fail mode): {0}")]
+    MonitorRegistration(#[source] tessera_core::error::IpcError),
 }
 
 impl From<AcquireError> for FlowError {
@@ -189,14 +227,17 @@ impl FlowError {
     /// | Variant                                                | Code                       |
     /// | ------------------------------------------------------ | -------------------------- |
     /// | `Usb` / `Mount` / `Discovery`                          | `PAM_AUTHINFO_UNAVAIL` (9) |
+    /// | `UsbSerialMissing`                                     | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11` (module load / wait / serial / config)        | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11OpensslEngineNotImplemented`                    | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11ModulePathMissingInConfig`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
+    /// | `Pkcs11StrictPresenceUnsupported`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `MaxTries` / `Pkcs11Acquire(PinLocked|MaxAttempts)`    | `PAM_MAXTRIES` (8)         |
     /// | `Conv` / `Pkcs11Acquire(Conv)` / `Pkcs11(PinIncorrect)`| `PAM_AUTH_ERR` (7)         |
     /// | `CertScope`                                            | `PAM_AUTH_ERR` (7)         |
+    /// | `MaxIntegrityMalformed`                                | `PAM_PERM_DENIED` (6)      |
     /// | `Pkcs12` / `Crypto` / `Trust`                          | `PAM_PERM_DENIED` (6)      |
-    /// | `Mapping`                                              | `PAM_PERM_DENIED` (6)      |
+    /// | `Mapping` / `MonitorRegistration`                      | `PAM_PERM_DENIED` (6)      |
     /// | other `Pkcs11(...)` / `Pkcs11Acquire(Pkcs11)`          | `PAM_AUTH_ERR` (7)         |
     /// | `Internal`                                             | `PAM_SYSTEM_ERR` (4)       |
     #[must_use]
@@ -208,8 +249,10 @@ impl FlowError {
             | Self::Mount(_)
             | Self::Discovery(_)
             | Self::P12Envelope(_)
+            | Self::UsbSerialMissing
             | Self::Pkcs11OpensslEngineNotImplemented
             | Self::Pkcs11ModulePathMissingInConfig
+            | Self::Pkcs11StrictPresenceUnsupported
             | Self::Pkcs11(
                 Pkcs11Error::ModuleLoadFailed { .. }
                 | Pkcs11Error::InitFailed { .. }
@@ -222,15 +265,19 @@ impl FlowError {
             // PAM_MAXTRIES — exhausted PIN-retry budget on either path.
             Self::MaxTries
             | Self::Pkcs11Acquire(P11Acquire::PinLocked | P11Acquire::MaxAttemptsExceeded) => 8,
-            // PAM_PERM_DENIED — cert chain rejected the auth, or the
-            // requested role was denied (not found / not covered / needs an
-            // absent backend) under `[roles].enforce = require`.
+            // PAM_PERM_DENIED — cert chain rejected the auth, the requested
+            // role was denied (not found / not covered / needs an absent
+            // backend) under `[roles].enforce = require`, or a strict-mode
+            // monitord registration failure denied a session that could not
+            // be placed under continuous-presence enforcement.
             Self::Pkcs12(_)
             | Self::Crypto(_)
             | Self::Trust(_)
             | Self::Mapping(_)
+            | Self::MaxIntegrityMalformed(_)
             | Self::RoleDenied(_)
-            | Self::DelegationDenied(_) => 6,
+            | Self::DelegationDenied(_)
+            | Self::MonitorRegistration(_) => 6,
             // PAM_SYSTEM_ERR — internal invariants.
             Self::Internal(_) => 4,
             // PAM_AUTH_ERR — every other authentication-side failure
@@ -480,20 +527,39 @@ where
         Mode::Pkcs12 => {
             authenticate_pkcs12(deps, io, pam_user, pam_service, session_id, prompt_pin)
         }
-        Mode::Pkcs11 => match deps.cfg.crypto_backend {
-            CryptoBackend::Pkcs11Native => {
-                let pkcs11_io = real_pkcs11_io(deps.cfg)?;
-                authenticate_pkcs11(
-                    deps,
-                    &pkcs11_io,
-                    pam_user,
-                    pam_service,
-                    session_id,
-                    prompt_pin,
-                )
+        Mode::Pkcs11 => {
+            ensure_pkcs11_presence_mode(deps.cfg)?;
+            match deps.cfg.crypto_backend {
+                CryptoBackend::Pkcs11Native => {
+                    let pkcs11_io = real_pkcs11_io(deps.cfg)?;
+                    authenticate_pkcs11(
+                        deps,
+                        &pkcs11_io,
+                        pam_user,
+                        pam_service,
+                        session_id,
+                        prompt_pin,
+                    )
+                }
+                CryptoBackend::Openssl => Err(FlowError::Pkcs11OpensslEngineNotImplemented),
             }
-            CryptoBackend::Openssl => Err(FlowError::Pkcs11OpensslEngineNotImplemented),
-        },
+        }
+    }
+}
+
+/// Refuse an authentication policy that promises PKCS#11 removal enforcement
+/// before a native token-event source exists.
+fn ensure_pkcs11_presence_mode(
+    cfg: &tessera_core::config::validated::ValidatedConfig,
+) -> Result<(), FlowError> {
+    if cfg.monitor.fail_mode == tessera_core::config::validated::MonitorFailMode::Strict {
+        tracing::error!(
+            target: "tessera.flow",
+            "strict monitoring requested for pkcs11, but native token-removal observation is unavailable; denying authentication"
+        );
+        Err(FlowError::Pkcs11StrictPresenceUnsupported)
+    } else {
+        Ok(())
     }
 }
 
@@ -655,6 +721,32 @@ where
         )));
     };
 
+    // Step 4b — continuous-presence precondition. The daemon keys removal
+    // enforcement on the USB descriptor serial; a device that exposes none
+    // authenticates but can never be matched by a removal event, silently
+    // losing the continuous-presence guarantee (fail-open). Refuse it here
+    // — before the PIN prompt — mirroring the PKCS#11 path, which requires
+    // a non-empty token serial.
+    //
+    // The escape hatch is the monitor fail mode. `on_usb_removed` has no
+    // non-enforcing variant (every value locks/logs-out/runs-hook/shuts-
+    // down), so the meaningful "monitoring is best-effort" signal is
+    // `fail_mode = permissive`: there the admin has accepted that presence
+    // checks may not hold, so a serial-less device is allowed. Strict mode
+    // (continuous presence is a hard requirement) denies it fail-closed.
+    if dev.serial.is_none()
+        && deps.cfg.monitor.fail_mode == tessera_core::config::validated::MonitorFailMode::Strict
+    {
+        tracing::warn!(
+            target: "tessera.flow",
+            devnode = ?dev.devnode,
+            vid = format!("{:04x}", dev.vid),
+            pid = format!("{:04x}", dev.pid),
+            "pkcs12 device exposes no stable USB serial; refusing auth under strict monitoring"
+        );
+        return Err(FlowError::UsbSerialMissing);
+    }
+
     // Step 5 — PIN-retry loop.  When the operator configured
     // `pkcs12_pin_prompt` it replaces the default "Smart-card PIN: "
     // prompt, mirroring `pkcs11_pin_prompt` on the PKCS#11 path.
@@ -756,17 +848,7 @@ where
     let verified_leaf = verified.verified_leaf();
     let cert_ident_value = tessera_core::x509::CertIdent::from(&verified_leaf);
     let cert_max_integrity =
-        match tessera_core::x509::max_integrity_ext::extract_max_integrity(&verified_leaf) {
-            Ok(label) => label,
-            Err(e) => {
-                tessera_core::mac::audit::emit_cert_ext_parse_failed(
-                    pam_user,
-                    &cert_ident_value,
-                    &e.to_string(),
-                );
-                None
-            }
-        };
+        extract_cert_max_integrity(&verified_leaf, pam_user, &cert_ident_value)?;
     let cert_ident = Some(cert_ident_value);
     let home_dir = resolve_home_dir(pam_user);
 
@@ -829,9 +911,11 @@ where
 
     // Step 11c — notify monitord with the FULL post-auth payload (USB
     // serial from the discovered device, cert CN/serial from the
-    // validated leaf, target from PAM_TTY). Failure stays non-fatal:
-    // the auth itself already succeeded, and the FailModeWrapper around
-    // the production client decides whether to swallow IPC errors.
+    // validated leaf, target from PAM_TTY). Under strict fail mode a
+    // registration failure denies the login: a cert-authenticated session
+    // monitord never recorded can never have its token/USB removal enforced.
+    // Under permissive mode the FailModeWrapper has already converted the
+    // transport error to Ok, so this branch fires only in strict mode.
     let cert_cn_str = auth_ctx.cert_cn.as_deref().unwrap_or("");
     let cert_serial_str = auth_ctx.cert_serial.as_deref().unwrap_or("");
     let extras = session_open_extras(&loaded.end_entity, pam_user);
@@ -842,6 +926,12 @@ where
         host_id_hash: deps.host_id_hash,
         target: deps.pam_target.clone(),
         usb_serial: dev.serial.as_deref(),
+        // Device-topology binding: the daemon uses VID/PID + devnode to
+        // decide whether a later udev `add` is really the same physical
+        // device before cancelling a pending removal action. The USB
+        // descriptor serial alone is attacker-controlled and cloneable.
+        usb_vid_pid: auth_ctx.usb_vid_pid.as_deref(),
+        usb_devnode: dev.devnode.to_str(),
         cert_cn: cert_cn_str,
         cert_serial: cert_serial_str,
         engineer_ski: &extras.engineer_ski,
@@ -849,14 +939,16 @@ where
         uid: extras.uid,
         role: auth_ctx.role.as_ref().map(|r| r.role.as_str()),
         role_version: auth_ctx.role.as_ref().map(|r| r.role_version),
+        // Only role sessions carry a time-bound ceiling. The absolute expiry is
+        // clamped to the certificate's notAfter so the enforced deadline can
+        // never outlive the certificate.
+        session_expiry: session_expiry(
+            auth_ctx.role.as_ref(),
+            auth_ctx.authenticated_at,
+            auth_ctx.cert_not_after,
+        ),
     };
-    if let Err(e) = deps.monitor.open_session(&info) {
-        tracing::warn!(
-            target: "tessera.flow",
-            error = %e,
-            "monitor open_session failed (non-fatal)"
-        );
-    }
+    register_session_or_deny(deps.monitor, &info)?;
 
     tracing::info!(
         target: "tessera.flow",
@@ -1029,6 +1121,8 @@ where
         pkcs11_challenge_response, select_mechanism, FoundCertificate, FoundPrivateKey,
     };
 
+    ensure_pkcs11_presence_mode(deps.cfg)?;
+
     // Step 1 — pre_auth hooks (Stage 5). Same gate as the PKCS#12 path.
     //
     // Pre-auth IPC notification was deliberately removed: it used to fire
@@ -1134,17 +1228,7 @@ where
     let verified_leaf = verified.verified_leaf();
     let cert_ident_value = tessera_core::x509::CertIdent::from(&verified_leaf);
     let cert_max_integrity =
-        match tessera_core::x509::max_integrity_ext::extract_max_integrity(&verified_leaf) {
-            Ok(label) => label,
-            Err(e) => {
-                tessera_core::mac::audit::emit_cert_ext_parse_failed(
-                    pam_user,
-                    &cert_ident_value,
-                    &e.to_string(),
-                );
-                None
-            }
-        };
+        extract_cert_max_integrity(&verified_leaf, pam_user, &cert_ident_value)?;
     let cert_ident = Some(cert_ident_value);
     let home_dir = resolve_home_dir(pam_user);
 
@@ -1201,7 +1285,11 @@ where
 
     // Step 11c — notify monitord with the FULL post-auth payload. In
     // PKCS#11 mode the token serial occupies the `usb_serial` slot the
-    // daemon keys removal enforcement on.
+    // daemon keys removal enforcement on. Under strict fail mode a
+    // registration failure denies the login: without a recorded session the
+    // token's removal could never trigger the configured lock/logout. Under
+    // permissive mode the FailModeWrapper absorbs the transport error, so
+    // this branch fires only in strict mode.
     let cert_cn_str = auth_ctx.cert_cn.as_deref().unwrap_or("");
     let cert_serial_str = auth_ctx.cert_serial.as_deref().unwrap_or("");
     let extras = session_open_extras(&cert.certificate, pam_user);
@@ -1212,6 +1300,11 @@ where
         host_id_hash: deps.host_id_hash,
         target: deps.pam_target.clone(),
         usb_serial: auth_ctx.usb_serial.as_deref(),
+        // PKCS#11 tokens are not enumerated as USB block devices, so there
+        // is no VID/PID or devnode to bind removal cancellation to; the
+        // token serial in `usb_serial` is the only identifier available.
+        usb_vid_pid: None,
+        usb_devnode: None,
         cert_cn: cert_cn_str,
         cert_serial: cert_serial_str,
         engineer_ski: &extras.engineer_ski,
@@ -1219,18 +1312,46 @@ where
         uid: extras.uid,
         role: auth_ctx.role.as_ref().map(|r| r.role.as_str()),
         role_version: auth_ctx.role.as_ref().map(|r| r.role_version),
+        // Only role sessions carry a time-bound ceiling. The absolute expiry is
+        // clamped to the certificate's notAfter so the enforced deadline can
+        // never outlive the certificate.
+        session_expiry: session_expiry(
+            auth_ctx.role.as_ref(),
+            auth_ctx.authenticated_at,
+            auth_ctx.cert_not_after,
+        ),
     };
-    if let Err(e) = deps.monitor.open_session(&info) {
-        tracing::warn!(
-            target: "tessera.flow",
-            error = %e,
-            "monitor open_session failed (non-fatal)"
-        );
-    }
+    register_session_or_deny(deps.monitor, &info)?;
 
     Ok(FlowOutcome {
         auth_ctx,
         mount: None,
+    })
+}
+
+/// Registers a freshly authenticated session with monitord, failing closed
+/// when the configured fail mode demands it.
+///
+/// `monitor` is already wrapped in a [`tessera_core::ipc::FailModeWrapper`]:
+/// in permissive mode that wrapper turns transport failures (connect / timeout
+/// / decode) into `Ok(())` before they reach this function, so the login is
+/// unaffected. A returned `Err` therefore means either the fail mode is strict
+/// or the error is one that changes the verdict regardless of mode (the device
+/// backing the session is gone, or the daemon rejected us). In every such case
+/// the session cannot be placed under continuous-presence enforcement — later
+/// token or USB removal could never trigger the configured lock/logout — so we
+/// deny rather than grant a session monitord never recorded.
+fn register_session_or_deny(
+    monitor: &dyn MonitorClient,
+    info: &OpenSessionInfo<'_>,
+) -> Result<(), FlowError> {
+    monitor.open_session(info).map_err(|e| {
+        tracing::warn!(
+            target: "tessera.flow",
+            error = %e,
+            "monitor open_session failed under strict fail mode; denying auth"
+        );
+        FlowError::MonitorRegistration(e)
     })
 }
 
@@ -1721,6 +1842,27 @@ fn resolve_role_stage(
     Ok(Some(payload))
 }
 
+/// Extract `MAX_INTEGRITY` without collapsing a malformed present extension
+/// into the optional/absent state.
+///
+/// Both credential backends call this shared chokepoint before role,
+/// delegation, and session policy. The parse failure is audited once and
+/// returned fail-closed.
+fn extract_cert_max_integrity(
+    verified_leaf: &tessera_core::x509::VerifiedX509,
+    pam_user: &str,
+    cert_ident: &tessera_core::x509::CertIdent,
+) -> Result<Option<tessera_core::mac::IntegrityLabel>, FlowError> {
+    tessera_core::x509::max_integrity_ext::extract_max_integrity(verified_leaf).map_err(|error| {
+        tessera_core::mac::audit::emit_cert_ext_parse_failed(
+            pam_user,
+            cert_ident,
+            &error.to_string(),
+        );
+        FlowError::MaxIntegrityMalformed(error)
+    })
+}
+
 /// Live delegation-envelope enforcement (tags-delegation §4, wired in §5).
 ///
 /// Runs AFTER trust verification and role resolution on BOTH auth paths. For
@@ -1759,10 +1901,10 @@ fn enforce_delegation_stage(
 
     // Whether this chain is envelope-scoped (any CA carries
     // delegation_constraints). A malformed/mis-placed extension is itself
-    // fail-closed here. For a non-envelope (per-host) chain the delegation
-    // ceilings do not apply, so a malformed *non-critical* leaf max_integrity
-    // is tolerated exactly as before; for an envelope-scoped chain it must
-    // fail closed (the leaf level is a security ceiling input — see below).
+    // fail-closed here. Production authentication has already rejected a
+    // malformed leaf `MAX_INTEGRITY` through `extract_cert_max_integrity`; the
+    // scoped re-check below remains defense-in-depth for direct/internal
+    // callers.
     let scoped = match tessera_core::trust::chain_carries_constraints(&chain) {
         Ok(s) => s,
         Err(err) => {
@@ -1867,6 +2009,38 @@ fn cert_remaining_ttl(cert_not_after: Option<SystemTime>) -> Option<std::time::D
     )
 }
 
+/// Absolute wall-clock instant at which a bounded role session must end.
+///
+/// The deadline is the earliest of the role/default TTL measured from the
+/// authentication instant (`authenticated_at + role.ttl`) and the
+/// certificate's own `notAfter`. Anchoring the role/default component at
+/// `authenticated_at` and then clamping against `notAfter` is what guarantees
+/// the enforced deadline can never outlive the certificate — even though the
+/// daemon records its own `opened_at` a moment later and the role TTL was
+/// itself derived from a cert-remaining value sampled slightly earlier still.
+/// Because the daemon schedules termination directly against this absolute
+/// instant (no re-anchoring), the drift that a relative TTL would introduce is
+/// eliminated.
+///
+/// Returns `None` when the session has no role (hence no time ceiling). A role
+/// TTL so large that `authenticated_at + ttl` overflows the clock falls back to
+/// the certificate's `notAfter`, or to `None` when the certificate is
+/// non-expiring — never a panic.
+fn session_expiry(
+    role: Option<&tessera_core::role::SessionRolePayload>,
+    authenticated_at: SystemTime,
+    cert_not_after: Option<SystemTime>,
+) -> Option<SystemTime> {
+    let ttl = role?.ttl;
+    let role_deadline = authenticated_at.checked_add(ttl);
+    match (role_deadline, cert_not_after) {
+        (Some(rd), Some(na)) => Some(rd.min(na)),
+        (Some(rd), None) => Some(rd),
+        (None, Some(na)) => Some(na),
+        (None, None) => None,
+    }
+}
+
 fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
     let Some(cert) = tessera_core::pkcs12::try_extract_cert_without_pin(p12_bytes) else {
         return "Пароль .p12 неверный. Проверьте флешку и попробуйте ещё раз.".to_string();
@@ -1920,7 +2094,7 @@ mod tests {
     use std::time::Duration;
     use tessera_core::config::validated::{UserMapping, UserMatchCriteria};
     use tessera_core::host_identity::HostIdSourceKind;
-    use tessera_core::ipc::StubClient;
+    use tessera_core::ipc::{FailModeWrapper, MonitorFailMode, StubClient};
     use tessera_core::trust::openssl_verifier::{OpensslVerifier, OpensslVerifierConfig};
 
     /// Loads a fixture under `crates/tessera_core/tests/fixtures/`.
@@ -2170,6 +2344,82 @@ level = "info"
             FlowError::Discovery(DiscoveryError::P12NotFound { .. })
         ));
         assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+    }
+
+    #[test]
+    fn serial_less_pkcs12_device_denied_under_strict_monitoring() {
+        // A USB device that exposes no stable descriptor serial can never be
+        // matched by a removal event, so under strict monitoring (continuous
+        // presence is a hard requirement) it must be refused fail-closed —
+        // mirroring the PKCS#11 `TokenSerialMissing` path.
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let mut cfg = minimal_cfg();
+        cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+
+        let mut io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        io.device.serial = None;
+        let err = authenticate(deps, &io, "alice", "ssh", "sess-noserial".into(), |_| {
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, FlowError::UsbSerialMissing), "got {err:?}");
+        assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+    }
+
+    #[test]
+    fn serial_less_pkcs12_device_allowed_under_permissive_monitoring() {
+        // Permissive monitoring is the documented escape hatch: the admin has
+        // accepted that presence checks may be best-effort, so a serial-less
+        // device is allowed to authenticate. `minimal_cfg` is permissive.
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let cfg = minimal_cfg();
+        assert_eq!(
+            cfg.monitor.fail_mode,
+            tessera_core::config::validated::MonitorFailMode::Permissive
+        );
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+
+        let mut io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        io.device.serial = None;
+        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-noserial-ok".into(), |_| {
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .expect("permissive monitoring allows a serial-less device");
+        assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
+        assert!(outcome.auth_ctx.usb_serial.is_none());
     }
 
     #[test]
@@ -2515,6 +2765,83 @@ level = "info"
             "got {err:?}"
         );
         assert_eq!(err.pam_code(), 9);
+    }
+
+    #[test]
+    fn dispatcher_rejects_strict_pkcs11_before_loading_module() {
+        let mut cfg = pkcs11_native_cfg();
+        cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
+        let verifier = build_verifier();
+        let mappings = vec![cn_mapping("alice", "alice")];
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+        let io = dummy_flow_io();
+
+        let err = authenticate(
+            deps,
+            &io,
+            "alice",
+            "ssh",
+            "sess-p11-strict-dispatch".into(),
+            |_| Ok(SecretString::from("unused")),
+        )
+        .expect_err("strict pkcs11 must fail before loading the provider");
+
+        assert!(matches!(err, FlowError::Pkcs11StrictPresenceUnsupported));
+        assert_eq!(err.pam_code(), 9);
+    }
+
+    #[test]
+    fn strict_pkcs11_presence_is_rejected_before_token_io() {
+        let mut cfg = pkcs11_native_cfg();
+        cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
+        let verifier = build_verifier();
+        let mappings = vec![cn_mapping("alice", "alice")];
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+        let stub = StubPkcs11Io::new();
+        *stub.on_wait.borrow_mut() = Some(Err(Pkcs11Error::TokenWaitTimeout { seconds: 1 }));
+
+        let err = authenticate_pkcs11::<NoopMountOps, _, _>(
+            deps,
+            &stub,
+            "alice",
+            "ssh",
+            "sess-p11-strict".into(),
+            |_| Ok(SecretString::from("unused")),
+        )
+        .expect_err("strict pkcs11 must fail before token I/O");
+
+        assert!(matches!(err, FlowError::Pkcs11StrictPresenceUnsupported));
+        assert_eq!(err.pam_code(), 9);
+        assert!(
+            stub.on_wait.borrow().is_some(),
+            "strict-mode rejection must happen before token discovery"
+        );
     }
 
     #[test]
@@ -3261,8 +3588,316 @@ level = "info"
     }
 
     #[test]
+    fn session_expiry_never_exceeds_cert_not_after_under_delay() {
+        use tessera_core::role::{bounded_ttl, RoleId, SessionRolePayload};
+
+        // Reference instant at which cert-remaining is sampled (the earlier
+        // instant in the flow). The cert expires one hour later.
+        let ttl_sampled_at = SystemTime::now();
+        let not_after = ttl_sampled_at + Duration::from_secs(3600);
+
+        // The role TTL folds in the cert-remaining sampled at `ttl_sampled_at`
+        // together with a very large global default, so the certificate is the
+        // binding constraint (as it is for a short-lived cert).
+        let cert_ttl_at_sample = cert_remaining_ttl(Some(not_after));
+        let ttl = bounded_ttl(cert_ttl_at_sample, None, Duration::from_secs(100_000));
+        let payload = SessionRolePayload {
+            role: RoleId::new("serv").expect("valid role id"),
+            role_version: 1,
+            ttl,
+            mac_mask: None,
+        };
+
+        // `authenticated_at` lands LATER than the cert-ttl sample — the exact
+        // drift the fix must absorb. A naive `authenticated_at + ttl` would push
+        // the deadline past `not_after`; clamping must pin it to `not_after`.
+        let authenticated_at = ttl_sampled_at + Duration::from_secs(30);
+        let expiry = session_expiry(Some(&payload), authenticated_at, Some(not_after))
+            .expect("role session has an expiry");
+
+        assert!(
+            expiry <= not_after,
+            "enforced deadline {expiry:?} must not exceed cert notAfter {not_after:?}"
+        );
+        assert_eq!(
+            expiry, not_after,
+            "when the cert binds, the deadline must equal notAfter exactly"
+        );
+    }
+
+    #[test]
+    fn session_expiry_uses_role_deadline_when_shorter_than_cert() {
+        use tessera_core::role::{bounded_ttl, RoleId, SessionRolePayload};
+
+        // Cert valid for an hour, but the role/default TTL is only 10 minutes,
+        // so the role component binds and the deadline sits before notAfter.
+        let authenticated_at = SystemTime::now();
+        let not_after = authenticated_at + Duration::from_secs(3600);
+        let ttl = bounded_ttl(
+            cert_remaining_ttl(Some(not_after)),
+            Some(Duration::from_secs(600)),
+            Duration::from_secs(100_000),
+        );
+        let payload = SessionRolePayload {
+            role: RoleId::new("serv").expect("valid role id"),
+            role_version: 1,
+            ttl,
+            mac_mask: None,
+        };
+
+        let expiry = session_expiry(Some(&payload), authenticated_at, Some(not_after))
+            .expect("role session has an expiry");
+        assert_eq!(expiry, authenticated_at + Duration::from_secs(600));
+        assert!(expiry < not_after);
+    }
+
+    #[test]
+    fn session_expiry_is_none_without_role() {
+        let authenticated_at = SystemTime::now();
+        let not_after = authenticated_at + Duration::from_secs(3600);
+        assert_eq!(
+            session_expiry(None, authenticated_at, Some(not_after)),
+            None
+        );
+    }
+
+    #[test]
     fn role_denied_maps_to_perm_denied() {
         let err = FlowError::RoleDenied(tessera_core::role::RoleDenyReason::NotCovered);
         assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    }
+
+    // -----------------------------------------------------------------
+    // Strict monitor-registration fail-closed (continuous-presence
+    // enforcement).
+    //
+    // A cert-authenticated session that monitord never records is a
+    // session whose token / USB removal can never trigger the configured
+    // lock or logout. Under `monitor_fail_mode = "strict"` a registration
+    // failure must therefore deny the login; under `permissive` the
+    // `FailModeWrapper` absorbs transport errors and the login proceeds.
+    // -----------------------------------------------------------------
+
+    /// [`MonitorClient`] whose `open_session` always fails with a transport
+    /// error (`monitord unavailable`). That error is *not* one of the
+    /// verdict-changing kinds (`DeviceGone` / `Unauthorized`), so the
+    /// `FailModeWrapper` propagates it only in strict mode — exactly the
+    /// distinction under test. All other methods succeed.
+    struct FailingMonitor;
+
+    impl MonitorClient for FailingMonitor {
+        fn hello(&self) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+        fn open_session(
+            &self,
+            _info: &OpenSessionInfo<'_>,
+        ) -> Result<(), tessera_core::error::IpcError> {
+            Err(tessera_core::error::IpcError::Unavailable)
+        }
+        fn close_session(
+            &self,
+            _session_id: &str,
+            _reason: &str,
+        ) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+        fn ping(&self) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pkcs12_strict_monitor_failure_denies_auth() {
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let cfg = minimal_cfg();
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        // Strict fail mode: a monitord that cannot record the session must
+        // turn the otherwise-successful cert auth into a definitive denial.
+        let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Strict);
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+
+        let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let err = authenticate(deps, &io, "alice", "ssh", "sess-mon-strict".into(), |_| {
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .expect_err("strict monitor failure must deny auth");
+        assert!(
+            matches!(err, FlowError::MonitorRegistration(_)),
+            "got {err:?}"
+        );
+        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    }
+
+    #[test]
+    fn pkcs12_permissive_monitor_failure_succeeds() {
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let verifier = build_verifier();
+        let cfg = minimal_cfg();
+        let mappings = vec![cn_mapping("alice", "alice")];
+
+        // Permissive fail mode: the wrapper converts the transport error to
+        // Ok(()) before the flow ever sees it, so auth still succeeds.
+        let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Permissive);
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            user_mappings: &mappings,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: RoleStage::disabled(),
+            device_tags: empty_device_tags(),
+        };
+
+        let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-mon-perm".into(), |_| {
+            Ok(SecretString::from("correct-pin".to_string()))
+        })
+        .expect("permissive monitor failure must not block auth");
+        assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
+    }
+
+    /// Minimal [`OpenSessionInfo`] for exercising the registration
+    /// chokepoint directly.
+    fn sample_open_session_info(session_id: &str) -> OpenSessionInfo<'_> {
+        OpenSessionInfo {
+            session_id,
+            pam_user: "alice",
+            pam_service: "ssh",
+            host_id_hash: "host-T-hash",
+            target: tessera_proto::SessionTarget::Unknown,
+            usb_serial: Some("TOKEN-SERIAL"),
+            usb_vid_pid: None,
+            usb_devnode: None,
+            cert_cn: "alice",
+            cert_serial: "00",
+            engineer_ski: "",
+            engineer_cert_sha256: "",
+            uid: 1000,
+            role: None,
+            role_version: None,
+            session_expiry: None,
+        }
+    }
+
+    #[test]
+    fn pkcs11_strict_monitor_registration_denies() {
+        // The PKCS#11 success path ends by registering the session with
+        // monitord through the same `register_session_or_deny` chokepoint the
+        // PKCS#12 path uses. A full `authenticate_pkcs11` cannot run without a
+        // live token (a `Pkcs11Session` is not synthesizable), so we drive that
+        // final registration step directly under strict fail mode.
+        let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Strict);
+        let info = sample_open_session_info("sess-p11-strict");
+        let err = register_session_or_deny(&monitor, &info)
+            .expect_err("strict monitor failure must deny the pkcs11 session");
+        assert!(
+            matches!(err, FlowError::MonitorRegistration(_)),
+            "got {err:?}"
+        );
+        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    }
+
+    #[test]
+    fn pkcs11_permissive_monitor_registration_absorbed() {
+        // Under permissive fail mode the wrapper absorbs the transport error,
+        // so the PKCS#11 registration step (and thus the login) succeeds.
+        let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Permissive);
+        let info = sample_open_session_info("sess-p11-perm");
+        register_session_or_deny(&monitor, &info)
+            .expect("permissive monitor failure must not block the pkcs11 session");
+    }
+
+    #[cfg(feature = "mac-tests")]
+    fn malformed_max_integrity_leaf() -> tessera_core::x509::VerifiedX509 {
+        use openssl::asn1::{Asn1Integer, Asn1Object, Asn1OctetString, Asn1Time};
+        use openssl::bn::BigNum;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::rsa::Rsa;
+        use openssl::x509::extension::BasicConstraints;
+        use openssl::x509::{X509Builder, X509Extension, X509NameBuilder};
+
+        let key = PKey::from_rsa(Rsa::generate(2048).expect("rsa")).expect("pkey");
+        let mut name = X509NameBuilder::new().expect("name builder");
+        name.append_entry_by_text("CN", "malformed-max-integrity")
+            .expect("subject CN");
+        let name = name.build();
+        let mut cert = X509Builder::new().expect("cert builder");
+        cert.set_version(2).expect("version");
+        let serial = BigNum::from_u32(1).expect("serial");
+        cert.set_serial_number(&Asn1Integer::from_bn(&serial).expect("asn1 serial"))
+            .expect("set serial");
+        cert.set_subject_name(&name).expect("subject");
+        cert.set_issuer_name(&name).expect("issuer");
+        cert.set_pubkey(&key).expect("pubkey");
+        cert.set_not_before(&Asn1Time::days_from_now(0).expect("not before"))
+            .expect("set not before");
+        cert.set_not_after(&Asn1Time::days_from_now(365).expect("not after"))
+            .expect("set not after");
+        cert.append_extension(
+            BasicConstraints::new()
+                .critical()
+                .ca()
+                .build()
+                .expect("basic constraints"),
+        )
+        .expect("append basic constraints");
+
+        // SEQUENCE claims five body bytes but contains only three.
+        let malformed_der = [0x30_u8, 0x05, 0x02, 0x01, 0x02];
+        let oid = Asn1Object::from_str(tessera_core::x509::oids::MAX_INTEGRITY_OID).expect("OID");
+        let octets = Asn1OctetString::new_from_bytes(&malformed_der).expect("octets");
+        let extension =
+            X509Extension::new_from_der(&oid, false, &octets).expect("MAX_INTEGRITY extension");
+        cert.append_extension(extension)
+            .expect("append MAX_INTEGRITY");
+        cert.sign(&key, MessageDigest::sha256()).expect("sign");
+        tessera_core::x509::VerifiedX509::from_trusted_for_test(cert.build())
+    }
+
+    #[cfg(feature = "mac-tests")]
+    fn assert_malformed_max_integrity_denied_for_backend(backend: &str) {
+        let cert = malformed_max_integrity_leaf();
+        let ident = tessera_core::x509::CertIdent::from(&cert);
+
+        let error = extract_cert_max_integrity(&cert, "alice", &ident)
+            .expect_err("malformed MAX_INTEGRITY must fail closed");
+
+        assert!(
+            matches!(error, FlowError::MaxIntegrityMalformed(_)),
+            "{backend}: unexpected error: {error:?}"
+        );
+        assert_eq!(error.pam_code(), 6, "{backend}");
+    }
+
+    #[cfg(feature = "mac-tests")]
+    #[test]
+    fn pkcs12_malformed_max_integrity_fails_closed() {
+        assert_malformed_max_integrity_denied_for_backend("pkcs12");
+    }
+
+    #[cfg(feature = "mac-tests")]
+    #[test]
+    fn pkcs11_malformed_max_integrity_fails_closed() {
+        assert_malformed_max_integrity_denied_for_backend("pkcs11");
     }
 }

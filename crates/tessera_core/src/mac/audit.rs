@@ -62,9 +62,8 @@ pub const EVENT_MAC_SESSIONS_FILE_WARN: &str = "mac_sessions_file_label_warning"
 /// МКЦ subsystem is not available, so the daemon fell back to the
 /// no-op `StubBackend`.
 pub const EVENT_MAC_RUNTIME_FALLBACK: &str = "mac_runtime_fallback";
-/// `mac_runtime_disabled` — `[mac].runtime = "disabled"` and the
-/// binary was built with `astra-mac`; the stub backend is used
-/// intentionally.
+/// `mac_runtime_disabled` — `[mac].runtime = "disabled"`; the stub backend
+/// is used intentionally even when a plugin is installed.
 pub const EVENT_MAC_RUNTIME_DISABLED: &str = "mac_runtime_disabled";
 
 /// Emit `mac_skipped`.
@@ -316,9 +315,8 @@ pub fn emit_runtime_fallback(reason: &str) {
     );
 }
 
-/// Emit `mac_runtime_disabled` — operator explicitly disabled the MAC
-/// backend via `[mac].runtime = "disabled"` even though the binary was
-/// built with `astra-mac`.
+/// Emit `mac_runtime_disabled` — operator explicitly disabled the selected
+/// plugin via `[mac].runtime = "disabled"`.
 pub fn emit_runtime_disabled() {
     tracing::info!(
         target: "mac.audit",

@@ -18,6 +18,27 @@
   удостоверение проходило аутентификацию. Миграция: чтобы сохранить
   прежнее поведение, добавьте `mode = "none"` явно; лучше — включите
   реальную проверку (`mode = "crl"` / `"ocsp"` / `"crl_then_ocsp"`).
+- **ГОСТ через OpenSSL теперь требует явный `gost_engine_path`.** Если
+  allow-list разрешает ГОСТ-подписи, неявный поиск native-модуля через
+  унаследованный `OPENSSL_ENGINES` отклоняется при загрузке конфига.
+- **Persistent state демона перенесён в `/var/lib/tessera/daemon/`.**
+  Родитель `/var/lib/tessera/` теперь `0750 root:tessera`, потому что в
+  нём лежат доверенные роли, теги и enrollment material. Старый
+  `wallpaper.orig.jpg` безопасно мигрируется postinst-скриптом.
+
+### Security
+
+- PAM проверяет конфиг, trust anchors/intermediates, CRL, PKCS#11-модуль,
+  GOST engine, standalone-роли и device tags по полной root-controlled
+  цепочке пути. Symlink, non-root owner или group/world write приводят к
+  fail-closed отказу.
+- Битое присутствующее расширение `MAX_INTEGRITY` больше не считается
+  отсутствующим: обе credential-схемы отклоняют его до применения
+  optional fallback.
+- Unmaintained-цепочка `ab_glyph -> owned_ttf_parser -> ttf-parser`
+  удалена. Wallpaper writer переведён на maintained `skrifa` и
+  `ab_glyph_rasterizer`; размеры шрифта, шаблона и raster allocation
+  ограничены.
 
 ## [0.4.0] — 2026-07-07
 

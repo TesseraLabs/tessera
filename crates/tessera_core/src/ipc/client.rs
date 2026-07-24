@@ -110,6 +110,8 @@ impl MonitordClient {
             pam_service: payload.pam_service.clone(),
             target: payload.target.clone(),
             usb_serial: payload.usb_serial.clone(),
+            usb_vid_pid: payload.usb_vid_pid.clone(),
+            usb_devnode: payload.usb_devnode.clone(),
             host_id_hash: payload.host_id_hash.clone(),
             opened_at: payload.opened_at,
             cert_cn: payload.cert_cn.clone(),
@@ -119,6 +121,7 @@ impl MonitordClient {
             uid: payload.uid,
             role: payload.role.clone(),
             role_version: payload.role_version,
+            session_expiry: payload.session_expiry,
         };
         self.send(&msg)?;
         match self.recv()? {
@@ -271,6 +274,8 @@ impl MonitorClient for ConnectPerCall {
             pam_service: info.pam_service.to_string(),
             target: info.target.clone(),
             usb_serial: info.usb_serial.map(str::to_string),
+            usb_vid_pid: info.usb_vid_pid.map(str::to_string),
+            usb_devnode: info.usb_devnode.map(str::to_string),
             host_id_hash: info.host_id_hash.to_string(),
             opened_at: SystemTime::now(),
             cert_cn: info.cert_cn.to_string(),
@@ -280,6 +285,7 @@ impl MonitorClient for ConnectPerCall {
             uid: info.uid,
             role: info.role.map(str::to_string),
             role_version: info.role_version,
+            session_expiry: info.session_expiry,
         };
         c.send_session_open(&payload)
     }

@@ -20,6 +20,8 @@ fn s(i: u128) -> ActiveSession {
         pam_service: "s".into(),
         target: SessionTarget::logind("c1"),
         usb_serial: Some("AB".into()),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "cn".into(),
@@ -27,6 +29,7 @@ fn s(i: u128) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     }
 }
 
@@ -42,6 +45,30 @@ fn persist_then_load_is_identical() {
 }
 
 #[test]
+fn session_expiry_round_trips_through_store() {
+    // The scheduled-termination deadline must survive a daemon restart, so
+    // the persisted registry has to carry `session_expiry` verbatim.
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("sessions.json");
+    let store = RegistryStore::new(path);
+    let deadline = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234);
+    let mut with_ttl = s(7);
+    with_ttl.session_expiry = Some(deadline);
+    store.persist(&[with_ttl.clone(), s(8)]).expect("persist");
+    let loaded = store.load().expect("load");
+    let restored = loaded
+        .iter()
+        .find(|r| r.session_id == with_ttl.session_id)
+        .expect("session present");
+    assert_eq!(restored.session_expiry, Some(deadline));
+    let plain = loaded
+        .iter()
+        .find(|r| r.session_id == Uuid::from_u128(8))
+        .expect("session present");
+    assert_eq!(plain.session_expiry, None);
+}
+
+#[test]
 fn missing_file_returns_empty_no_error() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = RegistryStore::new(dir.path().join("missing.json"));
@@ -50,13 +77,20 @@ fn missing_file_returns_empty_no_error() {
 }
 
 #[test]
-fn corrupt_file_returns_empty() {
+fn corrupt_file_is_fail_closed() {
+    // A corrupt registry must NOT silently reset to empty: doing so would drop
+    // every active session and its pending credential-removal action across a
+    // restart. `load()` reports it so the daemon can refuse to start.
+    use tessera_cli::registry::RegistryLoadError;
     let dir = tempfile::tempdir().expect("tmp");
     let path = dir.path().join("bad.json");
     std::fs::write(&path, b"{not-json").expect("write");
-    let store = RegistryStore::new(path);
-    let loaded = store.load().expect("load");
-    assert!(loaded.is_empty());
+    let store = RegistryStore::new(path.clone());
+    let err = store.load().expect_err("corrupt registry must be an error");
+    assert!(
+        matches!(&err, RegistryLoadError::Corrupt { path: p, .. } if *p == path),
+        "expected Corrupt for {path:?}, got {err:?}"
+    );
 }
 
 #[test]

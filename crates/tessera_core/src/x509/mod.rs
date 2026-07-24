@@ -15,12 +15,14 @@
 pub mod allowed_roles_ext;
 pub mod basic_constraints;
 pub mod chain;
+pub mod chain_policy;
 pub mod delegation_constraints_ext;
 pub(crate) mod der;
 pub(crate) mod der_helpers;
 pub mod error;
 pub(crate) mod ext;
 pub mod host_binding_ext;
+pub mod key_strength;
 pub mod max_integrity_ext;
 pub mod oids;
 pub mod pinning;

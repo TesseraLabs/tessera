@@ -42,7 +42,7 @@ the example really validates through `ValidatedConfig::try_from`.
 |----------------------------|--------------------|-------------|----------------------------------------------------------------|---------------------------------------------------------------|--------------------------------------------------------------------------------------|
 | `crypto_backend`           | string             | —           | `"openssl"`, `"pkcs11_native"`                                 | Which backend computes signatures and hashes.                | `"openssl"` is required for GOST via `gost-engine`.                                  |
 | `mode`                     | string             | —           | `"pkcs12"`, `"pkcs11"`                                         | Where the user's key lives.                                   | `"pkcs11"` — non-extractable key; `"pkcs12"` — software protection.                  |
-| `pkcs11_module`            | path               | —           | absolute path to a `.so`                                       | Which PKCS#11 module is used.                                 | Required when `mode = "pkcs11"`.                                                     |
+| `pkcs11_module`            | path               | —           | absolute path to a `.so`                                       | Which PKCS#11 module is used.                                 | Required when `mode = "pkcs11"`; the file and every ancestor must be root-controlled. |
 | `pkcs11_token_label`       | string             | `None`      | `≤ 64` bytes, no NUL                                           | Filter by the token's `CKA_LABEL`.                           | Guards against accidentally selecting someone else's token on the machine.          |
 | `pkcs11_object_label`      | string             | `None`      | `≤ 64` bytes, no NUL                                           | Filter by the object's `CKA_LABEL` (cert/privkey).           | Likewise, protection against selecting the wrong object.                             |
 | `pkcs11_max_pin_attempts`  | integer            | `3`         | `1..=5`                                                        | How many times the module offers to enter the PIN.           | Too many → anti-paranoia; too few → poor UX.                                         |
@@ -52,20 +52,26 @@ the example really validates through `ValidatedConfig::try_from`.
 | `pkcs11_allow_extractable_keys` | boolean       | `false`     | `true`, `false`                                                | Whether to accept keys with `CKA_EXTRACTABLE = TRUE`.        | `false` (default) — reject (fail-closed): an extractable key breaks the invariant of mode B. `true` — only `pkcs11_extractable_key` WARN; enable deliberately. |
 | `pkcs12_path_pattern`      | string             | `"certs/user.p12"` | path relative to the USB mountpoint, optional `${user}` | Where to look for the `.p12` on the USB media (supports `${user}`). | Relative path only; `..`/`.` segments and absolute paths are rejected by the validator. |
 | `pkcs12_pin_prompt`        | string             | `"Smart-card PIN: "` | UTF-8, non-empty, `≤ 128` bytes                     | Prompt text for the `.p12` password.                         | UX localization.                                                                    |
-| `gost_engine_path`         | path               | `None`      | absolute path to a `.so`                                       | Explicit path to `gost-engine`. By default, lookup by id.    | `None` — the engine is looked up via `OPENSSL_ENGINES`.                              |
+| `gost_engine_path`         | path               | `None`      | absolute path to a `.so`                                       | Explicit path to `gost-engine`; required when OpenSSL allows GOST signatures. | Implicit `OPENSSL_ENGINES` lookup is rejected; the file and every ancestor must be root-controlled. |
 | `usb_wait_seconds`         | integer            | `10`        | `0..=300`                                                      | How many seconds to wait for the USB media.                  | UX. At `0` — fail-fast.                                                              |
 | `usb_allowed_devices`      | array of strings   | `[]`        | `"vid:pid"` strings, 4 hex digits each (lsusb format), e.g. `["0951:1666"]` | Allow-list of USB devices treated as `.p12` media; empty/absent = any USB block device. | Hygiene against accidental/foreign flash drives, NOT a trust boundary: VID/PID are forgeable, trust comes only from decrypting the `.p12` + chain validation. |
 | `max_usb_partitions`       | integer            | `8`         | `1..=64`                                                       | Maximum number of partitions scanned when searching for the `.p12`. | DoS protection: a physical attacker cannot force a huge number of mount/umount operations. |
 | `on_usb_removed`           | string             | `"lock"`    | `"lock"`, `"logout"`, `"hook"`, `"shutdown"`                   | Action on confirmed USB removal.                             | `"shutdown"` fits terminals; `"lock"` fits workstations.                             |
 | `usb_removed_grace_seconds`| integer            | `0`         | `0..=300`                                                      | Cancellation window: reinserting the same serial cancels the action. | Protects against false triggers; set to `0` on terminals.                    |
 | `suspend_grace_seconds`    | integer            | `0`         | `0..=600`                                                      | Window after resume during which USB removal is ignored.     | Hubs often make noise during suspend; `30` seconds is a typical value.               |
-| `monitor_fail_mode`        | string             | `"strict"`  | `"strict"`, `"permissive"`                                     | Whether to propagate non-fatal `monitord` IPC errors to the calling code (`strict`) or swallow them with a WARN (`permissive`). | `DeviceGone`/`Unauthorized` are always fatal; `monitord` transport failures do not override a successful auth (see architecture.md §13). |
+| `monitor_fail_mode`        | string             | `"strict"`  | `"strict"`, `"permissive"`                                     | Whether to propagate non-fatal `monitord` IPC errors to the calling code (`strict`) or swallow them with a WARN (`permissive`). | `DeviceGone`/`Unauthorized` are always fatal. Strict mode currently rejects PKCS#11 authentication because native token-removal observation is not implemented. |
 
 > **Authorization (host + user) is described in the certificate itself
 > via X.509 v3 extensions** `pam_cert_host_binding` and
 > `pam_cert_user_binding`. This file contains only trust + identity +
 > monitor + hooks; see [cert-issuance.md](cert-issuance.md) for issuing
 > certificates with the required extensions.
+
+The PAM authentication entry point validates its configuration and every
+configured trust anchor, intermediate, CRL, PKCS#11 module, and GOST engine
+as a regular root-owned file beneath root-owned, non-group/world-writable
+directories. Unsafe paths fail authentication before native code or trust
+material is loaded.
 
 #### Values of `on_usb_removed`
 
@@ -78,7 +84,10 @@ the example really validates through `ValidatedConfig::try_from`.
 
 With `"hook"`, the `[monitor]` section must contain
 `on_usb_removed_hook_path = "/absolute/path"`. The validator refuses to
-load the config when `on_usb_removed = "hook"` and no `hook_path` is set.
+load the config when `on_usb_removed = "hook"` and no `hook_path` is set,
+or when the executable or any parent directory is not root-controlled.
+The path is checked again immediately before execution; the hook receives a
+minimal environment with a fixed system `PATH`.
 
 ### The `[monitor]` section
 
@@ -214,7 +223,7 @@ extension).
 | Field                        | Type   | Default                  | Allowed values                   | Effect                                                                 | Security implication                                                  |
 |------------------------------|--------|--------------------------|---------------------------------|--------------------------------------------------------------------------|------------------------------------------------------------------------|
 | `enforce`                    | string | `"false"`                | `"false"`, `"warn"`, `"require"` | Migration stage of role enforcement.                                   | `"false"` — roles are not checked (v0.3.19 behavior); `"require"` — full fail-closed. |
-| `dir`                        | path   | `/var/lib/tessera/roles` | absolute path to a directory     | Role-store directory (`<role>.toml` slices).                            | `root:root`, directory `0755`, files `0644`.                          |
+| `dir`                        | path   | `/var/lib/tessera/roles` | absolute path to a directory     | Role-store directory (`<role>.toml` slices).                            | Standalone loads enforce `root:root` on the directory, every slice, and all ancestors; no group/world write. |
 | `default_session_ttl_seconds`| integer| `43200` (12 h)           | seconds                          | Session TTL when neither the credential nor the role sets one.          | No unbounded session arises — the ceiling is always finite.          |
 
 **`enforce` semantics:**
@@ -248,7 +257,7 @@ envelope with a group constraint on an untagged device is rejected.
 |-----------|---------|--------------|-------------------------|------------------------------------------------------------------------|--------------------------------------------------------------|
 | `enforce` | boolean | `false`      | `true`/`false`          | Whether to read the tag source. `false` — a device with no applied tags. | Group delegations on an untagged device are rejected anyway (fail-closed). |
 | `mode`    | string  | `standalone` | `standalone`, `managed` | Trust model of the source: a tags file or a signed `manifest.toml`.    | `managed` requires a signed manifest.                       |
-| `source`  | path    | `/var/lib/tessera/tags.toml` (standalone) / role-store directory (managed) | absolute path | The tags file or the directory with the manifest. | The permissions on the source file are part of the trust boundary. |
+| `source`  | path    | `/var/lib/tessera/tags.toml` (standalone) / role-store directory (managed) | absolute path | The tags file or the directory with the manifest. | Standalone loads enforce a root-owned, non-group/world-writable file and complete ancestor path. |
 
 ### The `[[hooks]]` section
 
@@ -262,7 +271,7 @@ lifecycle stage. The full implementation is in
 | `command`          | list of strings | —    | `[ "/usr/local/sbin/foo", "arg" ]`, the first element is an absolute path                             | The hook's argv. Passed **literally**; placeholders in argv are NOT substituted. | Dynamic data is passed only through `env` — argv injection is impossible. |
 | `timeout_seconds`  | integer      | `10`    | `1..=120`                                                                                             | Execution timeout.                                      | The hook is killed with `SIGKILL` when it expires.                                     |
 | `on_failure`       | string       | `None`  | `"warn"`, `"ignore"`; any other value → abort                                                        | What to do on a non-zero hook return code.              | Default: abort (deny) for `pre_auth` (there, `"warn"` is also forced to abort); `"warn"` for the other stages. |
-| `run_as`           | string       | `None`  | UNIX name                                                                                             | The UID the hook runs under.                            | Defaults to `root`. Dropping privileges is best practice.                             |
+| `run_as`           | string       | `None`  | `"root"`, `"user"`                                                                                    | The privilege the hook runs under: `root` or `user` (the authenticated PAM user). | Defaults to `root`. Any other value (a typo, an account name) is a **configuration error**, not a silent fall-back to root. Dropping privileges (`user`) is best practice. |
 | `env`              | table        | `{}`    | `{ KEY = "literal ${placeholder}" }` strings                                                         | Environment variables passed to the hook.               | Base: a whitelist of `PATH`/`HOME`/`USER`/`LOGNAME`/`LANG` + all `TESSERA_*` variables; custom keys may override them. |
 
 `${...}` substitution works **only in `env` values** — `command` is
@@ -309,9 +318,9 @@ PAM_TEXT_INFO is not forwarded to the UI.
 |-------------------------|--------|---------------------------------------------------------------|--------------------------------------------------------------------------|
 | `update_wallpaper`      | bool   | `false`                                                       | Enable the wallpaper writer.                                             |
 | `wallpaper_target`      | path   | `/usr/share/wallpapers/fly-default-light.jpg`                 | The JPG that the daemon repaints.                                       |
-| `wallpaper_backup`      | path   | `/var/lib/tessera/wallpaper.orig.jpg`                    | Where the one-time original of the source is saved.                     |
+| `wallpaper_backup`      | path   | `/var/lib/tessera/daemon/wallpaper.orig.jpg`             | Where the one-time original of the source is saved.                     |
 | `wallpaper_font`        | path   | `/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf`        | The TrueType font used for rendering.                                   |
-| `wallpaper_font_size`   | int    | `64`                                                          | Font size in points.                                                    |
+| `wallpaper_font_size`   | int    | `64`                                                          | Font size in points (`1..=512`).                                        |
 | `wallpaper_text_color`  | string | `"#000000"`                                                   | Color in hex (`#RRGGBB`).                                               |
 | `wallpaper_gravity`     | enum   | `"south"`                                                     | `north` / `south` / `east` / `west` / `center` — the positioning anchor. |
 | `wallpaper_offset_x`    | int    | `0`                                                           | Horizontal offset in pixels from the gravity anchor.                    |
@@ -337,7 +346,7 @@ set of `host_id`s.
 | Field              | Type         | Default | Allowed values             | Effect                                                 | Security implication                                                  |
 |--------------------|--------------|---------|-----------------------------|--------------------------------------------------------|------------------------------------------------------------------------|
 | `when_host_id_in`  | list of strings | —     | list of `host_id`s          | On which machines to apply the override.                | Must be non-empty.                                                     |
-| `anchors`          | list of paths | `[]`   | PEM files                   | Which trust roots to use instead of the main ones.      | Narrows trust on specific machines.                                    |
+| `anchors`          | list of paths | —      | `≥ 1` PEM file              | Which trust roots to use instead of the main ones.      | Required and non-empty; narrows trust on specific machines.             |
 | `intermediates`    | list of paths | `[]`   | PEM files                   | Which intermediates to use.                             | Likewise.                                                              |
 
 ### Worked example: a minimal valid configuration
@@ -394,13 +403,16 @@ Details and ready-made `openssl.cnf` recipes are in
 
 ## Typical scenarios
 
-### 3.1 Terminal — offline, CRL with TTL, USB required
+### 3.1 Terminal — offline, CRL with TTL, PKCS#11 without continuous presence
 
-Properties: the machine is in a metal enclosure, no Internet, the key is
-on a token, USB removal → immediate session termination (no grace).
+Properties: the machine is in a metal enclosure, no Internet, and the key is
+on a token. Native PKCS#11 removal observation is not implemented yet, so this
+profile is suitable only where bounded role/session TTL is an acceptable
+compensating control. Do not deploy it where token removal must immediately
+end the session.
 
 ```toml
-crypto_backend = "openssl"
+crypto_backend = "pkcs11_native"
 mode           = "pkcs11"
 pkcs11_module  = "/usr/lib/librtpkcs11ecp.so"
 pkcs11_max_pin_attempts = 3
@@ -410,7 +422,7 @@ usb_wait_seconds         = 5
 on_usb_removed           = "shutdown"   # terminal — power off
 usb_removed_grace_seconds = 0           # no cancellation
 suspend_grace_seconds    = 0
-monitor_fail_mode        = "strict"
+monitor_fail_mode        = "permissive" # required for PKCS#11 until native removal monitoring
 
 [trust]
 anchors = ["/etc/tessera/ca/terminal-ca.pem"]
@@ -444,8 +456,10 @@ level = "warn"
 Rationale for the choices:
 
 - `mode = "pkcs11"` + `librtpkcs11ecp.so`: a non-extractable key.
-- `on_usb_removed = "shutdown"`: a terminal must not stay powered on with
-  an unlocked session.
+- `monitor_fail_mode = "permissive"`: PKCS#11 token serials are not USB
+  block-device serials. Strict authentication is refused until monitord has a
+  native token-event source; `on_usb_removed` is therefore not an enforcement
+  boundary for this profile.
 - `usb_removed_grace_seconds = 0`: on a terminal there can be no "pulled
   it out and changed my mind".
 - `mode = "crl"` with `crl_max_age_hours = 72`: three days is a
@@ -460,7 +474,7 @@ Rationale for the choices:
 ### 3.2 Workstation in a protected segment — CRL, GOST token
 
 ```toml
-crypto_backend = "openssl"
+crypto_backend = "pkcs11_native"
 mode           = "pkcs11"
 pkcs11_module  = "/usr/lib/librtpkcs11ecp.so"
 pkcs11_token_label = "STAFF"
@@ -471,7 +485,7 @@ usb_wait_seconds         = 10
 on_usb_removed           = "lock"
 usb_removed_grace_seconds = 30
 suspend_grace_seconds    = 60
-monitor_fail_mode        = "strict"
+monitor_fail_mode        = "permissive" # required for PKCS#11 until native removal monitoring
 
 [trust]
 anchors = ["/etc/tessera/ca/staff-ca.pem"]
@@ -502,7 +516,7 @@ stage           = "post_auth_success"
 command         = ["/usr/local/sbin/audit-login"]
 timeout_seconds = 5
 on_failure      = "warn"
-run_as          = "audit"
+run_as          = "user"
 env             = { AUDIT_USER = "${pam_user}", AUDIT_SERIAL = "${cert_serial}" }
 ```
 
@@ -560,16 +574,15 @@ Rationale:
 
 ## MAC integrity (Astra МКЦ, 0.3.0+)
 
-The `[mac]` section is optional. On a build without the `astra-mac`
-feature (Debian, Ubuntu, Astra without strict-mode) the presence of the
-section is not forbidden — but `cert_integrity = "required"` is rejected
-at config load: the stub backend cannot apply labels and must not
-silently pass an authentication that promised to apply them.
+The `[mac]` section is optional. The same open binary runs on
+Debian/Ubuntu/Astra. Real enforcement appears only when a signed runtime
+plugin is installed and explicitly selected with `backend`.
 
 ### Fields
 
 | Field                             | Type          | Default      | Description                                                                                                |
 |-----------------------------------|---------------|--------------|-----------------------------------------------------------------------------------------------------------|
+| `backend`                         | string        | —            | Explicit runtime plugin name, for example `"parsec"`. Absence selects `StubBackend`.                    |
 | `cert_integrity`                  | enum          | `"optional"` | One of `required` / `optional` / `ignore`. See below.                                                    |
 | `fallback_max_integrity.level`    | int (-128..127) | —          | The fallback label's level, when the `MAX_INTEGRITY` extension is absent and `cert_integrity = "optional"`. |
 | `fallback_max_integrity.categories` | string (hex or CSV) | —    | The category bitmask for the fallback. An empty string = `''B`.                                          |
@@ -581,42 +594,38 @@ silently pass an authentication that promised to apply them.
 - **`required`** — the certificate must contain `MAX_INTEGRITY`. If the
   extension is absent or the DER is broken, authentication is rejected
   (`mac_required_no_label` / `mac_parse_failed`).
-- **`optional`** — the extension is applied when present. If it is absent:
+- **`optional`** — the extension is applied when present. A present malformed
+  extension rejects authentication; only genuine absence may use the fallback:
   - `[mac.fallback_max_integrity]` is present → the fallback is applied;
   - no fallback → the labeling step is skipped (`mac_label_skipped` is
     logged).
-- **`ignore`** — the extension is parsed for diagnostics
-  (`mac_label_parsed`) but not applied. Safe for migrating a fleet of
-  machines without runtime MIC.
+- **`ignore`** — a valid extension is parsed for diagnostics
+  (`mac_label_parsed`) but not applied; malformed DER still rejects
+  authentication. Safe for migrating a fleet of machines without runtime MIC.
 
 ### `runtime` semantics (0.3.7+)
 
-The compile-time `astra-mac` feature decides **whether** the binary can
-link against libpdp. The `runtime` field decides **whether** the binary
-will actually use the real backend in the current process. This matters
-for a mixed fleet: the same `.deb` is installed on both MIC and non-MIC
-machines, and the behavior is controlled through `config.toml`.
+`backend` selects a separate signed shared library; `runtime` defines how
+it is used. The open host verifies signature and ABI before `dlopen`/`init`.
+Additional files are never auto-activated.
 
-- **`required`** — a `ParsecBackend` + an active MIC kernel
-  (`parsec_strict_mode() == 1`) are mandatory. If the kernel is not
-  active, authentication is rejected with a `mac_runtime_required` event
-  (ERROR). Requires a binary built with `astra-mac` — otherwise the
-  config is rejected at startup.
-- **`auto`** *(default)* — at session start `parsec_strict_mode` is
-  probed; if active — the real `ParsecBackend`, otherwise a fallback to
+- **`required`** — the selected plugin and its runtime are mandatory.
+  Missing files, bad signature/ABI/init, or an inactive runtime fail closed
+  with `plugin_rejected`/`mac_runtime_required`.
+- **`auto`** *(default)* — an active selected plugin is used; otherwise
+  the host falls back to
   `StubBackend` with a one-time `mac_runtime_fallback` event (WARN).
   Suitable for dev machines and a mixed fleet.
-- **`disabled`** — always `StubBackend`, even if the binary is built with
-  `astra-mac`. Used on terminals without a MIC kernel to guarantee that
-  `pdp_*` is never called. A `mac_runtime_disabled` event is logged (INFO).
+- **`disabled`** — always `StubBackend`, even when a plugin is installed.
+  Plugin callbacks are not invoked. `mac_runtime_disabled` is logged (INFO).
 
 Config validation:
 
 - `runtime = "disabled"` + `cert_integrity = "required"` is rejected at
   startup (logically incompatible: the stub cannot read or set the label
   that the cert policy requires).
-- `runtime = "required"` in a binary without `astra-mac` is rejected at
-  startup.
+- `runtime = "required"` or `cert_integrity = "required"` without
+  `backend` is rejected at startup.
 
 ### The effective label
 
@@ -636,6 +645,7 @@ after the intersection, `effective.level < cert.level`, a
 
 ```toml
 [mac]
+backend = "parsec"
 cert_integrity = "optional"
 
 [mac.fallback_max_integrity]

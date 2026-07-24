@@ -15,7 +15,7 @@ use tessera_proto::SessionTarget;
 
 pub mod store;
 
-pub use store::RegistryStore;
+pub use store::{RegistryLoadError, RegistryStore};
 
 /// Errors raised by [`SessionRegistry::update_target`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -38,6 +38,21 @@ pub struct ActiveSession {
     pub target: SessionTarget,
     /// USB serial that authorised the session.
     pub usb_serial: Option<String>,
+    /// USB `VID:PID` (lowercase hex `vvvv:pppp`) of the authenticating
+    /// device, when known.
+    ///
+    /// Captured at authentication time so a udev `add` event can be checked
+    /// against the device's vendor/product identity — not just the
+    /// cloneable USB descriptor serial — before it is allowed to cancel a
+    /// pending credential-removal action. `None` for PKCS#11 tokens and for
+    /// sessions registered by a client that predates this field.
+    #[serde(default)]
+    pub usb_vid_pid: Option<String>,
+    /// Block-device node the credential was read from (e.g. `/dev/sdb1`),
+    /// when known. Part of the same device-topology binding as
+    /// [`Self::usb_vid_pid`].
+    #[serde(default)]
+    pub usb_devnode: Option<String>,
     /// Hex host id hash.
     pub host_id_hash: String,
     /// Wall-clock open time.
@@ -57,6 +72,18 @@ pub struct ActiveSession {
     /// key for `find_by_uid`. `0` means "v1 client / unknown".
     #[serde(default)]
     pub uid: u32,
+    /// Absolute wall-clock instant at which a bounded role session must end,
+    /// as computed by the PAM module at authentication time (earliest of the
+    /// role/default TTL measured from the authentication instant and the
+    /// certificate's `notAfter`). `None` for sessions with no role/TTL.
+    /// Persisted so the deadline survives a daemon restart and the scheduled
+    /// termination is re-armed against the same absolute instant on startup.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "tessera_proto::system_time_serde::option"
+    )]
+    pub session_expiry: Option<SystemTime>,
 }
 
 /// Two-level state held under one mutex: `by_id` is the primary store,
@@ -182,16 +209,26 @@ impl SessionRegistry {
         }
     }
 
-    /// Look up the active session for `uid`. Returns `None` when no session
-    /// is currently tracked for that uid, or when `uid == 0` (sentinel
-    /// for "no uid recorded").
+    /// Look up the active, unexpired session for `uid`.
+    ///
+    /// Returns `None` when no session is currently tracked, `uid == 0`
+    /// (sentinel for "no uid recorded"), or the session's absolute TTL has
+    /// elapsed. The expiry check is independent of the state-manager timer so
+    /// a slow registry fsync cannot briefly expose stale role authorization.
     pub fn find_by_uid(&self, uid: u32) -> Option<ActiveSession> {
         if uid == 0 {
             return None;
         }
         let g = self.inner.lock();
         let session_id = *g.by_uid.get(&uid)?;
-        g.by_id.get(&session_id).cloned()
+        let session = g.by_id.get(&session_id)?;
+        if session
+            .session_expiry
+            .is_some_and(|deadline| deadline <= SystemTime::now())
+        {
+            return None;
+        }
+        Some(session.clone())
     }
 
     /// Return every session whose `usb_serial` matches `serial`.

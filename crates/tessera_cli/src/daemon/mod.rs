@@ -27,7 +27,7 @@ use tessera_core::config::validated::OnUsbRemoved as CoreOnUsbRemoved;
 use crate::logind::LogindActions;
 use crate::logind::{LogindActionsTrait, NoopActions};
 use crate::registry::{RegistryStore, SessionRegistry};
-use crate::state::{spawn_state_manager, OnUsbRemoved, StateConfig};
+use crate::state::{spawn_state_manager, CredentialMode, OnUsbRemoved, StateConfig};
 use crate::udev_query::{AlwaysPresent, UdevQuery};
 use crate::{actions, logging, logind, notify, registry, server, shutdown, state, udev_monitor};
 
@@ -130,8 +130,15 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     // its severity level; if any check reported `Error`, refuse to start
     // so misconfigurations surface loudly in `systemctl status` instead of
     // silently degrading every subsequent auth.
+    let mac_backend: Arc<dyn tessera_core::mac::MacBackend> = Arc::from(
+        tessera_core::plugin::load_enforcement_backend(validated.mac.backend.as_deref(), ""),
+    );
     let startup_opts = crate::startup_check::StartupCheckOptions::default();
-    let report = crate::startup_check::run_startup_checks(&validated, &startup_opts);
+    let report = crate::startup_check::run_startup_checks_with_backend(
+        &validated,
+        &startup_opts,
+        mac_backend.as_ref(),
+    );
     report.log();
     if report.has_errors() {
         anyhow::bail!(
@@ -207,11 +214,11 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     //
     // Замок кладётся рядом с файлом состояния; каталог создаётся при
     // необходимости (демон может стартовать раньше tmpfiles.d); фолбэк
-    // /var/lib/tessera/daemon.lock — для патологического случая пути без
-    // родителя. `lock_path` вычисляем ДО `RegistryStore::new`, который
+    // /var/lib/tessera/daemon/daemon.lock — для патологического случая пути
+    // без родителя. `lock_path` вычисляем ДО `RegistryStore::new`, который
     // забирает `state_file_path` во владение.
     let lock_path = state_file_path.parent().map_or_else(
-        || PathBuf::from("/var/lib/tessera/daemon.lock"),
+        || PathBuf::from("/var/lib/tessera/daemon/daemon.lock"),
         |dir| dir.join("daemon.lock"),
     );
     if let Some(lock_dir) = lock_path.parent() {
@@ -243,8 +250,22 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         "acquired daemon singleton lock"
     );
 
-    let store = RegistryStore::new(state_file_path);
-    let initial = store.load().unwrap_or_default();
+    let store = RegistryStore::with_backend(state_file_path, Arc::clone(&mac_backend));
+    // Fail closed on a corrupt or unreadable registry rather than silently
+    // starting empty: an empty registry would drop every active session and
+    // its pending credential-removal action, defeating continuous-presence
+    // enforcement across a restart. A missing file is not an error — it
+    // simply means a fresh host with no sessions yet.
+    let initial = store.load().map_err(|e| {
+        tracing::error!(
+            target: "tessera.monitord",
+            error = %e,
+            audit_level = "CRITICAL",
+            "session registry could not be loaded; refusing to start with an empty registry"
+        );
+        anyhow::Error::new(e)
+            .context("load persisted session registry (refusing to start fail-open)")
+    })?;
     let registry = SessionRegistry::from_snapshot(initial);
 
     let shutdown_tok = CancellationToken::new();
@@ -290,6 +311,10 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         }
     };
     let cfg = StateConfig {
+        credential_mode: match validated.mode {
+            tessera_core::config::validated::Mode::Pkcs12 => CredentialMode::Pkcs12,
+            tessera_core::config::validated::Mode::Pkcs11 => CredentialMode::Pkcs11,
+        },
         grace_seconds,
         suspend_grace_seconds,
         on_usb_removed,
@@ -392,7 +417,7 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         );
     }
 
-    let listener = server::bind_listener(&socket_path).await?;
+    let listener = server::bind_listener_with_backend(&socket_path, mac_backend.as_ref()).await?;
     let accept_event_tx = event_tx.clone();
     let accept_token = shutdown_tok.clone();
     // Plumb the validated `[monitor]` IPC knobs (idle timeout, connection
@@ -436,6 +461,8 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         pam_service: String::new(),
         target: tessera_proto::SessionTarget::Unknown,
         usb_serial: None,
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: String::new(),
         opened_at: std::time::SystemTime::UNIX_EPOCH,
         cert_cn: String::new(),
@@ -443,6 +470,7 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     };
     Ok(())
 }

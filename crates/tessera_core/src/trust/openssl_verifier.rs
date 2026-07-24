@@ -218,10 +218,11 @@ impl OpensslVerifier {
         }
         let crl_refs: Vec<&[u8]> = cfg.crl_pems.iter().map(Vec::as_slice).collect();
         let crl_store = CrlStore::from_pems(&crl_refs)?;
-        // Defense-in-depth: `crl` mode with an empty store makes the
-        // revocation check short-circuit to Ok for every certificate. Config
-        // validation already rejects this, but refuse construction rather
-        // than risk a silently disabled revocation check at auth time.
+        // Defense-in-depth: in `crl` mode an empty store covers no
+        // certificate, so every non-anchor cert would be refused as uncovered.
+        // Config validation already rejects this; refuse construction too so
+        // the misconfiguration surfaces early rather than as a blanket
+        // authentication failure at runtime.
         if matches!(cfg.revocation_mode, RevocationMode::Crl) && crl_store.is_empty() {
             return Err(TrustError::PathBuild("crl mode requires at least one CRL"));
         }
@@ -303,6 +304,18 @@ impl OpensslVerifier {
         //     intermediate without keyCertSign slips through.
         verify_intermediate_constraints(&chain, now, self.pre_cfg.clock_skew)?;
 
+        // 4b-bis. Per-link chain policy: public-key strength on every cert,
+        //     signature-algorithm allow-listing on every non-anchor link, and
+        //     the EKU intersection that keeps `clientAuth` reachable. The
+        //     crate does manual path validation, so these RFC 5280 rules are
+        //     applied explicitly here rather than by `X509_verify_cert`.
+        crate::x509::chain_policy::enforce_chain_policy(
+            &chain,
+            &crate::x509::chain_policy::ChainPolicy {
+                signature_alg_whitelist: &self.pre_cfg.signature_alg_whitelist,
+            },
+        )?;
+
         // 4c. Profile version-gate (4.1) + unknown-critical-extension scan
         //     (2.3) over every cert in the chain (fail-closed). The
         //     delegation-envelope checks (4.2-4.4, device.tags ⊇ requireTags +
@@ -349,7 +362,8 @@ impl OpensslVerifier {
     /// Revocation dispatch over the configured [`RevocationMode`].
     ///
     /// * `None`  — no revocation check.
-    /// * `Crl`   — strict offline CRL (unchanged behaviour).
+    /// * `Crl`   — strict offline CRL: every non-anchor cert must be covered
+    ///   by a fresh, authentic, in-scope CRL, else it fails closed.
     /// * `Ocsp`  — every non-anchor cert is checked via OCSP; the CRL store
     ///   is not consulted.
     /// * `CrlThenOcsp` — a fresh covering CRL gives the verdict offline;

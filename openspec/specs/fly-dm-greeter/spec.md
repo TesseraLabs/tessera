@@ -18,7 +18,7 @@
 
 ### Requirement: Backup-цикл
 
-Первый запуск (backup нет, target есть): writer ДОЛЖЕН (MUST) снять one-time backup `wallpaper_target → wallpaper_backup` (default `/var/lib/tessera/wallpaper.orig.jpg` — вне владений пакета fly-qdm, переживает apt-upgrade). Последующие запуски: backup НЕ перезаписывается; рендер ВСЕГДА из backup (идемпотентно). Обновление оригинала требует ручного удаления backup. Нет ни backup, ни target → тихий skip (хост без fly-dm).
+Первый запуск (backup нет, target есть): writer ДОЛЖЕН (MUST) снять one-time backup `wallpaper_target → wallpaper_backup` (default `/var/lib/tessera/daemon/wallpaper.orig.jpg` — в отдельном daemon-writable подкаталоге, вне владений пакета fly-qdm, переживает apt-upgrade). Последующие запуски: backup НЕ перезаписывается; рендер ВСЕГДА из backup (идемпотентно). Обновление оригинала требует ручного удаления backup. Нет ни backup, ни target → тихий skip (хост без fly-dm).
 
 #### Scenario: Первый запуск
 - **WHEN** backup отсутствует, target существует
@@ -26,7 +26,7 @@
 
 ### Requirement: Рендер
 
-Шаблон по локали (`LC_MESSAGES`/`LANG` startswith "ru" → template_ru) ДОЛЖЕН (MUST) поддерживать подстановки `{host_id_short}` (prefix8), `{source}`, `%n` (hostname). Дефолты: DejaVuSans-Bold 64pt, чёрный, gravity=south, offset_y=120, `wallpaper_offset_x`=0 (горизонтальный сдвиг баннера, может быть отрицательным; raw.rs:162, validated.rs:590, fly_dm_wallpaper_writer.rs:165). Запись atomic (tmpfile+rename), выход всегда JPEG. Pure Rust (`image`+`ab_glyph`) — без ImageMagick/Pango. Writer НЕ ДОЛЖЕН (MUST NOT) редактировать settings.ini (blur/color_overlay/path — зона оператора/Ansible; baseline для читаемости: `color_overlay=0,0,0,30`, `blur enable=false`).
+Шаблон по локали (`LC_MESSAGES`/`LANG` startswith "ru" → template_ru) ДОЛЖЕН (MUST) поддерживать подстановки `{host_id_short}` (prefix8), `{source}`, `%n` (hostname). Дефолты: DejaVuSans-Bold 64pt, чёрный, gravity=south, offset_y=120, `wallpaper_offset_x`=0 (горизонтальный сдвиг баннера, может быть отрицательным). Размер шрифта ограничен `1..=512`, шаблон — 1024 байтами, text raster — 16 Mi pixels. Запись atomic (tmpfile+rename), выход всегда JPEG. Pure Rust (`image` + maintained `skrifa` + `ab_glyph_rasterizer`) — без ImageMagick/Pango и без unmaintained `ttf-parser`. Writer НЕ ДОЛЖЕН (MUST NOT) редактировать settings.ini (blur/color_overlay/path — зона оператора/Ansible; baseline для читаемости: `color_overlay=0,0,0,30`, `blur enable=false`).
 
 #### Scenario: Русская локаль
 - **WHEN** `LANG` начинается с "ru"

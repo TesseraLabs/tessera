@@ -28,11 +28,15 @@
 
 ### Requirement: SPI-контракт MacBackend
 
-Trait `MacBackend` (probe/apply_session/get_user_mnkc) и `StubBackend` ДОЛЖНЫ (MUST) оставаться в открытом ядре как стабильный публичный контракт; коммерческий компонент реализует этот trait (ParsecBackend) и подключается статической линковкой. Изменение сигнатур trait — breaking change с согласованным релизом обеих частей.
+Trait `MacBackend` и `StubBackend`, а также C-ABI `backend.enforcement` ДОЛЖНЫ (MUST)
+оставаться в открытом ядре. Коммерческий Parsec-компонент поставляется отдельной
+подписанной `.so`, загружается только при явном `[mac] backend = "parsec"` и НЕ ДОЛЖЕН
+(MUST NOT) входить в Cargo-граф открытого репозитория. Изменение ABI version — breaking
+change с согласованным релизом обеих частей.
 
 #### Scenario: Коммерческая сборка поверх открытого ядра
-- **WHEN** коммерческая сборка использует открытое ядро (path-dep/submodule, pin на тег)
-- **THEN** ParsecBackend линкуется статически и проходит contract-тесты MacBackend из этого репозитория
+- **WHEN** установлен коммерческий Parsec-плагин, собранный против открытого ABI
+- **THEN** открытый host проверяет подпись и ABI до init, затем contract-тесты MacBackend проходят через C-vtable
 
 ### Requirement: CLA для внешних контрибьюторов
 

@@ -16,7 +16,7 @@ use crate::actions;
 use crate::logind::{LogindActionsTrait, NoopActions};
 use crate::registry::{RegistryStore, SessionRegistry};
 use crate::server;
-use crate::state::{spawn_state_manager, OnUsbRemoved, StateConfig};
+use crate::state::{spawn_state_manager, CredentialMode, OnUsbRemoved, StateConfig};
 use crate::udev_query::{AlwaysPresent, UdevQuery};
 
 /// Handle returned by [`spawn_test_server`].
@@ -138,6 +138,7 @@ async fn spawn_inner(
     let actions = Arc::new(RecordingActions::default());
     let actions_dyn: Arc<dyn LogindActionsTrait> = actions.clone();
     let cfg = StateConfig {
+        credential_mode: CredentialMode::Pkcs12,
         grace_seconds: 1,
         suspend_grace_seconds: 5,
         on_usb_removed,

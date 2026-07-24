@@ -61,6 +61,8 @@ fn seeded_session(uid: u32, ski: &str) -> ActiveSession {
         pam_service: "sshd".into(),
         target: SessionTarget::logind("c1"),
         usb_serial: Some("AB".into()),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "host".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "Alice".into(),
@@ -68,6 +70,7 @@ fn seeded_session(uid: u32, ski: &str) -> ActiveSession {
         engineer_ski: ski.into(),
         engineer_cert_sha256: "1234".into(),
         uid,
+        session_expiry: None,
     }
 }
 

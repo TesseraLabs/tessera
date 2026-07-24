@@ -1,0 +1,94 @@
+name: enterprise compatibility
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enterprise-compat-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  exact-sha:
+    name: enterprise exact-SHA compatibility
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 55
+    steps:
+      - name: Validate trusted PR source
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          OPEN_REPOSITORY: ${{ github.repository }}
+          OPEN_CORE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$HEAD_REPOSITORY" != "$OPEN_REPOSITORY" ]; then
+            echo "::error::Enterprise compatibility requires a branch in $OPEN_REPOSITORY; secrets are not exposed to fork PRs."
+            exit 1
+          fi
+          if [[ ! "$OPEN_CORE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The PR head is not a full lowercase Git commit SHA."
+            exit 1
+          fi
+
+      - name: Mint enterprise dispatch token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.TESSERA_CI_APP_ID }}
+          private-key: ${{ secrets.TESSERA_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: tessera-enterprise
+          permission-actions: read
+          permission-contents: write
+
+      - name: Dispatch exact-SHA compatibility run
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OPEN_CORE_SHA: ${{ github.event.pull_request.head.sha }}
+          OPEN_CORE_PR: ${{ github.event.pull_request.number }}
+          REQUEST_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          gh api --method POST \
+            repos/TesseraLabs/tessera-enterprise/dispatches \
+            -f event_type=open-core-pr \
+            -F "client_payload[open_core_sha]=$OPEN_CORE_SHA" \
+            -F "client_payload[open_core_pr]=$OPEN_CORE_PR" \
+            -F "client_payload[request_id]=$REQUEST_ID"
+
+      - name: Wait for enterprise result
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REQUEST_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          title="open-core compatibility $REQUEST_ID"
+          endpoint="repos/TesseraLabs/tessera-enterprise/actions/workflows/open-core-compat.yml/runs?event=repository_dispatch&per_page=50"
+          run_id=""
+
+          for _ in $(seq 1 120); do
+            run_id="$(
+              gh api "$endpoint" |
+                jq -r --arg title "$title" \
+                  '[.workflow_runs[] | select(.display_title == $title) | .id] | first // empty'
+            )"
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "::error::Enterprise compatibility run was not visible after 10 minutes."
+            exit 1
+          fi
+
+          echo "Following enterprise run $run_id"
+          gh run watch "$run_id" \
+            --repo TesseraLabs/tessera-enterprise \
+            --interval 10 \
+            --exit-status

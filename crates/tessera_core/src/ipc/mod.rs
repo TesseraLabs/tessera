@@ -41,6 +41,17 @@ pub struct OpenSessionInfo<'a> {
     pub target: SessionTarget,
     /// USB serial that authorised the session, when available.
     pub usb_serial: Option<&'a str>,
+    /// USB `VID:PID` (lowercase hex `vvvv:pppp`) of the authenticating
+    /// device, when available.
+    ///
+    /// Passed to the daemon so credential-removal cancellation can be bound
+    /// to the device's vendor/product identity rather than the cloneable
+    /// USB descriptor serial. `None` for PKCS#11 tokens.
+    pub usb_vid_pid: Option<&'a str>,
+    /// Block-device node the credential was read from (e.g. `/dev/sdb1`),
+    /// when available. Part of the same device-topology binding as
+    /// [`Self::usb_vid_pid`]. `None` for PKCS#11 tokens.
+    pub usb_devnode: Option<&'a str>,
     /// Common-Name from the validated end-entity certificate.
     pub cert_cn: &'a str,
     /// Hex serial of the validated end-entity certificate.
@@ -63,6 +74,17 @@ pub struct OpenSessionInfo<'a> {
     /// Resolved role slice version for audit (role-format). `None` when no
     /// role was selected.
     pub role_version: Option<u32>,
+    /// Absolute wall-clock instant at which a bounded role session must end —
+    /// the earliest of `authenticated_at + role.session.max_ttl`,
+    /// `authenticated_at + global default`, and the certificate's `notAfter`.
+    /// `None` for non-role sessions, which carry no time-bound ceiling.
+    ///
+    /// Anchoring at the authentication instant and clamping against `notAfter`
+    /// here (rather than shipping a relative TTL the daemon re-anchors at its
+    /// own `opened_at`) guarantees the enforced deadline can never outlive the
+    /// certificate. The daemon schedules termination directly against this
+    /// instant.
+    pub session_expiry: Option<std::time::SystemTime>,
 }
 
 /// Sync IPC client trait used by the PAM flow.

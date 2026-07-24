@@ -59,7 +59,7 @@ jobs:
           # compile time — baseline run #25 spent 510s compiling tests vs
           # 56s on ubuntu. Production release-mode validation lives in the
           # nightly workflow. Открытая astra-сборка — без МКЦ-FFI (закрытый
-          # crate tessera_mac_parsec живёт в tessera-enterprise).
+          # Parsec plugin собирается и поставляется из tessera-enterprise).
           ubuntu='{"id":"ubuntu","container":"","features":"","test_cmd":"cargo test --workspace","build_extra":"","artifact_name":"tessera-deb-ubuntu","skip_lintian":false}'
           astra='{"id":"astra","container":"ghcr.io/tesseralabs/tessera-astra-builder:latest","features":"","test_cmd":"cargo nextest run --workspace","build_extra":"--skip-lintian","artifact_name":"tessera-deb-astra","skip_lintian":true}'
           if [ "${INCLUDE_ASTRA}" = "true" ]; then
@@ -83,6 +83,7 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
       CARGO_PROFILE_RELEASE_LTO: "thin"
+      TESSERA_PLUGIN_PUBKEYS: ${{ vars.TESSERA_PLUGIN_PUBKEYS }}
     container:
       image: ${{ matrix.target.container }}
       credentials:
@@ -114,6 +115,23 @@ jobs:
               echo "::error::Cargo.toml version (${cargo_ver}) != debian/changelog (${deb_ver}). Bump debian/changelog before releasing."
               exit 1
           fi
+
+      - name: Verify trusted plugin keys are configured
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${TESSERA_PLUGIN_PUBKEYS//[[:space:]]/}" ]; then
+              echo "::error::Set repository variable TESSERA_PLUGIN_PUBKEYS to the trusted Ed25519 public key list."
+              exit 1
+          fi
+          IFS=',' read -ra keys <<< "$TESSERA_PLUGIN_PUBKEYS"
+          for key in "${keys[@]}"; do
+              key="${key//[[:space:]]/}"
+              if ! [[ "$key" =~ ^[0-9a-fA-F]{64}$ ]]; then
+                  echo "::error::Every TESSERA_PLUGIN_PUBKEYS item must be a 32-byte raw Ed25519 key (64 hex characters)."
+                  exit 1
+              fi
+          done
 
       # ---- Ubuntu-only steps: ставим build deps + rustup (в astra-образе всё это уже есть)
 
@@ -186,6 +204,13 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       # ---- Test + build
+
+      - name: Build runtime plugin fixture
+        run: |
+          cargo build -p tessera_test_plugin
+          cp target/debug/libtessera_test_plugin.so \
+             target/debug/tessera_backend_fixture.so
+          echo "TESSERA_TEST_PLUGIN=$GITHUB_WORKSPACE/target/debug/tessera_backend_fixture.so" >> "$GITHUB_ENV"
 
       - name: Run tests (regression guard)
         env:

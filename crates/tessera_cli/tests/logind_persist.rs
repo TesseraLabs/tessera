@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use tessera_cli::logind::LogindSignal;
 use tessera_cli::registry::{ActiveSession, RegistryStore, SessionRegistry};
-use tessera_cli::state::{spawn_state_manager, Event, OnUsbRemoved, StateConfig};
+use tessera_cli::state::{spawn_state_manager, CredentialMode, Event, OnUsbRemoved, StateConfig};
 use tessera_cli::udev_query::AlwaysPresent;
 use tessera_proto::SessionTarget;
 use tokio::sync::mpsc;
@@ -31,6 +31,8 @@ fn session_with_logind_id(uuid_seed: u128, logind_id: &str) -> ActiveSession {
         pam_service: "ssh".into(),
         target: SessionTarget::logind(logind_id),
         usb_serial: Some("AB".into()),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "alice".into(),
@@ -38,6 +40,7 @@ fn session_with_logind_id(uuid_seed: u128, logind_id: &str) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     }
 }
 
@@ -61,6 +64,7 @@ async fn logind_session_removed_persists_registry_snapshot() {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (action_tx, _action_rx) = mpsc::unbounded_channel();
     let cfg = StateConfig {
+        credential_mode: CredentialMode::Pkcs12,
         grace_seconds: 5,
         suspend_grace_seconds: 30,
         on_usb_removed: OnUsbRemoved::Lock,

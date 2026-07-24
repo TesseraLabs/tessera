@@ -2,9 +2,8 @@
 //!
 //! See `docs/superpowers/specs/2026-05-14-mac-integrity-design.md` for the
 //! full design.  The trait abstracts over the real Astra МКЦ FFI (provided by
-//! the closed `tessera_mac_parsec` crate, selected behind the
-//! `astra-mac` feature) and the in-process [`StubBackend`] used on developer
-//! hosts and in CI.
+//! a separately delivered runtime plugin) and the in-process [`StubBackend`]
+//! used on developer hosts and in CI.
 
 use crate::mac::IntegrityLabel;
 
@@ -61,9 +60,8 @@ pub enum MacRuntime {
 /// this state is probed only so the daemon can refuse or warn on hosts where
 /// an active МРД would make integrity-only labelling unsafe.
 ///
-/// The real probe lives in the closed `tessera_mac_parsec` backend (selected
-/// behind the `astra-mac` feature); open builds always report
-/// [`MrdState::Unknown`].
+/// The real probe lives in the separately delivered Parsec plugin; hosts
+/// without it report [`MrdState::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MrdState {
     /// Mandatory confidentiality control is active on this host.
@@ -77,14 +75,31 @@ pub enum MrdState {
 
 /// Abstraction over an Astra МКЦ backend.
 ///
-/// Implementations may either talk to the real kernel/userspace via FFI
-/// (`astra-mac` feature) or provide an in-process stub for unit tests and
-/// non-Astra hosts.  The trait is object-safe and `Send + Sync` so that it can
+/// Implementations may either talk to the real kernel/userspace through a
+/// runtime plugin or provide an in-process stub for unit tests and non-Astra
+/// hosts. The trait is object-safe and `Send + Sync` so that it can
 /// be stored behind `Arc<dyn MacBackend>` inside the PAM module.
 #[cfg_attr(feature = "mac-tests", mockall::automock)]
 pub trait MacBackend: Send + Sync {
     /// Probe the host for MAC support.  Cheap, side-effect free.
     fn probe(&self) -> MacRuntime;
+
+    /// Probe the host's mandatory confidentiality-control axis.
+    ///
+    /// Enforcement backends that cannot inspect a separate confidentiality
+    /// axis keep the conservative default [`MrdState::Unknown`].
+    fn probe_mrd(&self) -> MrdState {
+        MrdState::Unknown
+    }
+
+    /// Check that this process can write MAC labels.
+    ///
+    /// A backend returns [`MacError::CapMissing`] when the capability is
+    /// definitively absent and [`MacError::Unavailable`] when it cannot
+    /// inspect the capability. Actual write operations remain fail-closed.
+    fn check_write_capability(&self) -> Result<(), MacError> {
+        Err(MacError::Unavailable)
+    }
 
     /// Resolve the maximum МКЦ label allowed for `user` (the `MNKC` value
     /// from `mic.db`).
@@ -192,9 +207,3 @@ impl MacBackend for StubBackend {
         Ok(())
     }
 }
-
-// Planned (openspec/changes/backend-plugins/): `PluginBackend` — bridges a
-// C-ABI plugin vtable (`tessera_plugin_entry` envelope with a strict
-// abi_version check) onto the `MacBackend` trait, verifying the `.so`
-// signature against build-time-embedded keys before dlopen and wrapping
-// every FFI boundary in `catch_unwind`.

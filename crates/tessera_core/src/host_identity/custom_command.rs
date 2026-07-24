@@ -28,20 +28,48 @@ impl HostIdSource for CustomCommandSource {
         HostIdSourceKind::CustomCommand
     }
 
+    fn fetch(&self, _fs_root: &Path) -> Result<String, HostIdentityError> {
+        // The command runs with the PAM host's root authority. Re-validate the
+        // whole path — every ancestor owned by root, no group/other write —
+        // immediately before spawning, so a helper swapped for an
+        // attacker-owned file after startup cannot escalate to root. Execute
+        // the canonical (symlink-free) path the walk validated. The check runs
+        // on every resolution because host identity is re-resolved per auth.
+        let validated = crate::privileged_path::validate_path(
+            &self.cmd,
+            crate::privileged_path::ExecTrust::Root,
+        )
+        .map_err(|source| HostIdentityError::CommandUntrusted { source })?;
+        self.run_command(validated.canonical())
+    }
+}
+
+impl CustomCommandSource {
+    /// Spawn `cmd`, enforce the timeout, and return its trimmed stdout.
+    ///
+    /// Separated from [`CustomCommandSource::fetch`] so the spawn/drain/timeout/
+    /// reap machinery can be exercised in tests against a caller-owned script,
+    /// while `fetch` layers the root-ownership gate on top.
+    ///
+    /// # Errors
+    ///
+    /// [`HostIdentityError::Read`] when the child cannot be spawned or waited
+    /// on, [`HostIdentityError::CommandTimeout`] when it exceeds the deadline,
+    /// or [`HostIdentityError::CommandFailed`] when it exits non-zero.
     // Все игнорируемые результаты ниже — best-effort очистка на путях таймаута
     // и ошибки (drain stdout/stderr, kill/wait/reap, join потоков-читателей):
     // диагностику уже сформировал основной путь, реагировать на сбой cleanup нечем.
     #[allow(clippy::let_underscore_must_use)]
-    fn fetch(&self, _fs_root: &Path) -> Result<String, HostIdentityError> {
+    fn run_command(&self, cmd: &Path) -> Result<String, HostIdentityError> {
         // Spawn the child with piped stdout/stderr so we can drain them
         // even if the child outlives our wait window. On timeout we kill
         // the process and reap it, ensuring no orphaned PIDs / fds leak.
-        let mut child = Command::new(&self.cmd)
+        let mut child = Command::new(cmd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| HostIdentityError::Read {
-                path: self.cmd.clone(),
+                path: cmd.to_path_buf(),
                 source,
             })?;
 
@@ -90,7 +118,7 @@ impl HostIdSource for CustomCommandSource {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(HostIdentityError::Read {
-                        path: self.cmd.clone(),
+                        path: cmd.to_path_buf(),
                         source,
                     });
                 }
@@ -119,6 +147,15 @@ impl HostIdSource for CustomCommandSource {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    // The spawn/drain/timeout/reap machinery is tested via `run_command`, which
+    // takes an already-resolved path and does not gate on ownership. `fetch`
+    // (which runs the command as root) additionally enforces the root-ownership
+    // walk, tested separately below; a caller-owned test script could never
+    // pass that gate, so these tests target the lower layer directly.
+
     #[test]
     #[cfg(unix)]
     fn timeout_kills_long_running_child_and_reaps_promptly() {
@@ -130,9 +167,9 @@ mod tests {
         std::fs::write(&script_path, "#!/bin/sh\nwhile true; do sleep 1; done\n").expect("write");
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod");
-        let src = CustomCommandSource::new(script_path, Duration::from_millis(100));
+        let src = CustomCommandSource::new(script_path.clone(), Duration::from_millis(100));
         let start = Instant::now();
-        let result = src.fetch(Path::new("/"));
+        let result = src.run_command(&script_path);
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(HostIdentityError::CommandTimeout)));
         // Generous upper bound: timeout (100 ms) + reap latency, well
@@ -140,12 +177,9 @@ mod tests {
         // ran to completion (would block the recv_timeout return).
         assert!(
             elapsed < Duration::from_secs(2),
-            "fetch took {elapsed:?} — child not reaped promptly"
+            "run_command took {elapsed:?} — child not reaped promptly"
         );
     }
-
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     #[cfg(unix)]
@@ -155,8 +189,31 @@ mod tests {
         std::fs::write(&script_path, "#!/bin/sh\nprintf 'host-xyz\\n'\n").expect("write");
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod");
-        let src = CustomCommandSource::new(script_path, Duration::from_secs(2));
-        let result = src.fetch(Path::new("/")).expect("ok");
+        let src = CustomCommandSource::new(script_path.clone(), Duration::from_secs(2));
+        let result = src.run_command(&script_path).expect("ok");
         assert_eq!(result, "host-xyz");
+    }
+
+    /// SEC-008 negative case: a custom command whose path is owned by a
+    /// non-root uid must be refused before execution, because it runs with the
+    /// PAM host's root authority. The test does not run as root, so a script it
+    /// creates is owned by a non-root uid — exactly the rejection case.
+    #[test]
+    #[cfg(unix)]
+    fn fetch_rejects_non_root_owned_command() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("host-id.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf 'host-xyz\\n'\n").expect("write");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let src = CustomCommandSource::new(script_path, Duration::from_secs(2));
+        let result = src.fetch(Path::new("/"));
+        assert!(
+            matches!(result, Err(HostIdentityError::CommandUntrusted { .. })),
+            "non-root-owned custom command must be rejected, got {result:?}"
+        );
     }
 }

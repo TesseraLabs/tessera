@@ -18,7 +18,11 @@ Engine ДОЛЖЕН (MUST) загружаться once-per-process (OnceLock) и
 
 ### Requirement: Путь к engine
 
-`gost_engine_path` (только при `crypto_backend="openssl"`): `Some(p)` → файл ДОЛЖЕН (MUST) существовать, динамическая загрузка SO_PATH+ID+LOAD; `None` → поиск engine `"gost"` по стандартному OPENSSL_ENGINES (engine.rs:165–170). После загрузки — `ENGINE_set_default(ALL)` + sanity: ДОЛЖЕН (MUST) быть зарегистрирован `md_gost12_256` ИЛИ `streebog256` (разные форки именуют по-разному), иначе `DigestUnavailable` (engine.rs:173–182).
+`gost_engine_path` (только при `crypto_backend="openssl"`): если allow-list разрешает ГОСТ-подписи, абсолютный путь ОБЯЗАТЕЛЕН (MUST), файл и все его предки ДОЛЖНЫ (MUST) быть root-owned без group/world write. Неявный поиск engine `"gost"` через унаследованный `OPENSSL_ENGINES` ДОЛЖЕН (MUST) отклоняться при валидации конфигурации. После загрузки через SO_PATH+ID+LOAD — `ENGINE_set_default(ALL)` + sanity: ДОЛЖЕН (MUST) быть зарегистрирован `md_gost12_256` ИЛИ `streebog256` (разные форки именуют по-разному), иначе `DigestUnavailable`.
+
+#### Scenario: ГОСТ разрешён без явного пути
+- **WHEN** OpenSSL allow-list содержит ГОСТ-подпись, но `gost_engine_path` отсутствует
+- **THEN** конфигурация отклоняется до загрузки native-кода
 
 #### Scenario: Streebog-digest недоступен после загрузки
 - **WHEN** engine загружен, но ни `md_gost12_256`, ни `streebog256` не зарегистрированы

@@ -271,7 +271,42 @@ openssl pkcs12 -export \
     -passout pass:correct-pin \
     -out expired_leaf.p12
 
+# Independent "site" root CA (self-signed), cryptographically unrelated to the
+# main root above. Models a per-host narrowed trust anchor selected by a
+# [[trust_override]] entry: a leaf chaining to this root is accepted only on a
+# host whose override replaces the global anchors with it.
+openssl genrsa -out ca_site.key 2048
+openssl req -x509 -new -key ca_site.key -sha256 -days 3650 \
+    -subj "/CN=Site Test Root CA" \
+    -extensions v3_ca -config <(cat <<'EOF'
+[req]
+distinguished_name = dn
+[dn]
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+EOF
+) -out ca_site.pem
+
+# Leaf signed directly by the site root (no intermediate), with clientAuth EKU
+# and digitalSignature keyUsage so it passes leaf pre-validation.
+openssl genrsa -out leaf_site.key 2048
+openssl req -new -key leaf_site.key -subj "/CN=site-user" \
+    -addext "subjectAltName=email:site-user@site.example.org" -out leaf_site.csr
+openssl x509 -req -in leaf_site.csr -CA ca_site.pem -CAkey ca_site.key -CAcreateserial \
+    -days 3650 -sha256 \
+    -extfile <(cat <<'EOF'
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+subjectAltName = email:site-user@site.example.org
+EOF
+) -out leaf_site.pem
+
 rm -f *.csr *.srl
 rm -rf crl_db crl_openssl.cnf
 rm -rf expired_db expired_openssl.cnf
-rm -f revoked_leaf.key expired_leaf.key
+rm -f revoked_leaf.key expired_leaf.key ca_site.key leaf_site.key

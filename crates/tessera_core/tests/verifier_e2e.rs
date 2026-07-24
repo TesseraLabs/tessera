@@ -16,6 +16,10 @@ const REVOKED: &[u8] = include_bytes!("fixtures/revoked_leaf.pem");
 const INT: &[u8] = include_bytes!("fixtures/int.pem");
 const CA: &[u8] = include_bytes!("fixtures/ca.pem");
 const CRL_VALID: &[u8] = include_bytes!("fixtures/crl_valid.pem");
+/// Root-signed CRL (empty revocation list). In pure `crl` mode every
+/// non-anchor cert needs a covering CRL, so the intermediate (issued by the
+/// root) requires this alongside the intermediate-signed `crl_valid.pem`.
+const CRL_FOREIGN: &[u8] = include_bytes!("fixtures/crl_foreign.pem");
 
 fn whitelist() -> Vec<String> {
     vec!["sha256WithRSAEncryption".into(), "ecdsa-with-SHA256".into()]
@@ -27,7 +31,7 @@ fn config_builder() -> OpensslVerifierConfig {
             tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
         anchors: vec![Certificate::from_pem(CA).unwrap()],
         intermediates: vec![Certificate::from_pem(INT).unwrap()],
-        crl_pems: vec![CRL_VALID.to_vec()],
+        crl_pems: vec![CRL_VALID.to_vec(), CRL_FOREIGN.to_vec()],
         crl_strict: true,
         crl_max_age: None,
         clock_skew: Duration::from_secs(60),
@@ -160,9 +164,9 @@ fn zero_max_depth_is_a_construction_error() {
 
 #[test]
 fn crl_mode_with_empty_store_is_a_construction_error() {
-    // crl mode consults the CRL store for every certificate; an empty store
-    // would short-circuit to Ok and silently disable revocation, so refuse
-    // to construct the verifier (fail closed).
+    // crl mode requires a covering CRL for every non-anchor certificate; an
+    // empty store covers nothing and would refuse every chain, so reject the
+    // misconfiguration at construction time (fail closed, early and legible).
     let mut cfg = config_builder();
     cfg.crl_pems = vec![];
     let err = OpensslVerifier::new(cfg).unwrap_err();

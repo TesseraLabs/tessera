@@ -21,6 +21,11 @@ use tessera_core::hooks::{
     apply_on_failure, ForkExecExecutor, HookConfig, HookError, HookExecutor, HookStage, HookVars,
     OnFailure, RunAs,
 };
+use tessera_core::privileged_path::PrivilegedPathError;
+
+const ECHO: &str = "/usr/bin/echo";
+const FALSE: &str = "/usr/bin/false";
+const SLEEP: &str = "/usr/bin/sleep";
 
 fn make_hook(
     stage: HookStage,
@@ -41,12 +46,7 @@ fn make_hook(
 #[test]
 fn echo_returns_zero_exit() {
     let executor = ForkExecExecutor::new();
-    let hook = make_hook(
-        HookStage::PreAuth,
-        vec!["/bin/echo", "hello"],
-        5,
-        OnFailure::Abort,
-    );
+    let hook = make_hook(HookStage::PreAuth, vec![ECHO, "hello"], 5, OnFailure::Abort);
     let outcome = executor
         .execute(
             &hook,
@@ -65,31 +65,21 @@ fn echo_returns_zero_exit() {
 #[test]
 fn exit_code_propagates() {
     let executor = ForkExecExecutor::new();
-    let hook = make_hook(
-        HookStage::PreAuth,
-        vec!["/bin/sh", "-c", "exit 7"],
-        5,
-        OnFailure::Abort,
-    );
+    let hook = make_hook(HookStage::PreAuth, vec![FALSE], 5, OnFailure::Abort);
     let outcome = executor
         .execute(
             &hook,
             &HookVars::empty().with_pam_user("u").with_pam_service("s"),
         )
-        .expect("execute sh");
-    assert_eq!(outcome.exit_code, 7);
+        .expect("execute false");
+    assert_eq!(outcome.exit_code, 1);
     assert!(!outcome.killed_by_timeout);
 }
 
 #[test]
 fn timeout_kills_long_running_hook() {
     let executor = ForkExecExecutor::new();
-    let hook = make_hook(
-        HookStage::PreAuth,
-        vec!["/bin/sleep", "30"],
-        1,
-        OnFailure::Abort,
-    );
+    let hook = make_hook(HookStage::PreAuth, vec![SLEEP, "30"], 1, OnFailure::Abort);
     let outcome = executor
         .execute(
             &hook,
@@ -111,7 +101,8 @@ fn nonexistent_command_is_rejected_before_exec() {
     // whose path (or any ancestor) does not exist cannot be canonicalized, so
     // the executor fails closed with CommandUnusable rather than forking and
     // letting execve surface a 127 exit. Rejecting an unresolvable hook path up
-    // front is the intended fail-closed behavior.
+    // front is the intended fail-closed behavior. The privileged-path
+    // validator preserves the concrete path error under `CommandUnsafe`.
     let executor = ForkExecExecutor::new();
     let hook = make_hook(
         HookStage::PreAuth,
@@ -124,7 +115,12 @@ fn nonexistent_command_is_rejected_before_exec() {
         &HookVars::empty().with_pam_user("u").with_pam_service("s"),
     );
     assert!(
-        matches!(res, Err(HookError::CommandUnusable { .. })),
+        matches!(
+            res,
+            Err(HookError::CommandUnsafe(
+                PrivilegedPathError::Unresolvable { .. }
+            ))
+        ),
         "unresolvable hook path must be rejected before exec, got {res:?}"
     );
 }
@@ -132,7 +128,7 @@ fn nonexistent_command_is_rejected_before_exec() {
 #[test]
 fn echo_with_no_args_returns_zero() {
     let executor = ForkExecExecutor::new();
-    let hook = make_hook(HookStage::PreAuth, vec!["/bin/echo"], 5, OnFailure::Abort);
+    let hook = make_hook(HookStage::PreAuth, vec![ECHO], 5, OnFailure::Abort);
     let outcome = executor
         .execute(
             &hook,
@@ -145,37 +141,27 @@ fn echo_with_no_args_returns_zero() {
 #[test]
 fn on_failure_abort_maps_nonzero_to_err() {
     let executor = ForkExecExecutor::new();
-    let hook = make_hook(
-        HookStage::PreAuth,
-        vec!["/bin/sh", "-c", "exit 2"],
-        5,
-        OnFailure::Abort,
-    );
+    let hook = make_hook(HookStage::PreAuth, vec![FALSE], 5, OnFailure::Abort);
     let outcome = executor
         .execute(
             &hook,
             &HookVars::empty().with_pam_user("u").with_pam_service("s"),
         )
-        .expect("execute sh");
+        .expect("execute false");
     let r = apply_on_failure(Ok(outcome), OnFailure::Abort);
-    assert!(matches!(r, Err(HookError::NonZeroExit { exit_code: 2 })));
+    assert!(matches!(r, Err(HookError::NonZeroExit { exit_code: 1 })));
 }
 
 #[test]
 fn on_failure_warn_maps_nonzero_to_ok() {
     let executor = ForkExecExecutor::new();
-    let hook = make_hook(
-        HookStage::PreAuth,
-        vec!["/bin/sh", "-c", "exit 2"],
-        5,
-        OnFailure::Warn,
-    );
+    let hook = make_hook(HookStage::PreAuth, vec![FALSE], 5, OnFailure::Warn);
     let outcome = executor
         .execute(
             &hook,
             &HookVars::empty().with_pam_user("u").with_pam_service("s"),
         )
-        .expect("execute sh");
+        .expect("execute false");
     let r = apply_on_failure(Ok(outcome), OnFailure::Warn);
     assert!(r.is_ok());
 }
@@ -183,18 +169,13 @@ fn on_failure_warn_maps_nonzero_to_ok() {
 #[test]
 fn on_failure_ignore_maps_nonzero_to_ok() {
     let executor = ForkExecExecutor::new();
-    let hook = make_hook(
-        HookStage::PreAuth,
-        vec!["/bin/sh", "-c", "exit 2"],
-        5,
-        OnFailure::Ignore,
-    );
+    let hook = make_hook(HookStage::PreAuth, vec![FALSE], 5, OnFailure::Ignore);
     let outcome = executor
         .execute(
             &hook,
             &HookVars::empty().with_pam_user("u").with_pam_service("s"),
         )
-        .expect("execute sh");
+        .expect("execute false");
     let r = apply_on_failure(Ok(outcome), OnFailure::Ignore);
     assert!(r.is_ok());
 }

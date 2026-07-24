@@ -22,6 +22,22 @@ pub struct SessionOpenPayload {
     pub target: SessionTarget,
     /// USB serial that authorised the session, when available.
     pub usb_serial: Option<String>,
+    /// USB `VID:PID` of the authenticating device as lowercase hex
+    /// (`vvvv:pppp`), when available.
+    ///
+    /// Recorded so the daemon can bind credential-removal cancellation to
+    /// the device's vendor/product identity, not just the cloneable USB
+    /// descriptor serial. Optional NDJSON field; absent for PKCS#11 tokens
+    /// and v1 clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usb_vid_pid: Option<String>,
+    /// Block-device node the credential was read from (e.g. `/dev/sdb1`),
+    /// when available.
+    ///
+    /// Part of the device-topology binding described on [`Self::usb_vid_pid`].
+    /// Optional NDJSON field; absent for PKCS#11 tokens and v1 clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usb_devnode: Option<String>,
     /// Hex-encoded host id hash.
     pub host_id_hash: String,
     /// Wall clock time the PAM module decided the session was authenticated.
@@ -58,6 +74,22 @@ pub struct SessionOpenPayload {
     /// when no role was selected. Optional NDJSON field; see [`Self::role`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_version: Option<u32>,
+    /// Absolute wall-clock instant at which a bounded role session must end,
+    /// as Unix seconds. The earliest of `authenticated_at + role.max_ttl`,
+    /// `authenticated_at + global default`, and the certificate's `notAfter`.
+    /// `None` when no role/TTL applies. Additive optional field within
+    /// `PROTOCOL_VERSION` 2 — old frames deserialize to `None`.
+    ///
+    /// Sending an absolute deadline (rather than a relative TTL the daemon
+    /// re-anchors at its own `opened_at`) guarantees the enforced deadline can
+    /// never drift past the certificate's `notAfter`: the daemon schedules
+    /// termination directly against this instant.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::system_time_serde::option"
+    )]
+    pub session_expiry: Option<SystemTime>,
 }
 
 /// Client message.
@@ -90,6 +122,14 @@ pub enum ClientMessage {
         /// USB serial that authorised the session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usb_serial: Option<String>,
+        /// USB `VID:PID` (lowercase hex `vvvv:pppp`) of the authenticating
+        /// device. Optional NDJSON field; see [`SessionOpenPayload::usb_vid_pid`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usb_vid_pid: Option<String>,
+        /// Block-device node the credential was read from. Optional NDJSON
+        /// field; see [`SessionOpenPayload::usb_devnode`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usb_devnode: Option<String>,
         /// Host id hash.
         host_id_hash: String,
         /// Opened at (unix seconds).
@@ -116,6 +156,19 @@ pub enum ClientMessage {
         /// field; see `role`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role_version: Option<u32>,
+        /// Absolute wall-clock instant (Unix seconds) at which a bounded role
+        /// session must end — the earliest of `authenticated_at + role.max_ttl`,
+        /// `authenticated_at + global default`, and the certificate's
+        /// `notAfter`. `None` when no role/TTL applies. Additive optional field
+        /// within `PROTOCOL_VERSION` 2 — old frames deserialize to `None`. The
+        /// daemon schedules termination directly against this instant, so the
+        /// deadline can never drift past the certificate's `notAfter`.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::system_time_serde::option"
+        )]
+        session_expiry: Option<SystemTime>,
     },
     /// Look up the active session for a given Unix uid.
     ///

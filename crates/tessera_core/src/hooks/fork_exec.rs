@@ -21,7 +21,6 @@
 
 use std::ffi::CString;
 use std::os::fd::{IntoRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -39,6 +38,7 @@ use crate::hooks::user::lookup_user;
 use crate::hooks::validator::{HookConfig, RunAs};
 use crate::hooks::vars::HookVars;
 use crate::hooks::wait::wait_with_timeout;
+use crate::privileged_path::ExecTrust;
 
 /// Creates a pipe whose two ends both carry `O_CLOEXEC`.
 ///
@@ -86,82 +86,27 @@ pub(crate) fn build_groups_box(
 }
 
 /// Reject a hook executable (and every parent directory) that an
-/// unprivileged user could rewrite before it runs as root.
+/// unprivileged user could rewrite before the daemon runs it.
 ///
-/// The child path execs `argv[0]` at the parent's privilege (typically root
-/// for `run_as = Root`). A world-writable — or non-root/non-egid
-/// group-writable — hook file, or any such directory on its path, lets a
-/// local user swap the script for one of their choosing and have the daemon
-/// run it as root. `sudo` and `ssh` perform this same pre-exec ownership /
-/// permission walk for the identical reason.
-///
-/// This is a self-defending check: although `validate_hook` is expected to
-/// pass an absolute path, a non-absolute `path` is rejected here rather than
-/// trusted, because a relative path would make the ancestor walk meaningless
-/// (it would resolve against the daemon's cwd) and `canonicalize` could turn
-/// it into something unexpected. The path is then canonicalized once, so the
-/// canonical (symlink-free) file and every canonical ancestor up to `/` are
-/// the components actually checked — the same tree `execve` would resolve.
-/// Walking lexical parents would let a symlinked component hide the real
-/// parents from the permission walk. `S_IWOTH` is always fatal; `S_IWGRP`
-/// is fatal unless the owning group is root (gid 0) or this process's
-/// effective gid (a deliberately granted, trusted admin group).
+/// The child path execs `argv[0]` at the resolved privilege: root for
+/// `run_as = Root`, the target account for `run_as = User`. A hook file — or
+/// any directory on its path — writable by a party the target privilege does
+/// not trust lets a local user swap in their own payload and have the daemon
+/// run it. This delegates to the shared [`crate::privileged_path`] walk that
+/// `sudo`/`ssh` perform for the identical reason: every canonical component
+/// must be owned by a trusted UID and not writable by an untrusted group or by
+/// other.
 ///
 /// # Errors
 ///
-/// [`HookError::CommandUnusable`] when `path` is not absolute, when it cannot
-/// be canonicalized (fail closed), or for the first canonical component that
-/// is world-writable or group-writable by an untrusted group, or whose
-/// metadata cannot be read.
-fn check_exec_path_security(path: &Path) -> Result<(), HookError> {
-    // Self-defending: refuse a relative path rather than trusting the caller.
-    // A relative path makes the ancestor walk meaningless and canonicalize
-    // would resolve it against the daemon's cwd. Fail closed.
-    if !path.is_absolute() {
-        return Err(HookError::CommandUnusable {
-            path: path.to_path_buf(),
-        });
-    }
-
-    // Canonicalize once so the walk sees the real, symlink-free tree that
-    // execve would resolve. std::fs::metadata follows symlinks per-stat, so
-    // walking lexical `.parent()` of a symlinked path would skip the real
-    // parents of the resolved file. Resolving up front closes that gap.
-    // A path that cannot be canonicalized (missing, unreadable component)
-    // fails closed.
-    let real = std::fs::canonicalize(path).map_err(|_| HookError::CommandUnusable {
-        path: path.to_path_buf(),
-    })?;
-
-    // SAFETY: getegid is always successful and async-signal-safe; we are in
-    // the parent so any libc call is fine here.
-    #[allow(unsafe_code)]
-    let egid = unsafe { libc::getegid() } as u32;
-
-    let mut current = Some(real.as_path());
-    while let Some(component) = current {
-        let meta = std::fs::metadata(component).map_err(|_| HookError::CommandUnusable {
-            path: component.to_path_buf(),
-        })?;
-        let mode = meta.permissions().mode();
-        // S_IWOTH: writable by any local user — never acceptable.
-        if mode & 0o002 != 0 {
-            return Err(HookError::CommandUnusable {
-                path: component.to_path_buf(),
-            });
-        }
-        // S_IWGRP: acceptable only when the owning group is root or this
-        // process's effective gid (a trusted, admin-controlled group).
-        if mode & 0o020 != 0 {
-            let gid = meta.gid();
-            if gid != 0 && gid != egid {
-                return Err(HookError::CommandUnusable {
-                    path: component.to_path_buf(),
-                });
-            }
-        }
-        current = component.parent();
-    }
+/// [`HookError::CommandUnsafe`] when `path` is not absolute, cannot be resolved
+/// (fail closed), or has an untrusted owner/writable bit on any component.
+fn check_exec_path_security(path: &Path, trust: ExecTrust) -> Result<(), HookError> {
+    // The validated descriptor is not threaded into the async-signal-safe child
+    // path (which execs by path); it is dropped here. Re-resolution across the
+    // fork is safe because every ancestor is required to be root/target-owned,
+    // so no untrusted party can rename or replace a component in between.
+    crate::privileged_path::validate_path(path, trust)?;
     Ok(())
 }
 
@@ -204,11 +149,19 @@ impl HookExecutor for ForkExecExecutor {
         let command0 = hook.command.first().ok_or(HookError::CommandUnusable {
             path: std::path::PathBuf::new(),
         })?;
-        // Reject a hook executable (or any directory on its path) that a
-        // local user could rewrite before it runs as root. Done in the
+        // Reject a hook executable (or any directory on its path) that an
+        // untrusted local user could rewrite before it runs. Done in the
         // parent, before fork, exactly where sudo/ssh do their pre-exec
-        // permission walk.
-        check_exec_path_security(Path::new(command0))?;
+        // permission walk. The ownership policy tracks the privilege the child
+        // will actually run at.
+        let trust = match user_info.as_ref() {
+            None => ExecTrust::Root,
+            Some(user) => ExecTrust::User {
+                uid: user.uid,
+                gid: user.gid,
+            },
+        };
+        check_exec_path_security(Path::new(command0), trust)?;
 
         let mut argv_cstrings: Vec<CString> = Vec::with_capacity(hook.command.len());
         for arg in &hook.command {
@@ -496,6 +449,12 @@ mod tests {
         let _addr = b.as_ptr();
     }
 
+    /// True when the test process runs as root; the "non-root-owned" rejection
+    /// cases cannot be asserted then and are skipped.
+    fn running_as_root() -> bool {
+        nix::unistd::Uid::effective().is_root()
+    }
+
     /// A world-writable hook file must be rejected before exec: an
     /// unprivileged user could otherwise rewrite it and have it run as root.
     #[test]
@@ -513,62 +472,48 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o777))
             .expect("chmod world-writable");
 
-        let res = check_exec_path_security(&hook);
+        let res = check_exec_path_security(&hook, ExecTrust::Root);
         assert!(
-            matches!(res, Err(HookError::CommandUnusable { .. })),
+            matches!(res, Err(HookError::CommandUnsafe(_))),
             "world-writable hook must be rejected, got {res:?}"
         );
-
-        // No positive (tighten-then-passes) assertion: check_exec_path_security
-        // now canonicalizes and walks every real ancestor, and the system temp
-        // dir's ancestors are world-writable on common platforms (e.g.
-        // /private/tmp is sticky 1777 on macOS, /tmp is 1777 on Linux), so a
-        // 0o755 file under it would still be rejected by the ancestor walk.
-        // That rejection is correct, just not deterministic to assert here, so
-        // we only assert the file-mode rejection above.
     }
 
-    /// Group-writable by an untrusted (non-root, non-egid) group is rejected;
-    /// this is the second half of the recommendation. We can only assert the
-    /// untrusted-group path deterministically when not running as a member of
-    /// gid 0, so the file is owned by its creator's gid which is neither 0 nor
-    /// (in CI) the egid 0 case — kept minimal and self-contained.
+    /// SEC-004 negative case: a `0755` executable whose file and parent
+    /// directory are owned by a non-root uid must be rejected for a
+    /// `run_as = root` hook. This is the exact escalation the ownership walk
+    /// closes — the owner could rewrite the file, and `execve` would run it as
+    /// root. Since the test does not run as root, "owned by the current
+    /// (non-root) uid" is precisely the rejection case.
     #[test]
-    fn group_writable_untrusted_group_is_rejected_when_gid_nonzero() {
+    fn nonroot_owned_0755_executable_rejected_for_root_hook() {
         use std::io::Write as _;
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::PermissionsExt as _;
 
+        if running_as_root() {
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
-        let hook = dir.path().join("hook.sh");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).expect("mkdir bin");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod bin");
+        let hook = bin.join("hook.sh");
         {
             let mut f = std::fs::File::create(&hook).expect("create hook");
             f.write_all(b"#!/bin/sh\nexit 0\n").expect("write hook");
         }
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o770))
-            .expect("chmod group-writable");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        // SAFETY: getegid is always successful and async-signal-safe; called
-        // here in a single-threaded test on the parent side.
-        #[allow(unsafe_code)]
-        let egid = unsafe { libc::getegid() } as u32;
-        let gid = std::fs::metadata(&hook).expect("stat").gid();
-        let res = check_exec_path_security(&hook);
-        // When the file's owning group is untrusted, rejection is required.
-        // (Under the canonical ancestor walk the world-writable system temp
-        // dir would also trip the S_IWOTH check, so rejection is guaranteed
-        // either way — but the case we specifically want to pin down is the
-        // file's own untrusted group-writable bit.)
-        if gid != 0 && gid != egid {
-            assert!(
-                matches!(res, Err(HookError::CommandUnusable { .. })),
-                "group-writable by untrusted group must be rejected, got {res:?}"
-            );
-        }
+        let res = check_exec_path_security(&hook, ExecTrust::Root);
+        assert!(
+            matches!(res, Err(HookError::CommandUnsafe(_))),
+            "0755 executable owned by a non-root uid must be rejected for a root hook, got {res:?}"
+        );
     }
 
-    /// End-to-end exercise of the no-alloc child path. Forks a real
-    /// `/bin/true` (root-owned) and confirms `exit_code == 0` with the
-    /// rewired pre-built groups path active.
+    /// End-to-end exercise of the no-alloc child path. Forks a real,
+    /// root-owned `true` binary and confirms `exit_code == 0` with the rewired
+    /// pre-built groups path active.
     #[cfg(target_os = "linux")]
     #[test]
     fn fork_exec_runs_true_with_no_alloc_child_path() {
@@ -578,7 +523,10 @@ mod tests {
 
         let hook = HookConfig {
             stage: HookStage::PreAuth,
-            command: vec!["/bin/true".to_string()],
+            // Debian and Ubuntu merge `/bin` into `/usr/bin` through a
+            // symlink. Use the canonical path because privileged execution
+            // deliberately rejects every symlink component.
+            command: vec!["/usr/bin/true".to_string()],
             timeout: Duration::from_secs(5),
             on_failure: OnFailure::Warn,
             run_as: RunAs::Root,
@@ -587,7 +535,7 @@ mod tests {
         let vars = HookVars::empty();
         let exec = ForkExecExecutor::new();
         let outcome = exec.execute(&hook, &vars).expect("fork+exec succeeds");
-        assert_eq!(outcome.exit_code, 0, "/bin/true exits 0");
+        assert_eq!(outcome.exit_code, 0, "/usr/bin/true exits 0");
         assert!(!outcome.killed_by_timeout);
     }
 

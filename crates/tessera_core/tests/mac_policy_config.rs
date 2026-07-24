@@ -12,7 +12,6 @@
 #![allow(clippy::panic)]
 #![allow(clippy::items_after_statements)]
 
-#[cfg(feature = "astra-mac")]
 use tessera_core::config::validated::CertIntegrityMode;
 use tessera_core::config::validated::MacRuntimeMode;
 use tessera_core::config::RawConfig;
@@ -57,10 +56,6 @@ fn parses_required_with_fallback() {
     assert_eq!(raw.mac.warn_on_homedir_label_mismatch, Some(false));
 }
 
-// `Required` policy is rejected by `validate_mac` under stub builds (Phase 5
-// Task 5.4 fail-fast). This integration test exercises the validated layer
-// when MAC is actually available.
-#[cfg(feature = "astra-mac")]
 #[test]
 fn parses_required_with_fallback_validates() {
     // Verify the validated layer correctly converts the hex categories to u64
@@ -79,6 +74,7 @@ fn parses_required_with_fallback_validates() {
     let toml = format!(
         "{base}\n\
          [mac]\n\
+         backend = \"parsec\"\n\
          cert_integrity = \"required\"\n\
          warn_on_homedir_label_mismatch = false\n\
          \n\
@@ -150,7 +146,7 @@ fn runtime_default_is_auto() {
 
 #[test]
 fn runtime_disabled_with_cert_integrity_required_rejected() {
-    // Even on `astra-mac` builds, disabled + required is logically inconsistent.
+    // Even with a plugin selected, disabled + required is inconsistent.
     const FAKE_PEM_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
         MIIBfTCCAS6gAwIBAgIUcheCkYc5VvuuVlZ8KqfA8R6Bvs8wCgYIKoZIzj0EAwIw\n\
         -----END CERTIFICATE-----\n";
@@ -180,9 +176,8 @@ fn runtime_disabled_with_cert_integrity_required_rejected() {
     }
 }
 
-#[cfg(not(feature = "astra-mac"))]
 #[test]
-fn runtime_required_without_astra_mac_feature_rejected() {
+fn runtime_required_without_backend_rejected() {
     const FAKE_PEM_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
         MIIBfTCCAS6gAwIBAgIUcheCkYc5VvuuVlZ8KqfA8R6Bvs8wCgYIKoZIzj0EAwIw\n\
         -----END CERTIFICATE-----\n";
@@ -203,12 +198,27 @@ fn runtime_required_without_astra_mac_feature_rejected() {
     match err {
         Error::ConfigInvalid { reason } => {
             assert!(
-                reason.contains("runtime") && reason.contains("astra-mac"),
+                reason.contains("required") && reason.contains("backend"),
                 "unexpected reason: {reason}"
             );
         }
         other => panic!("unexpected error variant: {other:?}"),
     }
+}
+
+#[test]
+fn selected_backend_is_validated() {
+    let raw: RawConfig =
+        toml::from_str(&format!("{}\n[mac]\nbackend = \"parsec\"\n", base_config()))
+            .expect("valid backend");
+    assert_eq!(raw.mac.backend.as_deref(), Some("parsec"));
+
+    let err = toml::from_str::<RawConfig>(&format!(
+        "{}\n[mac]\nbackend = \"../parsec\"\n",
+        base_config()
+    ))
+    .expect("raw accepts strings");
+    assert_eq!(err.mac.backend.as_deref(), Some("../parsec"));
 }
 
 #[test]

@@ -10,18 +10,22 @@
 
 ### Requirement: SPI MacBackend
 
-Trait `MacBackend` (probe / apply_session / get_user_mnkc) и `StubBackend` ДОЛЖНЫ (MUST) оставаться в открытом ядре как стабильный публичный контракт. Реализация enforcement подключается статической линковкой в коммерческой сборке; открытая сборка ДОЛЖНА (MUST) работать только со StubBackend.
+Trait `MacBackend`, `StubBackend` и мост C-vtable ДОЛЖНЫ (MUST) оставаться в открытом
+ядре. Реальный enforcement подключается подписанным runtime-плагином; один и тот же
+открытый бинарь работает со StubBackend без плагина и с PluginBackend при явном выборе.
 
 #### Scenario: Открытая сборка
-- **WHEN** собран публичный репозиторий
-- **THEN** backend всегда StubBackend; реальный МКЦ-enforcement недоступен
+- **WHEN** собран и запущен публичный host без выбранного валидного плагина
+- **THEN** активен StubBackend; закрытый МКЦ-enforcement в Cargo-графе отсутствует
 
 ### Requirement: Поведение открытой сборки при required-политиках
 
-Открытая сборка ДОЛЖНА (MUST) отвергать на валидации конфига `[mac].cert_integrity=required` и `[mac].runtime=required` — открытая сборка не может молча имитировать enforcement (fail-fast вместо ложного чувства безопасности).
+Конфиг с `[mac].cert_integrity=required` или `[mac].runtime=required` ДОЛЖЕН (MUST)
+явно называть `[mac].backend`. Названный, но отсутствующий/невалидный плагин ДОЛЖЕН
+(MUST) давать runtime fail-closed и audit, а не ошибку Cargo-сборки.
 
 #### Scenario: required в открытой сборке
-- **WHEN** конфиг с `cert_integrity=required` загружается открытой сборкой
+- **WHEN** конфиг с required-политикой не называет backend
 - **THEN** конфиг отвергается с ошибкой валидации
 
 ### Requirement: Политика применения (orchestrator) — открыта для аудита

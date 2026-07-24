@@ -58,7 +58,8 @@ const SPKI: &[u8] = &[
 ];
 
 /// A deterministic RNG for reproducible RSA generation and PBES2 fixtures.
-/// Implements the `RustCrypto` `rand_core` 0.6 traits; not for production use.
+/// Implements the `RustCrypto` `rand_core` 0.6 and 0.10 traits used by the EC
+/// and hardened RSA stacks respectively; not for production use.
 struct FixtureRng(u64);
 
 impl FixtureRng {
@@ -95,6 +96,28 @@ impl RngCore for FixtureRng {
 }
 
 impl CryptoRng for FixtureRng {}
+
+impl rsa::rand_core::TryRng for FixtureRng {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.next() as u32)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.next())
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        for chunk in dest.chunks_mut(8) {
+            let bytes = self.next().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+impl rsa::rand_core::TryCryptoRng for FixtureRng {}
 
 /// Verifies certificate signatures against the CA public key by key type.
 enum Verifier {
@@ -167,10 +190,12 @@ fn p384_ca() -> (Vec<u8>, Verifier) {
 }
 
 fn rsa_ca() -> (Vec<u8>, Verifier) {
+    use rsa::pkcs8::{EncodePrivateKey as _, LineEnding as RsaLineEnding};
+
     let mut rng = FixtureRng::new(0x00A5_1234);
     let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
     let public = rsa::RsaPublicKey::from(&private);
-    let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let pem = private.to_pkcs8_pem(RsaLineEnding::LF).unwrap();
     (pem.as_bytes().to_vec(), Verifier::Rsa(Box::new(public)))
 }
 

@@ -34,6 +34,8 @@ pub mod ocsp;
 pub mod pam_conv;
 pub mod pam_data;
 pub mod pkcs12;
+pub mod plugin;
+pub mod privileged_path;
 pub mod role;
 pub mod secret;
 pub mod self_check;

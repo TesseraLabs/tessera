@@ -47,7 +47,9 @@ const NID_ID_GOST_R3410_2012_512: i32 = 980;
 ///
 /// Propagates [`CryptoError`] from the underlying per-algorithm helper.  If
 /// the certificate's public key is neither RSA, ECDSA on a supported curve,
-/// nor GOST 2012-256/512, returns [`CryptoError::UnsupportedKey`].
+/// nor GOST 2012-256/512, returns [`CryptoError::UnsupportedKey`].  If the key
+/// is of an accepted family but below the minimum strength (e.g. sub-2048-bit
+/// RSA), returns [`CryptoError::WeakKey`].
 pub fn challenge_response(
     end_entity: &Certificate,
     key: &PKey<Private>,
@@ -57,6 +59,16 @@ pub fn challenge_response(
         TrustError::Openssl(s) => CryptoError::Openssl(s),
         _ => CryptoError::UnsupportedKey("cannot extract pubkey"),
     })?;
+
+    // Reject a weak key before selecting an algorithm: a strong signature over
+    // a 1024-bit RSA key is still a weak key, and the round-trip below only
+    // proves possession, not adequacy.
+    crate::x509::key_strength::validate_public_key_strength(&pub_key).map_err(|e| match e {
+        TrustError::WeakKey(detail) => CryptoError::WeakKey(detail),
+        TrustError::Openssl(s) => CryptoError::Openssl(s),
+        other => CryptoError::WeakKey(other.to_string()),
+    })?;
+
     let id = pub_key.id();
     if id == Id::RSA {
         return rsa_pss::challenge_response_rsa_pss(&pub_key, key);

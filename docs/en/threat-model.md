@@ -487,7 +487,9 @@ module's.
   `/run/tessera/` (tmpfs).
 - **9.2.5** postinst applies `chattr +i` to `host_id` after the
   first write; the file itself lives in the dir `/var/lib/tessera/`
-  (0750 root:tessera).
+  (`0750 root:tessera`). Daemon-writable persistent state is isolated under
+  `/var/lib/tessera/daemon/` (`0750 tessera:tessera`), so a daemon
+  compromise cannot replace trusted role/tag paths through their parent.
 
 ### 9.3 Open risks
 

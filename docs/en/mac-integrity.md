@@ -14,13 +14,15 @@ integrity ceiling.
 | Policy (`[mac].cert_integrity` = required/optional/ignore; `[mac].runtime` = required/auto/disabled) | `mac/orchestrator.rs` |
 | Label algebra (level i8 + categories u64, DER codec) | `mac/label.rs` |
 | `mac_*` / `integrity_*` audit events (target `mac.audit`) | `mac/audit.rs` |
+| C ABI, signature verification, and runtime backend loader | `plugin/` |
 | The `[mac]` config section | `config/` |
 
 All of the decision logic is open and auditable.
 
 ## What is in the commercial distribution
 
-Actual application of labels to the kernel (ParsecBackend: libpdp/libparsec FFI),
+Actual application of labels to the kernel (the signed Parsec plugin:
+libpdp/libparsec FFI),
 activation in strict mode (capdb, systemd drop-in, PAMName), protection of the
 configuration with МКЦ labels, and the full integration documentation are part of
 the commercial package (`tessera-enterprise`). For contact, see
@@ -28,12 +30,23 @@ the commercial package (`tessera-enterprise`). For contact, see
 
 ## Behavior of the open-source build
 
-- The backend is always `StubBackend` (no-op enforcement).
-- `[mac].cert_integrity = "required"` or `[mac].runtime = "required"` are
-  **rejected at config validation**: the open-source build does not silently
-  imitate enforcement.
-- `optional` / `ignore` / `auto` / `disabled` all work (the policy is computed,
-  events are emitted, the label is not applied).
+- Without `[mac].backend`, the host uses `StubBackend` (no-op enforcement);
+  files in the plugin directory are never activated automatically.
+- With `backend = "parsec"`, the same open host looks up only
+  `/usr/lib/tessera/plugins/tessera_backend_parsec.so`, verifies its signature,
+  ABI/kind/name, and only then calls `dlopen`.
+- `[mac].cert_integrity = "required"` or `[mac].runtime = "required"` require
+  an explicitly selected backend. A missing or rejected selected plugin fails
+  closed instead of imitating enforcement.
+- With `runtime = "auto"`, a missing or rejected plugin falls back to
+  `StubBackend` with an audit event; a role carrying `mac_mask` is still
+  rejected.
+
+Official release builds embed raw Ed25519 public keys from
+`TESSERA_PLUGIN_PUBKEYS` (64 hex characters per key, comma-separated). The
+detached file format is `ed25519:<128 hex>` over the exact `.so` bytes, and
+release CI rejects an empty trust store. Configuration has no signature-check
+bypass.
 
 ## The МКЦ / МРД boundary
 

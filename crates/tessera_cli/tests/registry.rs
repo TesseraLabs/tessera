@@ -8,7 +8,7 @@
     clippy::let_underscore_must_use
 )]
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tessera_cli::registry::{ActiveSession, SessionRegistry};
 use tessera_proto::SessionTarget;
 use uuid::Uuid;
@@ -20,6 +20,8 @@ fn make(id: u128, serial: Option<&str>) -> ActiveSession {
         pam_service: "s".into(),
         target: SessionTarget::logind("c1"),
         usb_serial: serial.map(str::to_string),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "cn".into(),
@@ -27,6 +29,7 @@ fn make(id: u128, serial: Option<&str>) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 0,
+        session_expiry: None,
     }
 }
 
@@ -37,6 +40,8 @@ fn make_with_uid(id: u128, uid: u32, engineer_ski: &str) -> ActiveSession {
         pam_service: "sshd".into(),
         target: SessionTarget::logind("c1"),
         usb_serial: None,
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "Alice".into(),
@@ -44,6 +49,7 @@ fn make_with_uid(id: u128, uid: u32, engineer_ski: &str) -> ActiveSession {
         engineer_ski: engineer_ski.into(),
         engineer_cert_sha256: "1234".into(),
         uid,
+        session_expiry: None,
     }
 }
 
@@ -89,6 +95,19 @@ fn lookup_by_uid_missing_returns_none() {
     let r = SessionRegistry::new();
     r.add(make_with_uid(1, 1000, "abcd"));
     assert!(r.find_by_uid(999).is_none());
+}
+
+#[test]
+fn lookup_by_uid_rejects_expired_session_before_timer_cleanup() {
+    let r = SessionRegistry::new();
+    let mut expired = make_with_uid(1, 1000, "abcd");
+    expired.session_expiry = Some(SystemTime::now() - Duration::from_secs(1));
+    r.add(expired);
+
+    assert!(
+        r.find_by_uid(1000).is_none(),
+        "absolute TTL must gate authorization even before timer cleanup"
+    );
 }
 
 #[test]

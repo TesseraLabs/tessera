@@ -70,6 +70,7 @@ fn make_ctx() -> AuthContext {
 fn cfg_with_mac(mode: CertIntegrityMode) -> ValidatedConfig {
     let mut cfg = common::minimal_cfg();
     cfg.mac = MacPolicy {
+        backend: None,
         cert_integrity: mode,
         fallback_max_integrity: None,
         warn_on_homedir_label_mismatch: false,

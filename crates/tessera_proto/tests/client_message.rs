@@ -18,6 +18,8 @@ fn sample_open() -> ClientMessage {
         pam_service: "sshd".into(),
         target: SessionTarget::tty("/dev/pts/0"),
         usb_serial: Some("AB12CD".into()),
+        usb_vid_pid: Some("1234:5678".into()),
+        usb_devnode: Some("/dev/sdb1".into()),
         host_id_hash: "deadbeef".into(),
         opened_at: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         cert_cn: "Alice".into(),
@@ -27,6 +29,7 @@ fn sample_open() -> ClientMessage {
         uid: 0,
         role: Some("serv".into()),
         role_version: Some(7),
+        session_expiry: Some(UNIX_EPOCH + Duration::from_secs(1_700_003_600)),
     }
 }
 

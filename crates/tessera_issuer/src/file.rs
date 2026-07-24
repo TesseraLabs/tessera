@@ -232,7 +232,7 @@ impl FileSigner {
                 // a deterministic signature would leak CRT timing to another
                 // process on a shared host. The RNG only randomizes the blinding
                 // factor; the produced signature is standard PKCS#1 v1.5.
-                let mut rng = rsa::rand_core::OsRng;
+                let mut rng = rand::rng();
                 key.sign_with_rng(&mut rng, scheme, &hashed)
                     .map_err(|e| SignError::Backend(e.to_string()))
             }
@@ -393,6 +393,10 @@ fn parse_signing_key(
             SigningKeyKind::EcdsaP384(p384::ecdsa::SigningKey::from(secret))
         }
         SignatureAlgorithm::RsaPkcs1Sha256 => {
+            // `sad-rsa` tracks the RustCrypto 0.10 encoding stack (pkcs8 0.11),
+            // while the EC crates still use pkcs8 0.10. Import the trait through
+            // the RSA crate so method resolution selects the matching version.
+            use rsa::pkcs8::DecodePrivateKey as _;
             let secret = rsa::RsaPrivateKey::from_pkcs8_der(der)
                 .map_err(|e| FileSignError::Malformed(format!("RSA key parse failed: {e}")))?;
             SigningKeyKind::Rsa(Box::new(secret))
@@ -536,6 +540,28 @@ mod tests {
 
     impl CryptoRng for FixtureRng {}
 
+    impl rsa::rand_core::TryRng for FixtureRng {
+        type Error = core::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.next() as u32)
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(self.next())
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+            for chunk in dest.chunks_mut(8) {
+                let bytes = self.next().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            Ok(())
+        }
+    }
+
+    impl rsa::rand_core::TryCryptoRng for FixtureRng {}
+
     const KEY_ID: &str = "test-ca";
     const PASSPHRASE: &str = "correct horse battery staple";
 
@@ -632,10 +658,12 @@ mod tests {
 
     #[test]
     fn signs_and_verifies_rsa() {
+        use rsa::pkcs8::{EncodePrivateKey as _, LineEnding as RsaLineEnding};
+
         let mut rng = FixtureRng::new(0x00A5_1234_u64);
         let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
         let public = rsa::RsaPublicKey::from(&private);
-        let pem = private.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let pem = private.to_pkcs8_pem(RsaLineEnding::LF).unwrap();
         let file = write_key(pem.as_bytes());
 
         let signer = FileSigner::open(config(file.path().to_path_buf(), None), &never()).unwrap();

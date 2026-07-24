@@ -88,9 +88,10 @@ impl RoleStageOwned {
 fn build_role_stage(
     pamh: *mut pam_sys::pam_handle_t,
     roles_cfg: &tessera_core::config::validated::RolesSection,
+    device_os: tessera_core::role::RoleOs,
     suffix_role: Option<tessera_core::role::RoleId>,
 ) -> Result<RoleStageOwned, i32> {
-    use tessera_core::role::{RoleDenyReason, RoleEnforce, RoleId, RoleOs, RoleStore, TrustMode};
+    use tessera_core::role::{RoleDenyReason, RoleEnforce, RoleId, RoleStore, TrustMode};
 
     let enforce = roles_cfg.enforce_mode();
     if enforce == RoleEnforce::Disabled {
@@ -146,16 +147,10 @@ fn build_role_stage(
         }
     };
 
-    // Load the on-device role store (standalone trust = filesystem perms).
-    // On Astra the device OS is astra; otherwise linux. We compile per-OS
-    // for the open build (linux); the orchestration of astra slices happens
-    // on the real device which is built with the astra-mac feature.
-    let device_os = if cfg!(feature = "astra-mac") {
-        RoleOs::Astra
-    } else {
-        RoleOs::Linux
-    };
-    let store = match RoleStore::load(&roles_cfg.dir, device_os, TrustMode::Standalone) {
+    // Load the on-device role store through the privileged-path validator.
+    // OS selection is runtime state now: the same open PAM binary serves
+    // Linux and Astra, with the Parsec plugin identifying the Astra contour.
+    let store = match RoleStore::load_privileged(&roles_cfg.dir, device_os, TrustMode::Standalone) {
         Ok(s) => Some(s),
         Err(err) => {
             // Under `require` a store that cannot be loaded is fail-closed
@@ -198,14 +193,14 @@ fn build_device_tags(
     roles_cfg: &tessera_core::config::validated::RolesSection,
 ) -> tessera_core::tags::DeviceTags {
     use tessera_core::config::validated::TagsMode;
-    use tessera_core::tags::{load_standalone_optional, DeviceTags};
+    use tessera_core::tags::{load_standalone_optional_privileged, DeviceTags};
 
     let _ = roles_cfg; // reserved for managed-mode wiring (see below)
     if !tags_cfg.enforce {
         return DeviceTags::empty();
     }
     match tags_cfg.mode {
-        TagsMode::Standalone => match load_standalone_optional(&tags_cfg.source) {
+        TagsMode::Standalone => match load_standalone_optional_privileged(&tags_cfg.source) {
             Ok(tags) => tags,
             Err(err) => {
                 tracing::error!(
@@ -358,7 +353,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
-        let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
+        let cfg = match tessera_core::config::load_privileged_validated_config(&cfg_path) {
             Ok(c) => c,
             Err(err) => {
                 tracing::error!(target: "tessera.auth", error = %err, "config load failed");
@@ -434,8 +429,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         let pam_target = parse_pam_tty(pam_tty_value.as_deref());
 
         // 3. Resolve host identity (before wire so we fail fast on misconfig).
-        let (host_id_source, _host_id_raw, host_id_hash) = match crate::resolve_host_identity(&cfg)
-        {
+        let (host_id_source, host_id_raw, host_id_hash) = match crate::resolve_host_identity(&cfg) {
             Ok(t) => t,
             Err(err) => {
                 tracing::error!(target: "tessera.auth", error = %err, "host identity unresolved");
@@ -444,7 +438,9 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         };
 
         // 4. Wire trust verifier + monitor (consumes cfg; we keep wired.cfg).
-        let wired = match crate::di::wire(cfg) {
+        // The resolved raw host id selects any per-host `[[trust_override]]`
+        // that narrows the accepted trust anchors for this device.
+        let wired = match crate::di::wire(cfg, &host_id_raw) {
             Ok(w) => w,
             Err(err) => {
                 tracing::error!(target: "tessera.auth", error = %err, "wiring failed");
@@ -489,7 +485,12 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // Open Question). Then load the on-device role store. The requested
         // role + store + enforce mode travel atomically through Deps so the
         // role is resolved together with cert verification (no swap window).
-        let role_stage = match build_role_stage(pamh, &wired.cfg.roles, requested_role) {
+        let device_os = if wired.cfg.mac.backend.as_deref() == Some("parsec") {
+            tessera_core::role::RoleOs::Astra
+        } else {
+            tessera_core::role::RoleOs::Linux
+        };
+        let role_stage = match build_role_stage(pamh, &wired.cfg.roles, device_os, requested_role) {
             Ok(s) => s,
             Err(rc) => return rc,
         };
@@ -629,7 +630,7 @@ pub unsafe extern "C" fn pam_sm_open_session(
         // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
-        let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
+        let cfg = match tessera_core::config::load_privileged_validated_config(&cfg_path) {
             Ok(c) => c,
             Err(err) => {
                 tracing::error!(target: "tessera.session", error = %err, "config load failed");
@@ -742,7 +743,7 @@ pub unsafe extern "C" fn pam_sm_close_session(
         // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
         let cfg_path = config_path_from_args(&args);
-        let cfg = match tessera_core::config::load_validated_config(&cfg_path) {
+        let cfg = match tessera_core::config::load_privileged_validated_config(&cfg_path) {
             Ok(c) => c,
             Err(err) => {
                 tracing::error!(target: "tessera.session", error = %err, "config load failed (close)");

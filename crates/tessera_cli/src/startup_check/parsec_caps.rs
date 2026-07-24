@@ -10,41 +10,42 @@ use super::{KernelParsecState, StartupCheckRecord, StartupCheckReport};
 /// Without it `pdp_set_*` calls are kernel-rejected and the label silently
 /// stays at default, which defeats the whole point of MAC.
 ///
-/// We only run the FFI probe when (a) `astra-mac` is compiled in, (b) the
-/// kernel reports parsec active, and (c) the config asks for MAC label
+/// We only run this check when the selected runtime backend reports active
+/// and the config asks for MAC label
 /// writes (`runtime` not `Disabled` AND `cert_integrity` is not `Ignore`).
 /// In every other combination the daemon would never call `pdp_set_*`
 /// anyway, so missing capability is irrelevant.
 pub fn check(cfg: &ValidatedConfig, kernel: KernelParsecState, report: &mut StartupCheckReport) {
+    check_with_capability(cfg, kernel, None, report);
+}
+
+/// Check write capability with a result reported by the selected backend.
+pub fn check_with_capability(
+    cfg: &ValidatedConfig,
+    kernel: KernelParsecState,
+    capability: Option<bool>,
+    report: &mut StartupCheckReport,
+) {
     let writes_expected = !matches!(cfg.mac.runtime, MacRuntimeMode::Disabled)
         && !matches!(cfg.mac.cert_integrity, CertIntegrityMode::Ignore);
     if !writes_expected || !matches!(kernel, KernelParsecState::Active) {
         return;
     }
-    if chmac_cap_present() {
-        report.push(StartupCheckRecord::info(
+    match capability {
+        Some(true) => report.push(StartupCheckRecord::info(
             "parsec_cap_chmac_ok",
             "PARSEC_CAP_CHMAC present in effective set; daemon can write МКЦ labels",
-        ));
-    } else {
-        report.push(StartupCheckRecord::warn(
+        )),
+        Some(false) => report.push(StartupCheckRecord::warn(
             "parsec_cap_chmac_missing",
             "PARSEC_CAP_CHMAC not granted to tessera daemon; MAC labels on \
              sessions.json will NOT be applied. Activate via systemd drop-in: see \
              /usr/share/tessera/systemd/mac-integrity.conf.example",
-        ));
+        )),
+        None => report.push(StartupCheckRecord::warn(
+            "parsec_cap_chmac_unknown",
+            "the selected enforcement plugin could not inspect its MAC write \
+             capability; label writes remain fail-closed",
+        )),
     }
-}
-
-#[cfg(feature = "astra-mac")]
-fn chmac_cap_present() -> bool {
-    tessera_mac_parsec::check_chmac_capability()
-}
-
-#[cfg(not(feature = "astra-mac"))]
-fn chmac_cap_present() -> bool {
-    // Without the FFI we can't introspect; play safe and skip the warn by
-    // pretending it's present. Production binaries on Astra are always
-    // built with `astra-mac`.
-    true
 }

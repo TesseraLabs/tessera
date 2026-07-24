@@ -46,8 +46,9 @@ pub struct RawConfig {
     pub pkcs12_pin_prompt: Option<String>,
     /// Optional path to the gost-engine `.so` file.
     ///
-    /// When `None`, the engine is resolved by id `"gost"` from the system's
-    /// default engine search path.  When `Some`, it must point to a readable
+    /// Configuration validation requires this to be set whenever the OpenSSL
+    /// backend allows GOST signatures, preventing inherited engine search
+    /// paths from selecting native code. When set, it must point to a readable
     /// file (validated in [`crate::config::ValidatedConfig`]).
     #[serde(default)]
     pub gost_engine_path: Option<PathBuf>,
@@ -248,7 +249,7 @@ pub struct RawFlyDmGreeter {
     /// copies `wallpaper_target` → `wallpaper_backup` exactly once,
     /// then always re-renders from the backup. Kept outside
     /// `/usr/share/wallpapers/` so an apt upgrade of `fly-qdm` cannot
-    /// trample it. Default `/var/lib/tessera/wallpaper.orig.jpg`.
+    /// trample it. Default `/var/lib/tessera/daemon/wallpaper.orig.jpg`.
     #[serde(default)]
     pub wallpaper_backup: Option<String>,
     /// Absolute path to a TrueType font file used to render the banner.
@@ -621,6 +622,10 @@ const fn default_hook_timeout() -> u64 {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawMacPolicy {
+    /// Explicit runtime enforcement plugin name, for example `parsec`.
+    /// Absence selects the built-in [`crate::mac::StubBackend`].
+    #[serde(default)]
+    pub backend: Option<String>,
     /// Trinary policy for the X.509 `MAX_INTEGRITY` extension on the
     /// authenticating certificate (`required` | `optional` | `ignore`).
     #[serde(default)]
@@ -634,18 +639,15 @@ pub struct RawMacPolicy {
     /// with the user's `$HOME` label at session-open time. Default `true`.
     #[serde(default)]
     pub warn_on_homedir_label_mismatch: Option<bool>,
-    /// Runtime selection for the MAC backend (independent of the
-    /// compile-time `astra-mac` feature). Default `auto`.
+    /// Runtime selection for the MAC backend. Default `auto`.
     ///
     /// - `required` — fail authentication if the kernel МКЦ subsystem is
-    ///   not present. Requires the binary to be built with the
-    ///   `astra-mac` feature.
-    /// - `auto` — use the real `ParsecBackend` when the kernel МКЦ
-    ///   subsystem is available, otherwise fall back to the no-op
+    ///   not present.
+    /// - `auto` — use the selected plugin when its runtime is available,
+    ///   otherwise fall back to the no-op
     ///   `StubBackend` (with a `mac_runtime_fallback` audit event).
-    /// - `disabled` — always use the no-op `StubBackend`, even when the
-    ///   binary was built with the `astra-mac` feature. Used on Astra SE
-    ///   hosts where МКЦ is intentionally turned off.
+    /// - `disabled` — always use the no-op `StubBackend`, even when a plugin
+    ///   is installed. Used on Astra SE hosts where МКЦ is intentionally off.
     #[serde(default)]
     pub runtime: Option<RawMacRuntimeMode>,
 }

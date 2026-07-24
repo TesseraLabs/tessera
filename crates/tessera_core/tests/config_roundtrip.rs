@@ -5,7 +5,7 @@
 #![allow(clippy::panic_in_result_fn)]
 
 use std::path::{Path, PathBuf};
-use tessera_core::config::{RawConfig, ValidatedConfig};
+use tessera_core::config::{load_privileged_validated_config, RawConfig, ValidatedConfig};
 use tessera_core::Error;
 
 #[test]
@@ -91,6 +91,56 @@ fn validated_config_omits_gost_engine_path_when_absent() -> Result<(), Box<dyn s
     let raw: RawConfig = toml::from_str(&body)?;
     let validated = ValidatedConfig::try_from(&raw)?;
     assert!(validated.gost_engine_path.is_none());
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_relative_pkcs11_module() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let body = fixture_with_anchor(&anchor).replace(
+        "pkcs11_module = \"/bin/sh\"",
+        "pkcs11_module = \"module.so\"",
+    );
+    let raw: RawConfig = toml::from_str(&body)?;
+
+    let error =
+        ValidatedConfig::try_from(&raw).expect_err("relative native-module path must be rejected");
+
+    assert!(matches!(
+        error,
+        Error::ConfigInvalid { reason } if reason.contains("pkcs11_module must be an absolute path")
+    ));
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_relative_gost_engine_path() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let raw = parse_raw_with_gost_path(&anchor, "gost.so");
+
+    let error =
+        ValidatedConfig::try_from(&raw).expect_err("relative native-engine path must be rejected");
+
+    assert!(matches!(
+        error,
+        Error::ConfigInvalid { reason } if reason.contains("gost_engine_path must be an absolute path")
+    ));
+    Ok(())
+}
+
+#[test]
+fn privileged_config_loader_rejects_user_controlled_path() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, include_str!("fixtures/full_valid.toml"))?;
+
+    let error = load_privileged_validated_config(&config_path)
+        .expect_err("user-controlled config path must be rejected before parsing");
+
+    assert!(matches!(error, Error::PrivilegedPath { .. }));
     Ok(())
 }
 
@@ -198,6 +248,14 @@ fn fixture_with_anchor_and_sig_algs(anchor: &Path, algs: &[&str]) -> String {
     )
 }
 
+fn fixture_with_sig_algs_and_gost_path(anchor: &Path, algs: &[&str], gost_path: &Path) -> String {
+    format!(
+        "gost_engine_path = {:?}\n{}",
+        gost_path.to_string_lossy(),
+        fixture_with_anchor_and_sig_algs(anchor, algs)
+    )
+}
+
 #[test]
 fn empty_sig_alg_list_falls_back_to_safe_defaults() -> Result<(), Box<dyn std::error::Error>> {
     // The fixture sets `allowed_signature_algorithms = []`. An empty list must
@@ -250,9 +308,12 @@ fn validated_config_needs_gost_true_when_gost_oid_present() -> Result<(), Box<dy
 {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
-    let raw: RawConfig = toml::from_str(&fixture_with_anchor_and_sig_algs(
+    let engine = dir.path().join("gost.so");
+    std::fs::write(&engine, b"\x7fELF")?;
+    let raw: RawConfig = toml::from_str(&fixture_with_sig_algs_and_gost_path(
         &anchor,
         &["1.2.643.7.1.1.3.2"],
+        &engine,
     ))?;
     let v = ValidatedConfig::try_from(&raw)?;
     assert!(v.needs_gost());
@@ -263,15 +324,35 @@ fn validated_config_needs_gost_true_when_gost_oid_present() -> Result<(), Box<dy
 fn validated_config_needs_gost_true_when_mixed() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
-    let raw: RawConfig = toml::from_str(&fixture_with_anchor_and_sig_algs(
+    let engine = dir.path().join("gost.so");
+    std::fs::write(&engine, b"\x7fELF")?;
+    let raw: RawConfig = toml::from_str(&fixture_with_sig_algs_and_gost_path(
         &anchor,
         &[
             "rsa-with-sha256",
             "id-tc26-signwithdigest-gost3410-2012-512",
         ],
+        &engine,
     ))?;
     let v = ValidatedConfig::try_from(&raw)?;
     assert!(v.needs_gost());
+    Ok(())
+}
+
+#[test]
+fn validated_config_requires_explicit_gost_engine_path() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let raw: RawConfig = toml::from_str(&fixture_with_anchor_and_sig_algs(
+        &anchor,
+        &["1.2.643.7.1.1.3.2"],
+    ))?;
+    let err = ValidatedConfig::try_from(&raw).expect_err("GOST must not use an inherited search");
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("gost_engine_path is required")),
+        "unexpected error: {err:?}"
+    );
     Ok(())
 }
 
@@ -359,6 +440,33 @@ fn validated_config_rejects_hook_mode_without_hook_path() -> Result<(), Box<dyn 
     assert!(
         matches!(err, Error::ConfigInvalid { ref reason }
             if reason.contains("on_usb_removed_hook_path")),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validated_config_rejects_non_root_controlled_monitor_hook(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let hook = dir.path().join("hook.sh");
+    std::fs::write(&hook, b"#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    let body = fixture_with_anchor(&anchor);
+    let injected = format!(
+        "{body}\n[monitor]\non_usb_removed = \"hook\"\non_usb_removed_hook_path = {:?}\n",
+        hook.to_string_lossy()
+    );
+    let raw: RawConfig = toml::from_str(&injected)?;
+
+    let err = ValidatedConfig::try_from(&raw).expect_err("user-controlled root hook must fail");
+
+    assert!(
+        matches!(err, Error::ConfigInvalid { ref reason }
+            if reason.contains("not root-controlled")),
         "unexpected error: {err:?}"
     );
     Ok(())

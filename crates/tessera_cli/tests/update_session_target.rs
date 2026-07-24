@@ -35,6 +35,8 @@ fn seed_session(uuid: Uuid) -> ActiveSession {
         pam_service: "login".into(),
         target: SessionTarget::tty("/dev/tty1"),
         usb_serial: Some("AB12CD".into()),
+        usb_vid_pid: None,
+        usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
         cert_cn: "cn".into(),
@@ -42,6 +44,7 @@ fn seed_session(uuid: Uuid) -> ActiveSession {
         engineer_ski: String::new(),
         engineer_cert_sha256: String::new(),
         uid: 1000,
+        session_expiry: None,
     }
 }
 
