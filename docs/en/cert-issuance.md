@@ -214,8 +214,8 @@ list is parsed strictly fail-closed: on malformed DER **or** any string not
 passing the `role_id` regex, the whole extension is considered malformed (not a
 skip of a single string), the role list is empty → the requested role is not
 covered → deny (audit `cert_allowed_roles_parse_failed`). The absence of the
-extension = the certificate grants no roles (with `roles.enforce = require` —
-login denied; with `warn` — logged and skipped, migration mode).
+extension = the certificate grants no roles, so it cannot be used to log in at
+all: a role is always required and coverage is proven from this extension.
 
 Server-side semantics: see `docs/configuration.md` §"roles" and the delta spec
 `role-selection`. Extraction only from a verified certificate (`VerifiedX509`),

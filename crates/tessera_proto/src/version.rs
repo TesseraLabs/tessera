@@ -15,8 +15,7 @@
 /// The role-format change adds two further optional `SessionOpen` fields
 /// (`role`, `role_version`) within `PROTOCOL_VERSION` 2. They are optional NDJSON
 /// fields (`#[serde(default, skip_serializing_if = "Option::is_none")]`):
-/// frames without them deserialise into `None`, and a session opened with
-/// `[roles].enforce = false` omits them entirely. This is backward compatible,
-/// so no version bump is required (the strict-equality version rule is
-/// preserved).
+/// frames without them deserialise into `None`, which is how frames predating
+/// mandatory roles decode. This is backward compatible, so no version bump is
+/// required (the strict-equality version rule is preserved).
 pub const PROTOCOL_VERSION: u32 = 2;

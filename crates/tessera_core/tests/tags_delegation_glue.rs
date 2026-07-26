@@ -1,6 +1,6 @@
 //! Glue test for tags-delegation §5: load this device's tags from the
 //! configured `[tags]` standalone source, then run the live envelope
-//! enforcement (`enforce_delegation_opt`) against a chain whose CA carries
+//! enforcement (`enforce_delegation`) against a chain whose CA carries
 //! `requireTags{region:north}`.
 //!
 //! Proves the wired path end-to-end at the config→load→enforce boundary:
@@ -31,7 +31,7 @@ use openssl::x509::{X509Builder, X509Extension, X509NameBuilder};
 use tessera_core::config::validated::{TagsMode, TagsSection};
 use tessera_core::role::RoleId;
 use tessera_core::tags::{load_standalone_optional, DeviceTags};
-use tessera_core::trust::{chain_carries_constraints, enforce_delegation_opt, DelegationError};
+use tessera_core::trust::{chain_carries_constraints, enforce_delegation, DelegationError};
 use tessera_core::x509::oids::DELEGATION_CONSTRAINTS_OID;
 use tessera_core::x509::Certificate;
 
@@ -160,14 +160,14 @@ fn tags_section_for(dir: &std::path::Path, region: &str) -> (TagsSection, std::p
 fn load_and_enforce(
     tags_cfg: &TagsSection,
     chain: &[Certificate],
-    requested_role: Option<&RoleId>,
+    requested_role: &RoleId,
 ) -> Result<(), DelegationError> {
     // `build_device_tags` (entry.rs) for the standalone path resolves to
     // exactly this: read the configured source, empty set if absent.
     assert!(tags_cfg.enforce, "test drives the enforce = true path");
     assert_eq!(tags_cfg.mode, TagsMode::Standalone);
     let device_tags: DeviceTags = load_standalone_optional(&tags_cfg.source).unwrap();
-    enforce_delegation_opt(chain, &device_tags, requested_role, 0, None, None)
+    enforce_delegation(chain, &device_tags, requested_role, 0, None, None)
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn north_ca_admits_north_device_and_rejects_south_device() {
     // South device → loaded tags region:south → rejected (fail-closed).
     let south_dir = tempfile::tempdir().unwrap();
     let (south_cfg, _p) = tags_section_for(south_dir.path(), "south");
-    let err = load_and_enforce(&south_cfg, &chain, Some(&oper))
+    let err = load_and_enforce(&south_cfg, &chain, &oper)
         .expect_err("south device must be rejected by the north envelope");
     assert!(
         matches!(err, DelegationError::TagEnvelope { .. }),
@@ -192,7 +192,7 @@ fn north_ca_admits_north_device_and_rejects_south_device() {
     // North device → loaded tags region:north → admitted.
     let north_dir = tempfile::tempdir().unwrap();
     let (north_cfg, _p) = tags_section_for(north_dir.path(), "north");
-    load_and_enforce(&north_cfg, &chain, Some(&oper))
+    load_and_enforce(&north_cfg, &chain, &oper)
         .expect("north device must satisfy the north envelope");
 }
 
@@ -206,7 +206,7 @@ fn no_tags_source_rejects_envelope_but_passes_per_host_chain() {
     let ca = build_cert(true, Some(&cons));
     let scoped = vec![leaf, ca];
     let empty = DeviceTags::empty();
-    let err = enforce_delegation_opt(&scoped, &empty, Some(&oper), 0, None, None)
+    let err = enforce_delegation(&scoped, &empty, &oper, 0, None, None)
         .expect_err("no tags + envelope must reject (fail-closed)");
     assert!(
         matches!(err, DelegationError::TagEnvelope { .. }),
@@ -217,26 +217,8 @@ fn no_tags_source_rejects_envelope_but_passes_per_host_chain() {
     let leaf2 = build_cert(false, None);
     let ca2 = build_cert(true, None);
     let per_host = vec![leaf2, ca2];
-    enforce_delegation_opt(&per_host, &empty, Some(&oper), 0, None, None)
+    enforce_delegation(&per_host, &empty, &oper, 0, None, None)
         .expect("per-host chain without an envelope is unaffected by empty tags");
-}
-
-#[test]
-fn envelope_chain_with_no_requested_role_rejects() {
-    // No role selected + an envelope-scoped chain → fail-closed.
-    let cons = constraints(&[("region", "north")], &["oper"], 10, 315_360_000);
-    let leaf = build_cert(false, None);
-    let ca = build_cert(true, Some(&cons));
-    let chain = vec![leaf, ca];
-
-    let north_dir = tempfile::tempdir().unwrap();
-    let (north_cfg, _p) = tags_section_for(north_dir.path(), "north");
-    let err = load_and_enforce(&north_cfg, &chain, None)
-        .expect_err("an envelope chain with no role must reject");
-    assert!(
-        matches!(err, DelegationError::RoleNotAllowed { .. }),
-        "expected RoleNotAllowed, got {err:?}"
-    );
 }
 
 #[test]

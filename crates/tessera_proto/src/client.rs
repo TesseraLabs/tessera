@@ -63,8 +63,8 @@ pub struct SessionOpenPayload {
     /// v2 field; `0` when omitted by a v1 client.
     #[serde(default)]
     pub uid: u32,
-    /// Role id the session was opened with (role-format). `None` when
-    /// `[roles].enforce = false` or no role was selected.
+    /// Role id the session was opened with (role-format). `None` only for
+    /// frames predating mandatory roles.
     ///
     /// Optional NDJSON field added within `PROTOCOL_VERSION` 2: clients that omit
     /// it deserialise into `None`, keeping backward compatibility.
@@ -149,7 +149,8 @@ pub enum ClientMessage {
         #[serde(default)]
         uid: u32,
         /// Role id the session was opened with (role-format). Optional NDJSON
-        /// field within `PROTOCOL_VERSION` 2; absent for `enforce=false` logins.
+        /// field within `PROTOCOL_VERSION` 2; absent only from frames predating
+        /// mandatory roles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
         /// Resolved role slice version for audit (role-format). Optional NDJSON

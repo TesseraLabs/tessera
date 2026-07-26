@@ -27,6 +27,52 @@ use pam_tessera::flow::{authenticate, Deps, FlowError, FlowOutcome, InMemoryFlow
 
 use secrecy::SecretString;
 
+/// A complete role stage for the flow: an on-disk store holding the `serv`
+/// role plus a request naming it.
+///
+/// Every authentication resolves a role, so there is no "no role" stage to
+/// fall back on. The `leaf_*` fixtures carry
+/// `pam_cert_allowed_roles = [serv, oper]`, which is what proves coverage.
+pub struct RoleFixture {
+    _dir: tempfile::TempDir,
+    store: tessera_core::role::RoleStore,
+    requested: tessera_core::role::RoleId,
+}
+
+impl RoleFixture {
+    pub fn serv() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("serv.toml"),
+            b"role = \"serv\"\nversion = 4\nos = \"linux\"\nname = \"serv\"\nlevel = 1\n\
+              [payload]\ngroups = [\"wheel\"]\n"
+                .as_slice(),
+        )
+        .unwrap();
+        let store = tessera_core::role::RoleStore::load(
+            dir.path(),
+            tessera_core::role::RoleOs::Linux,
+            tessera_core::role::TrustMode::Standalone,
+        )
+        .unwrap();
+        Self {
+            _dir: dir,
+            store,
+            requested: tessera_core::role::RoleId::new("serv").unwrap(),
+        }
+    }
+
+    pub fn stage(&self) -> pam_tessera::flow::RoleStage<'_> {
+        pam_tessera::flow::RoleStage {
+            requested: self.requested.clone(),
+            store: &self.store,
+            default_session_ttl: Duration::from_secs(
+                tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
+            ),
+        }
+    }
+}
+
 /// Repository path to the shared X.509/p12 fixtures pile.
 pub fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tessera_core/tests/fixtures")
@@ -167,6 +213,7 @@ pub fn run_flow_with(
     let cfg = minimal_cfg();
     let monitor = StubClient;
     let exec = tessera_core::hooks::NoopExecutor::new();
+    let roles = RoleFixture::serv();
 
     let deps = Deps {
         cfg: &cfg,
@@ -177,7 +224,7 @@ pub fn run_flow_with(
         host_id_source: HostIdSourceKind::Override,
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
-        role_stage: pam_tessera::flow::RoleStage::disabled(),
+        role_stage: roles.stage(),
         device_tags: pam_tessera::flow::empty_device_tags(),
     };
 

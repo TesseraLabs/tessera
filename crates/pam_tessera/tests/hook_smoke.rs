@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use common::*;
 
-use pam_tessera::flow::{authenticate, empty_device_tags, Deps, InMemoryFlowIo, RoleStage};
+use pam_tessera::flow::{authenticate, empty_device_tags, Deps, InMemoryFlowIo};
 use secrecy::SecretString;
 use tessera_core::config::ValidatedConfig;
 use tessera_core::hooks::{ForkExecExecutor, HookConfig, HookStage, OnFailure, RunAs};
@@ -91,6 +91,7 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
     let verifier = build_verifier(vec![]);
     let monitor = StubClient;
     let executor = ForkExecExecutor::new();
+    let roles = RoleFixture::serv();
     let deps = Deps {
         cfg: &cfg,
         trust: &verifier,
@@ -100,7 +101,7 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
         host_id_source: HostIdSourceKind::Override,
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
-        role_stage: RoleStage::disabled(),
+        role_stage: roles.stage(),
         device_tags: empty_device_tags(),
     };
 
