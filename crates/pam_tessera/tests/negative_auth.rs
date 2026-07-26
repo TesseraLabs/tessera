@@ -44,7 +44,7 @@ fn wrong_pin_three_times_returns_max_tries() {
     )
     .unwrap_err();
     assert!(matches!(err, FlowError::MaxTries));
-    assert_eq!(err.pam_code(), 8); // PAM_MAXTRIES
+    assert_eq!(err.pam_code(), 11, "PAM_MAXTRIES");
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn missing_p12_returns_authinfo_unavail() {
         err,
         FlowError::Discovery(tessera_core::discovery::DiscoveryError::P12NotFound { .. })
     ));
-    assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+    assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn subject_mismatch_returns_perm_denied() {
         err,
         FlowError::Mapping(MappingError::SubjectMismatch { .. })
     ));
-    assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
 }
 
 // Cert host/user binding scope is exhaustively unit-tested in
@@ -133,7 +133,7 @@ fn uncovered_leaf_fails_closed_perm_denied() {
         matches!(err, FlowError::Trust(TrustError::CrlNotCovered(_))),
         "expected Trust(CrlNotCovered) for a leaf with no covering CRL, got {err:?}"
     );
-    assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn revoked_cert_with_matching_crl_returns_perm_denied() {
         matches!(err, FlowError::Trust(TrustError::Revoked(_))),
         "expected Trust(Revoked), got {err:?}"
     );
-    assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
 }
 
 #[test]
@@ -179,5 +179,5 @@ fn expired_cert_returns_perm_denied() {
         matches!(err, FlowError::Trust(TrustError::Validity(_))),
         "expected Trust(Validity), got {err:?}"
     );
-    assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+    assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
 }

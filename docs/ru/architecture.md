@@ -614,7 +614,7 @@ PAM-коды, которые получает стек; единственное
 | 6  | revocation check провалился (`crl`: серийник в CRL, CRL отсутствует/несвежа; `ocsp`/`crl_then_ocsp`: responder недоступен, таймаут, статус `unknown`/`revoked`, подпись ответа невалидна) | `PAM_PERM_DENIED` (6) |
 | 7  | challenge-response не сошёлся                                  | `PAM_PERM_DENIED` (6)  |
 | 8  | legacy `[[user_mapping]]` не дал совпадения                    | `PAM_PERM_DENIED` (6)  |
-| 9  | исчерпан лимит попыток PIN (`MaxTries`, `PinLocked`)           | `PAM_MAXTRIES` (8)     |
+| 9  | исчерпан лимит попыток PIN (`MaxTries`, `PinLocked`)           | `PAM_MAXTRIES` (11)    |
 | 10 | расширение `pam_cert_host_binding` отсутствует или невалидно   | `PAM_AUTH_ERR` (7)     |
 | 11 | host_id_hash не входит в записи `pam_cert_host_binding`        | `PAM_AUTH_ERR` (7)     |
 | 12 | расширение `pam_cert_user_binding` отсутствует или невалидно   | `PAM_AUTH_ERR` (7)     |
