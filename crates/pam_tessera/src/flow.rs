@@ -232,7 +232,7 @@ impl FlowError {
     /// | `Pkcs11OpensslEngineNotImplemented`                    | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11ModulePathMissingInConfig`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11StrictPresenceUnsupported`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
-    /// | `MaxTries` / `Pkcs11Acquire(PinLocked|MaxAttempts)`    | `PAM_MAXTRIES` (8)         |
+    /// | `MaxTries` / `Pkcs11Acquire(PinLocked|MaxAttempts)`    | `PAM_MAXTRIES` (11)        |
     /// | `Conv` / `Pkcs11Acquire(Conv)` / `Pkcs11(PinIncorrect)`| `PAM_AUTH_ERR` (7)         |
     /// | `CertScope`                                            | `PAM_AUTH_ERR` (7)         |
     /// | `MaxIntegrityMalformed`                                | `PAM_PERM_DENIED` (6)      |
@@ -263,8 +263,12 @@ impl FlowError {
                 | Pkcs11Error::TokenSerialMissing,
             ) => 9,
             // PAM_MAXTRIES — exhausted PIN-retry budget on either path.
+            // 11 per `<security/_pam_types.h>`; 8 is PAM_CRED_INSUFFICIENT,
+            // which tells the application the wrong story ("cannot reach the
+            // authentication data" instead of "stop asking, the budget is
+            // spent").
             Self::MaxTries
-            | Self::Pkcs11Acquire(P11Acquire::PinLocked | P11Acquire::MaxAttemptsExceeded) => 8,
+            | Self::Pkcs11Acquire(P11Acquire::PinLocked | P11Acquire::MaxAttemptsExceeded) => 11,
             // PAM_PERM_DENIED — cert chain rejected the auth, the requested
             // role was denied (not found / not covered / needs an absent
             // backend) under `[roles].enforce = require`, or a strict-mode
@@ -2309,7 +2313,7 @@ level = "info"
         .unwrap_err();
         assert!(matches!(err, FlowError::MaxTries));
         assert_eq!(attempts.get(), 3);
-        assert_eq!(err.pam_code(), 8); // PAM_MAXTRIES
+        assert_eq!(err.pam_code(), 11, "PAM_MAXTRIES");
     }
 
     #[test]
@@ -2343,7 +2347,7 @@ level = "info"
             err,
             FlowError::Discovery(DiscoveryError::P12NotFound { .. })
         ));
-        assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
     }
 
     #[test]
@@ -2380,7 +2384,7 @@ level = "info"
         })
         .unwrap_err();
         assert!(matches!(err, FlowError::UsbSerialMissing), "got {err:?}");
-        assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
     }
 
     #[test]
@@ -2453,7 +2457,7 @@ level = "info"
         })
         .unwrap_err();
         assert!(matches!(err, FlowError::Mapping(_)));
-        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+        assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
     }
 
     // Cert host/user binding scope is exhaustively tested in
@@ -2518,7 +2522,7 @@ level = "info"
             ),
             "got {err:?}"
         );
-        assert_eq!(err.pam_code(), 7); // PAM_AUTH_ERR — denied, no fallback
+        assert_eq!(err.pam_code(), 7, "PAM_AUTH_ERR — denied, no fallback");
     }
 
     #[test]
@@ -2730,7 +2734,7 @@ level = "info"
         .err()
         .expect("must fail");
         assert!(matches!(err, FlowError::Pkcs11OpensslEngineNotImplemented));
-        assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
     }
 
     #[test]
@@ -2764,7 +2768,7 @@ level = "info"
             matches!(err, FlowError::Pkcs11(Pkcs11Error::ModulePathMissing(_))),
             "got {err:?}"
         );
-        assert_eq!(err.pam_code(), 9);
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
     }
 
     #[test]
@@ -2800,7 +2804,7 @@ level = "info"
         .expect_err("strict pkcs11 must fail before loading the provider");
 
         assert!(matches!(err, FlowError::Pkcs11StrictPresenceUnsupported));
-        assert_eq!(err.pam_code(), 9);
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
     }
 
     #[test]
@@ -2837,7 +2841,7 @@ level = "info"
         .expect_err("strict pkcs11 must fail before token I/O");
 
         assert!(matches!(err, FlowError::Pkcs11StrictPresenceUnsupported));
-        assert_eq!(err.pam_code(), 9);
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
         assert!(
             stub.on_wait.borrow().is_some(),
             "strict-mode rejection must happen before token discovery"
@@ -2885,7 +2889,7 @@ level = "info"
             ),
             "got {err:?}"
         );
-        assert_eq!(err.pam_code(), 8); // PAM_MAXTRIES
+        assert_eq!(err.pam_code(), 11, "PAM_MAXTRIES");
     }
 
     #[test]
@@ -2925,7 +2929,7 @@ level = "info"
             matches!(err, FlowError::Pkcs11(Pkcs11Error::TokenWaitTimeout { .. })),
             "got {err:?}"
         );
-        assert_eq!(err.pam_code(), 9); // PAM_AUTHINFO_UNAVAIL
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
     }
 
     #[test]
@@ -2965,7 +2969,7 @@ level = "info"
             matches!(err, FlowError::Pkcs11(Pkcs11Error::TokenSerialMissing)),
             "got {err:?}"
         );
-        assert_eq!(err.pam_code(), 9);
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
     }
 
     // -----------------------------------------------------------------
@@ -3131,8 +3135,8 @@ level = "info"
         })
         .unwrap_err();
         assert!(matches!(err, FlowError::PreAuthHook(_)), "got {err:?}");
-        assert_eq!(err.pam_code(), 7); // PAM_AUTH_ERR
-                                       // Only the pre_auth hook ran; post-auth was never reached.
+        assert_eq!(err.pam_code(), 7, "PAM_AUTH_ERR");
+        // Only the pre_auth hook ran; post-auth was never reached.
         let calls = exec.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, Stage5HookStage::PreAuth);
@@ -3434,7 +3438,7 @@ level = "info"
         );
         // Maps to PAM_AUTHINFO_UNAVAIL (9) — same bucket as Discovery
         // failures (no usable credentials on the bus).
-        assert_eq!(err.pam_code(), 9);
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
 
         // Both junk partitions must have been unmounted on their way out.
         let umounts = ops.umount_calls.load(std::sync::atomic::Ordering::SeqCst);
@@ -3664,7 +3668,7 @@ level = "info"
     #[test]
     fn role_denied_maps_to_perm_denied() {
         let err = FlowError::RoleDenied(tessera_core::role::RoleDenyReason::NotCovered);
-        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+        assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
     }
 
     // -----------------------------------------------------------------
@@ -3740,7 +3744,7 @@ level = "info"
             matches!(err, FlowError::MonitorRegistration(_)),
             "got {err:?}"
         );
-        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+        assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
     }
 
     #[test]
@@ -3813,7 +3817,7 @@ level = "info"
             matches!(err, FlowError::MonitorRegistration(_)),
             "got {err:?}"
         );
-        assert_eq!(err.pam_code(), 6); // PAM_PERM_DENIED
+        assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
     }
 
     #[test]
@@ -3886,7 +3890,7 @@ level = "info"
             matches!(error, FlowError::MaxIntegrityMalformed(_)),
             "{backend}: unexpected error: {error:?}"
         );
-        assert_eq!(error.pam_code(), 6, "{backend}");
+        assert_eq!(error.pam_code(), 6, "{backend}: PAM_PERM_DENIED");
     }
 
     #[cfg(feature = "mac-tests")]

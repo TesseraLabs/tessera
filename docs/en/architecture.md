@@ -612,7 +612,7 @@ is set out in "Principles" below the table.
 | 6  | revocation check failed (`crl`: serial in the CRL, CRL absent/stale; `ocsp`/`crl_then_ocsp`: responder unreachable, timeout, status `unknown`/`revoked`, invalid response signature) | `PAM_PERM_DENIED` (6) |
 | 7  | challenge-response did not match                              | `PAM_PERM_DENIED` (6)  |
 | 8  | legacy `[[user_mapping]]` produced no match                   | `PAM_PERM_DENIED` (6)  |
-| 9  | PIN attempt limit exhausted (`MaxTries`, `PinLocked`)         | `PAM_MAXTRIES` (8)     |
+| 9  | PIN attempt limit exhausted (`MaxTries`, `PinLocked`)         | `PAM_MAXTRIES` (11)    |
 | 10 | the `pam_cert_host_binding` extension is absent or invalid    | `PAM_AUTH_ERR` (7)     |
 | 11 | host_id_hash is not among the `pam_cert_host_binding` entries | `PAM_AUTH_ERR` (7)     |
 | 12 | the `pam_cert_user_binding` extension is absent or invalid    | `PAM_AUTH_ERR` (7)     |
