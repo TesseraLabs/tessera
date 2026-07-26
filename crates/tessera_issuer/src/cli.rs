@@ -168,8 +168,10 @@ struct IssueRootArgs {
     /// A required tag `key=value` the envelope demands (repeat for several).
     #[arg(long = "require-tag")]
     require_tags: Vec<String>,
-    /// Certificate-format version.
-    #[arg(long, default_value_t = 1)]
+    /// Certificate-format version. `0` is the current format and the only one
+    /// an Engine accepts out of the box — raise it only for a fleet whose
+    /// configuration already admits the newer version.
+    #[arg(long, default_value_t = 0)]
     profile_version: u32,
     /// NDJSON issuance journal file.
     #[arg(long)]
@@ -214,8 +216,10 @@ struct IssueCaArgs {
     /// A required tag `key=value` the envelope demands (repeat for several).
     #[arg(long = "require-tag")]
     require_tags: Vec<String>,
-    /// Certificate-format version.
-    #[arg(long, default_value_t = 1)]
+    /// Certificate-format version. `0` is the current format and the only one
+    /// an Engine accepts out of the box — raise it only for a fleet whose
+    /// configuration already admits the newer version.
+    #[arg(long, default_value_t = 0)]
     profile_version: u32,
     /// NDJSON issuance journal file.
     #[arg(long)]
@@ -266,8 +270,10 @@ struct IssueLeafArgs {
     /// Integrity-ceiling category bitmask (used only with a level).
     #[arg(long, default_value_t = 0)]
     max_integrity_categories: u64,
-    /// Certificate-format version.
-    #[arg(long, default_value_t = 1)]
+    /// Certificate-format version. `0` is the current format and the only one
+    /// an Engine accepts out of the box — raise it only for a fleet whose
+    /// configuration already admits the newer version.
+    #[arg(long, default_value_t = 0)]
     profile_version: u32,
     /// NDJSON issuance journal file.
     #[arg(long)]
@@ -1702,6 +1708,85 @@ mod tests {
         let pem = encode_pem("CERTIFICATE REQUEST", &der);
         let reparsed = Csr::parse(pem.as_bytes()).unwrap();
         assert_eq!(reparsed.subject(), "CN=engineer,O=Org");
+    }
+
+    /// Issuance and verification must agree on which certificate format is the
+    /// current one: an Engine left at its compiled-in ceiling accepts only the
+    /// baseline format, so a certificate minted without an explicit
+    /// `--profile-version` has to carry exactly that baseline. Any drift here
+    /// is invisible at issuance time and only surfaces as a rejected
+    /// authentication on the device.
+    #[test]
+    fn omitted_profile_version_defaults_to_the_baseline_format() {
+        /// The format version the Engine accepts with no `[trust]` override.
+        const BASELINE: u32 = 0;
+
+        let root = Cli::parse_from([
+            "issuer",
+            "issue-root",
+            "--spki",
+            "spki.pem",
+            "--subject",
+            "CN=Tessera Root",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1900000000",
+            "--journal",
+            "journal.ndjson",
+            "--out",
+            "root.pem",
+        ]);
+        let Command::IssueRoot(root) = root.command else {
+            panic!("expected issue-root");
+        };
+        assert_eq!(root.profile_version, BASELINE);
+
+        let ca = Cli::parse_from([
+            "issuer",
+            "issue-ca",
+            "--parent",
+            "root.pem",
+            "--spki",
+            "spki.pem",
+            "--subject",
+            "CN=Org CA",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1900000000",
+            "--journal",
+            "journal.ndjson",
+            "--out",
+            "ca.pem",
+        ]);
+        let Command::IssueCa(ca) = ca.command else {
+            panic!("expected issue-ca");
+        };
+        assert_eq!(ca.profile_version, BASELINE);
+
+        let leaf = Cli::parse_from([
+            "issuer",
+            "issue-leaf",
+            "--parent",
+            "ca.pem",
+            "--spki",
+            "spki.pem",
+            "--subject",
+            "CN=ivanov",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1600003600",
+            "--journal",
+            "journal.ndjson",
+            "--out",
+            "leaf.pem",
+        ]);
+        let Command::IssueLeaf(leaf) = leaf.command else {
+            panic!("expected issue-leaf");
+        };
+        assert_eq!(leaf.profile_version, BASELINE);
     }
 
     /// PEM and DER cert inputs decode to the same bytes.

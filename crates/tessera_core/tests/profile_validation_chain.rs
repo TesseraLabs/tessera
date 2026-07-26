@@ -126,6 +126,31 @@ fn absent_profile_version_treated_as_baseline() {
     verify_profile_and_criticals(&chain, MAX_SUPPORTED).expect("absent version is baseline");
 }
 
+/// The version-gate tests above run against a locally chosen ceiling, which
+/// keeps them version-neutral but says nothing about the ceiling an Engine
+/// actually ships with. This one pins the compiled-in default: whatever a
+/// stock issuance puts into `pam_cert_profile_version` must pass on a device
+/// with no `[trust].max_supported_profile_version` in its configuration.
+#[test]
+fn compiled_default_ceiling_accepts_the_baseline_format() {
+    use tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION as DEFAULT_MAX;
+
+    let explicit = vec![
+        build_cert(false, |b| {
+            add_ext(b, PROFILE_VERSION_OID, true, &der_integer(0));
+        }),
+        build_cert(true, |b| {
+            add_ext(b, PROFILE_VERSION_OID, true, &der_integer(0));
+        }),
+    ];
+    verify_profile_and_criticals(&explicit, DEFAULT_MAX)
+        .expect("an explicit baseline version passes the default ceiling");
+
+    let absent = vec![build_cert(false, |_b| {}), build_cert(true, |_b| {})];
+    verify_profile_and_criticals(&absent, DEFAULT_MAX)
+        .expect("an absent extension passes the default ceiling");
+}
+
 #[test]
 fn profile_version_above_supported_rejected() {
     // tasks.md 4.1 / scenario "Версия профиля выше поддерживаемой".

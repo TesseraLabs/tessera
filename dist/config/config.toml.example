@@ -174,6 +174,13 @@ clock_skew_seconds = 60
 #   "id-tc26-signwithdigest-gost3410-12-256"
 #   "id-tc26-signwithdigest-gost3410-12-512"
 allowed_signature_algorithms = []
+# Highest certificate-format version (`pam_cert_profile_version`) this Engine
+# understands. A certificate at any link of the chain declaring a higher
+# version rejects the whole chain (fail-closed version gate); an absent
+# extension counts as version 0. Omit the key to keep the compiled-in default
+# shown below, which is also the version `issuer` mints by default. Raise it
+# only after the whole fleet runs a build that understands the newer format.
+# max_supported_profile_version = 0
 
 # --- Trust → revocation ------------------------------------------------------
 [trust.revocation]
