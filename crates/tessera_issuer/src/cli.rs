@@ -44,6 +44,17 @@ use crate::{
     issue_ca, issue_crl, issue_leaf, issue_leaf_from_csr, issue_root, verify_lines, IssuedCert,
 };
 
+/// Default TTL ceiling of a fleet root's delegation envelope, seconds (one
+/// year). The dimension bounds the lifetime of the organisation CA issued
+/// directly under the root, so it is measured in the units an organisation CA
+/// is rotated in, not the units a shift lasts.
+const ROOT_MAX_TTL_SECS: u64 = 31_536_000;
+
+/// Default TTL ceiling of an organisation CA's delegation envelope, seconds
+/// (four hours). This dimension bounds the shift leaf, so it matches the shift
+/// length used throughout the issuance documentation.
+const ORG_CA_MAX_TTL_SECS: u64 = 14_400;
+
 /// The top-level `issuer` command line.
 #[derive(Debug, Parser)]
 #[command(name = "issuer", version, about = "Tessera certificate issuance", long_about = None)]
@@ -156,14 +167,25 @@ struct IssueRootArgs {
     /// `notAfter`, Unix seconds.
     #[arg(long)]
     not_after: u64,
-    /// A role the root envelope allows (repeat for several).
-    #[arg(long = "allow-role")]
+    /// A role the root envelope allows (repeat for several). Required: the
+    /// envelope's role list is a closed whitelist, so a root issued without one
+    /// allows no role at all and no login under it can ever succeed. There is no
+    /// default because role names belong to the deployment — any guess would
+    /// either repeat that dead end or silently widen the envelope beyond what
+    /// the operator named.
+    #[arg(long = "allow-role", required = true)]
     allow_roles: Vec<String>,
     /// The root envelope's integrity-level ceiling.
     #[arg(long, default_value_t = 0)]
     max_level: i8,
-    /// The root envelope's TTL ceiling, seconds.
-    #[arg(long, default_value_t = 0)]
+    /// The root envelope's TTL ceiling, seconds. Here it bounds the lifetime of
+    /// an organisation CA issued under the root, hence the year-scale default;
+    /// `0` is rejected because it would demand a zero-lifetime child.
+    #[arg(
+        long,
+        default_value_t = ROOT_MAX_TTL_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     max_ttl: u64,
     /// A required tag `key=value` the envelope demands (repeat for several).
     #[arg(long = "require-tag")]
@@ -204,14 +226,22 @@ struct IssueCaArgs {
     /// `notAfter`, Unix seconds.
     #[arg(long)]
     not_after: u64,
-    /// A role the CA's envelope allows (repeat for several).
-    #[arg(long = "allow-role")]
+    /// A role the CA's envelope allows (repeat for several). Required for the
+    /// same reason as on `issue-root`: an empty list is a closed whitelist with
+    /// no entries, so nothing issued under this CA can authenticate.
+    #[arg(long = "allow-role", required = true)]
     allow_roles: Vec<String>,
     /// The envelope's integrity-level ceiling.
     #[arg(long, default_value_t = 0)]
     max_level: i8,
-    /// The envelope's TTL ceiling, seconds.
-    #[arg(long, default_value_t = 0)]
+    /// The envelope's TTL ceiling, seconds. Here it bounds the lifetime of a
+    /// shift leaf issued under this CA, hence the shift-scale default; `0` is
+    /// rejected because it would demand a zero-lifetime leaf.
+    #[arg(
+        long,
+        default_value_t = ORG_CA_MAX_TTL_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     max_ttl: u64,
     /// A required tag `key=value` the envelope demands (repeat for several).
     #[arg(long = "require-tag")]
@@ -1732,6 +1762,8 @@ mod tests {
             "1600000000",
             "--not-after",
             "1900000000",
+            "--allow-role",
+            "oper",
             "--journal",
             "journal.ndjson",
             "--out",
@@ -1755,6 +1787,8 @@ mod tests {
             "1600000000",
             "--not-after",
             "1900000000",
+            "--allow-role",
+            "oper",
             "--journal",
             "journal.ndjson",
             "--out",
@@ -1787,6 +1821,112 @@ mod tests {
             panic!("expected issue-leaf");
         };
         assert_eq!(leaf.profile_version, BASELINE);
+    }
+
+    /// The `issue-root` argv without envelope flags, ready to be extended.
+    fn root_argv() -> Vec<&'static str> {
+        vec![
+            "issuer",
+            "issue-root",
+            "--spki",
+            "spki.pem",
+            "--subject",
+            "CN=Tessera Root",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1900000000",
+            "--journal",
+            "journal.ndjson",
+            "--out",
+            "root.pem",
+        ]
+    }
+
+    /// The `issue-ca` argv without envelope flags, ready to be extended.
+    fn ca_argv() -> Vec<&'static str> {
+        vec![
+            "issuer",
+            "issue-ca",
+            "--parent",
+            "root.pem",
+            "--spki",
+            "spki.pem",
+            "--subject",
+            "CN=Org CA",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1900000000",
+            "--journal",
+            "journal.ndjson",
+            "--out",
+            "ca.pem",
+        ]
+    }
+
+    /// The envelope's role list is a closed whitelist: an empty one allows no
+    /// role, so a CA issued that way passes issuance and then fails every
+    /// login. Refusing at argument parsing keeps the operator from learning
+    /// this on the device, where the diagnosis points at the trust chain rather
+    /// than at the issuing command.
+    #[test]
+    fn issuing_a_ca_without_an_allowed_role_is_refused() {
+        assert!(
+            Cli::try_parse_from(root_argv()).is_err(),
+            "issue-root must not mint a root whose envelope allows no role"
+        );
+        assert!(
+            Cli::try_parse_from(ca_argv()).is_err(),
+            "issue-ca must not mint a CA whose envelope allows no role"
+        );
+    }
+
+    /// The TTL ceiling bounds the *child* link, so a zero ceiling demands a
+    /// zero-lifetime child — no issuable certificate satisfies it.
+    #[test]
+    fn an_explicitly_zero_ttl_ceiling_is_refused() {
+        let mut root = root_argv();
+        root.extend(["--allow-role", "oper", "--max-ttl", "0"]);
+        assert!(
+            Cli::try_parse_from(root).is_err(),
+            "issue-root must not accept a zero TTL ceiling"
+        );
+
+        let mut ca = ca_argv();
+        ca.extend(["--allow-role", "oper", "--max-ttl", "0"]);
+        assert!(
+            Cli::try_parse_from(ca).is_err(),
+            "issue-ca must not accept a zero TTL ceiling"
+        );
+    }
+
+    /// The two defaults differ because the dimension bounds different things:
+    /// under a root it caps the organisation CA, under an organisation CA it
+    /// caps the shift leaf. A single shared value would be wrong for one of
+    /// them, and any zero would be wrong for both.
+    #[test]
+    fn omitted_ttl_ceilings_default_to_what_each_envelope_bounds() {
+        let mut root_args = root_argv();
+        root_args.extend(["--allow-role", "oper"]);
+        let Command::IssueRoot(root) = Cli::parse_from(root_args).command else {
+            panic!("expected issue-root");
+        };
+        assert_eq!(root.max_ttl, ROOT_MAX_TTL_SECS);
+        assert_eq!(root.allow_roles, vec!["oper".to_owned()]);
+
+        let mut ca_args = ca_argv();
+        ca_args.extend(["--allow-role", "oper"]);
+        let Command::IssueCa(ca) = Cli::parse_from(ca_args).command else {
+            panic!("expected issue-ca");
+        };
+        assert_eq!(ca.max_ttl, ORG_CA_MAX_TTL_SECS);
+        assert_eq!(ca.allow_roles, vec!["oper".to_owned()]);
+
+        assert_ne!(
+            root.max_ttl, ca.max_ttl,
+            "the two ceilings bound different links and cannot share a value"
+        );
     }
 
     /// PEM and DER cert inputs decode to the same bytes.
