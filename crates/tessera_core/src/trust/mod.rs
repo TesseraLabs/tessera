@@ -6,9 +6,7 @@ pub mod openssl_verifier;
 pub mod stub;
 pub mod types;
 
-pub use delegation::{
-    chain_carries_constraints, enforce_delegation, enforce_delegation_opt, DelegationError,
-};
+pub use delegation::{chain_carries_constraints, enforce_delegation, DelegationError};
 pub use openssl_verifier::{
     OpensslVerifier, OpensslVerifierConfig, Stage2TrustVerifier, Stage2VerifiedChain,
 };

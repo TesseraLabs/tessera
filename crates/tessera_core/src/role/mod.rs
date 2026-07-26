@@ -26,7 +26,7 @@ pub use manifest::{
 pub use schema::{parse_slice, Payload, RoleId, RoleOs, RoleSchemaError, RoleSlice, SessionLimits};
 pub use selection::{
     bounded_ttl, payload_backend_available, resolve_and_cover, CoverageMethod, Resolution,
-    RoleDenyReason, RoleEnforce, SessionFixError, SessionRolePayload,
+    RoleDenyReason, SessionFixError, SessionRolePayload,
 };
 pub use store::{RoleStore, RoleStoreError, TrustMode, DEFAULT_ROLES_DIR, MAX_ROLES};
 pub use update::{atomic_update, cleanup_staged, UpdateTrust};

@@ -430,33 +430,16 @@ pub struct Deps<'a> {
 /// Built once per `pam_sm_authenticate` and threaded through [`Deps`] so the
 /// requested role travels with the cert verification — there is no later
 /// re-read of `PAM_USER` and no swap window (polkit CVE-2021-3560).
+/// Both fields are mandatory: a login without a role, or without a store to
+/// resolve it against, is rejected before the stage is built — the flow has no
+/// "no role selected" state to represent.
 pub struct RoleStage<'a> {
-    /// The role parsed from the `<user>+<role>` login suffix / prompt, or
-    /// `None` when none was supplied.
-    pub requested: Option<tessera_core::role::RoleId>,
-    /// The on-device role store (already loaded by the cdylib). `None` when
-    /// enforcement is disabled (the store is not loaded in that case).
-    pub store: Option<&'a tessera_core::role::RoleStore>,
-    /// Enforcement mode mapped from `[roles].enforce`.
-    pub enforce: tessera_core::role::RoleEnforce,
+    /// The role parsed from the `<user>+<role>` login suffix / prompt.
+    pub requested: tessera_core::role::RoleId,
+    /// The on-device role store (already loaded by the cdylib).
+    pub store: &'a tessera_core::role::RoleStore,
     /// Global default session TTL from `[roles].default_session_ttl`.
     pub default_session_ttl: std::time::Duration,
-}
-
-impl RoleStage<'_> {
-    /// A disabled stage (pre-role behaviour) — convenient default for tests
-    /// and the `enforce = false` migration phase.
-    #[must_use]
-    pub fn disabled() -> Self {
-        Self {
-            requested: None,
-            store: None,
-            enforce: tessera_core::role::RoleEnforce::Disabled,
-            default_session_ttl: std::time::Duration::from_secs(
-                tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
-            ),
-        }
-    }
 }
 
 /// Outcome of a successful authentication.
@@ -875,7 +858,7 @@ where
     if let Err(e) = enforce_delegation_stage(
         &verified,
         deps.device_tags,
-        role.as_ref(),
+        &role,
         cert_max_integrity,
         &verified_leaf,
     ) {
@@ -898,7 +881,7 @@ where
         cert_max_integrity,
         cert_ident,
         home_dir,
-        role,
+        role: Some(role),
     };
 
     // Step 11b — post_auth_success hooks (Stage 5). Run after every
@@ -1251,7 +1234,7 @@ where
     enforce_delegation_stage(
         &verified,
         deps.device_tags,
-        role.as_ref(),
+        &role,
         cert_max_integrity,
         &verified_leaf,
     )?;
@@ -1271,7 +1254,7 @@ where
         cert_max_integrity,
         cert_ident,
         home_dir,
-        role,
+        role: Some(role),
     };
 
     // Drop the session here so `C_Logout` runs before we return.
@@ -1741,11 +1724,9 @@ fn authorize_user(
 /// snapshotted into a [`SessionRolePayload`] with a bounded TTL and a
 /// backend-availability gate.
 ///
-/// Returns:
-/// - `Ok(None)` — enforcement disabled, or warn-mode with no usable role:
-///   behave as before (no role attached to the session).
-/// - `Ok(Some(payload))` — role resolved, covered, and enforceable.
-/// - `Err(FlowError::RoleDenied)` — `require` mode and the role was denied.
+/// Returns the fixed session payload, or `Err(FlowError::RoleDenied)` when the
+/// role does not resolve, is not covered, or cannot be enforced. There is no
+/// success path without a role.
 ///
 /// `cert_ttl` is `notAfter - now` (saturating); `None` means the cert has no
 /// usable expiry, in which case the global default bounds the session.
@@ -1754,29 +1735,9 @@ fn resolve_role_stage(
     stage: &RoleStage<'_>,
     user: &str,
     cert_ttl: Option<std::time::Duration>,
-) -> Result<Option<tessera_core::role::SessionRolePayload>, FlowError> {
+) -> Result<tessera_core::role::SessionRolePayload, FlowError> {
     use tessera_core::role::{
-        self, resolve_and_cover, CoverageMethod, Resolution, RoleDenyReason, RoleEnforce,
-        SessionRolePayload,
-    };
-
-    if stage.enforce == RoleEnforce::Disabled {
-        return Ok(None);
-    }
-    // Enforcement on but no store loaded → fail-closed under `require`
-    // ("roles not configured"), benign skip under `warn`.
-    let Some(store) = stage.store else {
-        return match stage.enforce {
-            RoleEnforce::Require => {
-                role::audit::emit_role_deny(
-                    user,
-                    stage.requested.as_ref().map_or("", role::RoleId::as_str),
-                    RoleDenyReason::NotFound.as_str(),
-                );
-                Err(FlowError::RoleDenied(RoleDenyReason::NotFound))
-            }
-            _ => Ok(None),
-        };
+        self, resolve_and_cover, CoverageMethod, Resolution, SessionRolePayload,
     };
 
     // Extract the cert's allowed_roles extension (fail-closed on malformed).
@@ -1801,15 +1762,13 @@ fn resolve_role_stage(
         };
 
     let resolution = resolve_and_cover(
-        store,
-        stage.requested.as_ref(),
+        stage.store,
+        Some(&stage.requested),
         allowed.as_deref(),
-        stage.enforce,
         user,
     );
 
     let (slice, method) = match resolution {
-        Resolution::Skipped => return Ok(None),
         Resolution::Denied { reason } => return Err(FlowError::RoleDenied(reason)),
         Resolution::Allowed { slice, method } => (slice, method),
     };
@@ -1820,14 +1779,10 @@ fn resolve_role_stage(
             Ok(p) => p,
             Err(fix_err) => {
                 let reason = fix_err.deny_reason();
-                // Backend unavailable is an explicit deny in both warn and
-                // require: silently narrowing privileges is forbidden by the
-                // spec. Under warn we still proceed without the role.
+                // A role whose payload cannot be enforced denies: silently
+                // narrowing the granted privileges is forbidden by the spec.
                 role::audit::emit_role_deny(user, slice.role.as_str(), reason.as_str());
-                return match stage.enforce {
-                    RoleEnforce::Require => Err(FlowError::RoleDenied(reason)),
-                    _ => Ok(None),
-                };
+                return Err(FlowError::RoleDenied(reason));
             }
         };
 
@@ -1843,7 +1798,7 @@ fn resolve_role_stage(
         method_str,
         payload.ttl.as_secs(),
     );
-    Ok(Some(payload))
+    Ok(payload)
 }
 
 /// Extract `MAX_INTEGRITY` without collapsing a malformed present extension
@@ -1871,7 +1826,7 @@ fn extract_cert_max_integrity(
 ///
 /// Runs AFTER trust verification and role resolution on BOTH auth paths. For
 /// every CA in the verified chain carrying `pam_cert_delegation_constraints`,
-/// [`tessera_core::trust::enforce_delegation_opt`] checks
+/// [`tessera_core::trust::enforce_delegation`] checks
 /// `device.tags ⊇ requireTags`, role ∈ `allowRoles`, level ≤ `maxLevel`, and
 /// link TTL ≤ parent `maxTtl` (AND/MIN across all links). A chain carrying NO
 /// constraints is a no-op (prior per-host semantics preserved).
@@ -1879,8 +1834,8 @@ fn extract_cert_max_integrity(
 /// Inputs:
 /// * `verified` — the stage-2 verified chain (full `[leaf]++mids++[anchor]`).
 /// * `device_tags` — this device's trusted, applied tag set.
-/// * `role` — the resolved session role (`None` when role enforcement is off);
-///   an envelope-scoped chain with no role rejects fail-closed.
+/// * `role` — the resolved session role; always present, since a login that
+///   resolves no role never reaches this stage.
 /// * `cert_max_integrity` — the leaf `max_integrity` label, if present. Its
 ///   `level` is BOTH the requested integrity level (the level the session
 ///   assumes) and the leaf ceiling.
@@ -1897,7 +1852,7 @@ fn extract_cert_max_integrity(
 fn enforce_delegation_stage(
     verified: &tessera_core::trust::Stage2VerifiedChain,
     device_tags: &DeviceTags,
-    role: Option<&tessera_core::role::SessionRolePayload>,
+    role: &tessera_core::role::SessionRolePayload,
     cert_max_integrity: Option<tessera_core::mac::IntegrityLabel>,
     verified_leaf: &tessera_core::x509::VerifiedX509,
 ) -> Result<(), FlowError> {
@@ -1925,8 +1880,8 @@ fn enforce_delegation_stage(
         }
     };
 
-    // Requested role = the resolved session role (if any).
-    let requested_role = role.map(|r| &r.role);
+    // Requested role = the resolved session role.
+    let requested_role = &role.role;
 
     // Requested integrity level = the leaf's max_integrity level (the level the
     // session assumes); leaf ceiling = the same value. Absent extension =
@@ -1969,7 +1924,7 @@ fn enforce_delegation_stage(
             Err(_) => Some(Vec::new()),
         };
 
-    if let Err(err) = tessera_core::trust::enforce_delegation_opt(
+    if let Err(err) = tessera_core::trust::enforce_delegation(
         &chain,
         device_tags,
         requested_role,
@@ -2120,6 +2075,52 @@ mod tests {
         tmp
     }
 
+    /// A complete role stage for flow tests: an on-disk store holding the
+    /// `serv` role plus a request naming it.
+    ///
+    /// Every authentication resolves a role, so there is no "no role" stage to
+    /// fall back on. The `leaf_rsa` / `leaf_ecdsa` fixtures carry
+    /// `pam_cert_allowed_roles = [serv, oper]`, which is what proves coverage.
+    struct RoleFixture {
+        _dir: tempfile::TempDir,
+        store: tessera_core::role::RoleStore,
+        requested: tessera_core::role::RoleId,
+    }
+
+    impl RoleFixture {
+        fn serv() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("serv.toml"),
+                b"role = \"serv\"\nversion = 4\nos = \"linux\"\nname = \"serv\"\nlevel = 1\n\
+                  [payload]\ngroups = [\"wheel\"]\n"
+                    .as_slice(),
+            )
+            .unwrap();
+            let store = tessera_core::role::RoleStore::load(
+                dir.path(),
+                tessera_core::role::RoleOs::Linux,
+                tessera_core::role::TrustMode::Standalone,
+            )
+            .unwrap();
+            Self {
+                _dir: dir,
+                store,
+                requested: tessera_core::role::RoleId::new("serv").unwrap(),
+            }
+        }
+
+        fn stage(&self) -> RoleStage<'_> {
+            RoleStage {
+                requested: self.requested.clone(),
+                store: &self.store,
+                default_session_ttl: Duration::from_secs(
+                    tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
+                ),
+            }
+        }
+    }
+
     fn build_verifier() -> OpensslVerifier {
         let ca = Certificate::from_pem(&fixture_bytes("ca.pem")).unwrap();
         let int_ = Certificate::from_pem(&fixture_bytes("int.pem")).unwrap();
@@ -2217,6 +2218,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2226,7 +2228,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -2255,6 +2257,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2264,7 +2267,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -2291,6 +2294,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2300,7 +2304,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -2326,6 +2330,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2335,7 +2340,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2364,6 +2369,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2373,7 +2379,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -2403,6 +2409,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2412,7 +2419,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -2439,6 +2446,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2448,7 +2456,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
@@ -2569,6 +2577,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2578,7 +2587,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -2715,6 +2724,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2724,7 +2734,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
         let io = dummy_flow_io();
@@ -2746,6 +2756,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2755,7 +2766,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
         let io = dummy_flow_io();
@@ -2779,6 +2790,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2788,7 +2800,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
         let io = dummy_flow_io();
@@ -2815,6 +2827,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2824,7 +2837,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
         let stub = StubPkcs11Io::new();
@@ -2855,6 +2868,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2864,7 +2878,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -2899,6 +2913,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2908,7 +2923,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -2939,6 +2954,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -2948,7 +2964,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3078,6 +3094,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = MockExec::new(Vec::new());
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3087,7 +3104,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3116,6 +3133,7 @@ level = "info"
 
         let monitor = StubClient;
         let exec = MockExec::new(vec![Ok(nonzero_outcome(Stage5HookStage::PreAuth, 7))]);
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3125,7 +3143,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3161,6 +3179,7 @@ level = "info"
             Stage5HookStage::PostAuthSuccess,
             42,
         ))]);
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3170,7 +3189,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3201,6 +3220,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = MockExec::new(vec![Ok(nonzero_outcome(Stage5HookStage::PreAuth, 1))]);
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3210,7 +3230,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3359,6 +3379,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3368,7 +3389,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3415,6 +3436,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3424,7 +3446,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3479,6 +3501,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3488,7 +3511,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3534,6 +3557,7 @@ level = "info"
         let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3543,7 +3567,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3565,18 +3589,6 @@ level = "info"
     }
 
     // ---- role-format glue (tasks 4.3/4.4) --------------------------------
-
-    #[test]
-    fn role_stage_disabled_is_pre_role_default() {
-        let stage = RoleStage::disabled();
-        assert_eq!(stage.enforce, tessera_core::role::RoleEnforce::Disabled);
-        assert!(stage.requested.is_none());
-        assert!(stage.store.is_none());
-        assert_eq!(
-            stage.default_session_ttl,
-            Duration::from_secs(tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS)
-        );
-    }
 
     #[test]
     fn cert_remaining_ttl_future_and_past() {
@@ -3722,6 +3734,7 @@ level = "info"
         // turn the otherwise-successful cert auth into a definitive denial.
         let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Strict);
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3731,7 +3744,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 
@@ -3758,6 +3771,7 @@ level = "info"
         // Ok(()) before the flow ever sees it, so auth still succeeds.
         let monitor = FailModeWrapper::new(FailingMonitor, MonitorFailMode::Permissive);
         let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
         let deps = Deps {
             cfg: &cfg,
             trust: &verifier,
@@ -3767,7 +3781,7 @@ level = "info"
             host_id_source: HostIdSourceKind::Override,
             user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: RoleStage::disabled(),
+            role_stage: roles.stage(),
             device_tags: empty_device_tags(),
         };
 

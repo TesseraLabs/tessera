@@ -268,56 +268,6 @@ pub fn chain_carries_constraints(chain: &[Certificate]) -> Result<bool, Delegati
     Ok(false)
 }
 
-/// Like [`enforce_delegation`] but for a possibly-absent requested role.
-///
-/// When `requested_role` is `Some`, this delegates verbatim to
-/// [`enforce_delegation`]. When it is `None` (no role was selected — e.g.
-/// `[roles].enforce = false`), an envelope-scoped chain cannot be satisfied:
-/// a group-delegation login that names no role cannot be proven to fall within
-/// any CA's `allowRoles`, so the chain is rejected fail-closed. A chain that
-/// carries NO delegation constraints is unaffected (prior per-host semantics).
-///
-/// # Errors
-///
-/// Any [`DelegationError`] — every one is a fail-closed rejection.
-pub fn enforce_delegation_opt(
-    chain: &[Certificate],
-    device_tags: &DeviceTags,
-    requested_role: Option<&RoleId>,
-    requested_level: i8,
-    leaf_max_integrity_level: Option<i8>,
-    leaf_allowed_roles: Option<&[RoleId]>,
-) -> Result<(), DelegationError> {
-    if let Some(role) = requested_role {
-        return enforce_delegation(
-            chain,
-            device_tags,
-            role,
-            requested_level,
-            leaf_max_integrity_level,
-            leaf_allowed_roles,
-        );
-    }
-    // No role selected: only envelope-free (per-host) chains are allowed
-    // through. An envelope-scoped chain rejects fail-closed — we attribute it
-    // to the first constraint-bearing CA so the audit culprit serial is
-    // meaningful.
-    for (index, cert) in chain.iter().enumerate() {
-        let verified = VerifiedX509::new(cert.x509().clone());
-        match extract_delegation_constraints(&verified) {
-            Ok(Some(_)) => {
-                return Err(DelegationError::RoleNotAllowed {
-                    role: String::new(),
-                    scope: format!("allowRoles of CA at chain index {index} (no role selected)"),
-                });
-            }
-            Ok(None) => {}
-            Err(source) => return Err(DelegationError::Malformed { index, source }),
-        }
-    }
-    Ok(())
-}
-
 /// A certificate link's lifetime, `notAfter − notBefore`, clamped at zero for
 /// the pathological case of a cert whose `notAfter` precedes its `notBefore`.
 fn link_lifetime(cert: &Certificate) -> Duration {

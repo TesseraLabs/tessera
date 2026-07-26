@@ -47,12 +47,10 @@ const PAM_PROMPT_ECHO_ON: i32 = 2;
 /// [`crate::flow::Deps`] can borrow it. Built by [`build_role_stage`].
 #[cfg(target_os = "linux")]
 struct RoleStageOwned {
-    /// Requested role parsed from the suffix / prompt (`None` = none given).
-    requested: Option<tessera_core::role::RoleId>,
-    /// Loaded role store (`None` when enforcement is disabled).
-    store: Option<tessera_core::role::RoleStore>,
-    /// Enforcement mode mapped from `[roles].enforce`.
-    enforce: tessera_core::role::RoleEnforce,
+    /// Requested role parsed from the suffix / prompt.
+    requested: tessera_core::role::RoleId,
+    /// Loaded role store.
+    store: tessera_core::role::RoleStore,
     /// Global default TTL from `[roles].default_session_ttl`.
     default_session_ttl: std::time::Duration,
 }
@@ -63,8 +61,7 @@ impl RoleStageOwned {
     fn as_deps(&self) -> crate::flow::RoleStage<'_> {
         crate::flow::RoleStage {
             requested: self.requested.clone(),
-            store: self.store.as_ref(),
-            enforce: self.enforce,
+            store: &self.store,
             default_session_ttl: self.default_session_ttl,
         }
     }
@@ -72,14 +69,14 @@ impl RoleStageOwned {
 
 /// Build the role-selection stage from config + the parsed suffix.
 ///
-/// When enforcement is disabled this is a cheap no-op stage (no prompt, no
-/// store load) preserving pre-role behaviour. When enforced and no role came
-/// from the suffix, prompt for one via the PAM conversation
-/// (`PAM_PROMPT_ECHO_ON`, input only — no role listing). The on-device store
-/// is loaded in standalone mode (filesystem-permission trust).
+/// Every login carries a role: when none came from the suffix, prompt for one
+/// via the PAM conversation (`PAM_PROMPT_ECHO_ON`, input only — no role
+/// listing). The on-device store is loaded in standalone mode
+/// (filesystem-permission trust).
 ///
-/// Returns the owned stage, or a PAM return code on a hard failure (no role
-/// supplied where one is required, or store load error under `require`).
+/// Returns the owned stage, or a PAM return code on a hard failure — no role
+/// could be obtained, or the store could not be loaded. Both are fail-closed:
+/// there is no configuration under which the login proceeds without a role.
 ///
 /// # Safety
 ///
@@ -91,29 +88,19 @@ fn build_role_stage(
     device_os: tessera_core::role::RoleOs,
     suffix_role: Option<tessera_core::role::RoleId>,
 ) -> Result<RoleStageOwned, i32> {
-    use tessera_core::role::{RoleDenyReason, RoleEnforce, RoleId, RoleStore, TrustMode};
-
-    let enforce = roles_cfg.enforce_mode();
-    if enforce == RoleEnforce::Disabled {
-        return Ok(RoleStageOwned {
-            requested: suffix_role,
-            store: None,
-            enforce,
-            default_session_ttl: roles_cfg.default_session_ttl,
-        });
-    }
+    use tessera_core::role::{RoleDenyReason, RoleId, RoleStore, TrustMode};
 
     // Resolve the requested role: prefer the suffix; otherwise prompt.
     // The nested match mirrors the two-axis decision (prompt outcome x role
     // validity); if-let chains would obscure the fail-closed branches.
     #[allow(clippy::single_match_else)]
-    let requested: Option<RoleId> = match suffix_role {
-        Some(r) => Some(r),
+    let requested: RoleId = match suffix_role {
+        Some(r) => r,
         None => {
             // SAFETY: `pamh` is the live PAM handle for this callback.
             match unsafe { prompt_for_role(pamh) } {
                 Ok(Some(raw)) => match RoleId::new(&raw) {
-                    Ok(r) => Some(r),
+                    Ok(r) => r,
                     Err(_) => {
                         tracing::warn!(
                             target: "role.audit",
@@ -122,15 +109,10 @@ fn build_role_stage(
                             raw_role = %raw,
                             "role prompt returned an invalid role_id",
                         );
-                        // Under enforcement a bad prompt value is fatal.
-                        if matches!(enforce, RoleEnforce::Require) {
-                            return Err(PAM_AUTH_ERR);
-                        }
-                        None
+                        return Err(PAM_AUTH_ERR);
                     }
                 },
-                // No conversation / empty input: deny "role not specified"
-                // under require; benign under warn.
+                // No conversation / empty input: the login names no role.
                 Ok(None) | Err(()) => {
                     tracing::warn!(
                         target: "role.audit",
@@ -138,10 +120,7 @@ fn build_role_stage(
                         reason = "syntax",
                         "role not specified and no usable conversation prompt",
                     );
-                    if matches!(enforce, RoleEnforce::Require) {
-                        return Err(PAM_AUTH_ERR);
-                    }
-                    None
+                    return Err(PAM_AUTH_ERR);
                 }
             }
         }
@@ -151,10 +130,10 @@ fn build_role_stage(
     // OS selection is runtime state now: the same open PAM binary serves
     // Linux and Astra, with the Parsec plugin identifying the Astra contour.
     let store = match RoleStore::load_privileged(&roles_cfg.dir, device_os, TrustMode::Standalone) {
-        Ok(s) => Some(s),
+        Ok(s) => s,
         Err(err) => {
-            // Under `require` a store that cannot be loaded is fail-closed
-            // ("roles not configured"); under `warn` we proceed without it.
+            // A store that cannot be loaded is "roles not configured" —
+            // fail-closed, because coverage cannot be proven without it.
             tracing::error!(
                 target: "role.audit",
                 event = "role_deny",
@@ -163,17 +142,13 @@ fn build_role_stage(
                 error = %err,
                 "role store load failed",
             );
-            if matches!(enforce, RoleEnforce::Require) {
-                return Err(PAM_AUTH_ERR);
-            }
-            None
+            return Err(PAM_AUTH_ERR);
         }
     };
 
     Ok(RoleStageOwned {
         requested,
         store,
-        enforce,
         default_session_ttl: roles_cfg.default_session_ttl,
     })
 }

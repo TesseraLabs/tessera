@@ -112,8 +112,8 @@ pub struct RawConfig {
     #[serde(default)]
     pub fly_dm_greeter: Option<RawFlyDmGreeter>,
     /// Role-format section (`[roles]`). Optional; when absent the validated
-    /// layer applies defaults (`enforce = false` — pre-role behaviour,
-    /// `dir = /var/lib/tessera/roles`, `default_session_ttl_seconds = 43200`).
+    /// layer applies defaults (`dir = /var/lib/tessera/roles`,
+    /// `default_session_ttl_seconds = 43200`).
     #[serde(default)]
     pub roles: RawRoles,
     /// Device-tags source section (`[tags]`, tags-delegation §5.2). Optional;
@@ -170,21 +170,23 @@ pub struct RawTags {
     pub source: Option<PathBuf>,
 }
 
-/// Migration / enforcement mode for the `[roles]` section.
+/// A key that no longer exists, kept in the raw layer only so validation can
+/// reject it by name.
 ///
-/// Three-stage rollout (design Migration Plan): `false` — roles are not
-/// checked (v0.3.19 behaviour); `warn` — resolve + coverage are checked and
-/// logged but never deny; `require` — full enforcement (fail-closed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum RawRolesEnforce {
-    /// Roles not checked — pre-role behaviour (default for this stage).
-    #[default]
-    False,
-    /// Checked + logged, never denies.
-    Warn,
-    /// Full enforcement; fail-closed.
-    Require,
+/// The whole config is `deny_unknown_fields`, so a dropped key would otherwise
+/// surface as a generic "unknown field" error indistinguishable from a typo.
+/// Deserialising accepts any value shape: the diagnostic must not depend on the
+/// operator having written a still-parseable value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedKey;
+
+impl<'de> serde::Deserialize<'de> for RemovedKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| RemovedKey)
+    }
 }
 
 /// Raw `[roles]` block.
@@ -196,9 +198,10 @@ pub enum RawRolesEnforce {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawRoles {
-    /// Enforcement mode. Default `false`.
+    /// Removed migration switch. Role checking is unconditional; the field is
+    /// accepted at parse time only so the validated layer can name the reason.
     #[serde(default)]
-    pub enforce: RawRolesEnforce,
+    pub enforce: Option<RemovedKey>,
     /// On-device role-store directory. Default `/var/lib/tessera/roles`.
     #[serde(default)]
     pub dir: Option<PathBuf>,

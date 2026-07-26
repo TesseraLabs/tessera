@@ -91,6 +91,7 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
     let verifier = build_verifier(vec![]);
     let monitor = StubClient;
     let executor = ForkExecExecutor::new();
+    let roles = RoleFixture::serv();
     let deps = Deps {
         cfg: &cfg,
         trust: &verifier,
@@ -100,7 +101,7 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
         host_id_source: HostIdSourceKind::Override,
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
-        role_stage: RoleStage::disabled(),
+        role_stage: roles.stage(),
         device_tags: empty_device_tags(),
     };
 

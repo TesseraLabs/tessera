@@ -234,8 +234,9 @@ payload (see `client.rs::SessionOpenPayload`):
 - `uid` — the Unix uid that the PAM module authenticated (v2; `0` when absent
   from a v1 client's frame);
 - `role`, `role_version` — the role id and the version of the role snapshot
-  the session was opened with (optional v2 NDJSON fields; serialized only when
-  a role is selected, absent when `[roles].enforce = false`).
+  the session was opened with (optional v2 NDJSON fields — optional for
+  compatibility with frames from earlier versions; in the current version every
+  login carries a role).
 
 Monitord adds the session to the registry and starts monitoring the USB.
 
