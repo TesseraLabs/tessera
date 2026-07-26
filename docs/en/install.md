@@ -2,8 +2,10 @@
 
 This document is a step-by-step scenario for installing and doing the
 basic configuration of `tessera` on a clean Astra Linux SE 1.7+
-machine. Every section ends with a verification command. If the check
-fails, read the "What to do if…" section at the end of the document.
+machine. At the end — a working certificate login, verified via
+`pamtester` (§9). Every section ends with a verification command; if the
+check fails, see §10 "Troubleshooting" and
+[troubleshooting.md](troubleshooting.md).
 
 > All commands are run as `root` or with `sudo`. While editing the PAM
 > stack, keep a root shell open in **another** terminal. If the PAM
@@ -135,41 +137,55 @@ not go through — `pam_tessera.so` simply does not load. See also
 ```bash
 # The release link is a placeholder; replace it with the real URL after
 # v0.4.0 is published (usually GitHub Releases or the Astra Linux
-# internal repository).
+# internal repository). The release publishes only the `.deb` in two
+# variants (`…-astra.deb` and `…-ubuntu.deb`, plus `.changes` and
+# `.buildinfo` for audit) — there are no ready-made checksum files there;
+# the operator computes them on a trusted machine (see §2.2).
 wget https://example.test/releases/tessera_0.4.0-1_amd64.deb
-wget https://example.test/releases/tessera_0.4.0-1_amd64.deb.sha256
-wget https://example.test/releases/tessera_0.4.0-1_amd64.deb.streebog256
 ```
 
-### 2.2 SHA-256 verification
+### 2.2 Generating the checksums (trusted machine)
+
+The checksums are computed by the builder or the operator on a
+**trusted** machine (not the target) with the `generate-checksums.sh`
+script:
 
 ```bash
-sha256sum -c tessera_0.4.0-1_amd64.deb.sha256
+scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
 ```
 
-Expected: `tessera_0.4.0-1_amd64.deb: OK`.
+The script puts a `checksums.txt` file into the `checksums/` directory —
+a combined report of SHA-256 and Streebog-256 (GOST R 34.11-2012-256) for
+the `.deb` itself and for every file inside the package — plus standalone
+`*.sha256` and `*.streebog256` files. The Streebog-256 section requires
+`gost-engine` (on Astra SE 1.7+ it is available by default); without it
+the section is skipped, and SHA-256 is still computed.
 
-### 2.3 Streebog-256 verification
+Three things are delivered to the target machine: the `.deb` itself,
+`checksums.txt`, and a copy of `verify-checksums.sh` (the script is
+self-contained — the only external thing it needs is `openssl` with
+`gost-engine` for the GOST section).
+
+### 2.3 Verifying on the target machine
 
 ```bash
-./scripts/verify-checksums.sh \
-    tessera_0.4.0-1_amd64.deb \
-    checksums/checksums.txt
+./verify-checksums.sh tessera_0.4.0-1_amd64.deb checksums.txt
 ```
 
-The script is described in [scripts/verify-checksums.sh](../../scripts/verify-checksums.sh)
-and checks both sums (SHA-256 and Streebog-256). See
-[configuration.md](configuration.md) for details.
+Expected: `OK: N checksum(s) verified`. The script (described in
+[scripts/verify-checksums.sh](../../scripts/verify-checksums.sh)) checks
+both sums: SHA-256 always, Streebog-256 only if `checksums.txt` has a GOST
+section and `gost-engine` is available on the machine. A non-zero exit
+code means either a checksum mismatch (code 1) or a launch problem:
+invalid arguments (2) or a missing `gost-engine` when a GOST section is
+present (3). In any of these cases do not install the package until the
+cause is understood.
 
 ### 2.4 Installation
 
 ```bash
 sudo apt install ./tessera_0.4.0-1_amd64.deb
 ```
-
-> Since 0.2.0 the `tessera-monitord` binary has been renamed to
-> `tessera`. Daemon mode is started as `tessera daemon`; the systemd
-> unit `tessera.service` already uses the new name.
 
 `apt` will pull in the missing dependencies (`libgost-engine | gost-engine`,
 `libpkcs11-helper1`, `librtpkcs11ecp`).
@@ -192,7 +208,7 @@ What is checked:
   1. `@include tessera-*` stands BEFORE `auth required pam_parsec_mac.so`
      (on Astra SE this kills the account phase with "Can't obtain required data").
      Check id: `pam_stack_misorder`.
-  2. (0.3.12+) `session required pam_tessera.so` stands BEFORE
+  2. `session required pam_tessera.so` stands BEFORE
      `pam_systemd.so` / `@include common-session` —
      `XDG_SESSION_ID` is not yet available at the moment of `pam_sm_open_session`,
      `UpdateSessionTarget` is not sent, and monitord cannot call
@@ -333,11 +349,50 @@ openssl req -new -engine gost -key alice.key -out alice.csr \
 
 ### 4.3 Signing the CSR
 
+The leaf certificate must carry two binding extensions —
+`pam_cert_host_binding` and `pam_cert_user_binding`. Without them the
+module rejects authentication **fail-closed** (`HostExtensionMissing` /
+`UserExtensionMissing`): §7 will not find the OID in the certificate, and
+`pamtester` in §9 will not pass. The OIDs and the ASN.1 syntax of the
+extensions are from [cert-issuance.md](cert-issuance.md).
+
+First find out this machine's `host_id_hash` — the source the daemon uses
+right now (the row with `active_under_current_config=yes`, column
+`hash_hex`):
+
+```bash
+HOST_HASH=$(sudo tessera dump-host-id | awk -F'\t' '$7 == "yes" { print $3 }')
+echo "host_id_hash = ${HOST_HASH}"   # 64 hex characters
+```
+
+Assemble the `extfile` with both extensions (host — only this machine,
+user — only `alice`):
+
+```bash
+cat > alice.ext <<EOF
+extendedKeyUsage = clientAuth
+keyUsage = critical,digitalSignature
+
+# Host: only this machine (host_id_hash obtained above)
+2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb
+# User: only alice
+2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub
+
+[ hb ]
+e0 = UTF8String:sha256:${HOST_HASH}
+
+[ ub ]
+e0 = UTF8String:alice
+EOF
+```
+
+Sign the CSR with this `extfile`:
+
 ```bash
 openssl x509 -req -engine gost -in alice.csr \
     -CA ca.pem -CAkey ca.key -CAcreateserial \
     -out alice.pem -days 365 \
-    -extfile <(printf "extendedKeyUsage=clientAuth\nkeyUsage=critical,digitalSignature\n")
+    -extfile alice.ext
 ```
 
 ### 4.4 Packing into P12
@@ -373,7 +428,7 @@ the trust module. The limit on the number of partitions scanned is set
 by the `max_usb_partitions` parameter in `config.toml` (8 by default,
 range 1..=64).
 
-> Since 0.3.5: if the USB stick has several partitions and some of them
+> If the USB stick has several partitions and some of them
 > contain foreign files with a name matching `pkcs12_path_pattern`
 > (typical for Apple-formatted media and USB sticks with multiple
 > partitions), `tessera` recognizes them as "not PKCS#12" by the ASN.1
@@ -457,14 +512,39 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 
 ### 6.4 Importing the key and certificate
 
+`pkcs11-tool` expects the key and certificate as separate DER/PEM objects,
+not as a PKCS#12 container. First extract them from `alice.p12` (the
+password is from §4.4):
+
+```bash
+openssl pkcs12 -in alice.p12 -nocerts -nodes -passin pass:test \
+    -out alice.token.key            # private key, PEM, no password
+openssl pkcs12 -in alice.p12 -clcerts -nokeys -passin pass:test \
+    -out alice.token.crt            # certificate, PEM
+# Some tokens accept only DER — convert if needed:
+#   openssl pkey -in alice.token.key -outform DER -out alice.token.key.der
+#   openssl x509 -in alice.token.crt -outform DER -out alice.token.crt.der
+```
+
+Import the certificate and the private key into the token:
+
 ```bash
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
     --login --pin '1234567890' \
-    --write-object alice.pem --type cert --label alice --id 01
+    --write-object alice.token.crt --type cert --label alice --id 01
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
     --login --pin '1234567890' \
-    --write-object alice.p12 --type privkey --label alice --id 01
+    --write-object alice.token.key --type privkey --label alice --id 01
 ```
+
+Wipe the temporary private key that was lying in the clear on disk:
+
+```bash
+shred -u alice.token.key alice.token.key.der 2>/dev/null || shred -u alice.token.key
+```
+
+> The behavior of `--write-object` for GOST keys depends on the token model
+> and the `librtpkcs11ecp` version — check it on your token model.
 
 ### Verification (section 6)
 
@@ -509,22 +589,21 @@ PAM-stack editing is split into a separate document —
 - fly-dm (why + applying it + the screen locker)
 - The three modes: `2fa` / `optional` / `cert-only`, with a lockout warning
 - sudo, login, sshd
-- The PAM stack with МКЦ in mind → [mac-integrity.md](mac-integrity.md)
+- The PAM stack with МКЦ in mind → [pam-integration.md §7](pam-integration.md#7-the-pam-stack-with-мкц-in-mind)
 - Safety of the edit + recovery
 
 > **IMPORTANT.** Open a second root shell before editing PAM.
-> Detail — [pam-integration.md §1](pam-integration.md).
+> Detail — [pam-integration.md §8 "Safety of the edit"](pam-integration.md#8-safety-of-the-edit).
 
 ### Verification (section 8)
 
 ```bash
-pamtester sudo alice authenticate
 sudo tessera check
 ```
 
-Expected: `Authentication successful` (with the USB or token inserted).
 `tessera check` catches PAM-stack ordering errors (for example
-`pam_stack_session_misorder`).
+`pam_stack_session_misorder`). The full authentication smoke test via
+`pamtester` is in section 9.
 ## 9. Smoke test via `pamtester`
 
 ### 9.1 Authentication
@@ -596,7 +675,7 @@ Details (caveats, the absence of logind logout) —
 - [docs/threat-model.md](threat-model.md) — the threat model and which
   attacks the module protects against.
 
-## MIC (MAC integrity): optional activation
+## МКЦ (MAC integrity): optional activation
 
 Full activation of mandatory integrity control (МКЦ) (the capability to
 the daemon, the shipped PAM stack, the systemd drop-in, per-user MNKC,

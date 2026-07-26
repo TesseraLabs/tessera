@@ -1,9 +1,5 @@
 # Tessera documentation
 
-This is the technical documentation: installation, configuration,
-operations. For a product overview — features, use cases, contacts —
-see [tessera-access.com](https://tessera-access.com/).
-
 The Russian documents in `docs/ru/` are the primary source; this
 English tree (`docs/en/`) mirrors them. The changelog is Russian-only —
 see [../ru/changelog.md](../ru/changelog.md) (Russian).
@@ -21,11 +17,12 @@ see [../ru/changelog.md](../ru/changelog.md) (Russian).
 3. [pam-integration.md](pam-integration.md) — editing `/etc/pam.d/*`,
    modes (`2fa` / `optional` / `cert-only`), SysV.
 4. [configuration.md](configuration.md) — `config.toml` reference.
-5. [mac-integrity.md](mac-integrity.md) — opt-in activation of
-   mandatory integrity control (МКЦ) on Astra strict mode.
+5. [mac-integrity.md](mac-integrity.md) — the open/commercial boundary
+   for МКЦ and the МКЦ/МРД line (activation — [install.md](install.md)
+   and [operations.md §7](operations.md#7-мкц-mac-integrity)).
 6. [clone-image.md](clone-image.md) — fleet rollout via a cloned image.
-7. [fly-dm-greeter.md](fly-dm-greeter.md) — the wallpaper banner on
-   fly-dm under МКЦ.
+7. [fly-dm-greeter.md](fly-dm-greeter.md) — host_id on the login screen
+   (for fly-dm under МКЦ — via the wallpaper).
 8. [operations.md](operations.md) — the runbook for routine operations.
 
 ### CA admin (certificate issuance)
@@ -34,8 +31,8 @@ see [../ru/changelog.md](../ru/changelog.md) (Russian).
    `pam_cert_host_binding`, `pam_cert_user_binding`, and
    `pam_cert_max_integrity` extensions, and issuance scenarios.
 2. [issuer.md](issuer.md) — the issuer tooling (`tessera_issuer`):
-   the `issuer` CLI, the CSR flow, the PKCS#11, Vault Transit and file
-   backends, and the issuance journal.
+   the `issuer` CLI, the `serve` agent, the CSR flow, the PKCS#11 and
+   Vault Transit backends, the issuance journal, and the web cabinet.
 3. [clone-image.md §6](clone-image.md) — the CA side of the clone-image
    workflow (per-host issuance).
 
@@ -44,8 +41,8 @@ see [../ru/changelog.md](../ru/changelog.md) (Russian).
 1. [threat-model.md](threat-model.md) — a threat model with evidence.
 2. [architecture.md](architecture.md) — the IPC protocol, fail-closed
    rules, and the host identity chain.
-3. [mac-integrity.md](mac-integrity.md) — МКЦ activation and protecting
-   `config.toml` via ilevel=63.
+3. [mac-integrity.md](mac-integrity.md) — the МКЦ/МРД boundary, the
+   makeup of the open-source part and the commercial distribution.
 
 ### Developer
 
@@ -60,41 +57,7 @@ see [../ru/changelog.md](../ru/changelog.md) (Russian).
   reference. Cert/auth errors, USB, monitord, PAM lockout, МКЦ,
   fly-dm, clone-image, security incidents.
 
-## What's new in 0.4.0
+## What's new
 
-- The project was renamed `pam_certauth` → **Tessera**: package `tessera`,
-  module `/lib/security/pam_tessera.so`, binary `/usr/bin/tessera`.
-- Paths moved: `/etc/tessera`, `/run/tessera`, `/var/lib/tessera`,
-  `/var/cache/tessera`; unit `tessera.service`, system user `tessera`.
-- Hook environment contract `PAM_CERTAUTH_*` → `TESSERA_*`; log
-  filter `TESSERA_LOG`.
-- Unchanged: the X.509 extension OIDs, the `config.toml` schema, the
-  IPC protocol.
-- First public release (dual-license AGPL-3.0 OR commercial).
-
-## What's new in 0.3.19
-
-- `tessera dump-host-id` — a TSV dump of all host_identity sources.
-- `finish-bootstrap.sh` — a single-pass transition from the clone-image
-  bootstrap to production.
-- `[fly_dm_greeter].update_wallpaper` — imprint the `host_id` into the
-  fly-dm JPG background.
-- CA tools removed from the `.deb` (shipped separately).
-
-See [../ru/changelog.md](../ru/changelog.md) (Russian).
-
-## What's new in 0.3.0
-
-- Integration of mandatory integrity control (МКЦ) for Astra SE
-  strict mode.
-- The `pam_cert_max_integrity` X.509 extension — the integrity ceiling
-  of an engineer's session.
-- A `[mac]` section in `config.toml` with the ternary `cert_integrity`
-  policy (`required` / `optional` / `ignore`).
-- One open host; signed enforcement plugins are selected at runtime.
-
-## Russian documentation
-
-- [../ru/index.md](../ru/index.md) — the Russian documentation tree
-  (primary).
-- [README.md](../../README.md) — the project overview (English).
+The change history ("what's new" per version) is kept in
+[../ru/changelog.md](../ru/changelog.md) (Russian only).

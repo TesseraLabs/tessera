@@ -1,5 +1,14 @@
 # Mandatory integrity control (МКЦ) — the open-source part
 
+This document draws the **boundary**: which МКЦ logic ships in the open-source
+Tessera build, which belongs to the commercial package, and where the line runs
+between МКЦ (integrity) and МРД (confidentiality). Here you will find the makeup
+of the open-source part, the behavior of the open-source build, and the rules
+for compatibility with МРД. The actual application of labels to the kernel,
+strict-mode activation, and step-by-step integration are **not** here — those
+are the commercial distribution (see
+[“What is in the commercial distribution”](#what-is-in-the-commercial-distribution)).
+
 Tessera integrates with Astra Linux SE's mandatory integrity control (МКЦ, Biba):
 an X.509 certificate carries a **ceiling** on the session's integrity level (the
 `pam_cert_max_integrity` extension), and the effective session label =

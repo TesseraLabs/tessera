@@ -2,12 +2,17 @@
 
 ## Introduction
 
-The "which user on which host" authorization is encoded in two X.509
-extensions of the leaf certificate, which the PAM module checks during the
+This document is addressed to the CA administrator: it explains which X.509
+extensions to embed in a Tessera leaf certificate, and provides ready-made
+`openssl.cnf` fragments from which the certificate is issued with a stock
+`openssl x509 -req`.
+
+There are six extensions. Two are mandatory: they encode the "which user on
+which host" authorization and are checked by the PAM module at the
 authentication phase:
 
-- `pam_cert_host_binding`
-- `pam_cert_user_binding`
+- `pam_cert_host_binding` — on which hosts the certificate is valid;
+- `pam_cert_user_binding` — for which PAM user.
 
 When both extensions are present, they and they alone define the certificate's
 scope. The `[[user_mapping]]` list in `config.toml` remains as a **legacy
@@ -15,19 +20,25 @@ fallback** for certificates issued without the `pam_cert_user_binding`
 extension; for new issuance the extensions must always be set by the CA (see
 `docs/threat-model.md`, the mandatory-extension policy).
 
-This document describes the extension syntax and provides ready-made recipes for
-`openssl.cnf` from which a certificate can be issued with a stock
-`openssl x509 -req`.
+The remaining four are optional, for specific capabilities; each is covered in
+its own section below:
+
+- `pam_cert_max_integrity` — the integrity-label ceiling on Astra МКЦ hosts;
+- `pam_cert_allowed_roles` — the roles the certificate may activate at login;
+- `pam_cert_profile_version` — the certificate format version (version-gate);
+- `pam_cert_delegation_constraints` — the delegation envelope for an
+  intermediate CA.
 
 ## OID table
 
-| Extension name | Dotted OID | ASN.1 syntax |
-|---|---|---|
-| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | `extnValue ::= SEQUENCE OF UTF8String` |
-| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | `extnValue ::= SEQUENCE OF UTF8String` |
-| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | `extnValue ::= SEQUENCE OF UTF8String` |
-| `pam_cert_profile_version` | `2.25.107983357797077476746994938370032043240` | `extnValue ::= INTEGER` (**critical**) |
-| `pam_cert_delegation_constraints` | `2.25.242193075883906031821745064285793775511` | `SEQUENCE { requireTags, allowRoles, maxLevel, maxTtl }` (**critical**, `CA=TRUE` only) |
+| Extension name | Dotted OID | ASN.1 syntax | Criticality |
+|---|---|---|---|
+| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | `extnValue ::= SEQUENCE OF UTF8String` | non-critical |
+| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | `extnValue ::= SEQUENCE OF UTF8String` | non-critical |
+| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | `extnValue ::= SEQUENCE OF UTF8String` | non-critical |
+| `pam_cert_max_integrity` | `2.25.273824307386008814506455310913083078403` | `extnValue ::= SEQUENCE { level INTEGER, categories BIT STRING }` | non-critical |
+| `pam_cert_profile_version` | `2.25.107983357797077476746994938370032043240` | `extnValue ::= INTEGER` | **critical** |
+| `pam_cert_delegation_constraints` | `2.25.242193075883906031821745064285793775511` | `SEQUENCE { requireTags, allowRoles, maxLevel, maxTtl }` | **critical**, `CA=TRUE` only |
 
 The OIDs live in the unregistered `2.25.<UUID>` branch (RFC 4530), which
 guarantees uniqueness without consulting any external registry. These values are
@@ -41,7 +52,7 @@ Each `UTF8String` entry in `pam_cert_host_binding` is interpreted as follows:
 | Entry | Meaning |
 |---|---|
 | `*` | allowed on any host |
-| `sha256:<HEX>` | allowed only on the host whose `host_id_hash` matches the given sixty-four-character lowercase-hex value (case-insensitive) |
+| `sha256:<HEX>` | allowed only on the host whose `host_id_hash` matches the given 64-character lowercase-hex value (case-insensitive) |
 | Any other UTF-8 string | the string is interpreted as a "raw" `machine_id` and the comparison goes through SHA-256 of the string |
 
 In `pam_cert_user_binding` an entry is either `*` (any PAM user) or an exact
@@ -183,7 +194,7 @@ The DER here is three TLVs: `SEQUENCE` (length 7), `INTEGER 2`,
 `BIT STRING '01'B`. The extension is declared non-critical (see above); the
 parser tolerates the critical flag, but issuance should be non-critical.
 
-## The `allowed_roles` extension (role selection at login, role-format)
+## The `allowed_roles` extension (role selection at login)
 
 `pam_cert_allowed_roles` is a non-critical X.509 v3 extension listing the
 `role_id`s that the leaf certificate is entitled to activate at login
@@ -231,7 +242,7 @@ The DER here: `SEQUENCE` (30 0c) → `UTF8String "oper"` (0c 04 6f 70 65 72) →
 `UTF8String "serv"` (0c 04 73 65 72 76). The extension is non-critical (no
 `critical,` prefix).
 
-## The `profile_version` extension (version-gate, tags-delegation)
+## The `profile_version` extension (version-gate)
 
 `pam_cert_profile_version` is a **critical** X.509 v3 extension carrying the
 integer version of the cert format. Engine knows
@@ -261,7 +272,7 @@ absence of the extension = baseline (version `0`), allowed.
 
 Equivalent as a DER string (`INTEGER 1`): `critical,DER:02:01:01`.
 
-## The `delegation_constraints` extension (delegation envelope, tags-delegation)
+## The `delegation_constraints` extension (delegation envelope)
 
 `pam_cert_delegation_constraints` is a **critical** X.509 v3 extension, valid
 **only on a cert with `basicConstraints CA=TRUE`** (on a leaf → malformed →
@@ -369,7 +380,7 @@ The cert receives `pam_cert_host_binding = <hash_hex>`,
 `extendedKeyUsage = clientAuth, emailProtection` (`emailProtection` is required
 by the stock Astra validator — openssl `CMS_verify`; `tessera` itself does not
 check this EKU). On a МКЦ workstation, additionally
-`pam_cert_max_integrity` (see the `MAX_INTEGRITY` extension section).
+`pam_cert_max_integrity` (see §"The `MAX_INTEGRITY` extension").
 
 The resulting `.p12` is packed onto the same USB stick by the CA tool and
 returned to the workstation.
