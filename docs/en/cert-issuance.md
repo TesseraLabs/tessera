@@ -264,13 +264,21 @@ Extraction only from a verified cert (`VerifiedX509`). Malformed (not an
 INTEGER) or a negative value → reject (audit `profile_version_rejected`). The
 absence of the extension = baseline (version `0`), allowed.
 
-`openssl.cnf` fragment for version `1`:
+The current format version is **`0`**; no other version exists yet. `issuer`
+without an explicit `--profile-version` issues certificates with version `0`,
+and that is the only version an Engine accepts without a configuration change.
+A value above zero makes sense only for a fleet where
+`[trust].max_supported_profile_version` has already been raised on every device
+— otherwise the issued certificate is rejected at the very first
+authentication.
+
+`openssl.cnf` fragment for the current version (`0`):
 
 ```ini
-2.25.107983357797077476746994938370032043240 = critical,ASN1:INTEGER:1
+2.25.107983357797077476746994938370032043240 = critical,ASN1:INTEGER:0
 ```
 
-Equivalent as a DER string (`INTEGER 1`): `critical,DER:02:01:01`.
+Equivalent as a DER string (`INTEGER 0`): `critical,DER:02:01:00`.
 
 ## The `delegation_constraints` extension (delegation envelope)
 
