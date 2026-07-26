@@ -18,8 +18,8 @@ use std::cell::RefCell;
 
 use tessera_ext::delegation::{narrows, DelegationConstraints, ScopeDimension};
 use tessera_ext::ext::{
-    extract_basic_constraints, extract_extension_value, parse_max_integrity, parse_profile_version,
-    parse_seq_of_utf8,
+    extract_basic_constraints, extract_extension, extract_extension_value, parse_max_integrity,
+    parse_profile_version, parse_seq_of_utf8,
 };
 use tessera_ext::oids::{
     ALLOWED_ROLES_OID, DELEGATION_CONSTRAINTS_OID, HOST_BINDING_OID, MAX_INTEGRITY_OID,
@@ -515,6 +515,41 @@ fn issued_artifacts_are_accepted_by_shared_parsers() {
     )
     .unwrap();
     assert_eq!((level, categories), (5, 0));
+}
+
+#[test]
+fn leaf_carries_key_usage_and_client_auth() {
+    let backend = MockSigner::ecdsa_sha256(key());
+    let root = root_ca(&backend);
+    let org = org_ca(&backend, &root);
+    let leaf = issue_leaf(
+        &backend,
+        &key(),
+        &org,
+        &leaf_request(),
+        &Serial::generate(),
+        &mut fresh_journal(),
+        TS,
+    )
+    .unwrap()
+    .der;
+
+    // keyUsage: BIT STRING, seven unused bits, only digitalSignature (bit 0).
+    let key_usage = extract_extension(&leaf, "2.5.29.15")
+        .unwrap()
+        .expect("leaf carries keyUsage");
+    assert_eq!(key_usage.value, vec![0x03, 0x02, 0x07, 0x80]);
+    assert!(key_usage.critical, "keyUsage is marked critical");
+
+    // extendedKeyUsage: SEQUENCE { OID 1.3.6.1.5.5.7.3.2 }.
+    let eku = extract_extension(&leaf, "2.5.29.37")
+        .unwrap()
+        .expect("leaf carries extendedKeyUsage");
+    assert_eq!(
+        eku.value,
+        vec![0x30, 0x0A, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02]
+    );
+    assert!(!eku.critical, "extendedKeyUsage is not critical");
 }
 
 /// A backend that signs with a real P-256 key (RFC 6979 deterministic ECDSA over

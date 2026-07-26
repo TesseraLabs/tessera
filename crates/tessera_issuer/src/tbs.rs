@@ -36,9 +36,22 @@ use crate::sign::SignatureAlgorithm;
 /// The standard `keyUsage` extension OID.
 const KEY_USAGE_OID: &str = "2.5.29.15";
 
+/// The standard `extendedKeyUsage` extension OID.
+const EXTENDED_KEY_USAGE_OID: &str = "2.5.29.37";
+
+/// `id-kp-clientAuth`: the purpose a shift leaf is used for — proving the
+/// engineer's identity to the Engine during authentication.
+const CLIENT_AUTH_OID: &str = "1.3.6.1.5.5.7.3.2";
+
 /// `keyUsage` `extnValue` asserting `keyCertSign | cRLSign` — a `BIT STRING`
 /// with one unused bit and the two high named bits set (`0x06`).
 const KEY_USAGE_CERT_AND_CRL_SIGN: [u8; 4] = [0x03, 0x02, 0x01, 0x06];
+
+/// `keyUsage` `extnValue` asserting `digitalSignature` — a `BIT STRING` with
+/// seven unused bits and only bit 0 set (`0x80`). This is the bit the leaf's
+/// challenge-response signature is made under; without it the Engine refuses
+/// the certificate before any chain building.
+const KEY_USAGE_DIGITAL_SIGNATURE: [u8; 4] = [0x03, 0x02, 0x07, 0x80];
 
 /// Encodes one `Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT
 /// FALSE, extnValue OCTET STRING }`.
@@ -55,8 +68,13 @@ fn encode_extension(oid: &str, critical: bool, extn_value: &[u8]) -> Result<Vec<
 }
 
 /// Builds the concatenated `Extension` elements for a shift-leaf: `basic
-/// Constraints` (cA=FALSE, critical), host/user binding, allowed-roles,
+/// Constraints` (cA=FALSE, critical), `keyUsage` (digitalSignature, critical),
+/// `extendedKeyUsage` (clientAuth), host/user binding, allowed-roles,
 /// `profile_version` (critical), and the optional `max_integrity`.
+///
+/// `keyUsage` and `extendedKeyUsage` are what make the certificate usable for
+/// authentication at all: the Engine's leaf pre-validation demands both before
+/// it looks at any Tessera extension.
 pub(crate) fn leaf_extensions(req: &LeafRequest) -> Result<Vec<u8>, IssueError> {
     let mut out = Vec::new();
     // basicConstraints cA=FALSE: the default is omitted, so the value is an
@@ -65,6 +83,22 @@ pub(crate) fn leaf_extensions(req: &LeafRequest) -> Result<Vec<u8>, IssueError> 
         BASIC_CONSTRAINTS_OID,
         true,
         &encode_tlv(TAG_SEQUENCE, &[]),
+    )?);
+    out.extend_from_slice(&encode_extension(
+        KEY_USAGE_OID,
+        true,
+        &KEY_USAGE_DIGITAL_SIGNATURE,
+    )?);
+    // extendedKeyUsage ::= SEQUENCE OF KeyPurposeId. Non-critical: relying
+    // parties that do not understand the extension are not meant to reject the
+    // certificate over it.
+    out.extend_from_slice(&encode_extension(
+        EXTENDED_KEY_USAGE_OID,
+        false,
+        &encode_tlv(
+            TAG_SEQUENCE,
+            &encode_tlv(TAG_OID, &encode_oid(CLIENT_AUTH_OID)?),
+        ),
     )?);
     out.extend_from_slice(&encode_extension(
         HOST_BINDING_OID,

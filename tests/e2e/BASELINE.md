@@ -17,7 +17,7 @@
 | ISS-002 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | ISS-003 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | ISS-004 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
-| ISS-005 | FAIL | 2026-07-26 | 0.4.0-1 | ubuntu-container | Красный по расхождению issuer и модуля: `issuer issue-root` выпускает корень без basicConstraints и keyUsage, а проверка цепочки требует у якоря keyUsage с keyCertSign (basic_constraints.rs:109) — выпущенный штатным путём корень доверия непригоден как якорь. Спека cert-issuance обещает обратное: «под которым проходят выпуск CA организаций и вся цепочка проверок Engine». Кейс фиксирует обещанное поведение |
+| ISS-005 | FAIL | 2026-07-26 | 0.4.0-1 | ubuntu-container | Дефект keyUsage/EKU исправлен (issuer-leaf-key-usage) — проверка листа пройдена. Кейс остаётся красным по другой причине: CA, выпущенный issuer, всегда несёт рамки делегирования, поэтому вход обязан выбрать роль, а выбор роли в целевой модели не реализован (тот же KNOWN GAP, что у ROLE-001…004). Плюс дефолты расходятся: issuer выпускает profile_version=1, модуль по умолчанию принимает максимум 0 |
 | REV-001 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | REV-002 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | REV-003 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
