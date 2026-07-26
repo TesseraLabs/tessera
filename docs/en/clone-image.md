@@ -72,44 +72,27 @@ what is baked into the bootstrap cert.
 
 ### 2.4 Wallpaper banner (optional, recommended on МКЦ-3)
 
-On production fly-qdm 2.15+ under МКЦ-3 the fly-modern theme hardcodes the
-rendering of `"Усиленный уровень защищенности"` in the headline slot —
-PAM_TEXT_INFO with `host_id` is **not visible** in the greeter UI. Workaround:
-print `host_id` directly onto the JPG background that `[background].path` in
-`/etc/X11/fly-dm/fly-modern/settings.ini` points at.
+For the CA admin to issue a per-host certificate, they need each device's
+`host_id` (§6.2). Normally `tessera` shows the `host_id` as an informational
+PAM message on the login screen — but the graphical fly-modern greeter under
+МКЦ-3 ignores those messages, and the `host_id` is not visible. The workaround:
+the daemon prints the `host_id` directly onto the JPG background of the login
+screen that `[background].path` in
+`/etc/X11/fly-dm/fly-modern/settings.ini` points at. The mechanics, options,
+and diagnostics are in [fly-dm-greeter.md](fly-dm-greeter.md); here only what is
+done on the reference machine before taking the image.
 
-It is enabled with a single line in `config.toml`:
+It is enabled with a single line in `config.toml` (already added in §2.3):
 
 ```toml
 [fly_dm_greeter]
 update_wallpaper = true
 ```
 
-Defaults (all overridable):
-
-| Field                 | Value                                                   |
-|-----------------------|---------------------------------------------------------|
-| `wallpaper_target`    | `/usr/share/wallpapers/fly-default-light.jpg`           |
-| `wallpaper_backup`    | `/var/lib/tessera/daemon/wallpaper.orig.jpg`       |
-| `wallpaper_font`      | `/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf`  |
-| `wallpaper_font_size` | `64`                                                    |
-| `wallpaper_text_color`| `#000000`                                               |
-| `wallpaper_gravity`   | `south`                                                 |
-| `wallpaper_offset_x`  | `0`                                                     |
-| `wallpaper_offset_y`  | `120`                                                   |
-| `template_ru`         | `Устройство %n  host_id={host_id_short} ({source})`       |
-| `template_en`         | `Device %n  host_id={host_id_short} ({source})`            |
-
-At each start of `tessera.service`:
-
-1. First time: `cp wallpaper_target → wallpaper_backup` (one-time original).
-2. Opens `wallpaper_backup` as the source.
-3. Renders `template_ru`/`template_en` (by locale), substituting
-   `{host_id_short}` (the first 8 hex), `{source}`, `%n` (hostname).
-4. Atomic save → `wallpaper_target`.
-
-The daemon **does not edit** `settings.ini` (the operator/ansible manages
-`blur`, `color_overlay`, `path`). On the reference machine, the baseline:
+The daemon **does not edit** the theme's `settings.ini` — the overlay
+(`color_overlay`), the blur (`blur`), and the background path stay with the
+operator. With a strong overlay or blur enabled the printed text is invisible,
+so before taking the image bring `settings.ini` to a working baseline:
 
 ```ini
 # /etc/X11/fly-dm/fly-modern/settings.ini
@@ -120,9 +103,6 @@ color_overlay=0,0,0,30
 [background][blur]
 enable=false
 ```
-
-With a strong `color_overlay` or blur enabled the text is invisible — lower the
-alpha and disable blur before taking the image.
 
 ### 2.5 Validating the reference machine
 
@@ -141,8 +121,9 @@ discretion). Before taking it:
 
 - stop `tessera.service` (`systemctl stop tessera`);
 - clear `/var/lib/tessera/sessions.json` (optional, not critical);
-- **do not clear** `/etc/machine-id` — after the flip it stops being used, but
-  until that moment a consistent override is needed.
+- **do not clear** `/etc/machine-id` — after switching host_id to the
+  production source (henceforth the flip) it stops being used, but until that
+  moment a consistent override is needed.
 
 ## 3. Rolling a clone out to a production workstation
 
@@ -166,8 +147,8 @@ Atomic, single-pass:
 
 1. **Rewrite `config.toml`**:
    - `[host_identity].sources = ["override"]` → `["dmi_board_serial", "machine_id"]` (default);
-   - the `override = "..."` line is commented out (`#override = "..."`).
-   - Backup → `/etc/tessera/config.toml.bak.<UTC-ISO8601>`.
+   - the `override = "..."` line is commented out (`#override = "..."`);
+   - a copy of the previous config → `/etc/tessera/config.toml.bak.<UTC-ISO8601>`.
 2. **Validates** the new config: `tessera check`. If ERROR — roll back the
    backup, exit ≠ 0.
 3. **Restarts** `tessera.service`, waits for `is-active=active` up to 30 s.
@@ -349,7 +330,8 @@ back (over a USB medium or through a secure channel to the workstation).
 ## 10. See also
 
 - [install.md §2.4¾](install.md) — a short aside about the tooling.
-- [install.md §8.5.1](install.md) — the wallpaper baseline in detail.
+- [§2.4](#24-wallpaper-banner-optional-recommended-on-мкц-3) — the wallpaper
+  baseline in detail; on the greeter — [fly-dm-greeter.md](fly-dm-greeter.md).
 - [cert-issuance.md](cert-issuance.md) — certificate extensions,
   per-host vs wildcard vs bootstrap.
 - [operations.md §2.4](operations.md) — where this workflow sits in the

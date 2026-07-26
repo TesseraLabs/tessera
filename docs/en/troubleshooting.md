@@ -18,7 +18,7 @@ universal:
 
 ```bash
 sudo journalctl -u tessera --since '5 min ago'
-sudo journalctl -t tessera | tail -50
+sudo journalctl -t pam_tessera | tail -50
 sudo tail -f /var/log/auth.log
 ```
 
@@ -29,7 +29,7 @@ sudo tail -f /var/log/auth.log
 ### `host_binding mismatch`
 
 **Symptom:** PAM denies with `HostNotAllowed` or
-`HostExtensionMissing`. Since 0.3.6, on the banner (TTY/sshd/sudo):
+`HostExtensionMissing`. On the banner (TTY/sshd/sudo):
 
 ```
 Сертификат выпущен для другого устройства.
@@ -48,7 +48,7 @@ prefix.)
 
 ```bash
 # What each configured host_identity source returned
-sudo journalctl -t tessera | grep 'host_identity: probe' | tail -20
+sudo journalctl -t pam_tessera | grep 'host_identity: probe' | tail -20
 # probe ok      source=MachineId raw=abc... host_id_hash_prefix=a1b2c3d4 host_id_hash=<full sha256 hex>
 # probe error   source=DmiBoardSerial error="ENOENT"
 # probe selected source=MachineId (first successful) host_id_hash_prefix=a1b2c3d4
@@ -89,21 +89,24 @@ sudo tail -f /var/log/auth.log &
 pamtester sudo alice authenticate
 ```
 
-Look for `tessera.auth.fail.<reason>` in the log. The list of reasons is
-in [architecture.md](architecture.md#13-fail-closed-rules).
+In the log (ident `pam_tessera`) look for the line `tessera.auth:
+authentication failed` — the denial category is in the `error=…` field.
+Role denials go separately, under the `role.audit` target: a `role_deny`
+event with a `reason=…` field (`not_found` / `not_covered` /
+`backend_unavailable` / `mask_exceeds_ceiling` / `syntax`). The list of
+reasons is in [architecture.md](architecture.md#13-fail-closed-rules).
 
 ### Certificate not accepted on the terminal (general checklist)
 
-Since 0.3.6, PAM prints a `PAM_TEXT_INFO` on screen with diagnostics for
-a `host_binding` mismatch and a wrong PIN. Check the screen **and**
-syslog:
+PAM prints a `PAM_TEXT_INFO` on screen with diagnostics for a
+`host_binding` mismatch and a wrong PIN. Check the screen **and** syslog:
 
 ```bash
 # The real host_id_hash of this machine
-sudo journalctl -t tessera | grep 'host_id resolved' | tail -1
+sudo journalctl -t pam_tessera | grep 'host_id resolved' | tail -1
 
 # Step-by-step trace (mount → discovery → envelope → chain → result)
-sudo journalctl -t tessera --since '5 min ago' \
+sudo journalctl -t pam_tessera --since '5 min ago' \
     | grep -E 'tessera\.(flow|host_identity)'
 ```
 
@@ -146,15 +149,15 @@ discipline. See
 
 ## 2. USB and tokens
 
-### `usb_wait_seconds` window expired
+### `usb medium not found` after waiting
 
 **Symptom:** `pamtester` waits ~10 s, then `usb medium not found`.
 
 **Fix:** check with `lsblk` that the USB is mounted and visible. For a
 larger window, increase `usb_wait_seconds` in `config.toml` (see
-[configuration.md](configuration.md#general-parameters)).
+[configuration.md](configuration.md#global-parameters)).
 
-### `pcscd not running`
+### The PKCS#11 token is not visible (`pcscd` not running)
 
 **Symptom:** the PKCS#11 token (Rutoken) is not visible in
 `pkcs11-tool -L`.
@@ -172,27 +175,26 @@ pcsc_scan          # should show the inserted token
 **Fix:** unlock with the SO-PIN, re-initialize the user PIN via
 `pkcs11-tool --init-pin`.
 
-### 14-second silence after `trying USB candidate`
+### Silence in the logs while probing partitions on a multi-partition USB
 
-**Symptom** (0.3.5 and earlier): 10–30 s with no logs between
-`trying USB candidate devnode=/dev/sdb1` and the module finishing. On a
-Ventoy / multi-partition USB.
+**Symptom:** on a Ventoy / multi-partition USB, 10–30 s pass between
+`trying USB candidate` and the module finishing. Duration = number of
+partitions × the mount timeout.
 
-**Cause:** 0.3.5 has no per-candidate logging — the module iterated over
-partitions with no output. Duration = number of partitions × timeout.
-
-**Fix:** upgrade to 0.3.6+ — step-by-step INFO logging was added:
+**Diagnosis:** on 0.4.0 each candidate is logged step by step (INFO
+`tessera.flow`):
 
 ```
-INFO tessera.flow: candidate mounted devnode="/dev/sdb1"
-INFO tessera.flow: p12 not found at <path>, skipping candidate
-INFO tessera.flow: trying USB candidate devnode="/dev/sdb2"
+INFO tessera.flow: trying USB candidate devnode="/dev/sdb1" ...
+INFO tessera.flow: candidate mounted devnode="/dev/sdb1" mountpoint=...
+INFO tessera.flow: no .p12 on this partition, trying next mountpoint=... missing=...
+INFO tessera.flow: trying USB candidate devnode="/dev/sdb2" ...
 ```
+
+If there are no per-candidate lines in the logs at all — the build is
+older than 0.3.6 (which added the step-by-step logging); upgrade.
 
 ### USB token blocked by USBGuard or the closed software environment (ЗПС)
-
-ЗПС — closed software environment, Astra's signed-executables
-enforcement.
 
 **Symptom:** auth fails with `AUTHINFO_UNAVAIL` right after insertion:
 
@@ -268,39 +270,41 @@ the module is integrated into. There is no alternative auth path.
 
 ## 3. monitord and daemon
 
-### `monitord not reachable`
+### monitord not reachable or won't start
 
-**Symptom:** PAM denies with `monitord unavailable` or hangs.
+**Symptoms (one case, two facets):**
+
+- PAM denies with `monitord unavailable` or hangs — the daemon is
+  formally alive, but the IPC socket is unreachable;
+- `systemctl status tessera` shows `failed` — the daemon doesn't come
+  up at all.
+
+**Diagnosis:**
 
 ```bash
 sudo systemctl status tessera
 sudo journalctl -xeu tessera -n 200
 sudo ls -la /run/tessera/
+lsof /run/tessera/monitord.sock        # is the socket in use
+openssl engine gost -t                 # is gost-engine available
 ```
 
 **Typical causes:**
 
-- the `/run/tessera/monitord.sock` socket wasn't created → check
-  `RuntimeDirectory=tessera` in the unit;
+- the `/run/tessera/monitord.sock` socket wasn't created or is in use →
+  check `RuntimeDirectory=tessera` in the unit and `lsof` on the socket;
 - permissions on `/run/tessera/` are wrong → should be
-  `drwxr-x--- root root` (0750);
-- `config.toml` is corrupted → run it manually:
-  `sudo /usr/bin/tessera` and read the diagnostic output.
-
-### monitord won't start
-
-**Symptom:** `systemctl status tessera` shows `failed`.
-
-```bash
-sudo journalctl -xeu tessera -n 200
-```
-
-**Typical causes:**
-
-- socket in use: `lsof /run/tessera/monitord.sock`;
-- wrong permissions on `/run/tessera/`: `ls -la`, should be `0750 root:root`;
-- corrupted `config.toml`: run manually `sudo /usr/bin/tessera`;
-- missing `gost-engine`: `openssl engine gost -t`.
+  `drwxr-x--- tessera tessera` (0750). The directory, its owner
+  (`User=tessera` / `Group=tessera`), and the mode
+  (`RuntimeDirectoryMode=0750`) are created by the unit itself at
+  startup — fix it with `sudo systemctl restart tessera`, not a manual
+  `chown`/`chmod`;
+- `config.toml` is corrupted → run validation without starting the
+  daemon: `sudo /usr/bin/tessera check` (or run the daemon in the
+  foreground `sudo /usr/bin/tessera daemon --config /etc/tessera/config.toml`
+  and read the diagnostic output);
+- `gost-engine` is missing → `openssl engine gost -t` without the
+  `[ available ]` marker.
 
 ---
 
@@ -367,14 +371,12 @@ A session with no logind id can't be terminated by address, so instead
 of silently dropping it, the action degrades to a reboot — the media is
 removed, and an open session is unacceptable.
 
-**Cause 1 (typical, 0.3.11 and earlier — pre-fix):** `@include tessera*`
-pulled in `session required pam_tessera.so` inside the snippet, and the
-snippet ended up above `@include common-session` (which has
-`pam_systemd.so`). `sm_open_session` fired before `pam_systemd`. In
-0.3.12 the session phase was moved out of the snippets into a separate
-line that `integrate-pam.sh` places AFTER `@include common-session`. The
-0.3.12+ daemon fails at startup with `ERROR pam_stack_session_misorder`
-if the order is wrong.
+**Cause 1 (typical):** the `session ... pam_tessera.so` line is above
+`@include common-session` (which has `pam_systemd.so`), so
+`sm_open_session` fires before `pam_systemd` and `XDG_SESSION_ID` isn't
+created yet. `integrate-pam.sh` places the session line AFTER
+`@include common-session`; the daemon fails to start with
+`ERROR pam_stack_session_misorder` if the order is wrong.
 
 Check:
 
@@ -409,12 +411,16 @@ created. Until a TTY-based logout fallback is implemented:
 **Verify the fix:**
 
 ```bash
-sudo journalctl -u tessera -f &
-# log in, wait for:
-#   INFO tessera.session: pushed logind session target to monitord
-#   target=LogindSession { id: "..." }
-# remove the USB:
-#   INFO tessera.monitord: grace window expired, dispatching action
+sudo journalctl -u tessera -f
+# 1. Log in. The daemon should update the session target from the
+#    placeholder (Tty/Display/Unknown) to LogindSession:
+#      INFO tessera.monitord: session target updated session_id=… new_target=LogindSession { id: "…" }
+# 2. Confirm the session is visible to logind:
+#      loginctl list-sessions
+# 3. Remove the USB and wait for action dispatch WITHOUT a reboot:
+#      INFO tessera.monitord: grace window expired, dispatching action serial=…
+#    An ALERT line "failing closed with reboot" means the logind id is
+#    still not captured — the PAM stack order isn't fixed.
 ```
 
 ---
@@ -422,7 +428,7 @@ sudo journalctl -u tessera -f &
 ## 5. Mandatory integrity control (МКЦ, Astra strict-mode)
 
 Mandatory integrity control (МКЦ) is a Biba-family integrity control on
-Astra; below it is referred to as MIC.
+Astra; below it is referred to as МКЦ.
 
 ### `pam_parsec_mac(login:account): Can't obtain required data`
 
@@ -463,11 +469,11 @@ sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/login
 # repeat for fly-dm
 ```
 
-**Cause 2:** the MIC kernel is off (`parsec.mac=0` in GRUB), but
+**Cause 2:** the МКЦ kernel is off (`parsec.mac=0` in GRUB), but
 `pam_parsec_mac.so` is in `/etc/pam.d/login`. The module has no MAC data —
 account fails. See the next case.
 
-**Cause 3:** the MIC kernel is on, but `service` has no MAC level.
+**Cause 3:** the МКЦ kernel is on, but `service` has no MAC level.
 
 ```bash
 sudo /sbin/pdpl-user service
@@ -484,7 +490,7 @@ sudo systemctl restart fly-dm
 
 ### `parsec.mac=0` + `pam_parsec_mac` in the stack
 
-**Symptom:** the MIC kernel is disabled via GRUB (`parsec.mac=0`), but
+**Symptom:** the МКЦ kernel is disabled via GRUB (`parsec.mac=0`), but
 `/etc/pam.d/login` contains `pam_parsec_mac.so` in auth/account/session.
 The module waits for MAC data that doesn't exist — login denied.
 
@@ -494,7 +500,7 @@ cat /sys/module/parsec/parameters/strict_mode    # N = off
 sudo astra-strictmode-control status             # НЕАКТИВНО
 ```
 
-**(A) You need MIC** — enable the kernel:
+**(A) You need МКЦ** — enable the kernel:
 
 ```bash
 # /etc/default/grub
@@ -504,7 +510,7 @@ sudo reboot
 sudo /sbin/pdpl-user --ilevel 63 service
 ```
 
-**(B) You don't need MIC** — remove `pam_parsec_mac.so`, set
+**(B) You don't need МКЦ** — remove `pam_parsec_mac.so`, set
 `runtime = "disabled"`:
 
 ```toml
@@ -521,7 +527,7 @@ sudo systemctl restart tessera fly-dm
 ```
 
 See [install.md §8.5](install.md) — the matrix of PAM stacks with/without
-MIC.
+МКЦ.
 
 ### `unknown field 'enabled', expected one of ... 'runtime'`
 
@@ -542,12 +548,12 @@ Removed in 0.3.7, replaced by `[mac].runtime`.
 enabled        = true
 cert_integrity = "optional"
 
-# now (for the MIC kernel ON)
+# now (for the МКЦ kernel ON)
 [mac]
 runtime        = "required"     # or "auto"
 cert_integrity = "optional"
 
-# or (for the MIC kernel OFF)
+# or (for the МКЦ kernel OFF)
 [mac]
 runtime        = "disabled"
 cert_integrity = "ignore"
@@ -562,7 +568,7 @@ WARN mac.audit: F_event="mac_caps_missing" F_detail="PARSEC_CAP_CHMAC not presen
 WARN mac.audit: F_event="mac_sessions_file_label_warning" F_error="parsec error: op=pdp_set_fd rc=-1"
 ```
 
-**Non-blocking.** The daemon starts and runs. It means the MIC label
+**Non-blocking.** The daemon starts and runs. It means the МКЦ label
 could not be set on `sessions.json`. It doesn't affect the auth flow.
 
 To clear it (optional):
@@ -584,7 +590,7 @@ stops validating.
 
 ```bash
 cat /sys/class/dmi/id/board_serial   # 0 or empty = unusable
-sudo journalctl -t tessera | grep 'host_identity:' | tail -10
+sudo journalctl -t pam_tessera | grep 'host_identity:' | tail -10
 ```
 
 For dev/test:
@@ -609,12 +615,12 @@ valid.
 `PAM_TEXT_INFO` nor via the stock «Добро пожаловать в %n» (_English:
 "Welcome to %n"_).
 
-**Cause:** on Astra with MIC-3, the fly-modern theme
+**Cause:** on Astra with МКЦ-3, the fly-modern theme
 (`libfly-dm_greet_modern.so`) hardcodes «Усиленный уровень
 защищенности» (_"Hardened security level"_) into the headline.
 GreetString and PAM messages are ignored.
 
-**Fix — wallpaper banner (0.3.19+):**
+**Fix — wallpaper banner:**
 
 ```toml
 # /etc/tessera/config.toml
@@ -641,12 +647,12 @@ sudo systemctl restart fly-dm           # picks up the new JPG
 Full set of options, baseline, and implementation —
 [fly-dm-greeter.md](fly-dm-greeter.md).
 
-**Cargo-cult approaches (removed in 0.3.19):**
+**What won't work (don't waste your time):**
 
 - `greeter-show-messages = true` in `/etc/X11/fly-dm/fly-dmrc` — a legacy
   KDM/LightDM key that fly-qdm 2.15+ doesn't parse.
-- `/etc/X11/fly-dm/override/GreetString.desktop` — on MIC-3, fly-modern
-  ignores GreetString, the headline is taken by the MIC status.
+- `/etc/X11/fly-dm/override/GreetString.desktop` — on МКЦ-3, fly-modern
+  ignores GreetString, the headline is taken by the МКЦ status.
 
 ### Wallpaper isn't updating
 
@@ -727,11 +733,15 @@ deliberately (it requires an operator decision + a physical stick).
 
 1. Add the serial to the CA's CRL.
 2. Re-issue and publish the CRL.
-3. Update the CRL on the endpoints (see [operations.md §2.2](operations.md);
-   the expedited procedure is `systemctl start tessera-crl-update.service`).
+3. Update the CRL on the endpoints (see
+   [operations.md §2.2](operations.md#22-refreshing-the-crl)). The
+   `tessera-crl-update.service` unit is not shipped with the package —
+   the operator creates it per operations.md §2.2; where it is set up,
+   the refresh can be expedited with a one-off
+   `systemctl start tessera-crl-update.service`.
 4. Check the log:
    ```bash
-   sudo journalctl -u tessera -g 'revoked' -n 100
+   sudo journalctl -t pam_tessera -g 'certificate revoked' -n 100
    ```
 5. Notify the user; arrange issuance of a new certificate.
 

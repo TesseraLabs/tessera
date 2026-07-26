@@ -44,8 +44,13 @@ The full description of the TOE boundaries is in
 
 ## 2. Components
 
-`tessera` is a workspace of four crates plus one OS integration
-(systemd, udev, logind).
+`tessera` is a workspace of six crates plus one OS integration
+(systemd, udev, logind). Below are the four runtime crates that run on the
+device. The other two belong to certificate issuance: `tessera_ext` — the
+shared definitions of Tessera's X.509 extensions (OIDs, DER codecs), used by
+both the core and the issuance tools; `tessera_issuer` — the issuance tools,
+whose pure-Rust core also builds for `wasm32` (the external web cabinet links
+it as its WASM core), described in [issuer.md](issuer.md).
 
 ### 2.1 `tessera_core` (rlib)
 
@@ -103,7 +108,8 @@ It is built into `/lib/security/pam_tessera.so` (see
 ### 2.4 `tessera_cli` (binary `tessera`)
 
 A multi-command CLI: `tessera daemon` (the long-running daemon, unit
-`tessera.service` with the launch line `/usr/bin/tessera daemon`),
+`tessera.service` with the launch line
+`/usr/bin/tessera daemon --config /etc/tessera/config.toml`),
 `tessera check`, `tessera dump-host-id`, `tessera role`, `tessera tags`,
 `tessera enroll`. The daemon owns:
 
@@ -220,7 +226,16 @@ payload (see `client.rs::SessionOpenPayload`):
 - `usb_serial` — the serial of the medium that authorized the session;
 - `host_id_hash` — hex SHA-256 of `host_id`;
 - `opened_at` — wall-clock unix time;
-- `cert_cn`, `cert_serial`.
+- `cert_cn`, `cert_serial`;
+- `engineer_ski` — the lowercase-hex `SubjectKeyIdentifier` of the engineer's
+  certificate (v2; an empty string on frames from a v1 client);
+- `engineer_cert_sha256` — the lowercase-hex `SHA-256(cert DER)` of the
+  engineer's leaf (v2);
+- `uid` — the Unix uid that the PAM module authenticated (v2; `0` when absent
+  from a v1 client's frame);
+- `role`, `role_version` — the role id and the version of the role snapshot
+  the session was opened with (optional v2 NDJSON fields; serialized only when
+  a role is selected, absent when `[roles].enforce = false`).
 
 Monitord adds the session to the registry and starts monitoring the USB.
 
@@ -231,6 +246,10 @@ from the registry and does **not** trigger `on_usb_removed` — the user
 explicitly ended the session.
 
 ## 5. Runtime file layout
+
+What `tessera` keeps on disk while running, who writes and who reads each
+path. The diagram below is the overall map; the table gives the exact owners
+and permissions.
 
 ```mermaid
 flowchart LR
@@ -249,7 +268,7 @@ flowchart LR
 |----------------------------------------------|--------------------------|--------------------------------|------------------------|
 | `/etc/tessera/config.toml`              | administrator            | cdylib + monitord              | `0640 root:root`       |
 | `/etc/tessera/ca/bundle.pem`            | administrator            | cdylib + monitord              | `0640 root:root`       |
-| `/run/tessera/monitord.sock`            | monitord                 | cdylib                         | `0660 root:tessera` |
+| `/run/tessera/monitord.sock`            | monitord                 | cdylib                         | `0660 tessera:tessera` |
 | `/run/tessera/sessions/<sid>/`          | cdylib                   | removed by MountGuard on drop  | `0700 root:root`       |
 | `/run/tessera/sessions.json`            | monitord                 | monitord (between daemon restarts within a boot; tmpfs, volatile) | `0600 tessera:tessera` |
 | `/run/tessera/daemon.lock`              | monitord (flock singleton; next to `sessions.json`, fallback `/var/lib/tessera/daemon/`) | monitord | —             |
@@ -370,7 +389,7 @@ unavailability.
 
 - `AF_UNIX` SOCK_STREAM.
 - Socket path: `/run/tessera/monitord.sock`.
-- Permissions: `0660 root:tessera` (see tmpfiles + systemd
+- Permissions: `0660 tessera:tessera` (see tmpfiles + systemd
   RuntimeDirectory).
 - Peer authentication: `SO_PEERCRED` — monitord checks that `uid == 0`. Any
   other peer is closed.
@@ -398,9 +417,9 @@ Rationale for choosing NDJSON:
 - `PROTOCOL_VERSION: u32 = 2` (see
   [`crates/tessera_proto/src/version.rs`](../../crates/tessera_proto/src/version.rs)).
   Version 2 added `GetActiveSessionByUid` / `ActiveSession`, the optional
-  `SessionOpen` fields (`engineer_ski`, `engineer_cert_sha256`, `uid`) and the
-  error code `NO_ACTIVE_SESSION` (1200); frames from a v1 client without the
-  new fields still deserialize.
+  `SessionOpen` fields (`engineer_ski`, `engineer_cert_sha256`, `uid`, plus the
+  optional `role` / `role_version`) and the error code `NO_ACTIVE_SESSION`
+  (1200); frames from a v1 client without the new fields still deserialize.
 - The first frame on any connection is `Hello { protocol_version }`.
 - If `protocol_version` does not equal the server's, monitord replies with
   `Error { code: 1000 (PROTOCOL_MISMATCH) }` and closes the connection.
@@ -449,14 +468,21 @@ From [`crates/tessera_proto/src/server.rs`](../../crates/tessera_proto/src/serve
 {"type": "error", "code": 1000, "message": "protocol version mismatch"}
 ```
 
-### 10.5 The "initiator → recipient → response → timeout" table
+### 10.5 Timeout and expected responses
 
-| Initiator | Message           | Recipient  | Expected response      | Timeout | Action on timeout            |
-|-----------|-------------------|------------|------------------------|---------|------------------------------|
-| client    | `Hello`           | server     | `HelloAck` or `Error`  | 2 s     | close the connection         |
-| client    | `SessionOpen`     | server     | `Ack` or `Error`       | 2 s     | per `monitor_fail_mode`      |
-| client    | `SessionClose`    | server     | `Ack`                  | 1 s     | log + continue               |
-| client    | `Ping`            | server     | `Pong`                 | 1 s     | log + continue               |
+There are no separate per-frame timeouts. The client applies a single
+configurable `monitor.timeout_ms` (default 2000 ms, range 100..=60000 ms) to
+the whole connection — the value is set via `set_read_timeout` /
+`set_write_timeout` on the socket at `MonitordClient::connect` (see
+[`crates/tessera_core/src/ipc/client.rs`](../../crates/tessera_core/src/ipc/client.rs))
+and covers both the handshake and all subsequent RPCs on that connection.
+
+| Initiator | Message           | Recipient  | Expected response      | Action on timeout            |
+|-----------|-------------------|------------|------------------------|------------------------------|
+| client    | `Hello`           | server     | `HelloAck` or `Error`  | close the connection         |
+| client    | `SessionOpen`     | server     | `Ack` or `Error`       | per `monitor_fail_mode`      |
+| client    | `SessionClose`    | server     | `Ack`                  | log + continue               |
+| client    | `Ping`            | server     | `Pong`                 | log + continue               |
 
 ### 10.6 Error codes
 
@@ -494,11 +520,22 @@ already happened (see §13).
     "host_id_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "opened_at":    {"type": "integer"},
     "cert_cn":      {"type": "string"},
-    "cert_serial":  {"type": "string", "pattern": "^[0-9a-f]+$"}
+    "cert_serial":  {"type": "string", "pattern": "^[0-9a-f]+$"},
+    "engineer_ski":         {"type": "string", "pattern": "^[0-9a-f]*$"},
+    "engineer_cert_sha256": {"type": "string", "pattern": "^[0-9a-f]*$"},
+    "uid":                  {"type": "integer"},
+    "role":                 {"type": ["string", "null"]},
+    "role_version":         {"type": ["integer", "null"]}
   },
   "required": ["session_id", "pam_user", "pam_service", "target", "host_id_hash", "opened_at", "cert_cn", "cert_serial"]
 }
 ```
+
+The `engineer_ski`, `engineer_cert_sha256`, `uid` fields are from version 2: a
+v2 client always serializes them, while a v1 client's frame without them
+deserializes to the defaults (empty string / `0`), which is why they are not
+listed in `required`. `role` / `role_version` are present only when the
+session is opened with a role.
 
 ## 11. Threading and concurrency model
 
@@ -558,6 +595,13 @@ result wins. If all sources are empty:
 
 ## 13. Fail-closed rules
 
+The module is designed fail-closed: a failure of any certificate check (the
+trust chain, revocation, challenge-response, host/user binding) leads to a
+denied login, not a pass-through. The table below lists the conditions and the
+PAM codes the stack receives; the single deliberate exception — monitord being
+unavailable does not undo an authentication success that has already happened —
+is set out in "Principles" below the table.
+
 | #  | Condition                                                     | Return                 |
 |----|---------------------------------------------------------------|------------------------|
 | 1  | panic in any `pam_sm_*`                                        | `PAM_AUTHINFO_UNAVAIL` (9) |
@@ -598,14 +642,14 @@ Principles:
 
 ## 14. Logging: `tracing` → syslog / journald
 
-The `tracing` subscriber of the cdylib `pam_tessera.so` is built at the moment
-of the first `pam_sm_*` call and sends records to **syslog** through the
-`LOG_AUTH` facility with the ident `tessera`. On systems with journald these
-lines are visible via `journalctl -t tessera` and land in
-`/var/log/auth.log` (on a plain syslog stack) with the prefix
-`tessera[<pid>]:`. This behavior appeared in 0.1.1 (`fix(pam): wire syslog
-backend for tracing subscriber`) — in 0.1.0 the cdylib wrote to stderr, which
-libpam discarded, and production diagnostics were effectively impossible.
+The cdylib `pam_tessera.so` logs to **syslog**, not to stderr: libpam discards
+the module's stderr, so production diagnostics on stderr are unavailable. The
+`tracing` subscriber is built at the moment of the first `pam_sm_*` call and
+sends records to syslog through the `LOG_AUTH` facility with the ident
+`pam_tessera`. On systems with journald these lines are visible via
+`journalctl -t pam_tessera` and land in `/var/log/auth.log` (on a plain syslog
+stack) with the prefix `pam_tessera[<pid>]:`. (The switch from stderr to syslog
+happened in 0.1.1, see [changelog.md](../ru/changelog.md) (Russian).)
 
 `tessera` uses `tracing-journald` and writes to journald through the native
 `Type=notify` channel. On SysV-init hosts without journald, `tracing` records

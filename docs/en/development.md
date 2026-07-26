@@ -37,11 +37,8 @@ cargo build --workspace --release
 
 - Default: no special features.
 - `tessera_core/pkcs11-tests` — enables the integration tests that require a
-  real `gost-engine` or softhsm2:
-
-  ```bash
-  cargo test --workspace --features tessera_core/pkcs11-tests
-  ```
+  real `gost-engine` or softhsm2. The recipe for running them with softhsm2
+  token initialization is in §2.2.
 
 ## 2. Tests
 
@@ -71,7 +68,7 @@ certificate lookup, the `CKA_EXTRACTABLE` check).
 Requires Linux + root + an installed `tessera`:
 
 ```bash
-# In a separate Astra SE 1.7.5 VM:
+# In a separate Astra SE 1.8 VM:
 sudo apt install ./target/release/tessera_0.4.0-1_amd64.deb
 sudo /usr/share/tessera/integrate-pam.sh --mode=2fa /etc/pam.d/sudo
 pamtester sudo alice authenticate
@@ -160,7 +157,19 @@ Commit messages are in English. Examples:
 5. **Merge via squash + rebase merge.** Large PRs — reviewed in batches of 3–5
    commits; squashed into `main` for a clean history.
 
-## 6. How to add a new PKCS#11 provider
+## 6. Git hooks
+
+The repo ships hooks in `scripts/git-hooks/` that block commits and pushes to
+`main` on weekdays between 08:00 and 19:00 local time. Enable them once per
+clone:
+
+```sh
+git config core.hooksPath scripts/git-hooks
+```
+
+`git commit --no-verify` / `git push --no-verify` override in emergencies.
+
+## 7. How to add a new PKCS#11 provider
 
 The current support is implemented in
 [`crates/tessera_core/src/token/`](../../crates/tessera_core/src/token/).
@@ -182,7 +191,7 @@ Steps:
    - [docs/threat-model.md](threat-model.md) — §3.3 (if the threat model
      changes).
 
-## 7. How to add a new host_id source
+## 8. How to add a new host_id source
 
 See [`crates/tessera_core/src/host_identity/`](../../crates/tessera_core/src/host_identity/).
 
@@ -198,7 +207,7 @@ Steps:
 6. Update [docs/configuration.md](configuration.md) (the `[host_identity]`
    table) and [architecture.md §12](architecture.md#12-host-identity-chain).
 
-## 7.1 Where the certificate authorization logic lives
+## 8.1 Where the certificate authorization logic lives
 
 The authorization of "which user on which host" is fully described in the
 certificate itself through X.509 extensions and is verified in code:
@@ -212,7 +221,7 @@ certificate itself through X.509 extensions and is verified in code:
   `host_id_hash` and `pam_user`. See also
   [docs/cert-issuance.md](cert-issuance.md) for the semantics of the entries.
 
-## 8. Versioning
+## 9. Versioning
 
 SemVer 2.0.0 semantics:
 
@@ -230,7 +239,7 @@ Each MAJOR release requires:
   (if the wire protocol changes);
 - an update of the threat model ([docs/threat-model.md](threat-model.md)).
 
-## 9. Further reading
+## 10. Further reading
 
 - [docs/architecture.md](architecture.md).
 - [docs/configuration.md](configuration.md).

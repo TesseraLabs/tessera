@@ -1,9 +1,5 @@
 # Документация Tessera
 
-Это техническая документация: установка, настройка, эксплуатация.
-О самом продукте — возможности, сценарии применения, контакты — на сайте
-[tessera-access.ru](https://tessera-access.ru/).
-
 Русская документация — первичная (канон). Английский перевод —
 в [docs/en/](../en/index.md); changelog ведётся только по-русски.
 
@@ -35,8 +31,8 @@
    `pam_cert_host_binding`, `pam_cert_user_binding`,
    `pam_cert_max_integrity`, сценарии выпуска.
 2. [issuer.md](issuer.md) — инструменты выпуска (`tessera_issuer`):
-   CLI `issuer`, CSR-поток, бэкенды PKCS#11, Vault Transit и файловый,
-   журнал выпусков.
+   CLI `issuer`, агент `serve`, CSR-поток, бэкенды PKCS#11 и
+   Vault Transit, журнал выпусков, веб-кабинет.
 3. [clone-image.md §6](clone-image.md) — CA-сторона clone-image
    workflow (выпуск per-host).
 
@@ -61,39 +57,6 @@
   диагностике. Cert/auth-ошибки, USB, monitord, PAM lockout, МКЦ,
   fly-dm, clone-image, инциденты безопасности.
 
-## Что нового в 0.4.0
+## Что нового
 
-- Проект переименован `pam_certauth` → **Tessera**: пакет `tessera`,
-  модуль `/lib/security/pam_tessera.so`, бинарь `/usr/bin/tessera`.
-- Пути перенесены: `/etc/tessera`, `/run/tessera`, `/var/lib/tessera`,
-  `/var/cache/tessera`; юнит `tessera.service`, системный пользователь `tessera`.
-- Контракт окружения хуков `PAM_CERTAUTH_*` → `TESSERA_*`;
-  фильтр логов `TESSERA_LOG`.
-- Неизменны: OID X.509-расширений, схема `config.toml`, IPC-протокол.
-- Первый публичный релиз (dual-license AGPL-3.0 OR commercial).
-
-## Что нового в 0.3.19
-
-- `tessera dump-host-id` — TSV-дамп всех host_identity-источников.
-- `finish-bootstrap.sh` — single-pass переход с clone-image bootstrap
-  на production.
-- `[fly_dm_greeter].update_wallpaper` — впечатать `host_id` в JPG-фон
-  fly-dm.
-- CA-инструменты вынесены из `.deb` (поставляются отдельно).
-
-См. [changelog.md](changelog.md).
-
-## Что нового в 0.3.0
-
-- Интеграция мандатного контроля целостности (МКЦ) для Astra SE
-  strict mode.
-- X.509-расширение `pam_cert_max_integrity` — потолок целостности
-  сессии инженера.
-- Секция `[mac]` в `config.toml` с тринарной политикой
-  `cert_integrity` (`required` / `optional` / `ignore`).
-- Один открытый host; подписанные enforcement-плагины выбираются в runtime.
-
-## English documentation
-
-- [docs/en/index.md](../en/index.md) — английское дерево документации.
-- [README.md](../../README.md) — English entry point.
+История изменений и «что нового» по версиям — в [changelog.md](changelog.md).

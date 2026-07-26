@@ -1,16 +1,73 @@
 # Integrating `tessera` into `/etc/pam.d/*`
 
-A guide to editing PAM stacks on Astra/Debian/Ubuntu. This document is
-split out of install.md §8 + §11 — here is everything about
-`integrate-pam.sh`, the two-include pattern, the modes, the specifics of
-fly-dm/sudo/login/sshd, and SysV init.
+The goal of this document is to wire Tessera's certificate check into the
+PAM stack of the services you need (`fly-dm`, `login`, `sudo`, `sshd`)
+and **not lock yourself out** in the process. All edits to
+`/etc/pam.d/*` are made by a single shipped script,
+`/usr/share/tessera/integrate-pam.sh`, which inserts the module's include
+at the correct position and saves a backup copy of each file.
+
+Reading order: first choose a mode (§1) — it determines whether you will
+be able to log in without the USB media and what its loss means; then how
+the script edits the files (§2–§3) and the specifics of each service
+(§4–§6); finally the edge cases (МКЦ, hosts without systemd) and
+recovery.
 
 > **IMPORTANT.** Before editing the PAM stack, **open a second root
 > shell** (for example, `ssh root@<host>`). If the main shell cannot
 > authenticate after the changes, the second terminal will be the only
 > way to roll them back.
 
-## 1. The shipped snippet and `integrate-pam.sh`
+## 1. Authentication modes
+
+`tessera` supports three operational modes, switched by choosing a PAM
+snippet:
+
+| Mode              | snippet                            | Scenario                              | Login without USB             |
+|-------------------|------------------------------------|---------------------------------------|-------------------------------|
+| `2fa` (default)   | `/etc/pam.d/tessera`              | Cert + password (classic 2FA)         | password works, but you can't log in without USB |
+| `optional`        | `/etc/pam.d/tessera-optional`     | Cert OR password (migration)          | yes, by password              |
+| `cert-only`       | `/etc/pam.d/tessera-only`         | Cert as the only factor               | NO, full lockout              |
+
+### Activation
+
+```bash
+# 2FA on sudo (the default):
+sudo /usr/share/tessera/integrate-pam.sh --mode=2fa /etc/pam.d/sudo
+
+# Migration mode:
+sudo /usr/share/tessera/integrate-pam.sh --mode=optional /etc/pam.d/sudo
+
+# Cert-only (losing the stick = lockout!):
+sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sudo
+```
+
+Rollback is the same for all modes:
+
+```bash
+sudo /usr/share/tessera/integrate-pam.sh --unintegrate /etc/pam.d/sudo
+```
+
+### The lockout warning for `cert-only`
+
+Before switching a service to `cert-only`, the admin must have a backup
+access channel:
+
+1. **An open root shell in another terminal** (TTY/SSH) for the whole
+   duration of the check — at least until you have confirmed that
+   cert-only auth works on a test account on this machine.
+2. **An alternative login path** that does NOT go through `tessera` —
+   for example, a separate sshd stack with `PubkeyAuthentication=yes` +
+   `UsePAM=no`, or a sudoers rule for the admin account without
+   `@include tessera`. Otherwise the loss or blocking of the single
+   token (USBGuard, ЗПС, physical loss) will take the host out of
+   service — nobody will be able to log in, including local root.
+
+Rollback is `integrate-pam.sh --unintegrate` from a live root shell or
+via the rescue target (see
+[troubleshooting.md §4 "Locked out after a failed PAM edit"](troubleshooting.md#4-pam-stack-and-lockout)).
+
+## 2. The shipped snippet and `integrate-pam.sh`
 
 `tessera` ships an includable snippet, `/etc/pam.d/tessera`
 (see [`dist/pam.d/tessera`](../../dist/pam.d/tessera)). Include it with
@@ -32,7 +89,7 @@ copy `<file>.bak.<UTC-timestamp>`.
   legacy behaviour for systems without a mandatory integrity control
   (МКЦ) stack, i.e. Ubuntu/Debian).
 
-## 2. The two-include pattern (0.3.12+)
+## 3. The two-include pattern (0.3.12+)
 
 Since 0.3.12 `integrate-pam.sh` wires the module in with **two** lines:
 
@@ -78,17 +135,18 @@ session line stands **before** `@include common-session` /
 sudo tessera check
 ```
 
-Otherwise the following appears in journald:
-
-```
-WARN tessera.session: XDG_SESSION_ID not in PAM env during sm_open_session
-WARN tessera.monitord: USB-removal action dropped: session has no logind id
-```
-
-When the stick is removed, logout will NOT happen — see
+With the wrong order, `XDG_SESSION_ID` does not make it into the PAM
+environment by the time our `pam_sm_open_session` runs (in the PAM
+module's log at DEBUG level: `XDG_SESSION_ID not yet in PAM env`, target
+`tessera.session`), and the session is left without a logind id. The cost
+of the mistake is high: when the stick is removed, the `lock`/`logout`
+action cannot address the session, and the daemon goes fail-closed — the
+device reboots, with the ALERT line
+`USB-removal … has no logind id; failing closed with reboot` in the log.
+For details, see
 [troubleshooting.md §4](troubleshooting.md#4-pam-stack-and-lockout).
 
-## 3. fly-dm
+## 4. fly-dm
 
 ### Why integrate fly-dm specifically
 
@@ -141,11 +199,14 @@ auth        required    pam_env.so
 
 The control in the [`dist/pam.d/tessera`](../../dist/pam.d/tessera)
 snippet is `required`: without successful cert authentication, login is
-impossible, and there is NO password fallback (this is the default `2fa`
-mode of the `integrate-pam.sh` script). The softer variant with a
-fallback to the following modules (`pam_unix.so`) is a separate snippet,
-[`dist/pam.d/tessera-optional`](../../dist/pam.d/tessera-optional), with
-`sufficient` control; use it only for a transition period, while not
+impossible. This is the default `2fa` mode of the `integrate-pam.sh`
+script; "there is NO password fallback" means that the password does
+**not** replace the certificate. The password is still requested by the
+rest of the PAM stack (`pam_unix.so`, etc.) as a second factor — but it
+cannot bypass a failed or missing cert authentication. The softer variant
+with a fallback to the following modules (`pam_unix.so`) is a separate
+snippet, [`dist/pam.d/tessera-optional`](../../dist/pam.d/tessera-optional),
+with `sufficient` control; use it only for a transition period, while not
 everyone has a token.
 
 ### The screen locker (a separate stack)
@@ -175,55 +236,6 @@ journalctl -u fly-dm -f              # logs during a live login
 See [fly-dm-greeter.md](fly-dm-greeter.md) — the wallpaper writer for
 МКЦ-3 fly-modern, where PAM_TEXT_INFO is not forwarded to the UI.
 
-## 4. Authentication modes
-
-`tessera` supports three operational modes, switched by choosing a PAM
-snippet:
-
-| Mode              | snippet                            | Scenario                              | Login without USB             |
-|-------------------|------------------------------------|---------------------------------------|-------------------------------|
-| `2fa` (default)   | `/etc/pam.d/tessera`              | Cert + password (classic 2FA)         | password works, but you can't log in without USB |
-| `optional`        | `/etc/pam.d/tessera-optional`     | Cert OR password (migration)          | yes, by password              |
-| `cert-only`       | `/etc/pam.d/tessera-only`         | Cert as the only factor               | NO, full lockout              |
-
-### Activation
-
-```bash
-# 2FA on sudo (the default):
-sudo /usr/share/tessera/integrate-pam.sh --mode=2fa /etc/pam.d/sudo
-
-# Migration mode:
-sudo /usr/share/tessera/integrate-pam.sh --mode=optional /etc/pam.d/sudo
-
-# Cert-only (losing the stick = lockout!):
-sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sudo
-```
-
-Rollback is the same for all modes:
-
-```bash
-sudo /usr/share/tessera/integrate-pam.sh --unintegrate /etc/pam.d/sudo
-```
-
-### The lockout warning for `cert-only`
-
-Before switching a service to `cert-only`, the admin must have a backup
-access channel:
-
-1. **An open root shell in another terminal** (TTY/SSH) for the whole
-   duration of the check — at least until you have confirmed that
-   cert-only auth works on a test account on this machine.
-2. **An alternative login path** that does NOT go through `tessera` —
-   for example, a separate sshd stack with `PubkeyAuthentication=yes` +
-   `UsePAM=no`, or a sudoers rule for the admin account without
-   `@include tessera`. Otherwise the loss or blocking of the single
-   token (USBGuard, ЗПС, physical loss) will take the host out of
-   service — nobody will be able to log in, including local root.
-
-Rollback is `integrate-pam.sh --unintegrate` from a live root shell or
-via the rescue target (see
-[troubleshooting.md §4 "Locked out after a failed PAM edit"](troubleshooting.md#4-pam-stack-and-lockout)).
-
 ## 5. sudo
 
 ```bash
@@ -241,7 +253,8 @@ sudo /usr/share/tessera/integrate-pam.sh /etc/pam.d/login
 The stack depends on whether the PARSEC МКЦ kernel is enabled.
 `pam_parsec_mac.so` is needed in the stack **only when the МКЦ kernel is
 actually working**. Details —
-[mac-integrity.md §6 "The PAM stack for МКЦ scenarios"](mac-integrity.md#6-pam-stack-for-mic-scenarios).
+[operations.md §7 "МКЦ (MAC integrity)"](operations.md#7-мкц-mac-integrity)
+and [mac-integrity.md](mac-integrity.md).
 
 ### Check the state of МКЦ
 
@@ -263,8 +276,12 @@ ls /sys/kernel/security/parsec 2>/dev/null       # ENOENT → МКЦ is off
 **Mixed fleet** — `runtime = "auto"`, a stack with `pam_parsec_mac.so`
 is safe.
 
-Full stack examples, validation, and the `runtime × cert_integrity`
-matrix — [mac-integrity.md](mac-integrity.md).
+The shipped stack and the МКЦ activation procedure —
+[operations.md §7](operations.md#7-мкц-mac-integrity) and
+[install.md §"МКЦ (MAC integrity): optional activation"](install.md#мкц-mac-integrity-optional-activation).
+The full `runtime × cert_integrity` matrix and the integration
+documentation are in the commercial distribution (see
+[mac-integrity.md, "What is in the commercial distribution"](mac-integrity.md#what-is-in-the-commercial-distribution)).
 
 ## 8. Safety of the edit
 
@@ -315,8 +332,8 @@ reads `/etc/tessera/config.toml`.
 - On SysV hosts there is no hardening sandbox (cgroups, ProtectSystem) —
   the operator accepts this trade-off consciously.
 - USB-removal `Lock`/`Logout` does **not** work without `pam_systemd.so`
-  — `XDG_SESSION_ID` is physically not created. Fallback:
-  `[on_usb_removed].action = "shutdown"` or `"hook"`. See
+  — `XDG_SESSION_ID` is physically not created. Fallback: the top-level
+  key `on_usb_removed = "shutdown"` (or `"hook"`). See
   [troubleshooting.md §4 "Logout requested but session has no logind id", Cause 3](troubleshooting.md#4-pam-stack-and-lockout).
 - On systemd hosts the SysV script does not need editing — the
   authoritative source of the service configuration is
@@ -325,10 +342,11 @@ reads `/etc/tessera/config.toml`.
 ## 11. See also
 
 - [install.md](install.md) — installing `tessera` in full.
-- [mac-integrity.md](mac-integrity.md) — МКЦ end-to-end activation and
-  the full matrix of PAM stacks.
-- [fly-dm-greeter.md](fly-dm-greeter.md) — the wallpaper banner on
-  fly-dm.
+- [mac-integrity.md](mac-integrity.md) — the open/commercial boundary for
+  МКЦ and the МКЦ / МРД line.
+- [operations.md §7](operations.md#7-мкц-mac-integrity) — МКЦ activation
+  (the shipped stack, drop-in, privileges).
+- [fly-dm-greeter.md](fly-dm-greeter.md) — host_id on the login screen.
 - [troubleshooting.md §4](troubleshooting.md#4-pam-stack-and-lockout) —
   lockout, recovery, `Logout requested but session has no logind id`.
 - [configuration.md](configuration.md) — the `config.toml` reference.

@@ -649,9 +649,9 @@ cdylib `pam_tessera.so` логирует в **syslog**, а не в stderr: libpa
 отбрасывает stderr модуля, поэтому на stderr production-диагностика
 недоступна. `tracing`-подписчик строится в момент первого вызова
 `pam_sm_*` и шлёт записи в syslog через `LOG_AUTH` facility с ident
-`tessera`. На системах с journald эти строки видны через
-`journalctl -t tessera` и попадают в `/var/log/auth.log` (на обычном
-syslog-стеке) с префиксом `tessera[<pid>]:`. (Переход с stderr на
+`pam_tessera`. На системах с journald эти строки видны через
+`journalctl -t pam_tessera` и попадают в `/var/log/auth.log` (на обычном
+syslog-стеке) с префиксом `pam_tessera[<pid>]:`. (Переход с stderr на
 syslog — 0.1.1, см. [changelog.md](changelog.md).)
 
 `tessera` использует `tracing-journald` и пишет в

@@ -2,9 +2,9 @@
 
 This section shows how Tessera is deployed across a fleet of terminals and
 **which engineers can do what on a device**. It is written for the customer's
-support engineers and information-security specialists: after reading it, the
-access device, the roles, and the permission boundaries are clear even before
-a pilot.
+support engineers and information-security specialists: after reading it, it is
+clear how access works, what roles exist, and where the permission boundaries
+lie — even before a pilot.
 
 The concrete values (roles, lifetimes, groups) are an example of one safe
 profile, not the only possibility. For the full parameter reference see
@@ -21,7 +21,7 @@ therefore local, on the device itself.
 On the terminal:
 
 - **Tessera Engine** — verifies the credential and enforces permissions
-  (enforcement);
+  (enforcement; for the scope in v0.4.0 see the "Status" box below);
 - **Tessera Login** (PAM module) — the entry point into the OS;
 - **monitord** — watches the media (pull the USB stick and the session closes);
 - a local role database in `/var/lib/tessera/roles/`;
@@ -59,7 +59,7 @@ operations.
 
 > **Status in v0.4.0.** The matrix describes the target profile. Today Tessera
 > applies the identity, the lifetime (TTL), and — on Astra, through the
-> commercial MIC adapter — the integrity mask `mac_mask` to the session.
+> commercial МКЦ adapter — the integrity mask `mac_mask` to the session.
 > Groups, `sudo` rules, and limits are defined by the role format and validated,
 > but are not yet applied to the session: OS enforcement for them is under
 > development
@@ -179,9 +179,10 @@ checked before rollout:
 
 ### 8.1. On an OS without mandatory control (Linux)
 
-Permissions are granted through standard OS mechanisms: supplementary groups,
-`sudo` roles, systemd session limits. Engine sets the groups itself (not via
-`pam_group`) — so that the permissions cannot be bypassed through DBus or sudo.
+The target mechanics: permissions are granted through standard OS mechanisms —
+supplementary groups, `sudo` roles, systemd session limits. Engine will set the
+groups itself (not via `pam_group`) — so that the permissions cannot be
+bypassed through DBus or sudo.
 
 > **Important.** This section describes the target mechanics. In v0.4.0
 > `groups`, `sudo_role`, and `limits` are parsed and validated

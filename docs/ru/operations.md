@@ -425,4 +425,4 @@ wallpaper-backup в `/var/lib/tessera/daemon/`. Родитель
 ## 8. Экстренный контакт
 
 Для конфиденциальных сообщений о безопасности — см. контакты в
-[README.md](../../README.md#безопасность-и-сообщения-об-уязвимостях).
+[README.md](../../README.md#maintainer-contact) (README — на английском).
