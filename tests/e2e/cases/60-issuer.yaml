@@ -181,6 +181,17 @@ cases:
       # Единственный, который подтверждает, что issuer и модуль аутентификации
       # понимают друг друга: по отдельности обе стороны могут быть исправны
       # и при этом несовместимы.
+      # Вход требует роли всегда, поэтому кейс поднимает ролевое хранилище и
+      # входит по имени ролевой учётной записи — так же, как это делает парк.
+      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
+      - run: |
+          install -d -m 0755 -o root -g root /var/lib/tessera/roles
+          install -m 0644 -o root -g root {{roles}}/store/serv.toml /var/lib/tessera/roles/serv.toml
+          cat >> /etc/tessera/config.toml <<'EOF'
+
+          [roles]
+          dir = "/var/lib/tessera/roles"
+          EOF
       - run: |
           rm -rf /tmp/issuer-e2e && install -d -m 0700 /tmp/issuer-e2e
           for k in root leaf; do
@@ -193,14 +204,14 @@ cases:
           issuer issue-root --backend file --key-file /tmp/issuer-e2e/root.key.pem \
             --spki /tmp/issuer-e2e/root.spki.pem --subject "CN=E2E Fleet Root" \
             --not-before $N --not-after $(( N + 86400 )) \
-            --allow-role oper --max-ttl 7200 \
+            --allow-role serv --max-ttl 7200 \
             --journal /tmp/issuer-e2e/journal.ndjson \
             --out /tmp/issuer-e2e/root.crt.pem
           issuer issue-leaf --backend file --key-file /tmp/issuer-e2e/root.key.pem \
             --parent /tmp/issuer-e2e/root.crt.pem \
             --spki /tmp/issuer-e2e/leaf.spki.pem \
-            --subject "CN={{user}}" \
-            --host '*' --user {{user}} \
+            --subject "CN=serv" \
+            --host '*' --user serv --role serv \
             --not-before $N --not-after $(( N + 3600 )) \
             --journal /tmp/issuer-e2e/journal.ndjson \
             --out /tmp/issuer-e2e/leaf.crt.pem
@@ -212,7 +223,8 @@ cases:
       - run: |
           install -m 0640 -o root -g root /tmp/issuer-e2e/root.crt.pem /etc/tessera/ca/bundle.pem
       - run: helpers/usb-loop.sh attach /tmp/issuer-e2e/leaf.p12
-      - run: pam-drive certauth {{user}} authenticate
+      # Отдельного указания роли нет: роль равна имени учётной записи входа.
+      - run: pam-drive certauth serv authenticate
         stdin: "e2e-issued"
         expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
         timeout: 60

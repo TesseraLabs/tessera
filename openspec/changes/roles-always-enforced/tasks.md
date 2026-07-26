@@ -10,4 +10,4 @@
 - [x] 8. `docs/ru/configuration.md`, `docs/en/configuration.md`: убрать `enforce` из таблицы `[roles]` и семантику миграционных стадий
 - [x] 9. `tests/e2e/cases/30-roles.yaml`: снять кейс, закреплявший поведение `enforce = "false"`; в `BASELINE.md` отразить снятие
 - [x] 10. `docs/ru/changelog.md` — раздел Breaking, с указанием миграции
-- [ ] 11. Прогон e2e (`--profile ubuntu-container --filter roles`) — статусы ROLE-кейсов не должны измениться по этой причине
+- [x] 11. Прогон e2e (`--profile ubuntu-container --filter roles`) — ROLE-001…004 остались красными по прежней причине (`prompt: Роль (role):` вместо вывода роли из имени учётной записи), расхождений с baseline нет. ISS-005 потребовал правки кейса: вход теперь всегда требует роль, поэтому кейс поднимает ролевое хранилище и входит по имени ролевой учётной записи
