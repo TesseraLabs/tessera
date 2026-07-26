@@ -80,6 +80,31 @@ envelope must be ⊆ the parent's; otherwise the core refuses before signing,
 naming the dimension (see the monotonic narrowing in
 [cert-issuance.md](cert-issuance.md)).
 
+#### Mandatory envelope: roles and the TTL ceiling
+
+`--allow-role` is required for both `issue-ca` and `issue-root`: the role list
+in a delegation envelope is a closed whitelist, and an empty list allows not
+"any role" but none at all. There can be no default here: role names belong to
+the particular deployment, so any substituted value would either repeat the same
+dead end or silently widen the envelope beyond what the operator named.
+
+`--max-ttl` bounds the lifetime of the **child** link, so the two operations
+give it different meanings and different defaults:
+
+| Operation | What `--max-ttl` bounds | Default |
+| --- | --- | --- |
+| `issue-root` | the organisation CA's lifetime under the fleet root | `31536000` (a year) |
+| `issue-ca` | the shift-leaf's lifetime under the organisation CA | `14400` (4 hours) |
+
+An explicit `--max-ttl 0` is refused at argument parsing: a zero ceiling demands
+a zero lifetime from the child link, so no issuable certificate passes under
+such a CA.
+
+Both restrictions close the same class of error: a certificate with an empty or
+zero envelope dimension looks valid, lands in the issuance journal and raises no
+warning, yet authentication under it always fails — and that is discovered only
+on the device.
+
 ### Issue a shift-leaf
 
 The leaf's public key comes from an explicit `--spki` (then `--subject` is
