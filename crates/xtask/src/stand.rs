@@ -6,10 +6,11 @@
 //! раннер разрешает один раз на старте прогона.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use secrecy::{ExposeSecret as _, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::vars::Vars;
 
@@ -25,6 +26,13 @@ source = "локальная сборка"
 # Коммит, из которого собран артефакт. Если подтвердить нечем — не заполнять:
 # прогон будет помечен как проведённый с неустановленным провенансом.
 # commit = "0000000000000000000000000000000000000000"
+
+# Что везётся в окружение помимо пакета: собранные отдельным пайплайном бинари,
+# которых нет ни в .deb, ни в репозитории. Секция необязательная.
+# [[artifacts]]
+# path = "/path/to/issuer"
+# target = "/usr/local/bin/issuer"
+# mode = "0755"
 
 [vars]
 # Подставляются в шаги реестра как {{user}}, {{fixtures}}, {{pin}}.
@@ -109,6 +117,10 @@ pub enum SecretError {
 pub struct StandConfig {
     /// Проверяемый пакет.
     pub package: PackageConfig,
+    /// Дополнительные артефакты стенда: то, что везётся в окружение помимо
+    /// пакета. Секция необязательная.
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactConfig>,
     /// Значения переменных реестра; значения вида `op://…` — ссылки на секреты.
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
@@ -129,6 +141,84 @@ pub struct PackageConfig {
     /// Коммит, из которого собран артефакт, если его есть чем подтвердить.
     #[serde(default)]
     pub commit: Option<String>,
+}
+
+/// Дополнительный артефакт стенда.
+///
+/// Место такого артефакта именно здесь: у бинарей со своим релизным пайплайном
+/// нет ни места в `.deb`, ни места в репозитории, а путь к собранному файлу
+/// у каждого стенда свой — профиль в git обязан оставаться безадресным.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactConfig {
+    /// Путь к файлу на машине оператора.
+    pub path: PathBuf,
+    /// Куда положить в окружении; путь абсолютный.
+    pub target: String,
+    /// Права на файл после доставки. Владельца задаёт не стенд: доставленное
+    /// всегда нормализуется до `root:root`.
+    #[serde(default)]
+    pub mode: FileMode,
+}
+
+/// Права на доставленный файл.
+///
+/// Отдельный тип, а не строка: неверная запись прав должна отбиваться разбором
+/// `stand.toml`, а не всплывать ненулевым кодом `chmod` посреди прогона.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMode(u32);
+
+impl FileMode {
+    /// Права по умолчанию: файл читаем всеми, пишет только владелец.
+    pub const DEFAULT: Self = Self(0o644);
+
+    /// Разбирает восьмеричную запись прав вида `0755`.
+    ///
+    /// # Ошибки
+    ///
+    /// Всё, что не является записью из трёх-четырёх восьмеричных цифр.
+    pub fn parse(text: &str) -> Result<Self, ModeError> {
+        let trimmed = text.trim();
+        let digits = trimmed.len();
+        let octal = trimmed.bytes().all(|byte| (b'0'..=b'7').contains(&byte));
+        if !(3..=4).contains(&digits) || !octal {
+            return Err(ModeError {
+                text: text.to_owned(),
+            });
+        }
+        u32::from_str_radix(trimmed, 8)
+            .map(Self)
+            .map_err(|_| ModeError {
+                text: text.to_owned(),
+            })
+    }
+}
+
+impl Default for FileMode {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl fmt::Display for FileMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04o}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for FileMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Неверная запись прав в `stand.toml`.
+#[derive(Debug, thiserror::Error)]
+#[error("права `{text}`: ожидаются три-четыре восьмеричные цифры, например \"0755\"")]
+pub struct ModeError {
+    /// Что было записано.
+    text: String,
 }
 
 /// Доступ к машине по SSH.
@@ -338,6 +428,65 @@ mod tests {
         assert!(config.vars.contains_key("pin"));
         assert_eq!(config.hosts["astra-vm"].port, Some(2222));
         assert!(config.package.commit.is_none());
+    }
+
+    #[test]
+    fn a_stand_without_extra_artifacts_stays_valid() {
+        let config: StandConfig = toml::from_str(SAMPLE).unwrap();
+        assert!(config.artifacts.is_empty());
+    }
+
+    #[test]
+    fn extra_artifacts_are_read_with_their_target_and_mode() {
+        let config: StandConfig = toml::from_str(
+            r#"
+[package]
+deb = "/art/tessera_0.4.0_amd64.deb"
+
+[[artifacts]]
+path = "/build/issuer"
+target = "/usr/local/bin/issuer"
+mode = "0755"
+
+[[artifacts]]
+path = "/build/policy.json"
+target = "/etc/tessera/policy.json"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.artifacts.len(), 2);
+        assert_eq!(config.artifacts[0].path, PathBuf::from("/build/issuer"));
+        assert_eq!(config.artifacts[0].target, "/usr/local/bin/issuer");
+        assert_eq!(config.artifacts[0].mode.to_string(), "0755");
+        // Права необязательны: без них файл читаем всеми, пишет только владелец.
+        assert_eq!(config.artifacts[1].mode, FileMode::DEFAULT);
+        assert_eq!(config.artifacts[1].mode.to_string(), "0644");
+    }
+
+    #[test]
+    fn a_malformed_mode_is_rejected_by_the_parser() {
+        // Опечатка в правах обязана отбиваться разбором stand.toml: ненулевой
+        // код chmod посреди прогона выглядел бы как сбой стенда без причины.
+        for text in ["rwxr-xr-x", "0o755", "0778", "75", "07555", ""] {
+            assert!(FileMode::parse(text).is_err(), "принято `{text}`");
+        }
+        assert_eq!(FileMode::parse("755").unwrap().to_string(), "0755");
+        assert_eq!(FileMode::parse(" 0640 ").unwrap().to_string(), "0640");
+
+        let err = toml::from_str::<StandConfig>(
+            r#"
+[package]
+deb = "/art/tessera.deb"
+
+[[artifacts]]
+path = "/build/issuer"
+target = "/usr/local/bin/issuer"
+mode = "rwxr-xr-x"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("восьмеричные"), "{err}");
     }
 
     #[test]

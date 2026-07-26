@@ -11,8 +11,8 @@ use crate::baseline::{self, Divergence};
 use crate::cli::E2eArgs;
 use crate::exec::{Delivery, ExecDeps, ExecOptions, Executor};
 use crate::interact::{ConsoleOperator, Operator, OperatorError, Verdict};
-use crate::profile::Profile;
-use crate::provenance::Provenance;
+use crate::profile::{FixturesEntry, Profile};
+use crate::provenance::{ArtifactProvenance, Provenance};
 use crate::redact::Redactor;
 use crate::registry::{self, Registry};
 use crate::report::{self, CaseResult, RunReport};
@@ -28,11 +28,6 @@ pub const EXIT_NO_STAND: i32 = 2;
 /// Всё, что раннер везёт в окружение, живёт под `/opt/tessera-e2e`: один корень
 /// даёт teardown'у единственное место для уборки.
 const REMOTE_PACKAGE: &str = "/opt/tessera-e2e/pkg/tessera.deb";
-
-/// Куда кладутся фикстуры; кейсам доступны как `{{fixtures}}`. Значение можно
-/// перекрыть переменной профиля или стенда — тогда доставка едет туда же, куда
-/// смотрят кейсы.
-const REMOTE_FIXTURES: &str = "/opt/tessera-e2e/fixtures";
 
 /// Прогон реестра.
 ///
@@ -63,11 +58,18 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
         println!("профиль {}: {description}", profile.name);
     }
 
+    let fixtures = profile.fixture_deliveries(&repo_root());
+
     let mut vars = prepare_vars(&profile, &stand)?;
     // Кейс не должен знать ни путь к пакету на машине оператора, ни раскладку
-    // окружения: он видит только подстановки.
-    if vars.plain("fixtures").is_none() {
-        vars.insert_plain("fixtures", REMOTE_FIXTURES);
+    // окружения: он видит только подстановки. Профиль и стенд сильнее: заданное
+    // ими место каталога и есть то, куда поедет доставка.
+    for entry in &fixtures {
+        if let Some(var) = &entry.var {
+            if vars.plain(var).is_none() {
+                vars.insert_plain(var.clone(), entry.target.clone());
+            }
+        }
     }
     vars.insert_plain("package", REMOTE_PACKAGE);
     let vars = vars;
@@ -99,6 +101,19 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
         );
     }
 
+    // Провенанс дополнительных артефактов считается до пересоздания окружения:
+    // отсутствующий файл — ошибка описания стенда, и узнать о ней нужно раньше
+    // первого кейса. Заодно отчёт получает контрольные суммы всего, что
+    // приедет в окружение помимо пакета.
+    let stand_artifacts = artifact_provenance(&stand)?;
+    announce_artifacts(&stand_artifacts);
+
+    let deliveries = plan_deliveries(&fixtures, &stand, &vars);
+    // Проверка до пересоздания окружения: отсутствующий каталог-источник — это
+    // ошибка описания стенда, и узнать о ней нужно раньше, чем сборка образа
+    // и первый кейс потратят минуты.
+    check_sources(&deliveries)?;
+
     let interrupt = Arc::new(AtomicBool::new(false));
     // Перехват сигнала нужен ради teardown: прерванный прогон не должен
     // оставлять окружение в промежуточном состоянии.
@@ -114,8 +129,6 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
     if args.recreate {
         driver.recreate().context("пересоздание окружения")?;
     }
-
-    let deliveries = plan_deliveries(&profile, &stand, &vars);
 
     let started_at = now();
     let run_dir = report::run_dir(&runs_root, &today(), &profile.name, &package);
@@ -137,6 +150,7 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
         profile: profile.name.clone(),
         environment: driver.describe(),
         package: package.clone(),
+        stand_artifacts,
         non_interactive: args.non_interactive,
         keep_on_failure: args.keep_on_failure,
         interrupted: interrupt.load(Ordering::SeqCst),
@@ -154,19 +168,84 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
 ///
 /// Цели берутся из тех же переменных, которые видит кейс: разъедься доставка
 /// с подстановкой, кейс искал бы пакет и фикстуры не там, куда их положили.
-fn plan_deliveries(profile: &Profile, stand: &StandConfig, vars: &Vars) -> Vec<Delivery> {
-    vec![
+fn plan_deliveries(fixtures: &[FixturesEntry], stand: &StandConfig, vars: &Vars) -> Vec<Delivery> {
+    let mut deliveries = vec![Delivery::new(
+        "пакет",
+        stand.package.deb.clone(),
+        vars.plain("package").unwrap_or(REMOTE_PACKAGE).to_owned(),
+    )];
+    deliveries.extend(fixtures.iter().map(|entry| {
+        let target = entry
+            .var
+            .as_deref()
+            .and_then(|var| vars.plain(var))
+            .unwrap_or(entry.target.as_str());
+        let what = match &entry.var {
+            Some(var) => format!("фикстуры {var}"),
+            None => format!("фикстуры {target}"),
+        };
+        Delivery::new(what, entry.source.clone(), target.to_owned())
+    }));
+    // Артефакты стенда едут последними: их цели заданы абсолютными путями и от
+    // раскладки раннера не зависят.
+    deliveries.extend(stand.artifacts.iter().map(|artifact| {
         Delivery::new(
-            "пакет",
-            stand.package.deb.clone(),
-            vars.plain("package").unwrap_or(REMOTE_PACKAGE).to_owned(),
-        ),
-        Delivery::new(
-            "фикстуры",
-            profile.fixtures_source_path(&repo_root()),
-            vars.plain("fixtures").unwrap_or(REMOTE_FIXTURES).to_owned(),
-        ),
-    ]
+            format!("артефакт стенда {}", artifact.target),
+            artifact.path.clone(),
+            artifact.target.clone(),
+        )
+        .with_mode(artifact.mode.to_string())
+    }));
+    deliveries
+}
+
+/// Называет вслух всё, что поедет в окружение помимо пакета.
+fn announce_artifacts(artifacts: &[ArtifactProvenance]) {
+    if artifacts.is_empty() {
+        return;
+    }
+    let targets: Vec<&str> = artifacts
+        .iter()
+        .map(|artifact| artifact.target.as_str())
+        .collect();
+    eprintln!("помимо пакета в окружение везётся: {}", targets.join(", "));
+}
+
+/// Считает происхождение дополнительных артефактов стенда.
+///
+/// # Ошибки
+///
+/// Отсутствующий или нечитаемый файл-источник любого из артефактов.
+fn artifact_provenance(stand: &StandConfig) -> anyhow::Result<Vec<ArtifactProvenance>> {
+    stand
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            ArtifactProvenance::of_file(
+                &artifact.path,
+                &artifact.target,
+                &artifact.mode.to_string(),
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .collect()
+}
+
+/// Проверяет, что везти есть что.
+///
+/// # Ошибки
+///
+/// Отсутствующий источник любой из доставок.
+fn check_sources(deliveries: &[Delivery]) -> anyhow::Result<()> {
+    for delivery in deliveries {
+        anyhow::ensure!(
+            delivery.local.exists(),
+            "доставка ({}): источник {} не найден",
+            delivery.what,
+            delivery.local.display()
+        );
+    }
+    Ok(())
 }
 
 /// Собирает переменные прогона, разрешая ссылки на секреты до первого кейса:
@@ -428,13 +507,38 @@ deb = "/art/tessera_0.4.0_amd64.deb"
         .unwrap()
     }
 
+    fn multi_fixture_profile() -> Profile {
+        toml::from_str(
+            r#"
+name = "ubuntu-container"
+driver = "docker"
+
+[[fixtures]]
+source = "crates/tessera_core/tests/fixtures"
+target = "/opt/tessera-e2e/fixtures"
+var = "fixtures"
+
+[[fixtures]]
+source = "tests/fixtures/roles"
+target = "/opt/tessera-e2e/roles"
+var = "roles"
+
+[docker]
+container = "c"
+image = "i"
+"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn deliveries_default_to_the_runner_layout() {
         let mut vars = Vars::new();
-        vars.insert_plain("fixtures", REMOTE_FIXTURES);
+        vars.insert_plain("fixtures", crate::profile::DEFAULT_FIXTURES_TARGET);
         vars.insert_plain("package", REMOTE_PACKAGE);
 
-        let deliveries = plan_deliveries(&profile(), &stand(), &vars);
+        let fixtures = profile().fixture_deliveries(&repo_root());
+        let deliveries = plan_deliveries(&fixtures, &stand(), &vars);
         assert_eq!(deliveries.len(), 2);
         assert_eq!(
             deliveries[0].local,
@@ -445,18 +549,127 @@ deb = "/art/tessera_0.4.0_amd64.deb"
             deliveries[1].local,
             repo_root().join(crate::profile::DEFAULT_FIXTURES_SOURCE)
         );
-        assert_eq!(deliveries[1].remote, REMOTE_FIXTURES);
+        assert_eq!(
+            deliveries[1].remote,
+            crate::profile::DEFAULT_FIXTURES_TARGET
+        );
+    }
+
+    #[test]
+    fn every_fixture_source_of_the_profile_gets_its_own_delivery() {
+        let fixtures = multi_fixture_profile().fixture_deliveries(&repo_root());
+        let deliveries = plan_deliveries(&fixtures, &stand(), &Vars::new());
+        assert_eq!(deliveries.len(), 3);
+        assert_eq!(
+            deliveries[1].local,
+            repo_root().join("crates/tessera_core/tests/fixtures")
+        );
+        assert_eq!(deliveries[1].remote, "/opt/tessera-e2e/fixtures");
+        assert_eq!(
+            deliveries[2].local,
+            repo_root().join("tests/fixtures/roles")
+        );
+        assert_eq!(deliveries[2].remote, "/opt/tessera-e2e/roles");
+        // Груз называется именем подстановки: сообщение о сбое доставки должно
+        // указывать на конкретный каталог, а не на «фикстуры» вообще.
+        assert_eq!(deliveries[2].what, "фикстуры roles");
     }
 
     #[test]
     fn a_stand_that_moves_the_fixtures_moves_the_delivery_with_them() {
-        // Кейс подставляет {{fixtures}}; вези раннер каталог по своему адресу,
-        // кейс искал бы фикстуры не там, где они лежат.
+        // Кейс подставляет {{fixtures}} и {{roles}}; вези раннер каталог по
+        // своему адресу, кейс искал бы материал не там, где он лежит.
         let mut vars = Vars::new();
         vars.insert_plain("fixtures", "/srv/e2e/fixtures");
+        vars.insert_plain("roles", "/srv/e2e/roles");
 
-        let deliveries = plan_deliveries(&profile(), &stand(), &vars);
+        let fixtures = multi_fixture_profile().fixture_deliveries(&repo_root());
+        let deliveries = plan_deliveries(&fixtures, &stand(), &vars);
         assert_eq!(deliveries[1].remote, "/srv/e2e/fixtures");
+        assert_eq!(deliveries[2].remote, "/srv/e2e/roles");
+    }
+
+    #[test]
+    fn a_missing_fixture_source_is_reported_before_the_run() {
+        let fixtures = multi_fixture_profile().fixture_deliveries(Path::new("/нет-такого-корня"));
+        let deliveries = plan_deliveries(&fixtures, &stand(), &Vars::new());
+        let err = check_sources(&deliveries).unwrap_err().to_string();
+        // Первым в списке идёт пакет, и его в тесте тоже нет: важно, что прогон
+        // не стартует, а сообщение называет и груз, и путь.
+        assert!(err.contains("источник"), "{err}");
+        assert!(err.contains("tessera_0.4.0_amd64.deb"), "{err}");
+    }
+
+    #[test]
+    fn a_present_source_passes_the_check() {
+        let fixtures = multi_fixture_profile().fixture_deliveries(&repo_root());
+        let deliveries = plan_deliveries(&fixtures, &stand(), &Vars::new());
+        // Пакет из stand.toml в дереве репозитория не лежит — проверяем только
+        // каталоги фикстур, которые обязаны существовать.
+        check_sources(&deliveries[1..]).unwrap();
+    }
+
+    fn stand_with_artifacts(path: &Path) -> StandConfig {
+        toml::from_str(&format!(
+            r#"
+[package]
+deb = "/art/tessera_0.4.0_amd64.deb"
+
+[[artifacts]]
+path = "{}"
+target = "/usr/local/bin/issuer"
+mode = "0755"
+"#,
+            path.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn extra_stand_artifacts_are_delivered_with_their_mode() {
+        let fixtures = profile().fixture_deliveries(&repo_root());
+        let stand = stand_with_artifacts(Path::new("/build/issuer"));
+        let deliveries = plan_deliveries(&fixtures, &stand, &Vars::new());
+        // Пакет, фикстуры профиля и артефакт стенда.
+        assert_eq!(deliveries.len(), 3);
+        let artifact = &deliveries[2];
+        assert_eq!(artifact.local, PathBuf::from("/build/issuer"));
+        assert_eq!(artifact.remote, "/usr/local/bin/issuer");
+        assert_eq!(artifact.mode.as_deref(), Some("0755"));
+        // Сообщение о сбое доставки должно называть конкретный артефакт.
+        assert_eq!(artifact.what, "артефакт стенда /usr/local/bin/issuer");
+    }
+
+    #[test]
+    fn a_stand_without_the_section_delivers_exactly_what_it_did_before() {
+        let fixtures = profile().fixture_deliveries(&repo_root());
+        let deliveries = plan_deliveries(&fixtures, &stand(), &Vars::new());
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries.iter().all(|delivery| delivery.mode.is_none()));
+        assert!(artifact_provenance(&stand()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_missing_artifact_source_is_reported_before_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let stand = stand_with_artifacts(&dir.path().join("нет-такого-issuer"));
+        let err = artifact_provenance(&stand).unwrap_err().to_string();
+        assert!(err.contains("/usr/local/bin/issuer"), "{err}");
+        assert!(err.contains("не найден"), "{err}");
+    }
+
+    #[test]
+    fn a_delivered_artifact_is_recorded_with_its_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("issuer");
+        std::fs::write(&source, b"issuer").unwrap();
+
+        let recorded = artifact_provenance(&stand_with_artifacts(&source)).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].target, "/usr/local/bin/issuer");
+        assert_eq!(recorded[0].mode, "0755");
+        assert_eq!(recorded[0].size, 6);
+        assert_eq!(recorded[0].sha256.len(), 64);
     }
 
     #[test]

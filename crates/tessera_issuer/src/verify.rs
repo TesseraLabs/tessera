@@ -44,6 +44,12 @@ pub(crate) fn self_check_leaf(
         return Err(reject("leaf certificate asserts cA=TRUE"));
     }
 
+    // keyUsage and extendedKeyUsage present: the Engine's leaf pre-validation
+    // rejects a certificate that lacks either, so releasing one would hand the
+    // operator an artifact that cannot authenticate anybody.
+    require_extension(cert_der, "2.5.29.15", "keyUsage")?;
+    require_extension(cert_der, "2.5.29.37", "extendedKeyUsage")?;
+
     // Leaf must NOT carry a delegation envelope (malformed on a leaf).
     if extract_extension_value(cert_der, DELEGATION_CONSTRAINTS_OID)?.is_some() {
         return Err(reject("leaf carries a delegation_constraints extension"));

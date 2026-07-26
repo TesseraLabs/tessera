@@ -1,0 +1,222 @@
+suite: issuer
+description: Выпуск удостоверений и приём выпущенного модулем аутентификации
+setup: [install-package, deploy-fixtures, deploy-issuer]
+
+# Выпуск проверяется файловым бэкендом подписи: ключ лежит на диске, HSM и токен
+# не нужны. Это не подмена продуктового пути — тот же код сборки TBS и подписи,
+# отличается только источник ключа, и именно так issuer работает у оператора
+# без аппаратного носителя.
+#
+# Корень задаёт КОНВЕРТ выпуска (--allow-role, --max-ttl, --max-level), а лист
+# может только сужать его. Поэтому корень здесь всегда выпускается с конвертом:
+# под корнем без него не выпустить ни одного листа с ненулевым сроком.
+#
+# Рабочие файлы живут в /tmp/issuer-e2e и удаляются в teardown: выпущенные
+# прогоном удостоверения и приватные ключи не должны его переживать.
+
+cases:
+  - id: ISS-001
+    title: Выпуск корня парка даёт самоподписанный сертификат
+    requirement: openspec/specs/cert-issuance/spec.md
+    requires: []
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-e2e && install -d -m 0700 /tmp/issuer-e2e
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-e2e/root.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-e2e/root.key.pem -pubout \
+            -out /tmp/issuer-e2e/root.spki.pem 2>/dev/null
+          N=$(date -u +%s)
+          issuer issue-root --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --spki /tmp/issuer-e2e/root.spki.pem --subject "CN=E2E Fleet Root" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 7200 \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/root.crt.pem
+      # Корень парка самоподписан: issuer и subject совпадают, иначе это не корень.
+      - run: openssl x509 -in /tmp/issuer-e2e/root.crt.pem -noout -subject -issuer
+        expect:
+          exit_code: 0
+          stdout_matches: 'subject=CN\s*=\s*E2E Fleet Root\nissuer=CN\s*=\s*E2E Fleet Root'
+    teardown:
+      - run: rm -rf /tmp/issuer-e2e
+
+  - id: ISS-002
+    title: Подделка записи в журнале выпусков ломает цепочку хешей
+    requirement: openspec/specs/issuance-journal/spec.md
+    requires: []
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-e2e && install -d -m 0700 /tmp/issuer-e2e
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-e2e/root.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-e2e/root.key.pem -pubout \
+            -out /tmp/issuer-e2e/root.spki.pem 2>/dev/null
+          N=$(date -u +%s)
+          issuer issue-root --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --spki /tmp/issuer-e2e/root.spki.pem --subject "CN=E2E Fleet Root" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 7200 \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/root.crt.pem
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-e2e/leaf.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-e2e/leaf.key.pem -pubout \
+            -out /tmp/issuer-e2e/leaf.spki.pem 2>/dev/null
+          issuer issue-leaf --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --parent /tmp/issuer-e2e/root.crt.pem \
+            --spki /tmp/issuer-e2e/leaf.spki.pem --subject "CN={{user}}" \
+            --host '*' --user {{user}} --role oper \
+            --not-before $N --not-after $(( N + 3600 )) \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/leaf.crt.pem
+      # Журнал — доказательство того, кто и что выпустил; целостность держится
+      # цепочкой хешей, а не доверием к файлу. Записей две: подделку первой
+      # выдаёт несовпадение с prev_hash второй.
+      - run: issuer verify-journal --journal /tmp/issuer-e2e/journal.ndjson
+        expect: { exit_code: 0, stdout_matches: 'chain intact' }
+      # Подменяется время записи — поле, входящее в хешируемую часть. Если такая
+      # правка проходит незамеченной, журнал перестаёт быть доказательством.
+      - run: |
+          sed -i '1s/"ts":[0-9]*/"ts":1000000000/' /tmp/issuer-e2e/journal.ndjson
+      - run: issuer verify-journal --journal /tmp/issuer-e2e/journal.ndjson
+        expect: { exit_code: 1 }
+    teardown:
+      - run: rm -rf /tmp/issuer-e2e
+
+  - id: ISS-003
+    title: Выпущенный лист несёт заданные рамки применения
+    requirement: openspec/specs/cert-scope-binding/spec.md
+    requires: []
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-e2e && install -d -m 0700 /tmp/issuer-e2e
+          for k in root leaf; do
+            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+              -out /tmp/issuer-e2e/$k.key.pem 2>/dev/null
+            openssl pkey -in /tmp/issuer-e2e/$k.key.pem -pubout \
+              -out /tmp/issuer-e2e/$k.spki.pem 2>/dev/null
+          done
+          N=$(date -u +%s)
+          issuer issue-root --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --spki /tmp/issuer-e2e/root.spki.pem --subject "CN=E2E Fleet Root" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 7200 \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/root.crt.pem
+          issuer issue-leaf --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --parent /tmp/issuer-e2e/root.crt.pem \
+            --spki /tmp/issuer-e2e/leaf.spki.pem \
+            --subject "CN={{user}}" \
+            --host '*' --user {{user}} --role oper \
+            --not-before $N --not-after $(( N + 3600 )) \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/leaf.crt.pem
+      # Рамки применения — то, чем удостоверение ограничено: без них лист пускал бы
+      # кого угодно и куда угодно. Проверяются все три расширения.
+      - run: openssl x509 -in /tmp/issuer-e2e/leaf.crt.pem -noout -text
+        expect:
+          exit_code: 0
+          stdout_matches: '2\.25\.183976554325829274683049824615098'
+      - run: openssl x509 -in /tmp/issuer-e2e/leaf.crt.pem -noout -text
+        expect:
+          exit_code: 0
+          stdout_matches: '2\.25\.215438916728501023845629178354627'
+      - run: openssl x509 -in /tmp/issuer-e2e/leaf.crt.pem -noout -text
+        expect:
+          exit_code: 0
+          stdout_matches: '2\.25\.185305973969816596290730578528098241367'
+    teardown:
+      - run: rm -rf /tmp/issuer-e2e
+
+  - id: ISS-004
+    title: Расширение рамок относительно родителя отклоняется
+    requirement: openspec/specs/cert-issuance/spec.md
+    requires: []
+    steps:
+      # Монотонное сужение: выпускающий не может выдать больше прав, чем имеет сам.
+      # Без этого правила скомпрометированный промежуточный центр выписывал бы
+      # себе любые полномочия, а иерархия доверия теряла бы смысл.
+      - run: |
+          rm -rf /tmp/issuer-e2e && install -d -m 0700 /tmp/issuer-e2e
+          for k in root leaf; do
+            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+              -out /tmp/issuer-e2e/$k.key.pem 2>/dev/null
+            openssl pkey -in /tmp/issuer-e2e/$k.key.pem -pubout \
+              -out /tmp/issuer-e2e/$k.spki.pem 2>/dev/null
+          done
+          N=$(date -u +%s)
+          issuer issue-root --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --spki /tmp/issuer-e2e/root.spki.pem --subject "CN=E2E Fleet Root" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 7200 \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/root.crt.pem
+      # Конверт корня разрешает только oper; лист просит serv.
+      - run: |
+          N=$(date -u +%s)
+          issuer issue-leaf --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --parent /tmp/issuer-e2e/root.crt.pem \
+            --spki /tmp/issuer-e2e/leaf.spki.pem \
+            --subject "CN={{user}}" \
+            --host '*' --user {{user}} --role serv \
+            --not-before $N --not-after $(( N + 3600 )) \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/leaf.crt.pem
+        expect:
+          exit_code: 1
+          stderr_matches: 'widens the parent envelope'
+      # Отказ должен быть настоящим: файла быть не должно, иначе «отклонено»
+      # означало бы лишь ненулевой код при выпущенном сертификате.
+      - expect_file: { path: /tmp/issuer-e2e/leaf.crt.pem, exists: false }
+    teardown:
+      - run: rm -rf /tmp/issuer-e2e
+
+  - id: ISS-005
+    title: Выпущенным удостоверением можно войти в систему
+    requirement: openspec/specs/cert-issuance/spec.md
+    requires: [service-manager, usb]
+    steps:
+      # Сквозной кейс: «выпустили → записали на носитель → вошли» целиком.
+      # Единственный, который подтверждает, что issuer и модуль аутентификации
+      # понимают друг друга: по отдельности обе стороны могут быть исправны
+      # и при этом несовместимы.
+      - run: |
+          rm -rf /tmp/issuer-e2e && install -d -m 0700 /tmp/issuer-e2e
+          for k in root leaf; do
+            openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+              -out /tmp/issuer-e2e/$k.key.pem 2>/dev/null
+            openssl pkey -in /tmp/issuer-e2e/$k.key.pem -pubout \
+              -out /tmp/issuer-e2e/$k.spki.pem 2>/dev/null
+          done
+          N=$(( $(date -u +%s) - 300 ))
+          issuer issue-root --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --spki /tmp/issuer-e2e/root.spki.pem --subject "CN=E2E Fleet Root" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 7200 \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/root.crt.pem
+          issuer issue-leaf --backend file --key-file /tmp/issuer-e2e/root.key.pem \
+            --parent /tmp/issuer-e2e/root.crt.pem \
+            --spki /tmp/issuer-e2e/leaf.spki.pem \
+            --subject "CN={{user}}" \
+            --host '*' --user {{user}} \
+            --not-before $N --not-after $(( N + 3600 )) \
+            --journal /tmp/issuer-e2e/journal.ndjson \
+            --out /tmp/issuer-e2e/leaf.crt.pem
+          openssl pkcs12 -export -inkey /tmp/issuer-e2e/leaf.key.pem \
+            -in /tmp/issuer-e2e/leaf.crt.pem -certfile /tmp/issuer-e2e/root.crt.pem \
+            -passout pass:e2e-issued -out /tmp/issuer-e2e/leaf.p12
+      # Доверие устройства переводится на выпущенный корень: иначе кейс проверял бы
+      # совпадение с заранее розданными якорями, а не приём свежевыпущенного.
+      - run: |
+          install -m 0640 -o root -g root /tmp/issuer-e2e/root.crt.pem /etc/tessera/ca/bundle.pem
+      - run: helpers/usb-loop.sh attach /tmp/issuer-e2e/leaf.p12
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "e2e-issued"
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: rm -rf /tmp/issuer-e2e
+      - run: helpers/setup/deploy-fixtures.sh
