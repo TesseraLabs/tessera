@@ -1,0 +1,55 @@
+suite: auth
+description: Аутентификация по удостоверению через PAM-стек certauth (pam_tessera.so)
+setup: [install-package, deploy-fixtures]
+
+cases:
+  - id: AUTH-001
+    title: Валидное удостоверение пускает пользователя
+    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt
+        stdin: "{{pin}}"
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)\nacct: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+
+  - id: AUTH-002
+    title: Неверный PIN не пускает пользователя
+    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      # Заведомо неверный PIN, не секрет: pin_loop отвечает conv-функции одним и тем
+      # же значением на все 3 попытки (хардкод), поэтому один неверный ввод
+      # исчерпывает бюджет так же, как три разных неверных.
+      # Ожидание — обещанное поведение, а не текущее: исчерпание попыток PIN обязано
+      # сообщаться стеку как PAM_MAXTRIES (11). Сейчас модуль возвращает 8
+      # (PAM_CRED_INSUFFICIENT), поэтому кейс падает — это известный дефект, занесённый
+      # в BASELINE.md. Подгонять ожидание под факт нельзя: тогда реестр закрепит дефект
+      # как эталон и перестанет о нём сообщать.
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "000000"
+        expect: { exit_code: 11, stdout_matches: 'auth: PAM_MAXTRIES \(11\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+
+  - id: AUTH-003
+    title: Просроченное удостоверение не пускает пользователя
+    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/expired_leaf.p12
+      # Просроченное удостоверение отвергается на проверке доверия, то есть уже
+      # в auth-фазе, а не на account-фазе: по таблице маппинга в спеке класс Trust
+      # даёт 6 PAM_PERM_DENIED. Поэтому кейс и спрашивает только authenticate —
+      # до account-фазы дело не доходит.
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach

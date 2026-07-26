@@ -1,0 +1,46 @@
+# Профиль окружения astra-container.
+#
+# Профиль описывает ТОЛЬКО тип окружения и его возможности. Адреса, учётные записи,
+# ключи и путь к .deb живут в ~/.config/tessera-e2e/stand.toml вне git.
+
+name = "astra-container"
+description = "Astra Linux SE 1.8.5 в контейнере, службы поднимаются хелпером"
+driver = "docker"
+
+# service-manager здесь нет: Astra-шный init намеренно завершается без модуля ядра
+# parsec, и обходить эту защиту не следует — единственный нужный демон поднимается
+# хелпером. Кейсы, которым нужен менеджер служб, получат SKIP с причиной.
+# mac отсутствует по той же причине: parsec-base даёт лишь userspace-часть.
+capabilities = ["usb"]
+
+default_timeout = 60
+
+# Служебные коды хелперов образа: сломан стенд, а не продукт.
+# 64 — ошибка аргументов, 70 — сбой самого драйвера (PAM не дал вердикта).
+# Настоящие коды PAM (1..~32) сюда не попадают и остаются предметом ожидания кейса.
+error_exit_codes = [64, 70]
+
+[vars]
+helpers = "/opt/tessera-e2e/helpers"
+fixtures = "/opt/tessera-e2e/fixtures"
+
+[docker]
+container = "tessera-e2e-astra"
+image = "tessera-e2e-astra:latest"
+dockerfile = "tests/e2e/images/astra.Dockerfile"
+context = "tests/e2e"
+# Образ существует только под amd64; на arm-хосте нужен эмулятор.
+platform = "linux/amd64"
+
+# privileged и tmpfs /run нужны и без systemd: loop-устройства, udevd и его
+# рабочий каталог. Команда контейнера (`sleep infinity`) задана CMD образа.
+run_args = [
+    "--privileged",
+    "--cgroupns=host",
+    "--tmpfs", "/run",
+    "--tmpfs", "/run/lock",
+]
+
+# Готовность профиля — это поднятый udevd, а не менеджер служб. Хелпер
+# идемпотентен: он и поднимает демон, и служит проверкой.
+ready_command = "/opt/tessera-e2e/helpers/udevd-start.sh"

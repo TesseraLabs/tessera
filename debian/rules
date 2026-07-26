@@ -32,8 +32,10 @@ override_dh_auto_clean:
 	rm -rf target debian/cargo_home
 
 override_dh_auto_build:
-	cargo build --release --workspace --locked --offline \
-		|| cargo build --release --workspace --locked
+	# xtask is the e2e harness runner, not part of the product: it ships in no
+	# package and must not cost anything when building the .deb.
+	cargo build --release --workspace --exclude xtask --locked --offline \
+		|| cargo build --release --workspace --exclude xtask --locked
 
 override_dh_auto_install:
 	# Place the cdylib at the canonical PAM module path with the expected

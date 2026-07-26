@@ -55,6 +55,12 @@ teardown, а полный откат остаётся ручной операц�
 - `ubuntu.Dockerfile`: `ubuntu:24.04` + systemd, udev, dosfstools, `pam-drive`.
 - `astra.Dockerfile`: `astra/ubi18-systemd:1.8.5` + udev, dosfstools, `parsec-base`, `pam-drive`.
 
+Крейт `xtask` исключён из `default-members`: голые `cargo build` и `cargo test` его не
+трогают, а `debian/rules` собирает продуктовые крейты с `--exclude xtask`, так что в сборку
+пакета он не входит. При этом `cargo test --workspace` в CI его собирает и гоняет его
+юнит-тесты — это осознанно: раннер выносит вердикт продукту, поэтому сам обязан быть под
+тестом. Тесты раннера не требуют ни docker, ни ssh, ни сети, и в контейнере CI проходят.
+
 `docker/astra-builder.Dockerfile` остаётся сборочным образом CI и в прогоне не участвует:
 он несёт rust-toolchain и dev-заголовки, а прогонять надо тот `.deb`, что уезжает на машины,
 в среде, похожей на машину. `.deb` берётся из `stand.toml` или скачивается артефактом

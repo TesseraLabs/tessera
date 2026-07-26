@@ -1,0 +1,58 @@
+# Профиль окружения ubuntu-container.
+#
+# Профиль описывает ТОЛЬКО тип окружения и его возможности. Адреса, учётные записи,
+# ключи и путь к .deb живут в ~/.config/tessera-e2e/stand.toml вне git.
+
+name = "ubuntu-container"
+description = "Ubuntu 24.04 в контейнере с systemd как PID 1"
+driver = "docker"
+
+# Кейс объявляет `requires`, профиль — `capabilities`; несовпадение даёт SKIP
+# с причиной. Возможностей mac, graphics и hardware-token здесь нет: модуля ядра
+# parsec в контейнере не бывает, X в образе нет, токен физически не пробросить.
+capabilities = ["usb", "service-manager"]
+
+default_timeout = 60
+
+# Служебные коды хелперов образа: сломан стенд, а не продукт.
+# 64 — ошибка аргументов, 70 — сбой самого драйвера (PAM не дал вердикта).
+# Настоящие коды PAM (1..~32) сюда не попадают и остаются предметом ожидания кейса.
+error_exit_codes = [64, 70]
+
+[vars]
+helpers = "/opt/tessera-e2e/helpers"
+fixtures = "/opt/tessera-e2e/fixtures"
+
+[docker]
+container = "tessera-e2e-ubuntu"
+image = "tessera-e2e-ubuntu:latest"
+dockerfile = "tests/e2e/images/ubuntu.Dockerfile"
+# Контекст сборки — tests/e2e/: Dockerfile копирует helpers/ относительно него.
+context = "tests/e2e"
+# Проверяется .deb под amd64, поэтому и контейнер amd64; на arm-хосте это Rosetta.
+platform = "linux/amd64"
+
+# systemd в контейнере требует privileged, хостового cgroup-namespace и
+# записываемого /sys/fs/cgroup; /run и /run/lock — tmpfs, иначе службы не стартуют.
+run_args = [
+    "--privileged",
+    "--cgroupns=host",
+    "-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
+    "--tmpfs", "/run",
+    "--tmpfs", "/run/lock",
+]
+
+# Готовность: systemd дошёл до running или degraded. degraded принимается наравне
+# с running — часть штатных юнитов в контейнере заведомо не поднимется, и ждать
+# чистого running значит ждать вечно. Ожидание внутри команды: раннер выполняет
+# проверку один раз, а systemd поднимается не мгновенно.
+ready_command = """
+for i in $(seq 1 60); do
+  case "$(systemctl is-system-running 2>/dev/null)" in
+    running|degraded) exit 0 ;;
+  esac
+  sleep 2
+done
+echo "systemd не дошёл до running/degraded" >&2
+exit 1
+"""
