@@ -1,0 +1,92 @@
+suite: install
+description: Установка пакета, раскладка файлов и интеграция в PAM-стек
+setup: [install-package]
+
+cases:
+  - id: INST-001
+    title: Пакет раскладывает модуль, бинарь и юнит по штатным путям
+    requirement: openspec/specs/build-release/spec.md
+    requires: []
+    steps:
+      # Пути — из debian/rules (модуль и бинарь ставятся вручную, минуя dh-cargo)
+      # и debian/install (всё остальное). Модуль в /lib/security, а не в /usr/bin,
+      # куда cdylib положил бы dh-cargo по умолчанию.
+      - expect_file: { path: /lib/security/pam_tessera.so }
+      - expect_file: { path: /usr/bin/tessera }
+      - expect_file: { path: /lib/systemd/system/tessera.service }
+      - expect_file: { path: /usr/lib/tmpfiles.d/tessera.conf }
+      - expect_file: { path: /etc/tessera/config.toml.example }
+      - expect_file: { path: /usr/share/tessera/integrate-pam.sh }
+      - expect_file: { path: /etc/pam.d/tessera }
+
+  - id: INST-002
+    title: Пакет создаёт каталоги состояния и кеша
+    requirement: openspec/specs/build-release/spec.md
+    requires: []
+    steps:
+      # Перечень — из debian/tessera.dirs. Каталоги создаёт пакет, а не первый
+      # запуск: иначе служба под непривилегированным пользователем не смогла бы
+      # их завести сама.
+      - expect_file: { path: /etc/tessera/ca }
+      - expect_file: { path: /etc/tessera/crl }
+      - expect_file: { path: /var/cache/tessera/ocsp }
+      - expect_file: { path: /var/lib/tessera/daemon }
+
+  - id: INST-003
+    title: Служба не активируется установкой без конфигурации
+    requirement: openspec/specs/daemon-lifecycle/spec.md
+    requires: [service-manager]
+    steps:
+      # Гарантия: установка пакета не поднимает enforcement сама по себе.
+      # Активация — осознанное действие оператора после настройки, о чём postinst
+      # и печатает инструкцию.
+      - run: systemctl is-active tessera.service
+        expect: { exit_code: 3, stdout_matches: 'inactive' }
+
+  - id: INST-004
+    title: Интеграция в PAM-стек добавляет обе строки и повторно ничего не меняет
+    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requires: []
+    steps:
+      - run: |
+          cat > /tmp/e2e-pam-target <<'EOF'
+          auth       required   pam_unix.so
+          account    required   pam_unix.so
+          session    required   pam_unix.so
+          EOF
+      - run: /usr/share/tessera/integrate-pam.sh /tmp/e2e-pam-target
+      - expect_file: { path: /tmp/e2e-pam-target, matches: '@include tessera' }
+      - expect_file:
+          path: /tmp/e2e-pam-target
+          matches: 'session\s+required\s+pam_tessera\.so'
+      # Идемпотентность: повторный запуск не должен ни дублировать строки, ни падать.
+      # Проверяется счётом вхождений, а не кодом возврата: скрипт завершится успехом
+      # в обоих случаях, а дубль строки сломает стек молча.
+      - run: /usr/share/tessera/integrate-pam.sh /tmp/e2e-pam-target
+      - run: grep -c '^@include tessera$' /tmp/e2e-pam-target
+        expect: { exit_code: 0, stdout_matches: '^1$' }
+      - run: grep -cE '^session\s+required\s+pam_tessera\.so' /tmp/e2e-pam-target
+        expect: { exit_code: 0, stdout_matches: '^1$' }
+    teardown:
+      - run: rm -f /tmp/e2e-pam-target /tmp/e2e-pam-target.bak.*
+
+  - id: INST-005
+    title: Откат интеграции снимает обе внесённые строки
+    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requires: []
+    steps:
+      - run: |
+          cat > /tmp/e2e-pam-revert <<'EOF'
+          auth       required   pam_unix.so
+          account    required   pam_unix.so
+          session    required   pam_unix.so
+          EOF
+      - run: /usr/share/tessera/integrate-pam.sh /tmp/e2e-pam-revert
+      - run: /usr/share/tessera/integrate-pam.sh --unintegrate /tmp/e2e-pam-revert
+      # Обе строки, а не только @include: postrm снимает лишь include, и если
+      # session-строка переживёт откат, она останется ссылаться на удалённый модуль —
+      # после чего ломаются sudo и вход в систему.
+      - run: grep -c 'tessera' /tmp/e2e-pam-revert
+        expect: { exit_code: 1, stdout_matches: '^0$' }
+    teardown:
+      - run: rm -f /tmp/e2e-pam-revert /tmp/e2e-pam-revert.bak.*

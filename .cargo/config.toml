@@ -9,3 +9,4 @@ rustflags = [
 
 [alias]
 ci = "clippy --workspace --all-targets -- -D warnings"
+xtask = "run --package xtask --"

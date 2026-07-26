@@ -33,3 +33,11 @@ notes/bootstrap-notes/
 
 # Local E2E scratch (issuer cabinet run)
 /e2e-tmp/
+
+# Локальный CARGO_HOME сборки пакета (debian/rules): сотни мегабайт исходников
+# зависимостей, которые иначе уезжают в коммит при `git add -A`.
+/debian/cargo_home/
+
+# Результаты прогонов e2e-реестра: артефакты конкретного стенда и машины.
+# Регрессия хранится в tests/e2e/BASELINE.md, он под контролем версий.
+/tests/e2e/runs/

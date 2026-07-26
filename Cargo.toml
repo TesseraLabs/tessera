@@ -8,6 +8,19 @@ members = [
     "crates/pam_tessera",
     "crates/tessera_cli",
     "crates/tessera_test_plugin",
+    "crates/xtask",
+]
+# Раннер e2e — инструмент разработчика: он не собирается и не тестируется
+# обычными `cargo build` / `cargo test` без явного `-p xtask`, поэтому не
+# удлиняет ни сборку пакета, ни прогон unit-тестов продукта.
+default-members = [
+    "crates/tessera_core",
+    "crates/tessera_ext",
+    "crates/tessera_issuer",
+    "crates/tessera_proto",
+    "crates/pam_tessera",
+    "crates/tessera_cli",
+    "crates/tessera_test_plugin",
 ]
 
 [workspace.package]

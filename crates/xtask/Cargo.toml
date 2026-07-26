@@ -1,0 +1,54 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Раннер e2e-реестра Tessera. Инструмент разработчика, в поставку не входит."
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+regex = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+# Поддерживаемый форк serde_yaml: сам serde_yaml объявлен unmaintained,
+# а deny.toml запрещает такие зависимости на уровне workspace.
+serde_norway = "0.9"
+# Безопасная регистрация обработчика сигнала: перехват Ctrl-C нужен, чтобы
+# teardown отработал, а поднимать ради этого unsafe-обёртку над sigaction незачем.
+signal-hook = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+panic_in_result_fn = "deny"
+let_underscore_must_use = "deny"
+indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"
