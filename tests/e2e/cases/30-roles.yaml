@@ -29,7 +29,6 @@ cases:
           cat >> /etc/tessera/config.toml <<'EOF'
 
           [roles]
-          enforce = "require"
           dir = "/var/lib/tessera/roles"
           EOF
       # Удостоверение разрешает вход в учётную запись serv и покрывает роль serv.
@@ -61,7 +60,6 @@ cases:
           cat >> /etc/tessera/config.toml <<'EOF'
 
           [roles]
-          enforce = "require"
           dir = "/var/lib/tessera/roles"
           EOF
       # Вход в учётную запись serv разрешён, но список ролей удостоверения
@@ -91,7 +89,6 @@ cases:
           cat >> /etc/tessera/config.toml <<'EOF'
 
           [roles]
-          enforce = "require"
           dir = "/var/lib/tessera/roles"
           EOF
       # Удостоверение допускает вход только в oper: попытка войти в serv должна
@@ -120,7 +117,6 @@ cases:
           cat >> /etc/tessera/config.toml <<'EOF'
 
           [roles]
-          enforce = "require"
           dir = "/var/lib/tessera/roles"
           EOF
       - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
@@ -131,31 +127,6 @@ cases:
       - expect_journal:
           identifier: pam_tessera
           matches: 'reason="?not_found"?'
-    teardown:
-      - run: helpers/usb-loop.sh detach
-      - run: helpers/setup/deploy-fixtures.sh
-
-  - id: ROLE-005
-    title: Режим миграции пропускает вход без проверки роли
-    requirement: openspec/specs/role-selection/spec.md
-    requires: [service-manager, usb]
-    steps:
-      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
-      # enforce = false — стадия миграции, роли не проверяются вовсе. Кейс держит
-      # это видимым: переход к require должен быть решением, а не следствием
-      # случайной правки дефолта.
-      - run: |
-          cat >> /etc/tessera/config.toml <<'EOF'
-
-          [roles]
-          enforce = "false"
-          dir = "/var/lib/tessera/roles"
-          EOF
-      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv-oper-only.p12
-      - run: pam-drive certauth serv authenticate
-        stdin: "123456"
-        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
-        timeout: 60
     teardown:
       - run: helpers/usb-loop.sh detach
       - run: helpers/setup/deploy-fixtures.sh

@@ -49,9 +49,10 @@ pub struct AuthContext {
     /// some PAM services run without a recognised passwd entry.
     pub home_dir: Option<PathBuf>,
     /// Role payload snapshot fixed at authenticate time (role-format).
-    /// `None` when `[roles].enforce = false` or no role was selected; the
-    /// session-open phase reads the bounded TTL and role metadata from this
-    /// copy so a later store edit cannot affect the live session.
+    /// Optional only for frames produced before roles became mandatory; a
+    /// login that resolves no role is now rejected outright. The session-open
+    /// phase reads the bounded TTL and role metadata from this copy so a later
+    /// store edit cannot affect the live session.
     pub role: Option<SessionRolePayload>,
 }
 

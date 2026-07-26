@@ -13,8 +13,7 @@
 //! already-loaded store) so they can be unit-tested in isolation:
 //!
 //! - [`resolve_and_cover`] — resolve the requested [`RoleId`] from the store
-//!   and verify membership in the certificate's `allowed_roles` list, gated
-//!   by the [`RoleEnforce`] mode.
+//!   and verify membership in the certificate's `allowed_roles` list.
 //! - [`SessionRolePayload::fix`] — snapshot the resolved slice's payload at
 //!   session-open time (so a later store edit cannot affect a live session),
 //!   compute the bounded TTL, and refuse roles whose payload needs an
@@ -25,21 +24,6 @@ use std::time::Duration;
 use super::audit;
 use super::schema::{RoleId, RoleSlice};
 use super::store::RoleStore;
-
-/// Migration / enforcement mode for the `[roles]` config section.
-///
-/// Mirrors `[roles].enforce` (`false` | `warn` | `require`); kept in
-/// `tessera_core` so the resolve/coverage logic is testable without the
-/// validated-config type. The PAM module maps its config enum onto this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoleEnforce {
-    /// Roles are not checked at all — pre-role behaviour (v0.3.19).
-    Disabled,
-    /// Resolve + coverage are checked and logged, but never deny.
-    Warn,
-    /// Full enforcement: any resolve / coverage failure denies the login.
-    Require,
-}
 
 /// Reason a role login was denied. Matches the `role_deny` audit dictionary
 /// (logging-audit spec): `not_found` / `not_covered` / `backend_unavailable`
@@ -120,10 +104,8 @@ pub enum Resolution {
         /// How coverage was proven.
         method: CoverageMethod,
     },
-    /// Enforcement is disabled — no role is selected; behave as v0.3.19.
-    Skipped,
-    /// Resolve or coverage failed. The caller decides (per [`RoleEnforce`])
-    /// whether to deny; an audit `role_deny` has already been emitted.
+    /// Resolve or coverage failed and the login must be rejected; an audit
+    /// `role_deny` has already been emitted.
     Denied {
         /// Why it failed.
         reason: RoleDenyReason,
@@ -131,8 +113,12 @@ pub enum Resolution {
 }
 
 /// Atomically resolve `requested` from `store` and verify it is covered by
-/// `allowed_roles`, gated by `enforce`. **No swap window**: the slice is
-/// cloned out of the store in the same call that checks coverage.
+/// `allowed_roles`. **No swap window**: the slice is cloned out of the store in
+/// the same call that checks coverage.
+///
+/// The check is unconditional — there is no configuration under which a login
+/// proceeds without a resolved, covered role. Every failure is a
+/// [`Resolution::Denied`] carrying the audited reason.
 ///
 /// Coverage is *membership only* (design Decision 3): the requested role
 /// must appear in `allowed_roles`; there is no level comparison
@@ -143,64 +129,31 @@ pub enum Resolution {
 /// - `None` — the cert has no extension; under cert-method coverage this
 ///   means the cert grants no roles, so any requested role is `NotCovered`.
 ///
-/// Behaviour by mode:
-/// - [`RoleEnforce::Disabled`] — returns [`Resolution::Skipped`] without
-///   touching the store (pre-role behaviour).
-/// - [`RoleEnforce::Warn`] — performs the checks and logs, but a failure
-///   still returns [`Resolution::Allowed`] when the role resolved, or
-///   [`Resolution::Skipped`] when it did not (never denies). A `role_deny`
-///   audit is emitted on failure for visibility, but the login proceeds.
-/// - [`RoleEnforce::Require`] — a failure returns [`Resolution::Denied`].
-///
-/// `requested` is the role id parsed from the login suffix / prompt. When
-/// `None`, the caller already decided a role was not supplied; under
-/// `Require` that is a [`RoleDenyReason::Syntax`] deny, under `Warn` /
-/// `Disabled` it is a skip.
+/// `requested` is the role id parsed from the login suffix / prompt; `None`
+/// means the caller could not obtain one, which denies with
+/// [`RoleDenyReason::Syntax`].
 #[must_use]
 pub fn resolve_and_cover(
     store: &RoleStore,
     requested: Option<&RoleId>,
     allowed_roles: Option<&[RoleId]>,
-    enforce: RoleEnforce,
     user: &str,
 ) -> Resolution {
-    if enforce == RoleEnforce::Disabled {
-        return Resolution::Skipped;
-    }
-
     let Some(role_id) = requested else {
-        // No role supplied where one may be needed.
-        return deny_or_skip(enforce, RoleDenyReason::Syntax, user, "");
+        return deny(RoleDenyReason::Syntax, user, "");
     };
 
     // Resolve from the store (one read; the slice is cloned out below so no
     // later store mutation can affect this decision).
     let Some(slice) = store.get(role_id) else {
-        return deny_or_skip(enforce, RoleDenyReason::NotFound, user, role_id.as_str());
+        return deny(RoleDenyReason::NotFound, user, role_id.as_str());
     };
 
     // Coverage: membership in the cert's allowed_roles. A cert without the
     // extension grants no roles (fail-closed).
     let covered = allowed_roles.is_some_and(|roles| roles.iter().any(|r| r == role_id));
     if !covered {
-        // Clone the slice anyway so warn-mode can still fix the session.
-        return match enforce {
-            RoleEnforce::Require => {
-                audit::emit_role_deny(user, role_id.as_str(), RoleDenyReason::NotCovered.as_str());
-                Resolution::Denied {
-                    reason: RoleDenyReason::NotCovered,
-                }
-            }
-            RoleEnforce::Warn => {
-                audit::emit_role_deny(user, role_id.as_str(), RoleDenyReason::NotCovered.as_str());
-                Resolution::Allowed {
-                    slice: Box::new(slice.clone()),
-                    method: CoverageMethod::Cert,
-                }
-            }
-            // Unreachable: Disabled handled above.
-            RoleEnforce::Disabled => Resolution::Skipped,
-        };
+        return deny(RoleDenyReason::NotCovered, user, role_id.as_str());
     }
 
     Resolution::Allowed {
@@ -209,25 +162,10 @@ pub fn resolve_and_cover(
     }
 }
 
-/// Map a resolve/coverage failure to a [`Resolution`] honouring `enforce`,
-/// emitting the `role_deny` audit event in every non-disabled mode.
-fn deny_or_skip(
-    enforce: RoleEnforce,
-    reason: RoleDenyReason,
-    user: &str,
-    requested_role: &str,
-) -> Resolution {
-    match enforce {
-        RoleEnforce::Require => {
-            audit::emit_role_deny(user, requested_role, reason.as_str());
-            Resolution::Denied { reason }
-        }
-        RoleEnforce::Warn => {
-            audit::emit_role_deny(user, requested_role, reason.as_str());
-            Resolution::Skipped
-        }
-        RoleEnforce::Disabled => Resolution::Skipped,
-    }
+/// Emit the `role_deny` audit event and produce the matching denial.
+fn deny(reason: RoleDenyReason, user: &str, requested_role: &str) -> Resolution {
+    audit::emit_role_deny(user, requested_role, reason.as_str());
+    Resolution::Denied { reason }
 }
 
 /// A snapshot of a resolved role's session-relevant payload, taken at
@@ -392,49 +330,24 @@ mod tests {
     // ---- resolve_and_cover -------------------------------------------------
 
     #[test]
-    fn disabled_always_skips_without_touching_store() {
-        let store = RoleStore::default();
-        let r = resolve_and_cover(
-            &store,
-            Some(&rid("serv")),
-            None,
-            RoleEnforce::Disabled,
-            "ivanov",
-        );
-        assert!(matches!(r, Resolution::Skipped));
-    }
-
-    #[test]
-    fn require_resolved_and_covered_is_allowed() {
+    fn resolved_and_covered_is_allowed() {
         let (_d, store) = store_with("serv", &linux_groups_slice("serv"));
         let allowed = vec![rid("oper"), rid("serv")];
-        let r = resolve_and_cover(
-            &store,
-            Some(&rid("serv")),
-            Some(&allowed),
-            RoleEnforce::Require,
-            "ivanov",
-        );
+        let r = resolve_and_cover(&store, Some(&rid("serv")), Some(&allowed), "ivanov");
         match r {
             Resolution::Allowed { slice, method } => {
                 assert_eq!(slice.role.as_str(), "serv");
                 assert_eq!(method, CoverageMethod::Cert);
             }
-            other => panic!("expected Allowed, got {other:?}"),
+            other @ Resolution::Denied { .. } => panic!("expected Allowed, got {other:?}"),
         }
     }
 
     #[test]
-    fn require_not_in_store_denies_not_found() {
+    fn not_in_store_denies_not_found() {
         let (_d, store) = store_with("serv", &linux_groups_slice("serv"));
         let allowed = vec![rid("admin")];
-        let r = resolve_and_cover(
-            &store,
-            Some(&rid("admin")),
-            Some(&allowed),
-            RoleEnforce::Require,
-            "ivanov",
-        );
+        let r = resolve_and_cover(&store, Some(&rid("admin")), Some(&allowed), "ivanov");
         assert!(matches!(
             r,
             Resolution::Denied {
@@ -444,17 +357,11 @@ mod tests {
     }
 
     #[test]
-    fn require_not_covered_denies_not_covered() {
+    fn not_covered_denies_not_covered() {
         // admin exists in store but cert allows only [oper, serv].
         let (_d, store) = store_with("admin", &linux_groups_slice("admin"));
         let allowed = vec![rid("oper"), rid("serv")];
-        let r = resolve_and_cover(
-            &store,
-            Some(&rid("admin")),
-            Some(&allowed),
-            RoleEnforce::Require,
-            "ivanov",
-        );
+        let r = resolve_and_cover(&store, Some(&rid("admin")), Some(&allowed), "ivanov");
         assert!(matches!(
             r,
             Resolution::Denied {
@@ -464,15 +371,9 @@ mod tests {
     }
 
     #[test]
-    fn require_no_extension_is_not_covered() {
+    fn no_extension_is_not_covered() {
         let (_d, store) = store_with("serv", &linux_groups_slice("serv"));
-        let r = resolve_and_cover(
-            &store,
-            Some(&rid("serv")),
-            None,
-            RoleEnforce::Require,
-            "ivanov",
-        );
+        let r = resolve_and_cover(&store, Some(&rid("serv")), None, "ivanov");
         assert!(matches!(
             r,
             Resolution::Denied {
@@ -482,9 +383,9 @@ mod tests {
     }
 
     #[test]
-    fn require_no_role_supplied_denies_syntax() {
+    fn no_role_supplied_denies_syntax() {
         let store = RoleStore::default();
-        let r = resolve_and_cover(&store, None, None, RoleEnforce::Require, "ivanov");
+        let r = resolve_and_cover(&store, None, None, "ivanov");
         assert!(matches!(
             r,
             Resolution::Denied {
@@ -494,31 +395,15 @@ mod tests {
     }
 
     #[test]
-    fn warn_not_covered_allows_but_resolves() {
-        let (_d, store) = store_with("admin", &linux_groups_slice("admin"));
-        let allowed = vec![rid("oper")];
-        let r = resolve_and_cover(
-            &store,
-            Some(&rid("admin")),
-            Some(&allowed),
-            RoleEnforce::Warn,
-            "ivanov",
-        );
-        // warn never denies: covered=false still yields Allowed with the slice.
-        assert!(matches!(r, Resolution::Allowed { .. }));
-    }
-
-    #[test]
-    fn warn_not_found_skips() {
+    fn empty_store_denies_not_found() {
         let store = RoleStore::default();
-        let r = resolve_and_cover(
-            &store,
-            Some(&rid("ghost")),
-            Some(&[]),
-            RoleEnforce::Warn,
-            "ivanov",
-        );
-        assert!(matches!(r, Resolution::Skipped));
+        let r = resolve_and_cover(&store, Some(&rid("ghost")), Some(&[]), "ivanov");
+        assert!(matches!(
+            r,
+            Resolution::Denied {
+                reason: RoleDenyReason::NotFound
+            }
+        ));
     }
 
     // ---- bounded_ttl -------------------------------------------------------

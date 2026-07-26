@@ -8,7 +8,7 @@ use crate::config::raw::{
     RawCertIntegrityMode, RawConfig, RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback,
     RawHostIdentity, RawLogging, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor,
     RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocation, RawRevocationMode,
-    RawRoles, RawRolesEnforce, RawTags, RawTagsMode, RawTrust, RawTrustOverride, RawUserMapping,
+    RawRoles, RawTags, RawTagsMode, RawTrust, RawTrustOverride, RawUserMapping,
 };
 use crate::error::TrustError;
 use crate::hooks::{validate_hook, HookConfig};
@@ -215,8 +215,6 @@ pub enum MacRuntimeMode {
 /// Validated `[roles]` section (role-format).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolesSection {
-    /// Enforcement mode. Default [`RolesEnforce::False`].
-    pub enforce: RolesEnforce,
     /// On-device role-store directory. Default `/var/lib/tessera/roles`.
     pub dir: PathBuf,
     /// Global default session TTL, used when neither the certificate nor the
@@ -227,36 +225,10 @@ pub struct RolesSection {
 impl Default for RolesSection {
     fn default() -> Self {
         Self {
-            enforce: RolesEnforce::False,
             dir: PathBuf::from(crate::role::DEFAULT_ROLES_DIR),
             default_session_ttl: Duration::from_secs(DEFAULT_ROLE_SESSION_TTL_SECONDS),
         }
     }
-}
-
-impl RolesSection {
-    /// Map to the `tessera_core::role` enforcement enum used by the
-    /// resolve/coverage core. Keeps the config and role layers decoupled.
-    #[must_use]
-    pub fn enforce_mode(&self) -> crate::role::RoleEnforce {
-        match self.enforce {
-            RolesEnforce::False => crate::role::RoleEnforce::Disabled,
-            RolesEnforce::Warn => crate::role::RoleEnforce::Warn,
-            RolesEnforce::Require => crate::role::RoleEnforce::Require,
-        }
-    }
-}
-
-/// Migration / enforcement mode for `[roles]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RolesEnforce {
-    /// Roles not checked — pre-role (v0.3.19) behaviour.
-    #[default]
-    False,
-    /// Checked + logged, never denies.
-    Warn,
-    /// Full enforcement (fail-closed).
-    Require,
 }
 
 /// Default global session TTL in seconds (12h) for the `[roles]` section.
@@ -675,12 +647,25 @@ fn validate_tags(raw: &RawTags, roles: &RawRoles) -> Result<TagsSection, Error> 
     })
 }
 
+/// Rejection message for the removed `[roles].enforce` key.
+///
+/// The key used to gate role checking (`false` | `warn` | `require`) and
+/// defaulted to "not checked". Naming the removal explicitly matters: an
+/// operator upgrading a fleet must be able to tell a deliberate behaviour
+/// change from a typo, which the generic `deny_unknown_fields` error cannot
+/// convey.
+const ROLES_ENFORCE_REMOVED: &str =
+    "[roles].enforce has been removed: every login requires an explicit role and the check \
+     cannot be disabled or downgraded to a warning by configuration; delete the key from \
+     config.toml and make sure the role store under [roles].dir is populated — an empty or \
+     unreadable store denies logins fail-closed";
+
 fn validate_roles(raw: &RawRoles) -> Result<RolesSection, Error> {
-    let enforce = match raw.enforce {
-        RawRolesEnforce::False => RolesEnforce::False,
-        RawRolesEnforce::Warn => RolesEnforce::Warn,
-        RawRolesEnforce::Require => RolesEnforce::Require,
-    };
+    if raw.enforce.is_some() {
+        return Err(Error::ConfigInvalid {
+            reason: ROLES_ENFORCE_REMOVED.to_string(),
+        });
+    }
     let dir = match raw.dir.as_ref() {
         Some(p) => {
             if !p.is_absolute() {
@@ -704,7 +689,6 @@ fn validate_roles(raw: &RawRoles) -> Result<RolesSection, Error> {
         None => Duration::from_secs(DEFAULT_ROLE_SESSION_TTL_SECONDS),
     };
     Ok(RolesSection {
-        enforce,
         dir,
         default_session_ttl,
     })
@@ -2178,51 +2162,41 @@ mod tests {
     #[test]
     fn roles_defaults_when_section_absent() {
         let s = validate_roles(&RawRoles::default()).expect("ok");
-        assert_eq!(s.enforce, RolesEnforce::False);
         assert_eq!(s.dir, PathBuf::from(crate::role::DEFAULT_ROLES_DIR));
         assert_eq!(
             s.default_session_ttl,
             Duration::from_secs(DEFAULT_ROLE_SESSION_TTL_SECONDS)
         );
-        // Default maps to the disabled enforcement mode in the role core.
-        assert_eq!(s.enforce_mode(), crate::role::RoleEnforce::Disabled);
     }
 
     #[test]
-    fn roles_enforce_modes_map_through() {
-        for (raw, want_cfg, want_core) in [
-            (
-                RawRolesEnforce::False,
-                RolesEnforce::False,
-                crate::role::RoleEnforce::Disabled,
-            ),
-            (
-                RawRolesEnforce::Warn,
-                RolesEnforce::Warn,
-                crate::role::RoleEnforce::Warn,
-            ),
-            (
-                RawRolesEnforce::Require,
-                RolesEnforce::Require,
-                crate::role::RoleEnforce::Require,
-            ),
-        ] {
-            let s = validate_roles(&RawRoles {
-                enforce: raw,
-                ..Default::default()
-            })
-            .expect("ok");
-            assert_eq!(s.enforce, want_cfg);
-            assert_eq!(s.enforce_mode(), want_core);
+    fn roles_enforce_key_is_rejected_by_name() {
+        for value in ["\"false\"", "\"warn\"", "\"require\"", "true", "0"] {
+            let raw: RawRoles = toml::from_str(&format!("enforce = {value}\n"))
+                .unwrap_or_else(|e| panic!("enforce = {value} must still parse: {e}"));
+            let err = validate_roles(&raw).unwrap_err();
+            match err {
+                Error::ConfigInvalid { reason } => {
+                    assert!(
+                        reason.contains("[roles].enforce has been removed"),
+                        "diagnostic must name the removed key, got: {reason}"
+                    );
+                    assert!(
+                        reason.contains("cannot be disabled"),
+                        "diagnostic must state the check is unconditional, got: {reason}"
+                    );
+                }
+                other => panic!("expected ConfigInvalid, got {other:?}"),
+            }
         }
     }
 
     #[test]
     fn roles_custom_dir_and_ttl() {
         let s = validate_roles(&RawRoles {
-            enforce: RawRolesEnforce::Require,
             dir: Some(PathBuf::from("/srv/roles")),
             default_session_ttl_seconds: Some(3600),
+            ..Default::default()
         })
         .expect("ok");
         assert_eq!(s.dir, PathBuf::from("/srv/roles"));
@@ -2379,13 +2353,11 @@ sources = ["dmi_board_serial"]
 level = "info"
 
 [roles]
-enforce = "require"
 dir = "/var/lib/tessera/roles"
 default_session_ttl_seconds = 7200
 "#;
         let raw: RawConfig = toml::from_str(toml_src).expect("raw parse");
         let roles = validate_roles(&raw.roles).expect("validate roles");
-        assert_eq!(roles.enforce, RolesEnforce::Require);
         assert_eq!(roles.dir, PathBuf::from("/var/lib/tessera/roles"));
         assert_eq!(roles.default_session_ttl, Duration::from_hours(2));
     }

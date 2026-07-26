@@ -61,6 +61,7 @@ fn missing_p12_returns_authinfo_unavail() {
     let mappings = vec![cn_mapping("alice", "alice")];
     let monitor = StubClient;
     let exec = tessera_core::hooks::NoopExecutor::new();
+    let roles = RoleFixture::serv();
     let deps = Deps {
         cfg: &cfg,
         trust: &verifier,
@@ -70,7 +71,7 @@ fn missing_p12_returns_authinfo_unavail() {
         host_id_source: HostIdSourceKind::Override,
         user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
-        role_stage: pam_tessera::flow::RoleStage::disabled(),
+        role_stage: roles.stage(),
         device_tags: pam_tessera::flow::empty_device_tags(),
     };
     let io = InMemoryFlowIo::new(tmp.path().to_path_buf());

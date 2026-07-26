@@ -66,8 +66,8 @@ fn session_open_with_role_serializes_and_roundtrips() {
 
 #[test]
 fn session_open_without_role_omits_fields_and_defaults_to_none() {
-    // 5.2: a session opened with no role (enforce=false) omits role /
-    // role_version entirely; the frame stays valid and decodes back to None.
+    // 5.2: a frame predating mandatory roles omits role / role_version
+    // entirely; the frame stays valid and decodes back to None.
     let mut msg = sample_open();
     if let ClientMessage::SessionOpen {
         role, role_version, ..

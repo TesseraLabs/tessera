@@ -222,20 +222,15 @@ extension).
 
 | Field                        | Type   | Default                  | Allowed values                   | Effect                                                                 | Security implication                                                  |
 |------------------------------|--------|--------------------------|---------------------------------|--------------------------------------------------------------------------|------------------------------------------------------------------------|
-| `enforce`                    | string | `"false"`                | `"false"`, `"warn"`, `"require"` | Migration stage of role enforcement.                                   | `"false"` — roles are not checked (v0.3.19 behavior); `"require"` — full fail-closed. |
 | `dir`                        | path   | `/var/lib/tessera/roles` | absolute path to a directory     | Role-store directory (`<role>.toml` slices).                            | Standalone loads enforce `root:root` on the directory, every slice, and all ancestors; no group/world write. |
 | `default_session_ttl_seconds`| integer| `43200` (12 h)           | seconds                          | Session TTL when neither the credential nor the role sets one.          | No unbounded session arises — the ceiling is always finite.          |
 
-**`enforce` semantics:**
+**Role checking is unconditional.** A role is required on every login, and no
+setting disables the check or downgrades it to a warning. A config that still
+contains the removed `[roles].enforce` key is rejected at validation with a
+diagnostic naming the removal.
 
-| Value       | Behavior |
-|-------------|-----------|
-| `"false"`   | No suffix/prompt is requested, coverage is not checked — login works as in v0.3.19. |
-| `"warn"`    | The role is checked, a mismatch is logged, but login is not refused (migration mode). |
-| `"require"` | Full enforcement: a role is mandatory and must be covered by the credential. |
-
-> **Fail-closed with `enforce = "require"`.** An empty or invalid role
-> store under `require` leads to refusal of logins that require a role,
+> **Fail-closed.** An empty or invalid role store leads to refusal of logins,
 > with a "roles not configured" diagnostic.
 
 **Role selection at login.** There is no default role — the role is
