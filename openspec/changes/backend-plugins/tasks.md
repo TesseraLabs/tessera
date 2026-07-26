@@ -23,3 +23,5 @@
 - [x] 4.1 CI tessera: убрать astra-mac из матрицы, добавить сборку фикстурного плагина
 - [x] 4.2 Удалить feature `astra-mac` и feature-gated код; обновить README/docs
 - [ ] 4.3 Threat-model §5.6 — финализировать по факту имплементации (алгоритм подписи); архив change'а
+  - [x] Threat-model §5.6 «Плагины бэкендов enforcement» написан по факту кода (RU+EN, ветка `docs/backend-plugins-threat-model`): Ed25519-detached подпись, вшитый список ключей, порядок verify→dlopen, `RTLD_NOW|RTLD_LOCAL`, ABI-валидация, degrade в StubBackend, аудит-события; + строка 5.8 в таблицу поверхности. Прошёл adversarial security-сверку с кодом (поправлены абсолюты dlclose/forensic-sha256/UB-заголовок, добавлены TOCTOU/teardown-риски). Тесты `tessera_core` зелёные (740 passed)
+  - [ ] Архив change'а — блокирован задачей 3.3 (E2E на Astra VM), невыполнимой локально

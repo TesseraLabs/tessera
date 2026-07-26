@@ -312,6 +312,7 @@ configuration is caught via `journalctl -t tessera | grep 'host_id resolved'`
 | 5.5 | IPC socket `/run/tessera/monitord.sock`| `SO_PEERCRED uid=0` + `0660` permissions. If root is already compromised, the module is already useless. |
 | 5.6 | Hooks in `[[hooks]]`                   | Placeholder whitelist, fork+execve, timeouts. The hook itself is the administrator's responsibility. |
 | 5.7 | Config files `/etc/tessera/config.toml` and trust anchors | `0640 root:root` permissions. Manual management. |
+| 5.8 | Backend plugins `/usr/lib/tessera/plugins/*.so` | Ed25519 signature against a build-embedded key list before `dlopen` (non-disableable in shipped builds); `RTLD_NOW`+`RTLD_LOCAL`; strict ABI validation; any failure → `StubBackend` + audit. Details in §5.6. |
 
 ## 5.1 Process privilege model
 
@@ -349,6 +350,104 @@ Compensating controls for `cert-only` (mandatory before deploy):
   privileged user;
 - a documented rescue-recovery procedure (see install.md §10
   "Lockout after a failed PAM edit").
+
+## 5.6 Enforcement backend plugins
+
+Platform enforcement backends (`ParsecBackend` for Astra МКЦ; SELinux later)
+are delivered not as compile-time features but as **signed runtime plugins**:
+a single open binary loads the backend from a separate `.so`. This removes the
+build combinatorics but introduces a new surface — **execution of third-party
+code inside the address space of a rooted process** (`pam_tessera` during the
+`auth` phase, see 5.1). Below is what closes that surface.
+
+Code: [`crates/tessera_core/src/plugin/`](../../crates/tessera_core/src/plugin/)
+(`verify.rs` — signature, `loader.rs` — loading and the C-ABI ↔ `MacBackend`
+bridge, `header.rs` — envelope/vtable, `audit.rs` — events).
+
+### 5.6.1 Trust: detached signature before `dlopen`
+
+- **Algorithm (as implemented):** Ed25519 detached signature over the **exact
+  bytes** of the `.so`. Signature file `<plugin>.so.sig`, format
+  `ed25519:<128 hex>`. The algorithm prefix is **mandatory** — an old signature
+  cannot be reinterpreted once a future ABI adds GOST.
+- **Trust anchor:** the public-key list is **embedded at build time**
+  (`TESSERA_PLUGIN_PUBKEYS` — 32-byte raw Ed25519 keys in hex). An empty list →
+  `NoKeys`: every plugin is rejected (**fail-closed**).
+- **Order (`loader.rs`):** `is_file` → **signature verification** → read and
+  SHA-256 (for audit) → `dlopen`. The signature is checked **before** any plugin
+  code; a foreign key or an altered image yields `Invalid`. Caveat: signature,
+  SHA-256 and `dlopen` are **three separate reads of the file by path**, so
+  "an altered image does not load" strictly holds only without a concurrent
+  swap between those reads (TOCTOU, see 5.6.5).
+- **Verification is non-disableable in shipped builds.** It is skipped only
+  under `cfg(debug_assertions)`; the `.deb` is built with the release profile
+  (no `debug-assertions`), and a debug build does not ship. An atypical release
+  with `debug-assertions` enabled would bypass the check — the package smoke
+  test rejecting an unsigned plugin guards against that.
+
+### 5.6.2 Load isolation
+
+- `dlopen` with `RTLD_NOW | RTLD_LOCAL`: unresolved symbols are rejected
+  immediately (no lazy binding), and plugin symbols **do not leak** into the
+  process global namespace.
+- ABI-contract validation of the envelope: `abi_version == 1`,
+  `kind == enforcement`, non-null `name`/`version`/`vtable`, and the header name
+  matches the name explicitly selected by config. Field mismatches and `null`
+  pointers → rejection. However, the header is parsed through pointers
+  (`&*header_ptr`, `CStr::from_ptr`, vtable cast), so a signed but
+  broken/version-diverged header carrying a non-null yet invalid pointer is UB
+  during parsing, **before** the panic boundary (residual risk, see 5.6.5). The
+  bar here is trust in the vendor signature.
+- **Panic boundary (plugin contract):** every callback must catch panics and
+  return `PLUGIN_PANIC` before crossing the C ABI (unwind cannot safely cross
+  independently linked dylib runtimes); the host does **not** force this, it
+  relies on the contract. `PLUGIN_PANIC` → audit and degradation, not a process
+  crash. Exception — `teardown`: it has no status code, and its panic is not
+  logged.
+- An **accepted** plugin stays loaded for the process lifetime (`ManuallyDrop`)
+  — `dlclose` is not called for the active backend, no dangling pointers. On
+  failure paths **after** `dlopen` (entry/header/abi/kind/name/init) the library
+  is unloaded by a normal `dlclose`; on an `init` failure `teardown` is not
+  called.
+
+### 5.6.3 Selection and degradation
+
+- The active backend is named **explicitly** by config
+  (`[mac] backend = "parsec"`); there is no auto-activation. Without a name —
+  `StubBackend`.
+- Any failure (missing file, signature, `dlopen`, envelope, ABI, `init`) →
+  `plugin_rejected` → **degradation to `StubBackend`**. Fail-closed for roles
+  requiring МКЦ is enforced not by the loader but by role policy (change
+  `role-format`): `StubBackend` issues no МКЦ label, and a role demanding
+  integrity is rejected.
+
+### 5.6.4 Audit (`target = plugin.audit`)
+
+| Event | When | Fields |
+|---|---|---|
+| `plugin_loaded` | plugin accepted | `name`, `plugin_version`, `kind`, **`sha256`** |
+| `plugin_rejected` | any load failure | `path`, `reason` (`missing`/`signature`/`dlopen`/`header`/`abi`/`kind`/`init`) |
+| `plugin_inactive_file` | `.so` present in the directory but not selected | `path` |
+| `plugin_panic` | callback returned `PLUGIN_PANIC` | `name`, `entry_point` |
+
+`plugin_loaded` is emitted right after `init` — **before** the final `probe` —
+so it means "initialized candidate", not "the backend became active" (the
+runtime mode may still degrade to `StubBackend`). The SHA-256 in the event is
+taken from a separate file read, not from the in-memory image (see TOCTOU in
+5.6.5) — a forensic pointer to the candidate, not a cryptographic binding to the
+active image.
+
+### 5.6.5 Residual risks
+
+| Risk | Assessment |
+|---|---|
+| `.so` swap by local root | Directory is `root:root`; write = root already compromised (outside the TOE, 4.1). The signature is defense-in-depth: even root cannot substitute its own backend without the vendor private key, short of rebuilding the binary (itself under dpkg/ЗПС signing, see 3.6.1). |
+| Build without embedded keys | A release mistake → `NoKeys` → enforcement disappears, but **fail-closed** + `plugin_rejected`. Closed by the package smoke test. |
+| Debug build without verification | Outside the shipping model (`cfg(debug_assertions)`, not in the `.deb`). |
+| Ed25519 signature, not GOST | The plugin signature is vendor delivery infrastructure, not a certificate chain; Ed25519 is acceptable. The mandatory format prefix keeps a GOST migration unambiguous. |
+| Malicious/buggy plugin after load | Runs with the process privileges. The boundary is the signature (trusted vendor) and the panic guard (cooperative, plugin-side); the plugin is thread-safe by contract. |
+| Broken/version-diverged **signed** header | A non-null but invalid pointer in the header → UB during parsing (`&*header_ptr`/`CStr::from_ptr`/vtable cast) before the panic boundary. The bar is trust in the vendor signature; envelope typing only catches field mismatches and `null`. |
+| TOCTOU: signature↔SHA-256↔`dlopen` | Three separate reads of the file by path; a concurrent writer could substitute a different image between verification and `dlopen`. Requires writing to a `root:root` directory = root already compromised (outside the TOE, 4.1); binding to a single immutable read (memfd) is a possible future measure. |
 
 ## 6. Adversary model
 
