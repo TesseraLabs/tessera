@@ -137,14 +137,17 @@ impl CommandDriver for DockerDriver {
             format!("{}:{remote}", self.config.container),
         ];
         let outcome = self.docker("cp", &args, timeout)?;
-        if outcome.exit_code == Some(0) {
-            return Ok(());
+        if outcome.exit_code != Some(0) {
+            return Err(DriverError::Failed {
+                operation: format!("docker cp {} → {remote}", local.display()),
+                code: outcome.exit_code.unwrap_or(-1),
+                detail: outcome.stderr,
+            });
         }
-        Err(DriverError::Failed {
-            operation: format!("docker cp {} → {remote}", local.display()),
-            code: outcome.exit_code.unwrap_or(-1),
-            detail: outcome.stderr,
-        })
+        // `docker cp` переносит владельца с машины оператора: на macOS это uid
+        // 501, и внутри контейнера доставленное принадлежит несуществующему
+        // непривилегированному пользователю.
+        super::restore_root_ownership(self, remote, timeout)
     }
 
     fn recreate(&self) -> Result<(), DriverError> {

@@ -1,0 +1,143 @@
+suite: revocation
+description: Проверка отзыва удостоверений по CRL
+setup: [install-package, deploy-fixtures]
+
+# Каждый кейс переводит [trust.revocation] в нужный режим правкой конфигурации,
+# а teardown возвращает окружение в известное состояние повторным запуском
+# подготовки: она перезаписывает конфиг целиком, поэтому восстанавливать
+# сохранённую копию не нужно.
+#
+# Фикстуры: crl_valid.pem выписана Intermediate и отзывает serial 99 — ровно тот,
+# что у revoked_leaf.p12. crl_foreign.pem выписана корневым CA, то есть покрывает
+# другой набор сертификатов.
+
+cases:
+  - id: REV-001
+    title: Отозванное удостоверение не пускает
+    requirement: openspec/specs/revocation/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: |
+          sed -i 's|^mode = "none"|mode = "crl"|; s|^crl_paths = \[\]|crl_paths = ["{{fixtures}}/crl_valid.pem"]|' /etc/tessera/config.toml
+      - run: helpers/usb-loop.sh attach {{fixtures}}/revoked_leaf.p12
+      # Отзыв — класс Trust, а он по таблице маппинга даёт 6 PAM_PERM_DENIED.
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: REV-002
+    title: Включённая проверка отзыва не мешает валидному удостоверению
+    requirement: openspec/specs/revocation/spec.md
+    requires: [service-manager, usb]
+    steps:
+      # Обратная сторона REV-001: без этого кейса «отказ всем подряд» выглядел бы
+      # как исправно работающий отзыв.
+      #
+      # Указаны обе CRL: режим crl требует покрытия каждого сертификата цепочки,
+      # а не только удостоверения. crl_valid.pem выписана Intermediate и покрывает
+      # leaf, crl_foreign.pem выписана корнем и покрывает сам Intermediate. С одной
+      # только первой доступ закрывается — см. REV-006.
+      - run: |
+          sed -i 's|^mode = "none"|mode = "crl"|; s|^crl_paths = \[\]|crl_paths = ["{{fixtures}}/crl_valid.pem", "{{fixtures}}/crl_foreign.pem"]|' /etc/tessera/config.toml
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: REV-003
+    title: Устаревшая CRL закрывает доступ, а не игнорируется
+    requirement: openspec/specs/revocation/spec.md
+    requires: [service-manager, usb]
+    steps:
+      # Режим crl — strict offline: просроченная CRL даёт отказ, а не «WARN и
+      # пропустить». Свежесть ограничивается сверху crl_max_age_hours: фикстура
+      # выписана в июне, поэтому суточного порога достаточно, чтобы она стала
+      # устаревшей без подмены системного времени.
+      - run: |
+          sed -i 's|^mode = "none"|mode = "crl"|; s|^crl_paths = \[\]|crl_paths = ["{{fixtures}}/crl_valid.pem"]\ncrl_max_age_hours = 24|' /etc/tessera/config.toml
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: REV-006
+    title: Неполное покрытие цепочки списками отзыва закрывает доступ
+    requirement: openspec/specs/revocation/spec.md
+    requires: [service-manager, usb]
+    steps:
+      # Указана только CRL промежуточного центра: она покрывает удостоверение,
+      # но не сам промежуточный сертификат. Режим crl обязан отказать, а не
+      # довольствоваться частичным покрытием — иначе отозванный промежуточный
+      # центр продолжал бы пускать всех выданных под ним.
+      - run: |
+          sed -i 's|^mode = "none"|mode = "crl"|; s|^crl_paths = \[\]|crl_paths = ["{{fixtures}}/crl_valid.pem"]|' /etc/tessera/config.toml
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        timeout: 60
+      # Код возврата у этого кейса тот же, что у REV-001, поэтому без проверки
+      # причины они неразличимы и могут «проходить» по неверному основанию.
+      # PAM-модуль пишет в журнал не как юнит, а под идентификатором syslog.
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'no in-scope CRL covers certificate'
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: REV-005
+    title: CRL из каталога вне контроля root не принимается
+    requirement: openspec/specs/revocation/spec.md
+    requires: [service-manager, usb]
+    steps:
+      # Материал доверия обязан лежать там, где его не может подменить
+      # непривилегированный пользователь. Кейс кладёт CRL в каталог, принадлежащий
+      # обычному пользователю, и ожидает отказ на загрузке конфигурации, а не
+      # молчаливое использование такой CRL.
+      - run: |
+          install -d -o {{user}} -g {{user}} -m 0755 /tmp/untrusted-crl
+          cp {{fixtures}}/crl_valid.pem /tmp/untrusted-crl/crl.pem
+          chown {{user}}:{{user}} /tmp/untrusted-crl/crl.pem
+      - run: |
+          sed -i 's|^mode = "none"|mode = "crl"|; s|^crl_paths = \[\]|crl_paths = ["/tmp/untrusted-crl/crl.pem"]|' /etc/tessera/config.toml
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      # Отказ приходит на загрузке конфигурации, то есть до разбора удостоверения,
+      # и относится к классу инфраструктурных ошибок — 9 PAM_AUTHINFO_UNAVAIL.
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect: { exit_code: 9, stdout_matches: 'auth: PAM_AUTHINFO_UNAVAIL \(9\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: rm -rf /tmp/untrusted-crl
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: REV-004
+    title: Режим none пропускает отозванное удостоверение
+    requirement: openspec/specs/revocation/spec.md
+    requires: [service-manager, usb]
+    steps:
+      # Документированное поведение, а не недосмотр: отказ от проверки отзыва
+      # требует явного mode = "none" и компенсируется коротким сроком жизни
+      # удостоверений. Кейс существует, чтобы это решение оставалось видимым:
+      # если однажды none начнёт молча проверять отзыв или наоборот, прогон скажет.
+      - run: helpers/usb-loop.sh attach {{fixtures}}/revoked_leaf.p12
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach

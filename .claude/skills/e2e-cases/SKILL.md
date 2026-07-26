@@ -43,9 +43,14 @@ cases:
 | Шаг | Поля | Смысл |
 |---|---|---|
 | `run` | `run`, `stdin`, `expect`, `timeout` | команда через `sh -lc` в целевом окружении |
-| `expect_journal` | `unit`, `matches` | регексп по срезу журнала за время кейса |
+| `expect_journal` | `unit` \| `identifier`, `matches` | регексп по срезу журнала за время кейса |
 | `expect_file` | `path`, `exists`, `mode`, `matches` | файл в целевом окружении |
 | `pause` | `pause`, `capture` | остановка с инструкцией оператору |
+
+`expect_journal` берёт срез либо по systemd-юниту (`unit`, это `journalctl -u`), либо
+по идентификатору syslog (`identifier`, это `journalctl -t`) — ровно одно из двух.
+PAM-модуль службой не является и пишет под идентификатором `pam_tessera`, по `unit`
+его записи не находятся вовсе.
 
 `expect`: `exit_code` (по умолчанию 0), `stdout_matches`, `stderr_matches` — регекспы.
 Больше ожиданий нет и не будет: всё остальное — в хелпер с осмысленным кодом возврата.

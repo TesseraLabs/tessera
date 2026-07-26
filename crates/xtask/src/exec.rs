@@ -421,8 +421,8 @@ impl<'a> Executor<'a> {
     }
 
     fn step_journal(&mut self, step: &JournalStep, record: &mut StepRecord) {
-        let unit = match self.vars.substitute(&step.unit) {
-            Ok(unit) => unit,
+        let source = match self.vars.substitute(step.source.value()) {
+            Ok(value) => step.source.with_value(value),
             Err(err) => return fail_with(record, Status::Error, err.to_string()),
         };
         let pattern = match self.vars.substitute(&step.matches) {
@@ -433,8 +433,9 @@ impl<'a> Executor<'a> {
             .journal_since
             .clone()
             .unwrap_or_else(|| "-10m".to_owned());
-        let command = format!("journalctl --no-pager -u {unit} --since '{since}'");
-        record.description = format!("expect_journal: {unit} =~ {pattern}");
+        let (flag, selector) = (source.flag(), source.value());
+        let command = format!("journalctl --no-pager {flag} {selector} --since '{since}'");
+        record.description = format!("expect_journal: {selector} =~ {pattern}");
 
         let outcome = match self.driver.exec(&command, None, self.step_timeout(None)) {
             Ok(outcome) => outcome,
@@ -449,7 +450,7 @@ impl<'a> Executor<'a> {
             Ok(re) if !re.is_match(&outcome.stdout) => fail_with(
                 record,
                 Status::Fail,
-                format!("в журнале {unit} нет совпадения с `{pattern}`"),
+                format!("в журнале {selector} нет совпадения с `{pattern}`"),
             ),
             Ok(_) => {}
         }
@@ -1099,6 +1100,47 @@ cases:
                 "dpkg -l tessera".to_owned()
             ]
         );
+    }
+
+    /// Юнит и идентификатор syslog — два разных отбора журнала. PAM-модуль
+    /// службой не является, и его записи доступны только по `-t`.
+    const JOURNAL_CASES: &str = r#"
+suite: journal
+cases:
+  - id: J-1
+    title: срез по юниту
+    requirement: r
+    steps:
+      - expect_journal: { unit: tessera.service, matches: "auth ok" }
+  - id: J-2
+    title: срез по идентификатору syslog
+    requirement: r
+    steps:
+      - expect_journal: { identifier: pam_tessera, matches: "auth ok" }
+"#;
+
+    #[test]
+    fn a_journal_step_selects_a_unit_or_a_syslog_identifier() {
+        let mut harness = Harness::new();
+        let (results, commands) = harness.run_all(JOURNAL_CASES);
+        let journal: Vec<String> = commands
+            .into_iter()
+            .filter(|command| command.starts_with("journalctl"))
+            .collect();
+        assert_eq!(
+            journal,
+            vec![
+                "journalctl --no-pager -u tessera.service --since '-10m'".to_owned(),
+                "journalctl --no-pager -t pam_tessera --since '-10m'".to_owned(),
+            ]
+        );
+        // Заглушка драйвера отдаёт пустой журнал, поэтому оба шага падают;
+        // важно, что причина называет именно тот отбор, который написан в кейсе.
+        assert_eq!(results[1].status, Status::Fail);
+        assert!(results[1].steps.iter().any(|step| step
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.contains("pam_tessera"))));
     }
 
     #[test]

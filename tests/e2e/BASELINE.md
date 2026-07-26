@@ -13,3 +13,9 @@
 | INST-003 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | INST-004 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | INST-005 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| REV-001 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| REV-002 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| REV-003 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| REV-004 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| REV-005 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| REV-006 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
