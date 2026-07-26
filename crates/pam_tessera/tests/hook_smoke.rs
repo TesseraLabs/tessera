@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use common::*;
 
-use pam_tessera::flow::{authenticate, empty_device_tags, Deps, InMemoryFlowIo, RoleStage};
+use pam_tessera::flow::{authenticate, empty_device_tags, Deps, InMemoryFlowIo};
 use secrecy::SecretString;
 use tessera_core::config::ValidatedConfig;
 use tessera_core::hooks::{ForkExecExecutor, HookConfig, HookStage, OnFailure, RunAs};
