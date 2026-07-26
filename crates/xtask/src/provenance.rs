@@ -23,6 +23,14 @@ pub enum ProvenanceError {
         /// Путь.
         path: PathBuf,
     },
+    /// Нет файла дополнительного артефакта стенда.
+    #[error("артефакт стенда {target}: файл-источник {path} не найден")]
+    MissingArtifact {
+        /// Куда его собирались положить в окружении.
+        target: String,
+        /// Путь на машине оператора.
+        path: PathBuf,
+    },
     /// Пакет не прочитать.
     #[error("не прочитать {path}: {source}")]
     Read {
@@ -78,32 +86,10 @@ impl Provenance {
                 path: path.to_path_buf(),
             });
         }
-        let mut file = std::fs::File::open(path).map_err(|source| ProvenanceError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0_u8; CHUNK];
-        let mut size = 0_u64;
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|source| ProvenanceError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-            if read == 0 {
-                break;
-            }
-            let Some(chunk) = buffer.get(..read) else {
-                break;
-            };
-            hasher.update(chunk);
-            size = size.saturating_add(read as u64);
-        }
+        let (sha256, size) = digest(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            sha256: hex::encode(hasher.finalize()),
+            sha256,
             size,
             source: source.map_or_else(
                 || format!("локальный путь {}", path.display()),
@@ -112,6 +98,77 @@ impl Provenance {
             commit: commit.map(str::to_owned).filter(|c| !c.trim().is_empty()),
         })
     }
+}
+
+/// Происхождение дополнительного артефакта стенда.
+///
+/// Отчёт обязан называть всё, что приехало в окружение помимо пакета: прогон,
+/// в котором рядом с продуктом работал бинарь неизвестного происхождения,
+/// чистым не считается.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactProvenance {
+    /// Путь к файлу на машине оператора.
+    pub path: PathBuf,
+    /// Куда он положен в окружении.
+    pub target: String,
+    /// Права на файл после доставки.
+    pub mode: String,
+    /// Контрольная сумма файла.
+    pub sha256: String,
+    /// Размер в байтах.
+    pub size: u64,
+}
+
+impl ArtifactProvenance {
+    /// Считает контрольную сумму артефакта и собирает запись о происхождении.
+    ///
+    /// # Ошибки
+    ///
+    /// [`ProvenanceError::MissingArtifact`] — файла нет; прочее — ошибки чтения.
+    pub fn of_file(path: &Path, target: &str, mode: &str) -> Result<Self, ProvenanceError> {
+        if !path.is_file() {
+            return Err(ProvenanceError::MissingArtifact {
+                target: target.to_owned(),
+                path: path.to_path_buf(),
+            });
+        }
+        let (sha256, size) = digest(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            target: target.to_owned(),
+            mode: mode.to_owned(),
+            sha256,
+            size,
+        })
+    }
+}
+
+/// Контрольная сумма и размер файла.
+fn digest(path: &Path) -> Result<(String, u64), ProvenanceError> {
+    let mut file = std::fs::File::open(path).map_err(|source| ProvenanceError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut size = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| ProvenanceError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        let Some(chunk) = buffer.get(..read) else {
+            break;
+        };
+        hasher.update(chunk);
+        size = size.saturating_add(read as u64);
+    }
+    Ok((hex::encode(hasher.finalize()), size))
 }
 
 #[cfg(test)]

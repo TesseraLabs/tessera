@@ -166,7 +166,7 @@ impl Step {
     pub fn describe(&self) -> String {
         match self {
             Self::Run(step) => format!("run: {}", step.run),
-            Self::ExpectJournal(step) => format!("expect_journal: {}", step.unit),
+            Self::ExpectJournal(step) => format!("expect_journal: {}", step.source.value()),
             Self::ExpectFile(step) => format!("expect_file: {}", step.path),
             Self::Pause(step) => format!("pause: {}", step.pause),
         }
@@ -224,14 +224,91 @@ impl Expect {
     }
 }
 
+/// Чем ограничен срез журнала.
+///
+/// Юнита недостаточно: PAM-модуль службой не является и пишет в журнал через
+/// syslog под своим идентификатором, поэтому `-u` его записей не находит вовсе.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalSource {
+    /// Systemd-юнит, отбор через `journalctl -u`.
+    Unit(String),
+    /// Идентификатор syslog, отбор через `journalctl -t`.
+    Identifier(String),
+}
+
+impl JournalSource {
+    /// Ключ `journalctl`, которым задаётся отбор.
+    #[must_use]
+    pub fn flag(&self) -> &'static str {
+        match self {
+            Self::Unit(_) => "-u",
+            Self::Identifier(_) => "-t",
+        }
+    }
+
+    /// Значение отбора — имя юнита либо идентификатор.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Unit(value) | Self::Identifier(value) => value,
+        }
+    }
+
+    /// Копия отбора с подставленным значением.
+    #[must_use]
+    pub fn with_value(&self, value: String) -> Self {
+        match self {
+            Self::Unit(_) => Self::Unit(value),
+            Self::Identifier(_) => Self::Identifier(value),
+        }
+    }
+}
+
 /// Шаг «проверить журнал».
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct JournalStep {
-    /// Имя systemd-юнита.
-    pub unit: String,
+    /// Чем ограничен срез журнала.
+    pub source: JournalSource,
     /// Регулярное выражение, которое должно найтись в срезе журнала за время кейса.
     pub matches: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalStepFields {
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    identifier: Option<String>,
+    matches: String,
+}
+
+impl<'de> Deserialize<'de> for JournalStep {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = JournalStepFields::deserialize(deserializer)?;
+        // Молчаливое предпочтение одного ключа другому дало бы шаг, который
+        // проверяет не тот срез журнала, что написал автор кейса, — и провал
+        // выглядел бы дефектом продукта.
+        let source = match (fields.unit, fields.identifier) {
+            (Some(unit), None) => JournalSource::Unit(unit),
+            (None, Some(identifier)) => JournalSource::Identifier(identifier),
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom(
+                    "expect_journal: unit и identifier взаимоисключающие, задайте ровно один",
+                ))
+            }
+            (None, None) => return Err(D::Error::custom(
+                "expect_journal: нужен unit (systemd-юнит) либо identifier (идентификатор syslog)",
+            )),
+        };
+        Ok(Self {
+            source,
+            matches: fields.matches,
+        })
+    }
 }
 
 /// Шаг «проверить файл».
@@ -529,6 +606,69 @@ cases:
             Some("auth: PAM_SUCCESS")
         );
         assert_eq!(run.expect.expected_exit_code(), 0);
+    }
+
+    fn journal_step(fields: &str) -> Result<Suite, serde_norway::Error> {
+        serde_norway::from_str(&format!(
+            r"
+suite: s
+cases:
+  - id: A-1
+    title: t
+    requirement: r
+    steps:
+      - expect_journal: {{ {fields} }}
+"
+        ))
+    }
+
+    #[test]
+    fn a_journal_step_accepts_a_syslog_identifier() {
+        let suite = journal_step(r#"identifier: pam_tessera, matches: "auth failed""#).unwrap();
+        let Step::ExpectJournal(journal) = &suite.cases[0].steps[0] else {
+            panic!("ожидался шаг проверки журнала");
+        };
+        assert_eq!(
+            journal.source,
+            JournalSource::Identifier("pam_tessera".to_owned())
+        );
+        assert_eq!(journal.source.flag(), "-t");
+        assert_eq!(journal.source.value(), "pam_tessera");
+    }
+
+    #[test]
+    fn a_journal_step_still_accepts_a_unit() {
+        let suite = journal_step(r#"unit: tessera.service, matches: "auth ok""#).unwrap();
+        let Step::ExpectJournal(journal) = &suite.cases[0].steps[0] else {
+            panic!("ожидался шаг проверки журнала");
+        };
+        assert_eq!(
+            journal.source,
+            JournalSource::Unit("tessera.service".to_owned())
+        );
+        assert_eq!(journal.source.flag(), "-u");
+    }
+
+    #[test]
+    fn a_journal_step_with_both_selectors_is_rejected() {
+        let err = journal_step(r#"unit: tessera, identifier: pam_tessera, matches: "x""#)
+            .expect_err("два отбора сразу — неоднозначность, а не выбор по умолчанию");
+        let text = err.to_string();
+        assert!(
+            text.contains("unit") && text.contains("identifier"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_journal_step_without_a_selector_is_rejected() {
+        let err = journal_step(r#"matches: "x""#)
+            .expect_err("без отбора неизвестно, какой срез журнала проверять");
+        let text = err.to_string();
+        assert!(
+            text.contains("unit") && text.contains("identifier"),
+            "{text}"
+        );
     }
 
     #[test]

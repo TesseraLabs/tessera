@@ -109,14 +109,17 @@ impl CommandDriver for SshDriver {
                     source,
                 }
             })?;
-        if outcome.exit_code == Some(0) {
-            return Ok(());
+        if outcome.exit_code != Some(0) {
+            return Err(DriverError::Failed {
+                operation: format!("scp {} → {remote}", local.display()),
+                code: outcome.exit_code.unwrap_or(-1),
+                detail: outcome.stderr,
+            });
         }
-        Err(DriverError::Failed {
-            operation: format!("scp {} → {remote}", local.display()),
-            code: outcome.exit_code.unwrap_or(-1),
-            detail: outcome.stderr,
-        })
+        // `scp` кладёт файлы от имени пользователя стенда. Нормализация идёт
+        // тем же путём, что и снос каталога перед доставкой, — командой в
+        // окружении; права на неё у стенда те же, что и на `rm -rf` в /opt.
+        super::restore_root_ownership(self, remote, timeout)
     }
 
     fn recreate(&self) -> Result<(), DriverError> {

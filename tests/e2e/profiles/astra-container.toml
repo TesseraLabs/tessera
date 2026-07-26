@@ -22,7 +22,22 @@ error_exit_codes = [64, 70]
 
 [vars]
 helpers = "/opt/tessera-e2e/helpers"
-fixtures = "/opt/tessera-e2e/fixtures"
+
+# Каталоги, которые раннер везёт в окружение перед первым действием подготовки.
+# source — путь от корня репозитория, target — место в окружении, var — имя,
+# под которым каталог виден кейсу. Владельца доставленного раннер нормализует
+# до root:root: материал доверия из каталога непривилегированного пользователя
+# продукт отвергает, и это был бы дефект стенда, а не поведение продукта.
+[[fixtures]]
+source = "crates/tessera_core/tests/fixtures"
+target = "/opt/tessera-e2e/fixtures"
+var = "fixtures"
+
+# Ролевые удостоверения и определения ролей лежат отдельно от фикстур ядра.
+[[fixtures]]
+source = "tests/fixtures/roles"
+target = "/opt/tessera-e2e/roles"
+var = "roles"
 
 [docker]
 container = "tessera-e2e-astra"

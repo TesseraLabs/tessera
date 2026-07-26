@@ -1,0 +1,161 @@
+suite: roles
+description: Допуск к роли при входе в ролевую учётную запись
+setup: [install-package, deploy-fixtures]
+
+# Кейсы написаны от ЦЕЛЕВОЙ модели «роль = ролевая учётная запись» (решение
+# 2026-06-19, зафиксировано в openspec/specs/role-selection/spec.md): инженер
+# входит в учётную запись с именем роли (`ssh serv@device`), запрошенная роль
+# равна имени этой записи, допуск проверяется расширением user_binding.
+# Личность инженера живёт в удостоверении и журнале выпусков, а не в имени входа.
+#
+# Код v0.4.x реализует только депрекейт-механизм — суффикс `<пользователь>+<роль>`;
+# перепроводка на ролевые учётные записи признана невыполненной (KNOWN GAP в той же
+# спеке). Поэтому кейсы ниже красные, и это их работа: пока разрыв между принятым
+# решением и кодом существует, каждый прогон о нём напоминает. Переписать их под
+# суффикс значило бы закрепить депрекейт-путь эталоном.
+#
+# Ролевые удостоверения целевой модели: PIN 123456, host_binding = ["*"].
+
+cases:
+  - id: ROLE-001
+    title: Вход в ролевую учётную запись с покрытой ролью открывает сессию
+    requirement: openspec/specs/role-selection/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
+      - run: |
+          install -d -m 0755 -o root -g root /var/lib/tessera/roles
+          install -m 0644 -o root -g root {{roles}}/store/serv.toml /var/lib/tessera/roles/serv.toml
+          cat >> /etc/tessera/config.toml <<'EOF'
+
+          [roles]
+          enforce = "require"
+          dir = "/var/lib/tessera/roles"
+          EOF
+      # Удостоверение разрешает вход в учётную запись serv и покрывает роль serv.
+      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
+      # Отдельного указания роли нет: роль равна имени учётной записи входа.
+      - run: pam-drive certauth serv authenticate
+        stdin: "123456"
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      # Успех сам по себе не доказывает, что роль разобрана и зафиксирована
+      # в сессии: audit-событие показывает, что payload роли действительно снят.
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'event="?role_session_open"?'
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: rm -f /var/lib/tessera/roles/serv.toml
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: ROLE-002
+    title: Роль вне списка разрешённых в удостоверении закрывает доступ
+    requirement: openspec/specs/role-selection/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
+      - run: |
+          install -d -m 0755 -o root -g root /var/lib/tessera/roles
+          install -m 0644 -o root -g root {{roles}}/store/serv.toml /var/lib/tessera/roles/serv.toml
+          cat >> /etc/tessera/config.toml <<'EOF'
+
+          [roles]
+          enforce = "require"
+          dir = "/var/lib/tessera/roles"
+          EOF
+      # Вход в учётную запись serv разрешён, но список ролей удостоверения
+      # содержит только oper: роль существует на устройстве и не покрыта.
+      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv-oper-only.p12
+      - run: pam-drive certauth serv authenticate
+        stdin: "123456"
+        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        timeout: 60
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'reason="?not_covered"?'
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: rm -f /var/lib/tessera/roles/serv.toml
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: ROLE-003
+    title: Ролевая учётная запись вне user_binding закрывает доступ
+    requirement: openspec/specs/cert-scope-binding/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
+      - run: |
+          install -d -m 0755 -o root -g root /var/lib/tessera/roles
+          install -m 0644 -o root -g root {{roles}}/store/serv.toml /var/lib/tessera/roles/serv.toml
+          cat >> /etc/tessera/config.toml <<'EOF'
+
+          [roles]
+          enforce = "require"
+          dir = "/var/lib/tessera/roles"
+          EOF
+      # Удостоверение допускает вход только в oper: попытка войти в serv должна
+      # отклоняться самим user_binding, до разбора ролей.
+      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-foreign.p12
+      - run: pam-drive certauth serv authenticate
+        stdin: "123456"
+        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: rm -f /var/lib/tessera/roles/serv.toml
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: ROLE-004
+    title: Роль, разрешённая удостоверением, но отсутствующая в хранилище, закрывает доступ
+    requirement: openspec/specs/role-store/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
+      # Хранилище пустое: роль разрешена удостоверением, но на устройстве не
+      # определена. От ROLE-002 отличается именно причиной отказа.
+      - run: |
+          install -d -m 0755 -o root -g root /var/lib/tessera/roles
+          rm -f /var/lib/tessera/roles/serv.toml
+          cat >> /etc/tessera/config.toml <<'EOF'
+
+          [roles]
+          enforce = "require"
+          dir = "/var/lib/tessera/roles"
+          EOF
+      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
+      - run: pam-drive certauth serv authenticate
+        stdin: "123456"
+        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        timeout: 60
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'reason="?not_found"?'
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: ROLE-005
+    title: Режим миграции пропускает вход без проверки роли
+    requirement: openspec/specs/role-selection/spec.md
+    requires: [service-manager, usb]
+    steps:
+      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
+      # enforce = false — стадия миграции, роли не проверяются вовсе. Кейс держит
+      # это видимым: переход к require должен быть решением, а не следствием
+      # случайной правки дефолта.
+      - run: |
+          cat >> /etc/tessera/config.toml <<'EOF'
+
+          [roles]
+          enforce = "false"
+          dir = "/var/lib/tessera/roles"
+          EOF
+      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv-oper-only.p12
+      - run: pam-drive certauth serv authenticate
+        stdin: "123456"
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: helpers/setup/deploy-fixtures.sh

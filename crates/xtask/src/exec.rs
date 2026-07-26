@@ -36,6 +36,9 @@ pub struct Delivery {
     pub local: PathBuf,
     /// Куда положить в окружении.
     pub remote: String,
+    /// Права, которые стенд требует выставить после доставки. `None` — оставить
+    /// как есть: у каталогов фикстур и у пакета своих требований нет.
+    pub mode: Option<String>,
 }
 
 impl Delivery {
@@ -46,7 +49,15 @@ impl Delivery {
             what: what.into(),
             local,
             remote: remote.into(),
+            mode: None,
         }
+    }
+
+    /// Требует выставить доставленному заданные права.
+    #[must_use]
+    pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
     }
 }
 
@@ -238,6 +249,10 @@ impl<'a> Executor<'a> {
             self.driver
                 .deliver(&delivery.local, &delivery.remote, DELIVERY_TIMEOUT)
                 .map_err(|err| format!("доставка ({}): {err}", delivery.what))?;
+            if let Some(mode) = &delivery.mode {
+                crate::driver::apply_mode(self.driver, &delivery.remote, mode, DELIVERY_TIMEOUT)
+                    .map_err(|err| format!("доставка ({}): {err}", delivery.what))?;
+            }
         }
         self.delivered = true;
         Ok(())
@@ -421,8 +436,8 @@ impl<'a> Executor<'a> {
     }
 
     fn step_journal(&mut self, step: &JournalStep, record: &mut StepRecord) {
-        let unit = match self.vars.substitute(&step.unit) {
-            Ok(unit) => unit,
+        let source = match self.vars.substitute(step.source.value()) {
+            Ok(value) => step.source.with_value(value),
             Err(err) => return fail_with(record, Status::Error, err.to_string()),
         };
         let pattern = match self.vars.substitute(&step.matches) {
@@ -433,8 +448,9 @@ impl<'a> Executor<'a> {
             .journal_since
             .clone()
             .unwrap_or_else(|| "-10m".to_owned());
-        let command = format!("journalctl --no-pager -u {unit} --since '{since}'");
-        record.description = format!("expect_journal: {unit} =~ {pattern}");
+        let (flag, selector) = (source.flag(), source.value());
+        let command = format!("journalctl --no-pager {flag} {selector} --since '{since}'");
+        record.description = format!("expect_journal: {selector} =~ {pattern}");
 
         let outcome = match self.driver.exec(&command, None, self.step_timeout(None)) {
             Ok(outcome) => outcome,
@@ -449,7 +465,7 @@ impl<'a> Executor<'a> {
             Ok(re) if !re.is_match(&outcome.stdout) => fail_with(
                 record,
                 Status::Fail,
-                format!("в журнале {unit} нет совпадения с `{pattern}`"),
+                format!("в журнале {selector} нет совпадения с `{pattern}`"),
             ),
             Ok(_) => {}
         }
@@ -1101,6 +1117,47 @@ cases:
         );
     }
 
+    /// Юнит и идентификатор syslog — два разных отбора журнала. PAM-модуль
+    /// службой не является, и его записи доступны только по `-t`.
+    const JOURNAL_CASES: &str = r#"
+suite: journal
+cases:
+  - id: J-1
+    title: срез по юниту
+    requirement: r
+    steps:
+      - expect_journal: { unit: tessera.service, matches: "auth ok" }
+  - id: J-2
+    title: срез по идентификатору syslog
+    requirement: r
+    steps:
+      - expect_journal: { identifier: pam_tessera, matches: "auth ok" }
+"#;
+
+    #[test]
+    fn a_journal_step_selects_a_unit_or_a_syslog_identifier() {
+        let mut harness = Harness::new();
+        let (results, commands) = harness.run_all(JOURNAL_CASES);
+        let journal: Vec<String> = commands
+            .into_iter()
+            .filter(|command| command.starts_with("journalctl"))
+            .collect();
+        assert_eq!(
+            journal,
+            vec![
+                "journalctl --no-pager -u tessera.service --since '-10m'".to_owned(),
+                "journalctl --no-pager -t pam_tessera --since '-10m'".to_owned(),
+            ]
+        );
+        // Заглушка драйвера отдаёт пустой журнал, поэтому оба шага падают;
+        // важно, что причина называет именно тот отбор, который написан в кейсе.
+        assert_eq!(results[1].status, Status::Fail);
+        assert!(results[1].steps.iter().any(|step| step
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.contains("pam_tessera"))));
+    }
+
     #[test]
     fn a_profile_without_the_helpers_variable_fails_loudly() {
         let mut harness = Harness::new();
@@ -1249,6 +1306,54 @@ cases:
                 "dpkg -l tessera".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn a_delivery_with_a_mode_gets_it_set_right_after_the_transport() {
+        let mut harness = Harness::new();
+        harness.deliveries = vec![Delivery::new(
+            "артефакт стенда /usr/local/bin/issuer",
+            delivery_source(),
+            "/usr/local/bin/issuer",
+        )
+        .with_mode("0755")];
+        let (result, commands) = harness.run(WITH_SETUP);
+        assert_eq!(result.status, Status::Pass);
+        // Права выставляются до подготовки: бинарь без бита исполнения провалил
+        // бы кейсы так, будто сломан продукт.
+        assert_eq!(
+            commands,
+            vec![
+                format!(
+                    "deliver {} -> /usr/local/bin/issuer",
+                    delivery_source().display()
+                ),
+                "chmod 0755 '/usr/local/bin/issuer'".to_owned(),
+                "/opt/tessera-e2e/helpers/setup/install-package.sh".to_owned(),
+                "dpkg -l tessera".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_chmod_after_delivery_is_a_stand_failure() {
+        let mut harness = Harness::new();
+        harness.driver = FakeDriver::failing_with("chmod", 1);
+        harness.deliveries = vec![Delivery::new(
+            "артефакт стенда /usr/local/bin/issuer",
+            delivery_source(),
+            "/usr/local/bin/issuer",
+        )
+        .with_mode("0755")];
+        let (result, commands) = harness.run(WITH_SETUP);
+        assert_eq!(result.status, Status::Error);
+        assert!(
+            result
+                .reason
+                .is_some_and(|r| r.contains("артефакт стенда /usr/local/bin/issuer")),
+            "причина должна называть груз"
+        );
+        assert!(!commands.iter().any(|c| c.contains("setup")));
     }
 
     #[test]

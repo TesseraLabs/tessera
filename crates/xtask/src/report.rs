@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::provenance::Provenance;
+use crate::provenance::{ArtifactProvenance, Provenance};
 use crate::redact::Redactor;
 use crate::registry::CaseMode;
 
@@ -161,6 +161,9 @@ pub struct RunReport {
     pub environment: String,
     /// Происхождение проверенного пакета.
     pub package: Provenance,
+    /// Что приехало в окружение помимо пакета.
+    #[serde(default)]
+    pub stand_artifacts: Vec<ArtifactProvenance>,
     /// Прогон шёл без оператора.
     pub non_interactive: bool,
     /// Teardown пропускался при провале.
@@ -215,6 +218,39 @@ pub fn write(dir: &Path, report: &RunReport, redactor: &Redactor) -> std::io::Re
     Ok(())
 }
 
+/// Раздел отчёта о том, что приехало в окружение помимо пакета.
+///
+/// Молчания здесь быть не может: прогон, в котором рядом с продуктом работал
+/// бинарь неизвестного происхождения, чистым не считается, а пустой раздел
+/// читался бы как «ничего не везлось».
+#[must_use]
+#[expect(
+    clippy::format_push_string,
+    reason = "отчёт собирается один раз за прогон: читаемость важнее аллокации"
+)]
+fn stand_artifacts_section(artifacts: &[ArtifactProvenance]) -> String {
+    if artifacts.is_empty() {
+        return "- Помимо пакета в окружение ничего не везлось\n".to_owned();
+    }
+    let mut out = format!("\n## Доставлено помимо пакета ({})\n\n", artifacts.len());
+    out.push_str(
+        "Эти файлы собраны вне проверяемого пакета; за их происхождение отвечает стенд.\n\n",
+    );
+    out.push_str("| в окружении | источник | права | sha256 | байт |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for artifact in artifacts {
+        out.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | {} |\n",
+            artifact.target,
+            artifact.path.display(),
+            artifact.mode,
+            artifact.sha256,
+            artifact.size
+        ));
+    }
+    out
+}
+
 /// Человекочитаемый отчёт.
 #[must_use]
 #[expect(
@@ -255,6 +291,8 @@ pub fn markdown(report: &RunReport) -> String {
             report.secret_vars.join(", ")
         ));
     }
+
+    out.push_str(&stand_artifacts_section(&report.stand_artifacts));
 
     out.push_str("\n## Итог\n\n");
     for status in [
@@ -356,6 +394,7 @@ mod tests {
                 source: "локальная сборка".to_owned(),
                 commit: None,
             },
+            stand_artifacts: Vec::new(),
             non_interactive: false,
             keep_on_failure: false,
             interrupted: false,
@@ -397,6 +436,53 @@ mod tests {
         assert!(text.contains("Провенанс не установлен"), "{text}");
         // Использование ссылки на секрет фиксируется, само значение — нет.
         assert!(text.contains("pin"), "{text}");
+    }
+
+    fn passing_case() -> CaseResult {
+        CaseResult {
+            id: "ISSUER-001".to_owned(),
+            suite: "issuer".to_owned(),
+            title: "выпуск удостоверения".to_owned(),
+            requirement: "specs".to_owned(),
+            mode: CaseMode::Auto,
+            status: Status::Pass,
+            reason: None,
+            steps: Vec::new(),
+            teardown: TeardownOutcome::Ok,
+            registry_root: PathBuf::from("tests/e2e/cases"),
+            duration_ms: 1,
+        }
+    }
+
+    /// Прогон, в котором рядом с продуктом работал бинарь неизвестного
+    /// происхождения, чистым не считается: отчёт обязан назвать и файл, и сумму.
+    #[test]
+    fn everything_delivered_besides_the_package_is_named_in_the_report() {
+        let mut report = report_with(passing_case());
+        report.stand_artifacts = vec![ArtifactProvenance {
+            path: PathBuf::from("/build/issuer"),
+            target: "/usr/local/bin/issuer".to_owned(),
+            mode: "0755".to_owned(),
+            sha256: "cd".repeat(32),
+            size: 4096,
+        }];
+
+        let text = markdown(&report);
+        assert!(text.contains("Доставлено помимо пакета (1)"), "{text}");
+        assert!(text.contains("/usr/local/bin/issuer"), "{text}");
+        assert!(text.contains("/build/issuer"), "{text}");
+        assert!(text.contains("0755"), "{text}");
+        assert!(text.contains(&"cd".repeat(32)), "{text}");
+    }
+
+    #[test]
+    fn a_run_without_extra_artifacts_says_so_outright() {
+        let text = markdown(&report_with(passing_case()));
+        assert!(
+            text.contains("Помимо пакета в окружение ничего не везлось"),
+            "{text}"
+        );
+        assert!(!text.contains("Доставлено помимо пакета"), "{text}");
     }
 
     #[test]

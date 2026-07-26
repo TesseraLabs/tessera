@@ -72,9 +72,14 @@ pub trait CommandDriver {
     /// стенда свой, а профиль в git обязан быть безадресным; сборочный контекст
     /// репозитория для этого не годится.
     ///
+    /// Реализация обязана оставить доставленное в том же виде, в каком оно
+    /// лежало бы на настоящей машине: владелец `root:root`, запись только у
+    /// владельца — см. [`restore_root_ownership`].
+    ///
     /// # Ошибки
     ///
-    /// Ошибки транспорта и ненулевой код копирования.
+    /// Ошибки транспорта, ненулевой код копирования и ненулевой код
+    /// нормализации владельца.
     fn deliver(&self, local: &Path, remote: &str, timeout: Duration) -> Result<(), DriverError>;
 
     /// Пересоздаёт окружение с нуля.
@@ -146,6 +151,63 @@ pub fn clear_remote_path(
     }
     Err(DriverError::Failed {
         operation: format!("подготовка каталога {parent}"),
+        code: outcome.exit_code.unwrap_or(-1),
+        detail: outcome.stderr,
+    })
+}
+
+/// Приводит доставленное к тому виду, в каком оно лежало бы на настоящей
+/// машине: владелец `root:root`, запись только у владельца.
+///
+/// Без этого шага стенд подсовывает продукту материал доверия (якоря, CRL),
+/// подконтрольный непривилегированному пользователю: `docker cp` сохраняет
+/// владельца с машины оператора, `scp` — пользователя стенда. Продукт такой
+/// материал отвергает, и по делу, — но отказ описывает дефект стенда, а не
+/// поведение продукта.
+///
+/// # Ошибки
+///
+/// Ошибки транспорта и ненулевой код нормализации.
+pub fn restore_root_ownership(
+    driver: &dyn CommandDriver,
+    remote: &str,
+    timeout: Duration,
+) -> Result<(), DriverError> {
+    let command = format!("chown -R root:root '{remote}' && chmod -R go-w '{remote}'");
+    let outcome = driver.exec(&command, None, timeout)?;
+    if outcome.exit_code == Some(0) {
+        return Ok(());
+    }
+    Err(DriverError::Failed {
+        operation: format!("нормализация владельца {remote}"),
+        code: outcome.exit_code.unwrap_or(-1),
+        detail: outcome.stderr,
+    })
+}
+
+/// Выставляет доставленному файлу заданные стендом права.
+///
+/// Отдельным шагом после доставки: транспорт переносит права с машины
+/// оператора, а нормализация владельца знает только про запись группы и
+/// остальных. Бинарь, приехавший без бита исполнения, провалил бы кейсы так,
+/// будто продукт сломан.
+///
+/// # Ошибки
+///
+/// Ошибки транспорта и ненулевой код `chmod`.
+pub fn apply_mode(
+    driver: &dyn CommandDriver,
+    remote: &str,
+    mode: &str,
+    timeout: Duration,
+) -> Result<(), DriverError> {
+    let command = format!("chmod {mode} '{remote}'");
+    let outcome = driver.exec(&command, None, timeout)?;
+    if outcome.exit_code == Some(0) {
+        return Ok(());
+    }
+    Err(DriverError::Failed {
+        operation: format!("права {mode} на {remote}"),
         code: outcome.exit_code.unwrap_or(-1),
         detail: outcome.stderr,
     })
@@ -262,6 +324,77 @@ mod tests {
         .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("/opt/tessera-e2e/pkg"), "{text}");
+        assert!(text.contains("нет прав"), "{text}");
+    }
+
+    #[test]
+    fn delivered_material_is_handed_over_root_owned_and_not_group_writable() {
+        let driver = FakeDriver {
+            log: RefCell::new(Vec::new()),
+            code: 0,
+        };
+        restore_root_ownership(&driver, "/opt/tessera-e2e/fixtures", Duration::from_secs(1))
+            .unwrap();
+        // Материал доверия, подконтрольный непривилегированному пользователю,
+        // продукт отвергает: транспорт обязан снять и владельца, и запись.
+        assert_eq!(
+            driver.log.borrow().as_slice(),
+            ["chown -R root:root '/opt/tessera-e2e/fixtures' \
+              && chmod -R go-w '/opt/tessera-e2e/fixtures'"]
+        );
+    }
+
+    #[test]
+    fn a_delivered_binary_gets_the_mode_the_stand_asked_for() {
+        let driver = FakeDriver {
+            log: RefCell::new(Vec::new()),
+            code: 0,
+        };
+        apply_mode(
+            &driver,
+            "/usr/local/bin/issuer",
+            "0755",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            driver.log.borrow().as_slice(),
+            ["chmod 0755 '/usr/local/bin/issuer'"]
+        );
+    }
+
+    #[test]
+    fn a_failed_chmod_is_reported_as_a_stand_failure() {
+        let driver = FakeDriver {
+            log: RefCell::new(Vec::new()),
+            code: 1,
+        };
+        let err = apply_mode(
+            &driver,
+            "/usr/local/bin/issuer",
+            "0755",
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("/usr/local/bin/issuer"), "{text}");
+        assert!(text.contains("нет прав"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_normalisation_is_reported_as_a_stand_failure() {
+        let driver = FakeDriver {
+            log: RefCell::new(Vec::new()),
+            code: 1,
+        };
+        let err = restore_root_ownership(
+            &driver,
+            "/opt/tessera-e2e/pkg/tessera.deb",
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("/opt/tessera-e2e/pkg/tessera.deb"), "{text}");
         assert!(text.contains("нет прав"), "{text}");
     }
 

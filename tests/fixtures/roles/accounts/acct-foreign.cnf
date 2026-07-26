@@ -1,0 +1,41 @@
+# OpenSSL config — role-account leaf bound to a foreign account: login into
+# `serv` is refused by user_binding itself.
+#
+# Target role model ("role = role account"): the certificate authorises the
+# `oper` account only, so an attempt to log into `serv` MUST be rejected on the
+# user_binding check, before role coverage is even consulted.
+#
+# Used by gen-role-account-certs.sh; signed by the CA in ../ca.{key,crt}.pem.
+#
+# OIDs (see crates/tessera_core/src/x509/oids.rs — do NOT change):
+#   2.25.183976554325829274683049824615098          HOST_BINDING_OID
+#   2.25.215438916728501023845629178354627          USER_BINDING_OID
+#   2.25.185305973969816596290730578528098241367    ALLOWED_ROLES_OID
+#
+# DER payload for SEQUENCE { UTF8String "oper" }:
+#   30 06 0c 04 6f 70 65 72
+#   ^^ ^^                      SEQUENCE, content length = 6 octets
+#      ^^ 0c 04 6f 70 65 72    UTF8String "oper"            (6 octets)
+[ req ]
+default_bits        = 2048
+default_md          = sha256
+prompt              = no
+distinguished_name  = dn
+req_extensions      = leaf_ext
+
+[ dn ]
+CN = acct-foreign
+O  = tessera-test
+C  = RU
+
+[ leaf_ext ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, keyEncipherment
+extendedKeyUsage       = clientAuth, emailProtection
+subjectKeyIdentifier   = hash
+# pam_cert_host_binding = ["*"]  (wildcard — authorises any host, test leaf)
+2.25.183976554325829274683049824615098 = DER:30:03:0c:01:2a
+# pam_cert_user_binding = [oper]  (login into `serv` is not authorised at all)
+2.25.215438916728501023845629178354627 = DER:30:06:0c:04:6f:70:65:72
+# pam_cert_allowed_roles = [oper]  (non-critical)
+2.25.185305973969816596290730578528098241367 = DER:30:06:0c:04:6f:70:65:72

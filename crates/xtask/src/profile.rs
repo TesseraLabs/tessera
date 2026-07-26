@@ -79,13 +79,21 @@ pub struct Profile {
     /// Таймаут шага по умолчанию, секунды.
     #[serde(default)]
     pub default_timeout: Option<u64>,
-    /// Каталог с фикстурами, который раннер доставляет в окружение перед
-    /// первым действием подготовки; путь от корня репозитория.
+    /// Устаревший синоним одиночной секции `[[fixtures]]`: каталог фикстур,
+    /// который едет в место по умолчанию под именем `fixtures`.
     ///
-    /// Поле, а не константа: приватный реестр возит свои фикстуры, и жёстко
-    /// зашитый путь закрыл бы ему дорогу.
+    /// Оставлен ради профилей вне этого репозитория: `deny_unknown_fields`
+    /// превратил бы переименование поля в отказ читать чужой профиль.
     #[serde(default)]
     pub fixtures_source: Option<PathBuf>,
+    /// Каталоги, которые раннер доставляет в окружение перед первым действием
+    /// подготовки.
+    ///
+    /// Список, а не одно поле: ролевым кейсам нужен второй каталог репозитория
+    /// рядом с фикстурами ядра. Пустой список означает набор по умолчанию —
+    /// фикстуры ядра под именем `fixtures`.
+    #[serde(default)]
+    pub fixtures: Vec<FixturesEntry>,
     /// Служебные коды возврата хелперов образа: такой код означает, что сломан
     /// стенд, а не продукт, и даёт шагу `ERROR` вместо `FAIL`.
     ///
@@ -100,6 +108,27 @@ pub struct Profile {
     /// Параметры профиля по SSH.
     #[serde(default)]
     pub ssh: Option<SshProfile>,
+}
+
+/// Каталог, который раннер везёт в окружение перед первым действием подготовки.
+///
+/// Один каталог — один груз: раннер сносит цель перед копированием, и класть
+/// два источника в одно место значило бы терять первый.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixturesEntry {
+    /// Источник на машине оператора; путь от корня репозитория. Абсолютный
+    /// путь берётся как есть — так приватная лаборатория возит своё.
+    pub source: PathBuf,
+    /// Куда положить в окружении.
+    pub target: String,
+    /// Имя подстановки, под которым каталог виден кейсу.
+    ///
+    /// Без него каталог доставляется, но кейсу не адресуем. Одноимённая
+    /// переменная профиля или стенда перекрывает `target`: доставка едет туда
+    /// же, куда смотрит кейс, иначе кейс искал бы материал не там.
+    #[serde(default)]
+    pub var: Option<String>,
 }
 
 /// Параметры контейнерного окружения.
@@ -164,17 +193,51 @@ impl Profile {
 
     fn validate(&self) -> Result<(), ProfileError> {
         let detail = match self.driver {
-            DriverKind::Docker if self.docker.is_none() => Some("нет секции [docker]"),
-            DriverKind::Ssh if self.ssh.is_none() => Some("нет секции [ssh]"),
-            _ => None,
+            DriverKind::Docker if self.docker.is_none() => Some("нет секции [docker]".to_owned()),
+            DriverKind::Ssh if self.ssh.is_none() => Some("нет секции [ssh]".to_owned()),
+            _ => self.fixtures_detail(),
         };
         match detail {
             Some(detail) => Err(ProfileError::Invalid {
                 name: self.name.clone(),
-                detail: detail.to_owned(),
+                detail,
             }),
             None => Ok(()),
         }
+    }
+
+    /// Что не так с описанием фикстур, если не так хоть что-нибудь.
+    fn fixtures_detail(&self) -> Option<String> {
+        if !self.fixtures.is_empty() && self.fixtures_source.is_some() {
+            return Some(
+                "заданы и fixtures_source, и [[fixtures]]: оставьте что-то одно".to_owned(),
+            );
+        }
+        let mut targets: BTreeSet<&str> = BTreeSet::new();
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        for entry in &self.fixtures {
+            if !entry.target.starts_with('/') {
+                return Some(format!(
+                    "[[fixtures]] target = \"{}\": ожидался абсолютный путь в окружении",
+                    entry.target
+                ));
+            }
+            // Совпадение целей молча съело бы первый каталог: перед копированием
+            // раннер сносит цель. Совпадение имён — тем более: кейс увидел бы
+            // одно место вместо двух.
+            if !targets.insert(entry.target.as_str()) {
+                return Some(format!(
+                    "[[fixtures]]: цель {} названа дважды",
+                    entry.target
+                ));
+            }
+            if let Some(var) = entry.var.as_deref() {
+                if !names.insert(var) {
+                    return Some(format!("[[fixtures]]: подстановка {var} названа дважды"));
+                }
+            }
+        }
+        None
     }
 
     /// Возможности, которых профиль не даёт.
@@ -183,21 +246,31 @@ impl Profile {
         missing_capabilities(requires, &self.capabilities)
     }
 
-    /// Каталог фикстур, приведённый к абсолютному пути.
+    /// Каталоги фикстур с источниками, приведёнными к абсолютным путям.
     ///
-    /// По умолчанию — фикстуры ядра: те же удостоверения, на которых стоят
-    /// unit-тесты, чтобы e2e и unit проверяли систему на одном материале.
+    /// Профиль без своего списка получает фикстуры ядра: те же удостоверения,
+    /// на которых стоят unit-тесты, чтобы e2e и unit проверяли систему на одном
+    /// материале.
     #[must_use]
-    pub fn fixtures_source_path(&self, repo_root: &Path) -> PathBuf {
-        let relative = self
-            .fixtures_source
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_FIXTURES_SOURCE));
-        if relative.is_absolute() {
-            relative
+    pub fn fixture_deliveries(&self, repo_root: &Path) -> Vec<FixturesEntry> {
+        let mut entries = if self.fixtures.is_empty() {
+            vec![FixturesEntry {
+                source: self
+                    .fixtures_source
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_FIXTURES_SOURCE)),
+                target: DEFAULT_FIXTURES_TARGET.to_owned(),
+                var: Some(DEFAULT_FIXTURES_VAR.to_owned()),
+            }]
         } else {
-            repo_root.join(relative)
+            self.fixtures.clone()
+        };
+        for entry in &mut entries {
+            if !entry.source.is_absolute() {
+                entry.source = repo_root.join(&entry.source);
+            }
         }
+        entries
     }
 
     /// Означает ли код возврата сбой стенда, а не вердикт продукта.
@@ -212,6 +285,15 @@ impl Profile {
 
 /// Каталог фикстур по умолчанию, если профиль не задал свой.
 pub const DEFAULT_FIXTURES_SOURCE: &str = "crates/tessera_core/tests/fixtures";
+
+/// Куда фикстуры по умолчанию едут в окружении.
+///
+/// Всё, что раннер везёт в окружение, живёт под `/opt/tessera-e2e`: один корень
+/// даёт teardown'у единственное место для уборки.
+pub const DEFAULT_FIXTURES_TARGET: &str = "/opt/tessera-e2e/fixtures";
+
+/// Под каким именем фикстуры по умолчанию видны кейсу.
+pub const DEFAULT_FIXTURES_VAR: &str = "fixtures";
 
 /// Возможности из `requires`, которых нет в наборе профиля.
 #[must_use]
@@ -300,12 +382,16 @@ image = "tessera-e2e/ubuntu:24.04"
     }
 
     #[test]
-    fn fixtures_source_defaults_to_the_core_fixtures() {
+    fn fixtures_default_to_the_core_fixtures_under_the_runner_layout() {
         let profile: Profile = toml::from_str(DOCKER_PROFILE).unwrap();
+        let entries = profile.fixture_deliveries(Path::new("/ws/tessera"));
+        assert_eq!(entries.len(), 1);
         assert_eq!(
-            profile.fixtures_source_path(Path::new("/ws/tessera")),
+            entries[0].source,
             PathBuf::from("/ws/tessera/crates/tessera_core/tests/fixtures")
         );
+        assert_eq!(entries[0].target, "/opt/tessera-e2e/fixtures");
+        assert_eq!(entries[0].var.as_deref(), Some("fixtures"));
     }
 
     #[test]
@@ -315,10 +401,15 @@ image = "tessera-e2e/ubuntu:24.04"
             "\nfixtures_source = \"tests/e2e-private/fixtures\"\n\n[docker]",
         );
         let profile: Profile = toml::from_str(&text).unwrap();
+        let entries = profile.fixture_deliveries(Path::new("/ws/tessera"));
+        // Устаревшее поле остаётся синонимом одиночной секции: профиль вне
+        // этого репозитория не должен ломаться от переименования.
         assert_eq!(
-            profile.fixtures_source_path(Path::new("/ws/tessera")),
+            entries[0].source,
             PathBuf::from("/ws/tessera/tests/e2e-private/fixtures")
         );
+        assert_eq!(entries[0].target, DEFAULT_FIXTURES_TARGET);
+        assert_eq!(entries[0].var.as_deref(), Some(DEFAULT_FIXTURES_VAR));
     }
 
     #[test]
@@ -329,9 +420,101 @@ image = "tessera-e2e/ubuntu:24.04"
         );
         let profile: Profile = toml::from_str(&text).unwrap();
         assert_eq!(
-            profile.fixtures_source_path(Path::new("/ws/tessera")),
+            profile.fixture_deliveries(Path::new("/ws/tessera"))[0].source,
             PathBuf::from("/srv/lab/fixtures")
         );
+    }
+
+    #[test]
+    fn several_fixture_sources_are_resolved_against_the_repository_root() {
+        let text = DOCKER_PROFILE.replace(
+            "\n[docker]",
+            r#"
+[[fixtures]]
+source = "crates/tessera_core/tests/fixtures"
+target = "/opt/tessera-e2e/fixtures"
+var = "fixtures"
+
+[[fixtures]]
+source = "tests/fixtures/roles"
+target = "/opt/tessera-e2e/roles"
+var = "roles"
+
+[[fixtures]]
+source = "/srv/lab/extra"
+target = "/opt/tessera-e2e/extra"
+
+[docker]"#,
+        );
+        let profile: Profile = toml::from_str(&text).unwrap();
+        profile.validate().unwrap();
+        let entries = profile.fixture_deliveries(Path::new("/ws/tessera"));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[1].source,
+            PathBuf::from("/ws/tessera/tests/fixtures/roles")
+        );
+        assert_eq!(entries[1].target, "/opt/tessera-e2e/roles");
+        assert_eq!(entries[1].var.as_deref(), Some("roles"));
+        // Абсолютный источник берётся как есть, подстановка необязательна.
+        assert_eq!(entries[2].source, PathBuf::from("/srv/lab/extra"));
+        assert_eq!(entries[2].var, None);
+    }
+
+    #[test]
+    fn the_old_field_and_the_new_section_together_are_rejected() {
+        let text = DOCKER_PROFILE.replace(
+            "\n[docker]",
+            r#"
+fixtures_source = "tests/e2e-private/fixtures"
+
+[[fixtures]]
+source = "tests/fixtures/roles"
+target = "/opt/tessera-e2e/roles"
+
+[docker]"#,
+        );
+        let profile: Profile = toml::from_str(&text).unwrap();
+        let err = profile.validate().unwrap_err().to_string();
+        assert!(err.contains("fixtures_source"), "{err}");
+    }
+
+    #[test]
+    fn a_relative_fixtures_target_is_rejected() {
+        let text = DOCKER_PROFILE.replace(
+            "\n[docker]",
+            r#"
+[[fixtures]]
+source = "tests/fixtures/roles"
+target = "opt/tessera-e2e/roles"
+
+[docker]"#,
+        );
+        let profile: Profile = toml::from_str(&text).unwrap();
+        let err = profile.validate().unwrap_err().to_string();
+        assert!(err.contains("абсолютный путь"), "{err}");
+    }
+
+    #[test]
+    fn two_sources_aimed_at_one_target_are_rejected() {
+        // Перед копированием раннер сносит цель: второй каталог молча съел бы
+        // первый, и кейс проверял бы не тот материал.
+        let text = DOCKER_PROFILE.replace(
+            "\n[docker]",
+            r#"
+[[fixtures]]
+source = "crates/tessera_core/tests/fixtures"
+target = "/opt/tessera-e2e/fixtures"
+
+[[fixtures]]
+source = "tests/fixtures/roles"
+target = "/opt/tessera-e2e/fixtures"
+
+[docker]"#,
+        );
+        let profile: Profile = toml::from_str(&text).unwrap();
+        let err = profile.validate().unwrap_err().to_string();
+        assert!(err.contains("дважды"), "{err}");
     }
 
     #[test]
