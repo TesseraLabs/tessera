@@ -12,7 +12,7 @@ use crate::cli::E2eArgs;
 use crate::exec::{Delivery, ExecDeps, ExecOptions, Executor};
 use crate::interact::{ConsoleOperator, Operator, OperatorError, Verdict};
 use crate::profile::{FixturesEntry, Profile};
-use crate::provenance::Provenance;
+use crate::provenance::{ArtifactProvenance, Provenance};
 use crate::redact::Redactor;
 use crate::registry::{self, Registry};
 use crate::report::{self, CaseResult, RunReport};
@@ -101,6 +101,13 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
         );
     }
 
+    // Провенанс дополнительных артефактов считается до пересоздания окружения:
+    // отсутствующий файл — ошибка описания стенда, и узнать о ней нужно раньше
+    // первого кейса. Заодно отчёт получает контрольные суммы всего, что
+    // приедет в окружение помимо пакета.
+    let stand_artifacts = artifact_provenance(&stand)?;
+    announce_artifacts(&stand_artifacts);
+
     let deliveries = plan_deliveries(&fixtures, &stand, &vars);
     // Проверка до пересоздания окружения: отсутствующий каталог-источник — это
     // ошибка описания стенда, и узнать о ней нужно раньше, чем сборка образа
@@ -143,6 +150,7 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
         profile: profile.name.clone(),
         environment: driver.describe(),
         package: package.clone(),
+        stand_artifacts,
         non_interactive: args.non_interactive,
         keep_on_failure: args.keep_on_failure,
         interrupted: interrupt.load(Ordering::SeqCst),
@@ -178,7 +186,49 @@ fn plan_deliveries(fixtures: &[FixturesEntry], stand: &StandConfig, vars: &Vars)
         };
         Delivery::new(what, entry.source.clone(), target.to_owned())
     }));
+    // Артефакты стенда едут последними: их цели заданы абсолютными путями и от
+    // раскладки раннера не зависят.
+    deliveries.extend(stand.artifacts.iter().map(|artifact| {
+        Delivery::new(
+            format!("артефакт стенда {}", artifact.target),
+            artifact.path.clone(),
+            artifact.target.clone(),
+        )
+        .with_mode(artifact.mode.to_string())
+    }));
     deliveries
+}
+
+/// Называет вслух всё, что поедет в окружение помимо пакета.
+fn announce_artifacts(artifacts: &[ArtifactProvenance]) {
+    if artifacts.is_empty() {
+        return;
+    }
+    let targets: Vec<&str> = artifacts
+        .iter()
+        .map(|artifact| artifact.target.as_str())
+        .collect();
+    eprintln!("помимо пакета в окружение везётся: {}", targets.join(", "));
+}
+
+/// Считает происхождение дополнительных артефактов стенда.
+///
+/// # Ошибки
+///
+/// Отсутствующий или нечитаемый файл-источник любого из артефактов.
+fn artifact_provenance(stand: &StandConfig) -> anyhow::Result<Vec<ArtifactProvenance>> {
+    stand
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            ArtifactProvenance::of_file(
+                &artifact.path,
+                &artifact.target,
+                &artifact.mode.to_string(),
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .collect()
 }
 
 /// Проверяет, что везти есть что.
@@ -557,6 +607,69 @@ image = "i"
         // Пакет из stand.toml в дереве репозитория не лежит — проверяем только
         // каталоги фикстур, которые обязаны существовать.
         check_sources(&deliveries[1..]).unwrap();
+    }
+
+    fn stand_with_artifacts(path: &Path) -> StandConfig {
+        toml::from_str(&format!(
+            r#"
+[package]
+deb = "/art/tessera_0.4.0_amd64.deb"
+
+[[artifacts]]
+path = "{}"
+target = "/usr/local/bin/issuer"
+mode = "0755"
+"#,
+            path.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn extra_stand_artifacts_are_delivered_with_their_mode() {
+        let fixtures = profile().fixture_deliveries(&repo_root());
+        let stand = stand_with_artifacts(Path::new("/build/issuer"));
+        let deliveries = plan_deliveries(&fixtures, &stand, &Vars::new());
+        // Пакет, фикстуры профиля и артефакт стенда.
+        assert_eq!(deliveries.len(), 3);
+        let artifact = &deliveries[2];
+        assert_eq!(artifact.local, PathBuf::from("/build/issuer"));
+        assert_eq!(artifact.remote, "/usr/local/bin/issuer");
+        assert_eq!(artifact.mode.as_deref(), Some("0755"));
+        // Сообщение о сбое доставки должно называть конкретный артефакт.
+        assert_eq!(artifact.what, "артефакт стенда /usr/local/bin/issuer");
+    }
+
+    #[test]
+    fn a_stand_without_the_section_delivers_exactly_what_it_did_before() {
+        let fixtures = profile().fixture_deliveries(&repo_root());
+        let deliveries = plan_deliveries(&fixtures, &stand(), &Vars::new());
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries.iter().all(|delivery| delivery.mode.is_none()));
+        assert!(artifact_provenance(&stand()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_missing_artifact_source_is_reported_before_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let stand = stand_with_artifacts(&dir.path().join("нет-такого-issuer"));
+        let err = artifact_provenance(&stand).unwrap_err().to_string();
+        assert!(err.contains("/usr/local/bin/issuer"), "{err}");
+        assert!(err.contains("не найден"), "{err}");
+    }
+
+    #[test]
+    fn a_delivered_artifact_is_recorded_with_its_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("issuer");
+        std::fs::write(&source, b"issuer").unwrap();
+
+        let recorded = artifact_provenance(&stand_with_artifacts(&source)).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].target, "/usr/local/bin/issuer");
+        assert_eq!(recorded[0].mode, "0755");
+        assert_eq!(recorded[0].size, 6);
+        assert_eq!(recorded[0].sha256.len(), 64);
     }
 
     #[test]

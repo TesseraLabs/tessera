@@ -13,6 +13,11 @@
 | INST-003 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | INST-004 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | INST-005 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| ISS-001 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| ISS-002 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| ISS-003 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| ISS-004 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
+| ISS-005 | FAIL | 2026-07-26 | 0.4.0-1 | ubuntu-container | Красный по расхождению issuer и модуля: `issuer issue-root` выпускает корень без basicConstraints и keyUsage, а проверка цепочки требует у якоря keyUsage с keyCertSign (basic_constraints.rs:109) — выпущенный штатным путём корень доверия непригоден как якорь. Спека cert-issuance обещает обратное: «под которым проходят выпуск CA организаций и вся цепочка проверок Engine». Кейс фиксирует обещанное поведение |
 | REV-001 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | REV-002 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |
 | REV-003 | PASS | 2026-07-26 | 0.4.0-1 | ubuntu-container |  |

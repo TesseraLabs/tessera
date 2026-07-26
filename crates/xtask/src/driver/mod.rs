@@ -185,6 +185,34 @@ pub fn restore_root_ownership(
     })
 }
 
+/// Выставляет доставленному файлу заданные стендом права.
+///
+/// Отдельным шагом после доставки: транспорт переносит права с машины
+/// оператора, а нормализация владельца знает только про запись группы и
+/// остальных. Бинарь, приехавший без бита исполнения, провалил бы кейсы так,
+/// будто продукт сломан.
+///
+/// # Ошибки
+///
+/// Ошибки транспорта и ненулевой код `chmod`.
+pub fn apply_mode(
+    driver: &dyn CommandDriver,
+    remote: &str,
+    mode: &str,
+    timeout: Duration,
+) -> Result<(), DriverError> {
+    let command = format!("chmod {mode} '{remote}'");
+    let outcome = driver.exec(&command, None, timeout)?;
+    if outcome.exit_code == Some(0) {
+        return Ok(());
+    }
+    Err(DriverError::Failed {
+        operation: format!("права {mode} на {remote}"),
+        code: outcome.exit_code.unwrap_or(-1),
+        detail: outcome.stderr,
+    })
+}
+
 /// Родительский каталог пути в целевом окружении.
 #[must_use]
 pub fn remote_parent(remote: &str) -> &str {
@@ -314,6 +342,43 @@ mod tests {
             ["chown -R root:root '/opt/tessera-e2e/fixtures' \
               && chmod -R go-w '/opt/tessera-e2e/fixtures'"]
         );
+    }
+
+    #[test]
+    fn a_delivered_binary_gets_the_mode_the_stand_asked_for() {
+        let driver = FakeDriver {
+            log: RefCell::new(Vec::new()),
+            code: 0,
+        };
+        apply_mode(
+            &driver,
+            "/usr/local/bin/issuer",
+            "0755",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            driver.log.borrow().as_slice(),
+            ["chmod 0755 '/usr/local/bin/issuer'"]
+        );
+    }
+
+    #[test]
+    fn a_failed_chmod_is_reported_as_a_stand_failure() {
+        let driver = FakeDriver {
+            log: RefCell::new(Vec::new()),
+            code: 1,
+        };
+        let err = apply_mode(
+            &driver,
+            "/usr/local/bin/issuer",
+            "0755",
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("/usr/local/bin/issuer"), "{text}");
+        assert!(text.contains("нет прав"), "{text}");
     }
 
     #[test]
