@@ -3,7 +3,12 @@
 #
 # Target role model ("role = role account"): the certificate authorises the
 # `oper` account only, so an attempt to log into `serv` MUST be rejected on the
-# user_binding check, before role coverage is even consulted.
+# user_binding check.
+#
+# allowed_roles deliberately covers `serv` even though user_binding does not
+# admit it. The two checks are separate, and a leaf that failed both would let
+# either one produce the refusal — the case could then pass while the check it
+# names is broken. Failing exactly one check is what makes the case diagnostic.
 #
 # Used by gen-role-account-certs.sh; signed by the CA in ../ca.{key,crt}.pem.
 #
@@ -37,5 +42,6 @@ subjectKeyIdentifier   = hash
 2.25.183976554325829274683049824615098 = DER:30:03:0c:01:2a
 # pam_cert_user_binding = [oper]  (login into `serv` is not authorised at all)
 2.25.215438916728501023845629178354627 = DER:30:06:0c:04:6f:70:65:72
-# pam_cert_allowed_roles = [oper]  (non-critical)
-2.25.185305973969816596290730578528098241367 = DER:30:06:0c:04:6f:70:65:72
+# pam_cert_allowed_roles = [serv]  (non-critical) — covered on purpose, so the
+# only thing that can refuse this login is user_binding.
+2.25.185305973969816596290730578528098241367 = DER:30:06:0c:04:73:65:72:76

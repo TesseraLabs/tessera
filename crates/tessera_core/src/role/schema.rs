@@ -11,8 +11,9 @@ use std::time::Duration;
 /// Maximum size of a role-slice file, in bytes (64 KiB cap, spec requirement).
 pub const MAX_SLICE_BYTES: usize = 64 * 1024;
 
-/// Anchored, suffix-safe role-id pattern (no `+`): used as a `user+role`
-/// login suffix, the on-disk filename, and a MAC code input.
+/// Anchored role-id pattern. The same string is the name of the role account
+/// an engineer logs into, the on-disk slice filename, and a MAC code input, so
+/// it stays within portable Unix account-name syntax.
 static ROLE_ID_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     // Pattern is a compile-time constant verified by `regex_compiles_and_matches`;
     // `expect` here can only fire on a developer typo, never on input.
@@ -53,9 +54,10 @@ impl std::fmt::Display for RoleOs {
 
 /// Validated role identifier: matches `^[a-z][a-z0-9-]{0,15}$`.
 ///
-/// Suffix-safe (contains no `+`) so it can be used as a `user+role`
-/// login suffix, as the on-disk filename, and as a MAC code input
-/// (design decision D4). Immutable: renaming is a new role.
+/// The pattern is a portable Unix account name, because the role id is also
+/// the name of the role account the engineer logs into (`ssh oper@device`);
+/// it doubles as the on-disk slice filename and as a MAC code input.
+/// Immutable: renaming is a new role.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RoleId(String);
 

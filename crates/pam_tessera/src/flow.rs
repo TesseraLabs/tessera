@@ -411,10 +411,9 @@ pub struct Deps<'a> {
     /// display to act on. The cdylib derives this from `PAM_TTY`; tests
     /// that don't care can use [`tessera_proto::SessionTarget::Unknown`].
     pub pam_target: tessera_proto::SessionTarget,
-    /// Role-selection stage (role-format). Carries the requested role, the
-    /// loaded role store, the enforcement mode, and the global default TTL.
-    /// `enforce = Disabled` (the default migration stage) makes the whole
-    /// stage a no-op, preserving pre-role behaviour.
+    /// Role-selection stage. Carries the requested role (the login account
+    /// name), the loaded role store, and the global default TTL. Every login
+    /// carries a role — there is no configuration that disables the stage.
     pub role_stage: RoleStage<'a>,
     /// This device's trusted, applied tag set (tags-delegation §5). Loaded
     /// once per attempt from the configured `[tags]` source. When no source is
@@ -425,7 +424,7 @@ pub struct Deps<'a> {
     pub device_tags: &'a DeviceTags,
 }
 
-/// Inputs to the atomic resolve + coverage stage (role-format, task 4.3/4.4).
+/// Inputs to the atomic resolve + coverage stage.
 ///
 /// Built once per `pam_sm_authenticate` and threaded through [`Deps`] so the
 /// requested role travels with the cert verification — there is no later
@@ -434,7 +433,8 @@ pub struct Deps<'a> {
 /// resolve it against, is rejected before the stage is built — the flow has no
 /// "no role selected" state to represent.
 pub struct RoleStage<'a> {
-    /// The role parsed from the `<user>+<role>` login suffix / prompt.
+    /// The requested role: the name of the account being logged into, which
+    /// in this model IS the role (`ssh oper@device`).
     pub requested: tessera_core::role::RoleId,
     /// The on-device role store (already loaded by the cdylib).
     pub store: &'a tessera_core::role::RoleStore,
@@ -1684,10 +1684,14 @@ impl FlowIo for InMemoryFlowIo {
 /// closed: silently routing such a cert through the legacy mapping
 /// would let a certificate that was meant to restrict users
 /// authenticate via a stale TOML entry instead.
-// Role selection (the `user+role` suffix, PAM_USER canonicalisation, store
-// resolve + allowed-roles coverage) runs separately in `resolve_role_stage`,
-// invoked after cert verification; this function only handles the legacy
-// user↔cert authorisation (user_binding extension or `[[user_mapping]]`).
+// This is one of TWO checks applied to the same name, and they must stay
+// separate. Here: "is the holder allowed into this role account" —
+// `pam_cert_user_binding` (or the legacy `[[user_mapping]]` for certs without
+// the extension). Separately, in `resolve_role_stage` after cert verification:
+// "is the holder allowed to activate this role" — store resolve plus
+// `pam_cert_allowed_roles` coverage. A certificate that admits its holder into
+// account `serv` but does not list role `serv` is a legitimate configuration,
+// and such a login must be refused — merging the two would silently permit it.
 fn authorize_user(
     cert: &Certificate,
     pam_user: &str,
@@ -2559,6 +2563,72 @@ level = "info"
         // ...and deny bob even though a mapping would have allowed him.
         let mappings = vec![cn_mapping("bob", "alice")];
         let err = authorize_user(&cert, "bob", &mappings).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlowError::CertScope(HostBindingError::UserNotAllowed { .. })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// `SEQUENCE { UTF8String "serv" }` — a `user_binding` admitting exactly
+    /// the `serv` role account.
+    const USER_BINDING_SERV_DER: &[u8] = &[0x30, 0x06, 0x0C, 0x04, b's', b'e', b'r', b'v'];
+
+    #[test]
+    fn role_account_login_passes_both_checks() {
+        // The engineer logs into `serv`, so the same string is checked twice:
+        // admission into the account, then permission to activate the role.
+        let cert = cert_with_user_binding_ext(USER_BINDING_SERV_DER);
+        authorize_user(&cert, "serv", &[]).expect("serv account admitted by cert");
+
+        let roles = RoleFixture::serv();
+        let resolution = tessera_core::role::resolve_and_cover(
+            &roles.store,
+            Some(&roles.requested),
+            Some(std::slice::from_ref(&roles.requested)),
+            "serv",
+        );
+        assert!(
+            matches!(resolution, tessera_core::role::Resolution::Allowed { .. }),
+            "got {resolution:?}"
+        );
+    }
+
+    #[test]
+    fn account_admission_does_not_grant_the_same_named_role() {
+        // A certificate that admits its holder into the `serv` account but
+        // lists only `oper` among the allowed roles is a legitimate
+        // configuration, and the login into `serv` must be refused. The two
+        // checks therefore cannot be merged into one.
+        let cert = cert_with_user_binding_ext(USER_BINDING_SERV_DER);
+        authorize_user(&cert, "serv", &[]).expect("account admission still succeeds");
+
+        let roles = RoleFixture::serv();
+        let oper = tessera_core::role::RoleId::new("oper").unwrap();
+        let resolution = tessera_core::role::resolve_and_cover(
+            &roles.store,
+            Some(&roles.requested),
+            Some(&[oper]),
+            "serv",
+        );
+        assert!(
+            matches!(
+                resolution,
+                tessera_core::role::Resolution::Denied {
+                    reason: tessera_core::role::RoleDenyReason::NotCovered
+                }
+            ),
+            "got {resolution:?}"
+        );
+    }
+
+    #[test]
+    fn role_account_outside_user_binding_is_refused() {
+        // `ssh admin@device` against a certificate bound to `serv` only.
+        let cert = cert_with_user_binding_ext(USER_BINDING_SERV_DER);
+        let err = authorize_user(&cert, "admin", &[]).unwrap_err();
         assert!(
             matches!(
                 err,

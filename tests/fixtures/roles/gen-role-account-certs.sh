@@ -4,9 +4,10 @@
 # (`ssh serv@device`), the requested role equals the login account name, and
 # admission is decided by pam_cert_user_binding plus pam_cert_allowed_roles.
 #
-# The suffix form `<user>+<role>` covered by gen-role-certs.sh is the
-# deprecated mechanism; those leaves bind to a human account (`ivanov`) and are
-# left untouched by this script.
+# These leaves are the only ones the module can be exercised with: the suffix
+# form `<user>+<role>` that gen-role-certs.sh produces leaves for no longer
+# exists, and those leaves bind to a human account (`ivanov`) that no login can
+# reach.
 #
 # Pre-conditions:
 #   - openssl >= 3.0 (custom OID with raw DER:.. syntax)

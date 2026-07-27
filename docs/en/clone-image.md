@@ -36,7 +36,7 @@ The steps are performed once, on the reference machine, before taking the image.
 
 ### 2.1 Installing `tessera`
 
-See [install.md §1–§8](install.md). All sections are performed in full, except
+See [install.md §1–§9](install.md). All sections are performed in full, except
 the personal USB medium (section 5): instead of the per-user/.p12, a
 **bootstrap chain** is placed on the reference machine.
 

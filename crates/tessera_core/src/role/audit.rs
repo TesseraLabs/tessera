@@ -41,8 +41,10 @@ pub const REASON_HASH_MISMATCH: &str = "hash_mismatch";
 /// Emit `role_session_open` — a session opened with a resolved role.
 ///
 /// `method` is `cert` or `code`; `ttl_seconds` is the bounded session TTL.
-/// The canonical user name and the role are always separate fields (never a
-/// `user+role` splice).
+/// The account name and the role stay separate fields even though a role
+/// login carries the same value in both: they answer different questions
+/// (which account was entered, which role was activated) and log consumers
+/// must not have to split a composite string to get either.
 pub fn emit_role_session_open(
     user: &str,
     role: &str,

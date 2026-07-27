@@ -23,14 +23,6 @@ cases:
     requires: [service-manager, usb]
     steps:
       - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
-      - run: |
-          install -d -m 0755 -o root -g root /var/lib/tessera/roles
-          install -m 0644 -o root -g root {{roles}}/store/serv.toml /var/lib/tessera/roles/serv.toml
-          cat >> /etc/tessera/config.toml <<'EOF'
-
-          [roles]
-          dir = "/var/lib/tessera/roles"
-          EOF
       # Удостоверение разрешает вход в учётную запись serv и покрывает роль serv.
       - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
       # Отдельного указания роли нет: роль равна имени учётной записи входа.
@@ -54,14 +46,6 @@ cases:
     requires: [service-manager, usb]
     steps:
       - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
-      - run: |
-          install -d -m 0755 -o root -g root /var/lib/tessera/roles
-          install -m 0644 -o root -g root {{roles}}/store/serv.toml /var/lib/tessera/roles/serv.toml
-          cat >> /etc/tessera/config.toml <<'EOF'
-
-          [roles]
-          dir = "/var/lib/tessera/roles"
-          EOF
       # Вход в учётную запись serv разрешён, но список ролей удостоверения
       # содержит только oper: роль существует на устройстве и не покрыта.
       - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv-oper-only.p12
@@ -83,20 +67,15 @@ cases:
     requires: [service-manager, usb]
     steps:
       - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
-      - run: |
-          install -d -m 0755 -o root -g root /var/lib/tessera/roles
-          install -m 0644 -o root -g root {{roles}}/store/serv.toml /var/lib/tessera/roles/serv.toml
-          cat >> /etc/tessera/config.toml <<'EOF'
-
-          [roles]
-          dir = "/var/lib/tessera/roles"
-          EOF
       # Удостоверение допускает вход только в oper: попытка войти в serv должна
-      # отклоняться самим user_binding, до разбора ролей.
+      # отклоняться самим user_binding. Роль serv покрыта удостоверением намеренно,
+      # чтобы отказать могла ровно одна проверка: иначе кейс проходил бы и при
+      # сломанном user_binding — за него отработала бы проверка покрытия роли.
+      # Класс CertScope по таблице маппинга даёт 7 PAM_AUTH_ERR, а не 6.
       - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-foreign.p12
       - run: pam-drive certauth serv authenticate
         stdin: "123456"
-        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
         timeout: 60
     teardown:
       - run: helpers/usb-loop.sh detach
@@ -111,14 +90,9 @@ cases:
       - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
       # Хранилище пустое: роль разрешена удостоверением, но на устройстве не
       # определена. От ROLE-002 отличается именно причиной отказа.
-      - run: |
-          install -d -m 0755 -o root -g root /var/lib/tessera/roles
-          rm -f /var/lib/tessera/roles/serv.toml
-          cat >> /etc/tessera/config.toml <<'EOF'
-
-          [roles]
-          dir = "/var/lib/tessera/roles"
-          EOF
+      # Определение роли снимается из хранилища, которое разложила подготовка:
+      # каталог остаётся, роли в нём нет.
+      - run: rm -f /var/lib/tessera/roles/serv.toml
       - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
       - run: pam-drive certauth serv authenticate
         stdin: "123456"

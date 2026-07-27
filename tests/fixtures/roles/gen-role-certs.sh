@@ -11,9 +11,15 @@
 #
 # Outputs to ./{name}.{key,crt}.pem under tests/fixtures/roles/.
 #
-# Leaves (mirrors the 6.3 role E2E set):
-#   role-serv       pam_cert_allowed_roles = [serv]  -> covers `+serv`
-#   role-oper       pam_cert_allowed_roles = [oper]  -> does NOT cover `+serv`
+# SUPERSEDED: these leaves bind to a human account (`ivanov`) and were driven
+# by the `<user>+<role>` login suffix, which no longer exists — the role is now
+# the login account name. Use gen-role-account-certs.sh for anything that has
+# to authenticate. Kept only because the allowed_roles DER shapes below are
+# still the reference encoding.
+#
+# Leaves:
+#   role-serv       pam_cert_allowed_roles = [serv]
+#   role-oper       pam_cert_allowed_roles = [oper]
 #   role-malformed  pam_cert_allowed_roles = bad DER -> parse-failed, no roles
 #
 # The OID and DER encoding match crates/tessera_core/src/x509/oids.rs and the

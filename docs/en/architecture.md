@@ -173,7 +173,11 @@ The PAM stack makes several calls in the order `auth → account → session`.
    `PAM_AUTHINFO_UNAVAIL`.
 3. Run `self_check` (engine, paths, hooks placeholders). On error —
    `PAM_AUTHINFO_UNAVAIL`.
-4. Read `PAM_USER`, `PAM_SERVICE`, `PAM_TTY` from libpam.
+4. Read `PAM_USER`, `PAM_SERVICE`, `PAM_TTY` from libpam. The requested role is
+   derived from `PAM_USER`: the login account name IS the role. There is no
+   other source of the role, and `PAM_USER` is never rewritten. A name that
+   does not match the `role_id` format refuses the login before the medium is
+   touched.
 5. Assemble the DI graph via `di::wire` (mount, trust, token).
 6. Resolve `host_id` through the chain of sources from the config and compute
    `host_id_hash = sha256(host_id)`.

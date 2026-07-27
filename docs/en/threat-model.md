@@ -343,12 +343,12 @@ token loss falls on operations, not on the module itself:
 
 Compensating controls for `cert-only` (mandatory before deploy):
 
-- a backup access channel without `tessera` (see install.md §8) —
+- a backup access channel without `tessera` (see install.md §9) —
   a separate sshd stack with `UsePAM=no` or a sudoers rule for an
   emergency account;
 - a spare token with the same `pam_cert_user_binding` for every
   privileged user;
-- a documented rescue-recovery procedure (see install.md §10
+- a documented rescue-recovery procedure (see install.md §11
   "Lockout after a failed PAM edit").
 
 ## 5.6 Enforcement backend plugins

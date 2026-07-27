@@ -25,8 +25,9 @@ passphrase-protected `.p12` on a USB filesystem.
 - RSA / ECDSA via OpenSSL for mixed environments.
 - Host binding through per-cert X.509 v3 extensions — a stolen token on
   another machine does not work.
-- Explicit role selection at login (`user+role` suffix or PAM prompt,
-  no default role), authorised by the cert's `pam_cert_allowed_roles`.
+- Explicit role selection at login: the engineer logs into a role account
+  named after the role (`ssh oper@device`), with no default role; the login
+  is authorised by the cert's `pam_cert_allowed_roles`.
 - USB-removal monitoring via udev plus configurable response
   (`lock` / `logout` / `hook` / `shutdown`) via `systemd-logind` D-Bus.
 - Correct suspend/resume handling with a configurable grace window.
@@ -112,7 +113,7 @@ sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sudo
 The legacy flags `--strict` / `--optional` are still accepted as
 deprecated aliases for `--mode=2fa` / `--mode=optional`. Before
 deploying `cert-only`, read the lockout warning in
-[docs/en/install.md §8](docs/en/install.md) and
+[docs/en/install.md §9](docs/en/install.md) and
 [docs/en/operations.md §3.6](docs/en/operations.md).
 
 ## Logging

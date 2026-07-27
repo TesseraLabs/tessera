@@ -27,10 +27,17 @@ CONFIG_DIR="/etc/tessera"
 CA_DIR="$CONFIG_DIR/ca"
 PAM_SERVICE="/etc/pam.d/certauth"
 
-# Удостоверение выписано на CN=alice, host- и user-binding в нём wildcard.
-# Учётная запись окружения должна называться так же, иначе account-фаза
-# откажет по причине, не имеющей отношения к проверяемой гарантии.
-E2E_USER="${TESSERA_E2E_USER:-alice}"
+# Учётная запись входа — ролевая: имя учётной записи и есть запрашиваемая роль.
+# Поэтому имя обязано совпадать с ролью, определение которой раскладывается в
+# хранилище ниже, иначе резолв роли откажет по причине, не имеющей отношения к
+# проверяемой гарантии. Удостоверения фикстур несут user_binding wildcard и
+# allowed_roles, покрывающие эту роль.
+E2E_USER="${TESSERA_E2E_USER:-serv}"
+
+# Каталог ролевых фикстур (определения ролей и ролевые удостоверения). Раннер
+# везёт его отдельно от фикстур ядра.
+ROLES_FIXTURES_DIR="${TESSERA_E2E_ROLES:-/opt/tessera-e2e/roles}"
+ROLE_STORE_DIR="/var/lib/tessera/roles"
 
 EXIT_INTERNAL=70
 
@@ -134,10 +141,28 @@ custom_command_timeout_seconds = 5
 pam_user = "$E2E_USER"
 cert_subject_cn = "$E2E_USER"
 
+[roles]
+dir = "$ROLE_STORE_DIR"
+
 [logging]
 level = "debug"
 EOF
     chmod 0644 "$CONFIG_DIR/config.toml"
+}
+
+# Ролевое хранилище — такая же обязательная часть устройства, как якорь доверия:
+# роль проверяется при каждом входе, и без хранилища не проходит ни один кейс,
+# независимо от того, что он проверяет. Держать это в кейсах значило бы повторять
+# одну и ту же подготовку в каждом и получать отказ резолва там, где проверяется
+# совсем другое.
+deploy_role_store() {
+    local src="$ROLES_FIXTURES_DIR/store/$E2E_USER.toml"
+    [ -s "$src" ] || die_stand \
+        "не найдено определение роли $E2E_USER: $src (каталог ролевых фикстур везёт раннер)"
+    # Хранилище доверяется по правам файловой системы (модель sudoers.d):
+    # каталог и файлы обязаны принадлежать root, иначе продукт их отвергнет.
+    install -d -m 0755 -o root -g root "$ROLE_STORE_DIR"
+    install -m 0644 -o root -g root "$src" "$ROLE_STORE_DIR/$E2E_USER.toml"
 }
 
 deploy_pam_service() {
@@ -171,12 +196,14 @@ main() {
     ensure_user
     deploy_trust
     deploy_config
+    deploy_role_store
     deploy_pam_service
 
     echo "fixtures: $FIXTURES_DIR"
     echo "config: $CONFIG_DIR/config.toml"
+    echo "role store: $ROLE_STORE_DIR"
     echo "pam service: $PAM_SERVICE"
-    echo "user: $E2E_USER"
+    echo "role account: $E2E_USER"
 }
 
 main "$@"

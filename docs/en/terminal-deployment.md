@@ -96,7 +96,9 @@ All four are checked on the device, without a network.
 
 ## 5. Session lifecycle
 
-1. The engineer inserts the media, enters the PIN, selects a role.
+1. The engineer logs into a role account (`ssh oper@device`, or by picking the
+   account on the login screen) — that is what selects the role — inserts the
+   media and enters the PIN.
 2. Engine checks locally: the certificate signature against the trust chain →
    host binding (this device) → lifetime → whether the requested role is
    allowed.

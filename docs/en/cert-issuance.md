@@ -197,9 +197,16 @@ parser tolerates the critical flag, but issuance should be non-critical.
 ## The `allowed_roles` extension (role selection at login)
 
 `pam_cert_allowed_roles` is a non-critical X.509 v3 extension listing the
-`role_id`s that the leaf certificate is entitled to activate at login
-(`user+role`). The semantics are authorization-oriented: a requested role is
-covered if its `role_id` is present in the list.
+`role_id`s that the leaf certificate is entitled to activate at login. The
+requested role is the login account name (`ssh serv@device`). The semantics
+are authorization-oriented: a role is covered if its `role_id` is present in
+the list.
+
+This is not the same as `pam_cert_user_binding`: that one answers "may the
+holder log into this account", while `allowed_roles` answers "may the holder
+activate this role". In the role-account model both checks apply to the same
+string, but they stay separate: a certificate with `user_binding = [serv]` and
+`allowed_roles = [oper]` does not admit a login into `serv`.
 
 OID: `2.25.185305973969816596290730578528098241367`
 
