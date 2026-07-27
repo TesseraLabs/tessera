@@ -10,6 +10,6 @@
 - [x] 8. Фикстуры: `tests/fixtures/roles/accounts/*.cnf` и `crates/tessera_core/tests/fixtures/gen.sh` — убрать выпуск `user_binding`; перевыпустить. Серийники и открытые ключи фикстур ядра НЕ менять (на них завязаны OCSP/CRL)
 - [x] 9. e2e: снять кейс `ROLE-003` — его гарантия схлопнулась в `ROLE-002`; фикстура `acct-foreign` теряет смысл
 - [x] 10. `dist/config/config.toml.example`: убрать `[[user_mapping]]`
-- [ ] 11. `docs/{ru,en}/`: `install.md` (три расширения → два), `configuration.md` (раздел про `[[user_mapping]]`), `cert-issuance.md`, `architecture.md` — везде, где описан допуск по учётной записи
+- [x] 11. `docs/{ru,en}/`: `install.md` (три расширения → два), `configuration.md` (раздел про `[[user_mapping]]`), `cert-issuance.md`, `architecture.md` — везде, где описан допуск по учётной записи
 - [x] 12. `docs/ru/changelog.md` — Breaking, с миграцией
-- [ ] 13. Прогон e2e — все кейсы, кроме снятого, остаются зелёными; обновить `BASELINE.md`
+- [x] 13. Прогон e2e — все 22 кейса зелёные, ROLE-003 снят. Потребовалась правка набора выпуска: кейсы передавали удалённый `--user`, а ISS-003 проверял наличие отозванного расширения. Теперь ISS-003 проверяет две оси рамок и ОТСУТСТВИЕ отозванного OID — с отдельной проверкой разбора сертификата, иначе сбой openssl выглядел бы как «расширения нет»

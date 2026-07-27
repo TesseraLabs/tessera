@@ -66,7 +66,7 @@ cases:
           issuer issue-leaf --backend file --key-file /tmp/issuer-e2e/root.key.pem \
             --parent /tmp/issuer-e2e/root.crt.pem \
             --spki /tmp/issuer-e2e/leaf.spki.pem --subject "CN={{user}}" \
-            --host '*' --user {{user}} --role oper \
+            --host '*' --role oper \
             --not-before $N --not-after $(( N + 3600 )) \
             --journal /tmp/issuer-e2e/journal.ndjson \
             --out /tmp/issuer-e2e/leaf.crt.pem
@@ -108,12 +108,14 @@ cases:
             --parent /tmp/issuer-e2e/root.crt.pem \
             --spki /tmp/issuer-e2e/leaf.spki.pem \
             --subject "CN={{user}}" \
-            --host '*' --user {{user}} --role oper \
+            --host '*' --role oper \
             --not-before $N --not-after $(( N + 3600 )) \
             --journal /tmp/issuer-e2e/journal.ndjson \
             --out /tmp/issuer-e2e/leaf.crt.pem
       # Рамки применения — то, чем удостоверение ограничено: без них лист пускал бы
-      # кого угодно и куда угодно. Проверяются все три расширения.
+      # кого угодно и куда угодно. Осей две: на каких устройствах (host_binding)
+      # и какие роли — а значит и в какие ролевые учётные записи — разрешены
+      # (allowed_roles).
       - run: openssl x509 -in /tmp/issuer-e2e/leaf.crt.pem -noout -text
         expect:
           exit_code: 0
@@ -121,11 +123,19 @@ cases:
       - run: openssl x509 -in /tmp/issuer-e2e/leaf.crt.pem -noout -text
         expect:
           exit_code: 0
-          stdout_matches: '2\.25\.215438916728501023845629178354627'
-      - run: openssl x509 -in /tmp/issuer-e2e/leaf.crt.pem -noout -text
-        expect:
-          exit_code: 0
           stdout_matches: '2\.25\.185305973969816596290730578528098241367'
+      # Отозванный OID user_binding в выпущенном листе присутствовать не должен:
+      # выпуск, продолжающий его класть, означал бы, что удалённый механизм жив.
+      # Разбор сертификата проверяется отдельным шагом до поиска: иначе сбой
+      # самого openssl дал бы пустой вывод и «отсутствие» выглядело бы успехом.
+      - run: |
+          text=$(openssl x509 -in /tmp/issuer-e2e/leaf.crt.pem -noout -text) || exit 1
+          printf '%s' "$text" | grep -q 'X509v3' || exit 1
+          if printf '%s' "$text" | grep -q '2\.25\.215438916728501023845629178354627'; then
+            echo "выпущенный лист несёт отозванное расширение user_binding" >&2
+            exit 1
+          fi
+        expect: { exit_code: 0 }
     teardown:
       - run: rm -rf /tmp/issuer-e2e
 
@@ -159,7 +169,7 @@ cases:
             --parent /tmp/issuer-e2e/root.crt.pem \
             --spki /tmp/issuer-e2e/leaf.spki.pem \
             --subject "CN={{user}}" \
-            --host '*' --user {{user}} --role serv \
+            --host '*' --role serv \
             --not-before $N --not-after $(( N + 3600 )) \
             --journal /tmp/issuer-e2e/journal.ndjson \
             --out /tmp/issuer-e2e/leaf.crt.pem
@@ -203,7 +213,7 @@ cases:
             --parent /tmp/issuer-e2e/root.crt.pem \
             --spki /tmp/issuer-e2e/leaf.spki.pem \
             --subject "CN=serv" \
-            --host '*' --user serv --role serv \
+            --host '*' --role serv \
             --not-before $N --not-after $(( N + 3600 )) \
             --journal /tmp/issuer-e2e/journal.ndjson \
             --out /tmp/issuer-e2e/leaf.crt.pem
