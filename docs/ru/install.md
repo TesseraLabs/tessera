@@ -131,12 +131,12 @@ sudo dmesg | grep -i digsig | tail   # видны ли отказы по под�
 
 ```bash
 # Ссылка на релиз — placeholder; заменить на реальный URL после
-# публикации v0.4.0 (обычно — GitHub Releases или внутренний репозиторий
+# публикации v0.5.0 (обычно — GitHub Releases или внутренний репозиторий
 # Astra Linux). В релизе публикуются только `.deb` в двух вариантах
 # (`…-astra.deb` и `…-ubuntu.deb`, плюс `.changes` и `.buildinfo`
 # для аудита) — готовых файлов контрольных сумм там нет,
 # их считает оператор на доверенной машине (см. §2.2).
-wget https://example.test/releases/tessera_0.4.0-1_amd64.deb
+wget https://example.test/releases/tessera_0.5.0-1_amd64.deb
 ```
 
 ### 2.2 Генерация контрольных сумм (доверенная машина)
@@ -145,7 +145,7 @@ wget https://example.test/releases/tessera_0.4.0-1_amd64.deb
 машине (не на целевой) скриптом `generate-checksums.sh`:
 
 ```bash
-scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
+scripts/generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
 ```
 
 Скрипт кладёт в каталог `checksums/` файл `checksums.txt` —
@@ -162,7 +162,7 @@ scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
 ### 2.3 Проверка на целевой машине
 
 ```bash
-./verify-checksums.sh tessera_0.4.0-1_amd64.deb checksums.txt
+./verify-checksums.sh tessera_0.5.0-1_amd64.deb checksums.txt
 ```
 
 Ожидание: `OK: N checksum(s) verified`. Скрипт (описан в
@@ -176,7 +176,7 @@ scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
 ### 2.4 Установка
 
 ```bash
-sudo apt install ./tessera_0.4.0-1_amd64.deb
+sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
 `apt` подтянет недостающие зависимости (`libgost-engine | gost-engine`,
@@ -272,7 +272,7 @@ test -d /run/tessera && echo "runtime dir OK"
 test -S /run/tessera/monitord.sock && echo "socket OK"
 ```
 
-Ожидание: версия `0.4.0`, обе строки `OK`.
+Ожидание: версия `0.5.0`, обе строки `OK`.
 
 ## 3. Создание тестового CA (ГОСТ)
 

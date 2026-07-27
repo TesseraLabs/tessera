@@ -425,16 +425,16 @@ pub struct Deps<'a> {
 
 /// Inputs to the atomic resolve + coverage stage.
 ///
-/// Built once per `pam_sm_authenticate` and threaded through [`Deps`] so the
-/// requested role travels with the cert verification — there is no later
-/// re-read of `PAM_USER` and no swap window (polkit CVE-2021-3560).
-/// Both fields are mandatory: a login without a role, or without a store to
-/// resolve it against, is rejected before the stage is built — the flow has no
-/// "no role selected" state to represent.
+/// Built once per `pam_sm_authenticate` and threaded through [`Deps`].
+///
+/// The stage deliberately does **not** carry the requested role. The role is
+/// the login account name, so it is derived inside the flow from the same
+/// `pam_user` string every other step uses: a role that disagreed with
+/// `PAM_USER` would be an escalation (polkit CVE-2021-3560 class), and the
+/// cheapest way to guarantee it cannot happen is to leave no place to put it.
+/// A store is mandatory — a login without one is rejected before the stage is
+/// built, because coverage cannot be proven without it.
 pub struct RoleStage<'a> {
-    /// The requested role: the name of the account being logged into, which
-    /// in this model IS the role (`ssh oper@device`).
-    pub requested: tessera_core::role::RoleId,
     /// The on-device role store (already loaded by the cdylib).
     pub store: &'a tessera_core::role::RoleStore,
     /// Global default session TTL from `[roles].default_session_ttl`.
@@ -497,6 +497,12 @@ where
     P: FnMut(&str) -> Result<SecretString, PamConvError>,
 {
     use tessera_core::config::validated::{CryptoBackend, Mode};
+    // A login account name that cannot be a role id at all is refused here,
+    // before any credential material is touched — no PIN prompt, no USB mount,
+    // no token session. The derived value is discarded: the resolve stage
+    // re-derives it from the same `pam_user` string, so the two cannot
+    // disagree, and no caller gets a chance to supply a different role.
+    requested_role(pam_user)?;
     // Show a one-line greeter banner identifying THIS device before any
     // prompt. fly-dm forwards `PAM_TEXT_INFO` to the greeter UI when
     // `greeter-show-messages` is enabled, so the operator and the
@@ -1659,6 +1665,37 @@ impl FlowIo for InMemoryFlowIo {
 /// the cert was issued for, which is the actionable information for a
 /// "wrong flash" mix-up. When the cert is also encrypted (legacy bundles)
 /// we degrade gracefully to a generic password-wrong message.
+/// Derive the requested role from the login account name.
+///
+/// The account being logged into IS the role (`ssh oper@device`), so
+/// `pam_user` is the single source. Every caller in this module goes through
+/// here, which is what makes "requested role ≠ `PAM_USER`" unrepresentable
+/// rather than merely checked.
+///
+/// # Errors
+///
+/// Returns [`FlowError::RoleDenied`] with [`RoleDenyReason::Syntax`] when the
+/// name cannot be a role id. The `role_deny` audit event is emitted here so
+/// the refusal is visible regardless of which caller triggered it.
+fn requested_role(pam_user: &str) -> Result<tessera_core::role::RoleId, FlowError> {
+    use tessera_core::role::RoleDenyReason;
+
+    crate::role_selection::role_from_account(pam_user).map_err(|error| {
+        tracing::warn!(
+            target: "tessera.flow",
+            error = %error,
+            pam_user = %pam_user,
+            "login account name is not a role; refused before any credential is touched"
+        );
+        tessera_core::role::audit::emit_role_deny(
+            pam_user,
+            pam_user,
+            RoleDenyReason::Syntax.as_str(),
+        );
+        FlowError::RoleDenied(RoleDenyReason::Syntax)
+    })
+}
+
 /// Atomic resolve + coverage stage (role-format, tasks 4.3/4.4).
 ///
 /// Runs **after** the cert chain is verified and **before** the session
@@ -1684,6 +1721,11 @@ fn resolve_role_stage(
         self, resolve_and_cover, CoverageMethod, Resolution, SessionRolePayload,
     };
 
+    // The requested role is the login account name and nothing else. Deriving
+    // it here — from the same string the whole flow was driven with — is what
+    // keeps the resolved role and `PAM_USER` in lockstep.
+    let requested = requested_role(user)?;
+
     // Extract the cert's allowed_roles extension (fail-closed on malformed).
     let allowed: Option<Vec<role::RoleId>> =
         match tessera_core::x509::allowed_roles_ext::extract_allowed_roles(verified_leaf) {
@@ -1705,12 +1747,7 @@ fn resolve_role_stage(
             }
         };
 
-    let resolution = resolve_and_cover(
-        stage.store,
-        Some(&stage.requested),
-        allowed.as_deref(),
-        user,
-    );
+    let resolution = resolve_and_cover(stage.store, Some(&requested), allowed.as_deref(), user);
 
     let (slice, method) = match resolution {
         Resolution::Denied { reason } => return Err(FlowError::RoleDenied(reason)),
@@ -2011,10 +2048,12 @@ mod tests {
     }
 
     /// A complete role stage for flow tests: an on-disk store holding the
-    /// `serv` role plus a request naming it.
+    /// `serv` role.
     ///
     /// Every authentication resolves a role, so there is no "no role" stage to
-    /// fall back on. The `leaf_rsa` / `leaf_ecdsa` fixtures carry
+    /// fall back on. The requested role is not part of the stage — it is the
+    /// login account name, so flow tests must authenticate as `serv` for this
+    /// store to resolve. The `leaf_rsa` / `leaf_ecdsa` fixtures carry
     /// `pam_cert_allowed_roles = [serv, oper]`, which is what proves coverage.
     struct RoleFixture {
         _dir: tempfile::TempDir,
@@ -2045,9 +2084,11 @@ mod tests {
             }
         }
 
+        /// The login account name that resolves this fixture's role.
+        const ACCOUNT: &'static str = "serv";
+
         fn stage(&self) -> RoleStage<'_> {
             RoleStage {
-                requested: self.requested.clone(),
                 store: &self.store,
                 default_session_ttl: Duration::from_secs(
                     tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
@@ -2159,9 +2200,14 @@ level = "info"
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-1".into(), |_| {
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
+        let outcome = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-1".into(),
+            |_| Ok(SecretString::from("correct-pin".to_string())),
+        )
         .expect("happy path");
         assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
         assert_eq!(
@@ -2196,9 +2242,14 @@ level = "info"
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        let outcome = authenticate(deps, &io, "bob", "ssh", "sess-2".into(), |_| {
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
+        let outcome = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-2".into(),
+            |_| Ok(SecretString::from("correct-pin".to_string())),
+        )
         .expect("happy path ecdsa");
         assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("bob"));
         assert_eq!(
@@ -2232,10 +2283,17 @@ level = "info"
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
         let attempts = std::cell::Cell::new(0_u32);
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-3".into(), |_| {
-            attempts.set(attempts.get() + 1);
-            Ok(SecretString::from("badpin".to_string()))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-3".into(),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Ok(SecretString::from("badpin".to_string()))
+            },
+        )
         .unwrap_err();
         assert!(matches!(err, FlowError::MaxTries));
         assert_eq!(attempts.get(), 3);
@@ -2264,9 +2322,14 @@ level = "info"
             device_tags: empty_device_tags(),
         };
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-4".into(), |_| {
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-4".into(),
+            |_| Ok(SecretString::from("correct-pin".to_string())),
+        )
         .unwrap_err();
         assert!(matches!(
             err,
@@ -2303,9 +2366,14 @@ level = "info"
 
         let mut io = InMemoryFlowIo::new(tmp.path().to_path_buf());
         io.device.serial = None;
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-noserial".into(), |_| {
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-noserial".into(),
+            |_| Ok(SecretString::from("correct-pin".to_string())),
+        )
         .unwrap_err();
         assert!(matches!(err, FlowError::UsbSerialMissing), "got {err:?}");
         assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
@@ -2341,9 +2409,14 @@ level = "info"
 
         let mut io = InMemoryFlowIo::new(tmp.path().to_path_buf());
         io.device.serial = None;
-        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-noserial-ok".into(), |_| {
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
+        let outcome = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-noserial-ok".into(),
+            |_| Ok(SecretString::from("correct-pin".to_string())),
+        )
         .expect("permissive monitoring allows a serial-less device");
         assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
         assert!(outcome.auth_ctx.usb_serial.is_none());
@@ -2416,6 +2489,69 @@ level = "info"
         );
     }
 
+    /// Self-signed leaf carrying a `pam_cert_allowed_roles` extension whose
+    /// DER body is truncated: the outer SEQUENCE claims five content bytes
+    /// but only three follow.
+    fn malformed_allowed_roles_leaf() -> tessera_core::x509::VerifiedX509 {
+        use openssl::asn1::{Asn1Integer, Asn1Object, Asn1OctetString, Asn1Time};
+        use openssl::bn::BigNum;
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::rsa::Rsa;
+        use openssl::x509::{X509Builder, X509Extension, X509NameBuilder};
+
+        let key = PKey::from_rsa(Rsa::generate(2048).expect("rsa")).expect("pkey");
+        let mut name = X509NameBuilder::new().expect("name builder");
+        name.append_entry_by_text("CN", "malformed-allowed-roles")
+            .expect("subject CN");
+        let name = name.build();
+        let mut cert = X509Builder::new().expect("cert builder");
+        cert.set_version(2).expect("version");
+        let serial = BigNum::from_u32(1).expect("serial");
+        cert.set_serial_number(&Asn1Integer::from_bn(&serial).expect("asn1 serial"))
+            .expect("set serial");
+        cert.set_subject_name(&name).expect("subject");
+        cert.set_issuer_name(&name).expect("issuer");
+        cert.set_pubkey(&key).expect("pubkey");
+        cert.set_not_before(&Asn1Time::days_from_now(0).expect("not before"))
+            .expect("set not before");
+        cert.set_not_after(&Asn1Time::days_from_now(365).expect("not after"))
+            .expect("set not after");
+
+        let malformed_der = [0x30_u8, 0x05, 0x02, 0x01, 0x02];
+        let oid = Asn1Object::from_str(tessera_core::x509::oids::ALLOWED_ROLES_OID).expect("OID");
+        let octets = Asn1OctetString::new_from_bytes(&malformed_der).expect("octets");
+        let extension =
+            X509Extension::new_from_der(&oid, false, &octets).expect("allowed_roles extension");
+        cert.append_extension(extension)
+            .expect("append allowed_roles");
+        cert.sign(&key, MessageDigest::sha256()).expect("sign");
+        tessera_core::x509::VerifiedX509::from_trusted_for_test(cert.build())
+    }
+
+    #[test]
+    fn malformed_allowed_roles_denies_every_account() {
+        // The parser and the coverage check are each tested on their own; this
+        // covers the seam between them, where a malformed extension is turned
+        // into an empty admission list. "Empty" and "absent" must behave the
+        // same — the alternative, skipping the check when the list cannot be
+        // read, would make a corrupted extension grant everything.
+        let roles = RoleFixture::serv();
+        let leaf = malformed_allowed_roles_leaf();
+
+        let err = resolve_role_stage(&leaf, &roles.stage(), RoleFixture::ACCOUNT, None)
+            .expect_err("a malformed admission list must not admit anything");
+
+        assert!(
+            matches!(
+                err,
+                FlowError::RoleDenied(tessera_core::role::RoleDenyReason::NotCovered)
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
+    }
+
     #[test]
     fn pkcs12_pin_prompt_from_config_reaches_prompter() {
         let tmp = stage_p12_mount("leaf_rsa.p12", false);
@@ -2439,10 +2575,17 @@ level = "info"
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
         let seen = std::cell::RefCell::new(Vec::new());
-        authenticate(deps, &io, "alice", "ssh", "sess-prompt".into(), |p| {
-            seen.borrow_mut().push(p.to_string());
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
+        authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-prompt".into(),
+            |p| {
+                seen.borrow_mut().push(p.to_string());
+                Ok(SecretString::from("correct-pin".to_string()))
+            },
+        )
         .expect("happy path with custom prompt");
         assert_eq!(seen.borrow().as_slice(), ["PIN: "]);
     }
@@ -2582,9 +2725,14 @@ level = "info"
             device_tags: empty_device_tags(),
         };
         let io = dummy_flow_io();
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-p11-1".into(), |_| {
-            Ok(SecretString::from("any"))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-p11-1".into(),
+            |_| Ok(SecretString::from("any")),
+        )
         .err()
         .expect("must fail");
         assert!(matches!(err, FlowError::Pkcs11OpensslEngineNotImplemented));
@@ -2612,9 +2760,14 @@ level = "info"
             device_tags: empty_device_tags(),
         };
         let io = dummy_flow_io();
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-p11-2".into(), |_| {
-            Ok(SecretString::from("any"))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-p11-2".into(),
+            |_| Ok(SecretString::from("any")),
+        )
         .err()
         .expect("must fail");
         assert!(
@@ -2648,7 +2801,7 @@ level = "info"
         let err = authenticate(
             deps,
             &io,
-            "alice",
+            RoleFixture::ACCOUNT,
             "ssh",
             "sess-p11-strict-dispatch".into(),
             |_| Ok(SecretString::from("unused")),
@@ -2684,7 +2837,7 @@ level = "info"
         let err = authenticate_pkcs11::<NoopMountOps, _, _>(
             deps,
             &stub,
-            "alice",
+            RoleFixture::ACCOUNT,
             "ssh",
             "sess-p11-strict".into(),
             |_| Ok(SecretString::from("unused")),
@@ -2725,7 +2878,7 @@ level = "info"
         let err = authenticate_pkcs11::<NoopMountOps, _, _>(
             deps,
             &stub,
-            "alice",
+            RoleFixture::ACCOUNT,
             "ssh",
             "sess-p11-3".into(),
             |_| Ok(SecretString::from("badpin")),
@@ -2767,7 +2920,7 @@ level = "info"
         let err = authenticate_pkcs11::<NoopMountOps, _, _>(
             deps,
             &stub,
-            "alice",
+            RoleFixture::ACCOUNT,
             "ssh",
             "sess-p11-4".into(),
             |_| Ok(SecretString::from("any")),
@@ -2806,7 +2959,7 @@ level = "info"
         let err = authenticate_pkcs11::<NoopMountOps, _, _>(
             deps,
             &stub,
-            "alice",
+            RoleFixture::ACCOUNT,
             "ssh",
             "sess-p11-5".into(),
             |_| Ok(SecretString::from("any")),
@@ -2939,9 +3092,14 @@ level = "info"
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        authenticate(deps, &io, "alice", "ssh", "sess-h1".into(), |_| {
-            Ok(SecretString::from("correct-pin"))
-        })
+        authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-h1".into(),
+            |_| Ok(SecretString::from("correct-pin")),
+        )
         .expect("happy path with hooks");
 
         let calls = exec.calls();
@@ -2976,9 +3134,14 @@ level = "info"
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-h2".into(), |_| {
-            Ok(SecretString::from("correct-pin"))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-h2".into(),
+            |_| Ok(SecretString::from("correct-pin")),
+        )
         .unwrap_err();
         assert!(matches!(err, FlowError::PreAuthHook(_)), "got {err:?}");
         assert_eq!(err.pam_code(), 7, "PAM_AUTH_ERR");
@@ -3020,9 +3183,14 @@ level = "info"
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-h3".into(), |_| {
-            Ok(SecretString::from("correct-pin"))
-        })
+        let outcome = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-h3".into(),
+            |_| Ok(SecretString::from("correct-pin")),
+        )
         .expect("warn must not abort");
         assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
         // Hook was indeed invoked.
@@ -3064,7 +3232,7 @@ level = "info"
         let err = authenticate_pkcs11::<NoopMountOps, _, _>(
             deps,
             &stub,
-            "alice",
+            RoleFixture::ACCOUNT,
             "ssh",
             "sess-h4".into(),
             |_| Ok(SecretString::from("any")),
@@ -3215,9 +3383,14 @@ level = "info"
             device_tags: empty_device_tags(),
         };
 
-        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-fb1".into(), |_| {
-            Ok(SecretString::from("correct-pin"))
-        })
+        let outcome = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-fb1".into(),
+            |_| Ok(SecretString::from("correct-pin")),
+        )
         .expect("must fall back to partition 2 and authenticate");
 
         assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
@@ -3270,9 +3443,14 @@ level = "info"
             device_tags: empty_device_tags(),
         };
 
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-fb2".into(), |_| {
-            Ok(SecretString::from("correct-pin"))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-fb2".into(),
+            |_| Ok(SecretString::from("correct-pin")),
+        )
         .unwrap_err();
         assert!(
             matches!(err, FlowError::P12Envelope(_)),
@@ -3333,9 +3511,14 @@ level = "info"
             device_tags: empty_device_tags(),
         };
 
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-empty".into(), |_| {
-            Ok(SecretString::from("any"))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-empty".into(),
+            |_| Ok(SecretString::from("any")),
+        )
         .unwrap_err();
         assert!(
             matches!(err, FlowError::Discovery(_)),
@@ -3387,9 +3570,14 @@ level = "info"
             device_tags: empty_device_tags(),
         };
 
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-wpin".into(), |_| {
-            Ok(SecretString::from("definitely-wrong-pin"))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-wpin".into(),
+            |_| Ok(SecretString::from("definitely-wrong-pin")),
+        )
         .unwrap_err();
         assert!(
             matches!(err, FlowError::MaxTries),
@@ -3563,9 +3751,14 @@ level = "info"
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-mon-strict".into(), |_| {
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
+        let err = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-mon-strict".into(),
+            |_| Ok(SecretString::from("correct-pin".to_string())),
+        )
         .expect_err("strict monitor failure must deny auth");
         assert!(
             matches!(err, FlowError::MonitorRegistration(_)),
@@ -3598,9 +3791,14 @@ level = "info"
         };
 
         let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        let outcome = authenticate(deps, &io, "alice", "ssh", "sess-mon-perm".into(), |_| {
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
+        let outcome = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-mon-perm".into(),
+            |_| Ok(SecretString::from("correct-pin".to_string())),
+        )
         .expect("permissive monitor failure must not block auth");
         assert_eq!(outcome.auth_ctx.cert_cn.as_deref(), Some("alice"));
     }

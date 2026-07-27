@@ -105,9 +105,14 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
 
     // 4. Drive the flow.
     let io = InMemoryFlowIo::new(usb_tmp.path().to_path_buf());
-    let _outcome = authenticate(deps, &io, "alice", "ssh", "sess-smoke".into(), |_| {
-        Ok(SecretString::from("correct-pin"))
-    })
+    let _outcome = authenticate(
+        deps,
+        &io,
+        RoleFixture::ACCOUNT,
+        "ssh",
+        "sess-smoke".into(),
+        |_| Ok(SecretString::from("correct-pin")),
+    )
     .expect("flow with real fork+execve hook");
 
     // 5. Assert the marker exists and contains the expected line.

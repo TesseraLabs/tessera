@@ -1,3 +1,25 @@
+tessera (0.5.0-1) unstable; urgency=medium
+
+  * Breaking: the requested role is the login account name. The
+    <user>+<role> suffix and the role PAM prompt are gone, and the module
+    no longer rewrites PAM_USER. An account name that is not a valid
+    role_id (^[a-z][a-z0-9-]{0,15}$) is refused before any credential is
+    read. Role accounts must exist on the device before upgrading.
+  * Breaking: admission to the login account is decided by a single list,
+    the certificate's pam_cert_allowed_roles extension. The
+    pam_cert_user_binding extension, `issuer issue-leaf --user` and the
+    [[user_mapping]] config section are removed; a config still carrying
+    [[user_mapping]] is rejected at startup with a targeted diagnostic.
+  * Breaking: `issuer issue-root` and `issuer issue-ca` require
+    --allow-role and reject --max-ttl 0.
+  * The session and account phases now verify PAM_USER against the account
+    fixed at authenticate time, and refuse when it changed or cannot be
+    read. Previously the session phase acted on the live PAM_USER, falling
+    back to the certificate CN when it could not be read.
+  * PAM_MAXTRIES is reported as 11, not 8.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Mon, 27 Jul 2026 20:49:29 +0300
+
 tessera (0.4.0-1) unstable; urgency=medium
 
   * Project renamed pam_certauth -> Tessera. The source and binary package

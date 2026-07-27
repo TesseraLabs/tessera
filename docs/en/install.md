@@ -136,12 +136,12 @@ not go through — `pam_tessera.so` simply does not load. See also
 
 ```bash
 # The release link is a placeholder; replace it with the real URL after
-# v0.4.0 is published (usually GitHub Releases or the Astra Linux
+# v0.5.0 is published (usually GitHub Releases or the Astra Linux
 # internal repository). The release publishes only the `.deb` in two
 # variants (`…-astra.deb` and `…-ubuntu.deb`, plus `.changes` and
 # `.buildinfo` for audit) — there are no ready-made checksum files there;
 # the operator computes them on a trusted machine (see §2.2).
-wget https://example.test/releases/tessera_0.4.0-1_amd64.deb
+wget https://example.test/releases/tessera_0.5.0-1_amd64.deb
 ```
 
 ### 2.2 Generating the checksums (trusted machine)
@@ -151,7 +151,7 @@ The checksums are computed by the builder or the operator on a
 script:
 
 ```bash
-scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
+scripts/generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
 ```
 
 The script puts a `checksums.txt` file into the `checksums/` directory —
@@ -169,7 +169,7 @@ self-contained — the only external thing it needs is `openssl` with
 ### 2.3 Verifying on the target machine
 
 ```bash
-./verify-checksums.sh tessera_0.4.0-1_amd64.deb checksums.txt
+./verify-checksums.sh tessera_0.5.0-1_amd64.deb checksums.txt
 ```
 
 Expected: `OK: N checksum(s) verified`. The script (described in
@@ -184,7 +184,7 @@ cause is understood.
 ### 2.4 Installation
 
 ```bash
-sudo apt install ./tessera_0.4.0-1_amd64.deb
+sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
 `apt` will pull in the missing dependencies (`libgost-engine | gost-engine`,
@@ -282,7 +282,7 @@ test -d /run/tessera && echo "runtime dir OK"
 test -S /run/tessera/monitord.sock && echo "socket OK"
 ```
 
-Expected: version `0.4.0`, both `OK` lines.
+Expected: version `0.5.0`, both `OK` lines.
 
 ## 3. Creating a test CA (GOST)
 

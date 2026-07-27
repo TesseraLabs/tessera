@@ -32,8 +32,14 @@ fn leaf_serial(name: &str) -> String {
 #[test]
 fn wrong_pin_three_times_returns_max_tries() {
     let _serial = leaf_serial("leaf_rsa.pem");
-    let err =
-        run_flow_with("leaf_rsa.p12", "alice", "wrong-pin", vec![], "host-T-hash").unwrap_err();
+    let err = run_flow_with(
+        "leaf_rsa.p12",
+        RoleFixture::ACCOUNT,
+        "wrong-pin",
+        vec![],
+        "host-T-hash",
+    )
+    .unwrap_err();
     assert!(matches!(err, FlowError::MaxTries));
     assert_eq!(err.pam_code(), 11, "PAM_MAXTRIES");
 }
@@ -64,9 +70,14 @@ fn missing_p12_returns_authinfo_unavail() {
         device_tags: pam_tessera::flow::empty_device_tags(),
     };
     let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-    let err = authenticate(deps, &io, "alice", "ssh", "sess-x".into(), |_| {
-        Ok(SecretString::from("correct-pin"))
-    })
+    let err = authenticate(
+        deps,
+        &io,
+        RoleFixture::ACCOUNT,
+        "ssh",
+        "sess-x".into(),
+        |_| Ok(SecretString::from("correct-pin")),
+    )
     .unwrap_err();
     assert!(matches!(
         err,
@@ -91,7 +102,7 @@ fn uncovered_leaf_fails_closed_perm_denied() {
     let _serial = leaf_serial("leaf_rsa.pem");
     let err = run_flow_with(
         "leaf_rsa.p12",
-        "alice",
+        RoleFixture::ACCOUNT,
         "correct-pin",
         vec![read_fixture("crl_foreign.pem")],
         "host-T-hash",
@@ -133,7 +144,7 @@ fn expired_cert_returns_perm_denied() {
     let _serial = leaf_serial("expired_leaf.pem");
     let err = run_flow_with(
         "expired_leaf.p12",
-        "alice",
+        RoleFixture::ACCOUNT,
         "correct-pin",
         vec![],
         "host-T-hash",

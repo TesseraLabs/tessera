@@ -21,8 +21,8 @@ test-support = []
 mac-tests = ["tessera_core/mac-tests"]
 
 [dependencies]
-tessera_core = { path = "../tessera_core", version = "0.4.0" }
-tessera_proto = { path = "../tessera_proto", version = "0.4.0" }
+tessera_core = { path = "../tessera_core", version = "0.5.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time", "sync", "process"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }

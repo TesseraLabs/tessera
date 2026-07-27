@@ -11,6 +11,7 @@ pub mod pam_args;
 pub mod panic_guard;
 pub mod role_selection;
 pub mod session;
+pub mod session_identity;
 pub mod xdg_capture;
 
 #[cfg(target_os = "linux")]

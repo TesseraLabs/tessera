@@ -26,8 +26,8 @@ pkcs11-tests = ["tessera_core/pkcs11-tests"]
 mac-tests = ["tessera_core/mac-tests"]
 
 [dependencies]
-tessera_core = { path = "../tessera_core", version = "0.4.0" }
-tessera_proto = { path = "../tessera_proto", version = "0.4.0" }
+tessera_core = { path = "../tessera_core", version = "0.5.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 syslog = { workspace = true }
@@ -44,6 +44,10 @@ uuid = { workspace = true }
 pam-sys = { workspace = true }
 
 [dev-dependencies]
+# `mac-tests` carries `VerifiedX509::from_trusted_for_test`, which unit tests
+# need to hand a hand-built leaf to the extension-parsing stages. Declared as a
+# dev-dependency so the escape hatch exists only while building test targets.
+tessera_core = { path = "../tessera_core", version = "0.5.0", features = ["mac-tests"] }
 tempfile = { workspace = true }
 toml = { workspace = true }
 

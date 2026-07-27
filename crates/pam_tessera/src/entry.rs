@@ -14,7 +14,13 @@
 //!
 //! The other `pam_sm_*` hooks (`acct_mgmt`, `open_session`, `close_session`,
 //! `setcred`) are wired to the [`AuthContext`] stored in PAM data by
-//! `pam_sm_authenticate`.
+//! `pam_sm_authenticate`. Each of them re-reads `PAM_USER` only to check it
+//! against the account fixed in that context — see
+//! `verified_session_account`. `PAM_USER` is application-owned mutable
+//! state, so between the authentication and session phases it can name a
+//! different account than the certificate admitted; acting on the new name
+//! would grant that account the MAC label and the privileged hooks of a login
+//! it never passed.
 #![allow(
     clippy::similar_names,
     clippy::doc_markdown,
@@ -36,14 +42,18 @@ const PAM_AUTH_ERR: i32 = 7;
 const PAM_SYSTEM_ERR: i32 = 4;
 #[cfg(target_os = "linux")]
 const PAM_ACCT_EXPIRED: i32 = 13;
+/// `PAM_PERM_DENIED` — the verdict code for "the credential does not authorise
+/// this", which is what a `PAM_USER` that the certificate was never checked
+/// against amounts to. Matches the role-denial row of the
+/// [`crate::flow::FlowError::pam_code`] table.
+#[cfg(target_os = "linux")]
+const PAM_PERM_DENIED: i32 = 6;
 
 /// Owned holder for the role-selection stage: keeps the loaded
 /// [`tessera_core::role::RoleStore`] alive for the lifetime of the flow so
 /// [`crate::flow::Deps`] can borrow it. Built by [`build_role_stage`].
 #[cfg(target_os = "linux")]
 struct RoleStageOwned {
-    /// Requested role — the name of the account being logged into.
-    requested: tessera_core::role::RoleId,
     /// Loaded role store.
     store: tessera_core::role::RoleStore,
     /// Global default TTL from `[roles].default_session_ttl`.
@@ -55,18 +65,18 @@ impl RoleStageOwned {
     /// Borrow this owned stage as the flow's [`crate::flow::RoleStage`].
     fn as_deps(&self) -> crate::flow::RoleStage<'_> {
         crate::flow::RoleStage {
-            requested: self.requested.clone(),
             store: &self.store,
             default_session_ttl: self.default_session_ttl,
         }
     }
 }
 
-/// Build the role-selection stage from config + the requested role.
+/// Build the role-selection stage from config.
 ///
-/// The requested role is the login account name, already derived from
-/// `PAM_USER` by the caller; this function only loads the on-device store in
-/// standalone mode (filesystem-permission trust).
+/// Only the on-device store is loaded here (standalone mode, filesystem-
+/// permission trust). The requested role is *not* part of the stage: the flow
+/// derives it from the same `PAM_USER` string it authenticates with, so this
+/// entry point has no way to hand it a different one.
 ///
 /// Returns the owned stage, or a PAM return code when the store could not be
 /// loaded. That is fail-closed: coverage cannot be proven without a store, and
@@ -75,7 +85,6 @@ impl RoleStageOwned {
 fn build_role_stage(
     roles_cfg: &tessera_core::config::validated::RolesSection,
     device_os: tessera_core::role::RoleOs,
-    requested: tessera_core::role::RoleId,
 ) -> Result<RoleStageOwned, i32> {
     use tessera_core::role::{RoleDenyReason, RoleStore, TrustMode};
 
@@ -100,7 +109,6 @@ fn build_role_stage(
     };
 
     Ok(RoleStageOwned {
-        requested,
         store,
         default_session_ttl: roles_cfg.default_session_ttl,
     })
@@ -213,6 +221,57 @@ fn parse_pam_tty(tty: Option<&str>) -> tessera_proto::SessionTarget {
     }
 }
 
+/// Read `PAM_USER` off the live handle and check it against the account the
+/// stored [`AuthContext`] was authorised for.
+///
+/// Returns the authorised account name — taken from the context, not from the
+/// handle — so callers physically cannot keep using the unverified value.
+///
+/// Every post-authentication phase goes through here. `PAM_USER` is mutable
+/// state owned by the application, not by this module, so by the time a
+/// session or account callback runs it may name a different account than the
+/// one the certificate admitted. Acting on it unchecked would apply a MAC
+/// label and run privileged hooks for an account no credential ever covered.
+/// Both failure modes — a name that changed, and a `PAM_USER` that cannot be
+/// read at all — are refused; there is deliberately no fallback name, least of
+/// all the certificate CN, which identifies the engineer rather than the role
+/// account.
+///
+/// # Safety
+///
+/// `pamh` must be the live PAM handle for the current callback.
+#[cfg(target_os = "linux")]
+unsafe fn verified_session_account<'ctx>(
+    pamh: *mut pam_sys::pam_handle_t,
+    ctx: &'ctx tessera_core::pam_data::AuthContext,
+) -> Option<&'ctx str> {
+    // SAFETY: `pamh` is the live PAM handle (caller contract).
+    let observed = match unsafe { crate::pam_helpers::pam_get_user_string(pamh) } {
+        Ok(user) => user,
+        Err(err) => {
+            tracing::error!(
+                target: "tessera.session",
+                session_id = %ctx.session_id,
+                error = %err,
+                "pam_get_user failed after authentication; refusing to act under an unverified name",
+            );
+            return None;
+        }
+    };
+    match crate::session_identity::verify_session_account(ctx, &observed) {
+        Ok(account) => Some(account),
+        Err(err) => {
+            tracing::error!(
+                target: "tessera.session",
+                session_id = %ctx.session_id,
+                error = %err,
+                "PAM_USER does not match the authenticated account",
+            );
+            None
+        }
+    }
+}
+
 /// Generate a cryptographically random session id by hex-encoding 16 bytes
 /// from the OS RNG (`getrandom`/`OsRng`).
 ///
@@ -277,26 +336,12 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             }
         };
 
-        // 2a. Role selection: the account being logged into IS the requested
-        // role, so PAM_USER is the only source and the module never rewrites
-        // it — the name the rest of the stack sees is the name we act on, with
-        // no window between the two (polkit CVE-2021-3560 class). A name that
-        // cannot be a role id at all is rejected here, before any credential
-        // material is touched.
-        let requested_role = match crate::role_selection::role_from_account(&pam_user) {
-            Ok(role) => role,
-            Err(err) => {
-                tracing::warn!(
-                    target: "role.audit",
-                    event = "role_deny",
-                    reason = "syntax",
-                    pam_user = %pam_user,
-                    error = %err,
-                    "account name is not a role; rejected before authentication",
-                );
-                return PAM_AUTH_ERR;
-            }
-        };
+        // Role selection happens inside the flow: the account being logged
+        // into IS the requested role, so `pam_user` below is its only source
+        // and the module never rewrites `PAM_USER`. The name the rest of the
+        // stack sees is the name we act on, with no window between the two
+        // (polkit CVE-2021-3560 class). A name that cannot be a role id at all
+        // is refused by the flow before any credential material is touched.
         // SAFETY: `pamh` is the live PAM handle for this callback.
         let pam_service = unsafe { crate::pam_helpers::pam_get_service_string(pamh) }
             .unwrap_or_else(|err| {
@@ -368,16 +413,15 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         )
         .with_pamh(pamh);
 
-        // 7b. Role stage: load the on-device role store. The requested role
-        // (the login account name) and the store travel atomically through
-        // Deps so the role is resolved together with cert verification — the
-        // name is never re-read, so there is no swap window.
+        // 7b. Role stage: load the on-device role store. The store travels
+        // through Deps so the role is resolved together with cert verification
+        // — `PAM_USER` is never re-read, so there is no swap window.
         let device_os = if wired.cfg.mac.backend.as_deref() == Some("parsec") {
             tessera_core::role::RoleOs::Astra
         } else {
             tessera_core::role::RoleOs::Linux
         };
-        let role_stage = match build_role_stage(&wired.cfg.roles, device_os, requested_role) {
+        let role_stage = match build_role_stage(&wired.cfg.roles, device_os) {
             Ok(s) => s,
             Err(rc) => return rc,
         };
@@ -463,6 +507,11 @@ pub unsafe extern "C" fn pam_sm_setcred(
 #[no_mangle]
 /// PAM account management entry.
 ///
+/// Re-checks certificate expiry against the stored [`AuthContext`]. A
+/// `PAM_USER` that does not match the account that context was authorised for
+/// maps to `PAM_PERM_DENIED`: the verdict belongs to the account the
+/// certificate admitted, and cannot be transferred to another one.
+///
 /// # Safety
 ///
 /// Called by PAM with a valid handle.
@@ -478,6 +527,12 @@ pub unsafe extern "C" fn pam_sm_acct_mgmt(
         let Some(ctx) = (unsafe { crate::data_handle::get_auth_context(pamh) }) else {
             return PAM_AUTHINFO_UNAVAIL;
         };
+        // Account management decides about an account, so it must be the same
+        // account the certificate admitted.
+        // SAFETY: `pamh` is the live PAM handle for this callback.
+        if unsafe { verified_session_account(pamh, ctx) }.is_none() {
+            return PAM_PERM_DENIED;
+        }
         match crate::acct_mgmt_core(ctx, std::time::SystemTime::now()) {
             PAM_SUCCESS => PAM_SUCCESS,
             PAM_ACCT_EXPIRED => PAM_ACCT_EXPIRED,
@@ -500,6 +555,10 @@ const PAM_SESSION_ERR: i32 = 14;
 /// `on_failure = abort` plus non-zero exit / timeout) maps to
 /// `PAM_SESSION_ERR`.  A missing config or absent [`AuthContext`] is
 /// surfaced as `PAM_AUTHINFO_UNAVAIL`.
+///
+/// A `PAM_USER` that no longer names the authenticated account — or that
+/// cannot be read at all — also maps to `PAM_SESSION_ERR`: the session simply
+/// cannot be opened, because there is no name it may legitimately act under.
 ///
 /// # Safety
 ///
@@ -529,15 +588,18 @@ pub unsafe extern "C" fn pam_sm_open_session(
             return PAM_AUTHINFO_UNAVAIL;
         };
 
-        // PAM user (best-effort: fall back to cert_cn if PAM_USER is gone).
+        // The name this session may act under. Fail-closed: the MAC label and
+        // the privileged `session_open` hooks below both take it, and neither
+        // may run for an account the certificate was not checked against.
         // SAFETY: `pamh` is the live PAM handle for this callback.
-        let pam_user = unsafe { crate::pam_helpers::pam_get_user_string(pamh) }
-            .unwrap_or_else(|_| ctx.cert_cn.clone().unwrap_or_default());
+        let Some(pam_user) = (unsafe { verified_session_account(pamh, ctx) }) else {
+            return PAM_SESSION_ERR;
+        };
 
         // MAC integrity — orchestrator decides whether to apply a label,
         // skip (runtime inactive / policy ignore), or fail closed.  We
         // always invoke it; the orchestrator honours the policy.
-        match crate::session::run_open_session_pipeline(&cfg, ctx, &pam_user) {
+        match crate::session::run_open_session_pipeline(&cfg, ctx, pam_user) {
             Ok(()) => {}
             Err(rc) => return rc,
         }
@@ -575,7 +637,7 @@ pub unsafe extern "C" fn pam_sm_open_session(
             });
         }
 
-        let vars = tessera_core::hooks::HookVars::for_session_open(&pam_user, ctx);
+        let vars = tessera_core::hooks::HookVars::for_session_open(pam_user, ctx);
         let executor = tessera_core::hooks::ForkExecExecutor::new();
 
         tracing::info!(
@@ -639,11 +701,17 @@ pub unsafe extern "C" fn pam_sm_close_session(
 
         // SAFETY: `pamh` is the live PAM handle for this callback.
         if let Some(ctx) = unsafe { crate::data_handle::get_auth_context(pamh) } {
+            // Close-session hooks are privileged too, so they are subject to
+            // the same rule as the open side: no name, no hooks. Unlike
+            // open_session the failure is not surfaced — the return code stays
+            // PAM_SUCCESS because a logout cannot be blocked — but the hooks
+            // are skipped rather than run under an unverified account.
             // SAFETY: `pamh` is the live PAM handle for this callback.
-            let pam_user = unsafe { crate::pam_helpers::pam_get_user_string(pamh) }
-                .unwrap_or_else(|_| ctx.cert_cn.clone().unwrap_or_default());
+            let Some(pam_user) = (unsafe { verified_session_account(pamh, ctx) }) else {
+                return PAM_SUCCESS;
+            };
 
-            let vars = tessera_core::hooks::HookVars::for_session_close(&pam_user, ctx);
+            let vars = tessera_core::hooks::HookVars::for_session_close(pam_user, ctx);
             let executor = tessera_core::hooks::ForkExecExecutor::new();
 
             tracing::info!(

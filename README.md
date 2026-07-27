@@ -69,7 +69,7 @@ Detailed architecture: [docs/en/architecture.md](docs/en/architecture.md).
 ## Install
 
 ```bash
-sudo apt install ./tessera_0.4.0-1_amd64.deb
+sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
 Dependencies (`gost-engine`, `pcsc-lite`, `libssl3`, `lsb-base` for the
