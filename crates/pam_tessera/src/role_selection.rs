@@ -1,77 +1,63 @@
-//! Login-string role selection: parse the `<user>+<role>` suffix and
-//! canonicalise `PAM_USER`.
+//! Role selection: the requested role IS the login account name.
 //!
-//! This is the first thing `pam_sm_authenticate` does with the PAM user name
-//! (design Decision 6): split off the optional `+<role>` suffix, validate it,
-//! and rewrite `PAM_USER` to the canonical account name *before* any other
-//! work or any other module in the stack reads the user (polkit
-//! CVE-2021-3560 lesson — no swap window). The `+` character is therefore
-//! forbidden in canonical account names (enforced at provisioning).
+//! An engineer logs into a role account whose name is the role (`ssh
+//! oper@device`), so `PAM_USER` is the only source of the requested role.
+//! This module turns that name into a [`RoleId`] and nothing else — it never
+//! rewrites `PAM_USER`, and there is no second source (no name suffix, no PAM
+//! prompt, no environment variable). Multiple sources are what create a window
+//! in which the name read by the stack differs from the name the module acts
+//! on, and a difference between "before" and "after" is an escalation (the
+//! polkit CVE-2021-3560 class).
 //!
-//! Parsing is pure and unit-tested against the full edge table from the
-//! role-selection delta spec.
+//! An account name that cannot be a `role_id` at all (`Admin`, `svc_backup`,
+//! anything over 16 characters) is rejected here — before any credential
+//! material is touched. A name that is syntactically a `role_id` but names no
+//! role in the on-device store (`ivanov`, `root`) is rejected later, by the
+//! store resolve stage that runs after the certificate is verified: answering
+//! "does role X exist on this device" before authentication would hand an
+//! attacker at the console a role-existence oracle, and role names are
+//! deliberately not disclosed pre-authentication.
+//!
+//! The conversion is pure and unit-tested against the accepted/rejected name
+//! table from the role-selection spec.
 
 use tessera_core::role::RoleId;
 
-/// Errors from parsing a `<user>+<role>` login string.
+/// Errors from deriving the requested role from the login account name.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SelectionError {
-    /// The login string was empty, or the canonical user part was empty
-    /// (e.g. `+serv`).
-    #[error("empty user name in login string")]
-    EmptyUser,
-    /// The suffix was present but empty (`ivanov+`).
-    #[error("empty role suffix in login string")]
-    EmptyRole,
-    /// More than one `+` separator (`ivanov+a+b`).
-    #[error("multiple '+' separators in login string")]
-    MultipleSeparators,
-    /// The role part is not a valid `role_id` (`^[a-z][a-z0-9-]{0,15}$`).
-    #[error("invalid role_id in login string: {0}")]
-    InvalidRoleId(String),
+    /// PAM handed us an empty user name.
+    #[error("empty account name")]
+    EmptyAccount,
+    /// The account name is not a valid `role_id`
+    /// (`^[a-z][a-z0-9-]{0,15}$`), so it is not a role account.
+    #[error("account name is not a role: {0}")]
+    NotARole(String),
 }
 
-/// Parse a raw login string into `(canonical_user, optional_role)`.
+/// Derive the requested role from the login account name.
 ///
-/// Rules (role-selection delta spec edge table):
-/// - `ivanov` → `("ivanov", None)`
-/// - `ivanov+serv` → `("ivanov", Some(serv))`
-/// - `ivanov+` → [`SelectionError::EmptyRole`]
-/// - `ivanov+a+b` → [`SelectionError::MultipleSeparators`]
-/// - `+serv` (empty user) → [`SelectionError::EmptyUser`]
-/// - empty string → [`SelectionError::EmptyUser`]
-/// - `ivanov+Bad` (bad `role_id`) → [`SelectionError::InvalidRoleId`]
+/// Rules (role-selection spec):
+/// - `oper` → `RoleId("oper")`
+/// - `read-only` → `RoleId("read-only")`
+/// - `Admin`, `1serv`, `svc_backup`, `ivanov+serv`, a 17-char name →
+///   [`SelectionError::NotARole`]
+/// - empty string → [`SelectionError::EmptyAccount`]
 ///
-/// The role part is validated through [`RoleId`] so the same
-/// `^[a-z][a-z0-9-]{0,15}$` contract applies everywhere.
+/// The name is validated through [`RoleId`] so the same
+/// `^[a-z][a-z0-9-]{0,15}$` contract applies everywhere. This function only
+/// answers "could this name be a role at all"; whether the device actually
+/// carries such a role is decided by the store resolve stage after the
+/// certificate is verified.
 ///
 /// # Errors
 ///
 /// See [`SelectionError`].
-pub fn parse_user_role(raw: &str) -> Result<(String, Option<RoleId>), SelectionError> {
-    if raw.is_empty() {
-        return Err(SelectionError::EmptyUser);
+pub fn role_from_account(account: &str) -> Result<RoleId, SelectionError> {
+    if account.is_empty() {
+        return Err(SelectionError::EmptyAccount);
     }
-    let mut parts = raw.split('+');
-    // `split` always yields at least one element.
-    let user = parts.next().unwrap_or("");
-    let role_part = parts.next();
-    // Any further element means a second separator was present.
-    if parts.next().is_some() {
-        return Err(SelectionError::MultipleSeparators);
-    }
-    if user.is_empty() {
-        return Err(SelectionError::EmptyUser);
-    }
-    match role_part {
-        None => Ok((user.to_owned(), None)),
-        Some("") => Err(SelectionError::EmptyRole),
-        Some(role) => {
-            let role_id =
-                RoleId::new(role).map_err(|_| SelectionError::InvalidRoleId(role.to_owned()))?;
-            Ok((user.to_owned(), Some(role_id)))
-        }
-    }
+    RoleId::new(account).map_err(|_| SelectionError::NotARole(account.to_owned()))
 }
 
 #[cfg(test)]
@@ -81,74 +67,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plain_user_no_role() {
-        let (user, role) = parse_user_role("ivanov").unwrap();
-        assert_eq!(user, "ivanov");
-        assert_eq!(role, None);
+    fn role_account_name_is_the_role() {
+        assert_eq!(role_from_account("oper").unwrap().as_str(), "oper");
     }
 
     #[test]
-    fn user_with_role() {
-        let (user, role) = parse_user_role("ivanov+serv").unwrap();
-        assert_eq!(user, "ivanov");
-        assert_eq!(role.unwrap().as_str(), "serv");
-    }
-
-    #[test]
-    fn trailing_plus_is_empty_role() {
-        assert_eq!(parse_user_role("ivanov+"), Err(SelectionError::EmptyRole));
-    }
-
-    #[test]
-    fn double_suffix_rejected() {
+    fn hyphenated_role_account_ok() {
         assert_eq!(
-            parse_user_role("ivanov+a+b"),
-            Err(SelectionError::MultipleSeparators)
+            role_from_account("read-only").unwrap().as_str(),
+            "read-only"
         );
     }
 
     #[test]
-    fn empty_string_is_empty_user() {
-        assert_eq!(parse_user_role(""), Err(SelectionError::EmptyUser));
-    }
-
-    #[test]
-    fn leading_plus_is_empty_user() {
-        assert_eq!(parse_user_role("+serv"), Err(SelectionError::EmptyUser));
-    }
-
-    #[test]
-    fn bad_role_id_rejected() {
-        // Uppercase is not a valid role_id.
+    fn sixteen_char_name_is_the_boundary() {
+        let name = format!("a{}", "a".repeat(15));
+        assert_eq!(role_from_account(&name).unwrap().as_str(), name);
+        let too_long = format!("a{}", "a".repeat(16));
         assert!(matches!(
-            parse_user_role("ivanov+Serv"),
-            Err(SelectionError::InvalidRoleId(_))
-        ));
-        // Leading digit.
-        assert!(matches!(
-            parse_user_role("ivanov+1serv"),
-            Err(SelectionError::InvalidRoleId(_))
-        ));
-        // Too long (>16 chars).
-        let long = format!("ivanov+{}", "a".repeat(17));
-        assert!(matches!(
-            parse_user_role(&long),
-            Err(SelectionError::InvalidRoleId(_))
+            role_from_account(&too_long),
+            Err(SelectionError::NotARole(_))
         ));
     }
 
     #[test]
-    fn role_id_boundary_lengths() {
-        // 16-char role_id is accepted.
-        let role = format!("a{}", "a".repeat(15));
-        let s = format!("ivanov+{role}");
-        let (_user, parsed) = parse_user_role(&s).unwrap();
-        assert_eq!(parsed.unwrap().as_str(), role);
+    fn empty_account_rejected() {
+        assert_eq!(role_from_account(""), Err(SelectionError::EmptyAccount));
     }
 
     #[test]
-    fn hyphenated_role_id_ok() {
-        let (_u, role) = parse_user_role("ivanov+read-only").unwrap();
-        assert_eq!(role.unwrap().as_str(), "read-only");
+    fn names_that_cannot_be_a_role_id_are_rejected() {
+        // Legal Unix account names that no role can ever be called.
+        for name in ["Admin", "1serv", "svc_backup", "_oper", "oper.serv", "OPER"] {
+            assert!(
+                matches!(role_from_account(name), Err(SelectionError::NotARole(_))),
+                "{name} must not be accepted as a role account",
+            );
+        }
+    }
+
+    #[test]
+    fn personal_account_names_pass_syntax_and_are_denied_by_the_store() {
+        // `ivanov` and `root` satisfy the role_id pattern, so this stage
+        // cannot reject them; they are denied by the store resolve stage
+        // (`role_deny reason=not_found`) after the certificate is verified.
+        // Answering "does this role exist" earlier would be a pre-auth oracle.
+        assert!(role_from_account("ivanov").is_ok());
+        assert!(role_from_account("root").is_ok());
+    }
+
+    #[test]
+    fn plus_in_the_name_is_not_a_role_selector() {
+        // The `<user>+<role>` login form is gone: `+` is simply an illegal
+        // character in a role id, so the whole name is rejected rather than
+        // split.
+        assert_eq!(
+            role_from_account("ivanov+serv"),
+            Err(SelectionError::NotARole("ivanov+serv".to_owned()))
+        );
     }
 }

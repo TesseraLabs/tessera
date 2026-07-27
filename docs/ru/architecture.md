@@ -172,7 +172,10 @@ PAM-стек делает несколько вызовов в порядке `a
    `PAM_AUTHINFO_UNAVAIL`.
 3. Запустить `self_check` (engine, paths, hooks placeholders). При
    ошибке — `PAM_AUTHINFO_UNAVAIL`.
-4. Прочитать `PAM_USER`, `PAM_SERVICE`, `PAM_TTY` из libpam.
+4. Прочитать `PAM_USER`, `PAM_SERVICE`, `PAM_TTY` из libpam. Запрошенная роль
+   выводится из `PAM_USER`: имя учётной записи входа И ЕСТЬ роль. Иных
+   источников роли нет, и `PAM_USER` не переписывается. Имя, не
+   удовлетворяющее формату `role_id`, отвергает вход до обращения к носителю.
 5. Через `di::wire` собрать DI-граф (mount, trust, token).
 6. Резолвить `host_id` через цепочку источников из конфига и вычислить
    `host_id_hash = sha256(host_id)`.

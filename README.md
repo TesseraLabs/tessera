@@ -25,8 +25,9 @@ passphrase-protected `.p12` on a USB filesystem.
 - RSA / ECDSA via OpenSSL for mixed environments.
 - Host binding through per-cert X.509 v3 extensions — a stolen token on
   another machine does not work.
-- Explicit role selection at login (`user+role` suffix or PAM prompt,
-  no default role), authorised by the cert's `pam_cert_allowed_roles`.
+- Explicit role selection at login: the engineer logs into a role account
+  named after the role (`ssh oper@device`), with no default role; the login
+  is authorised by the cert's `pam_cert_allowed_roles`.
 - USB-removal monitoring via udev plus configurable response
   (`lock` / `logout` / `hook` / `shutdown`) via `systemd-logind` D-Bus.
 - Correct suspend/resume handling with a configurable grace window.

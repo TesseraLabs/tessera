@@ -8,6 +8,14 @@ for per-PR runs.
 **Validated end-to-end on Astra SE 1.8.4 (2026-06-15)** — all five scenarios
 (R1–R5) reproduce as asserted (results table below).
 
+> **Superseded — do not run as is.** Every scenario logs in as `ivanov+serv`,
+> and both mechanisms behind that are gone: the role is now the login account
+> name (the `user+role` suffix and the PAM prompt were removed), and role
+> checking is unconditional (`[roles].enforce` no longer exists, so R5
+> describes an impossible state). The equivalent coverage lives in
+> `tests/e2e/cases/30-roles.yaml` (ROLE-001…004). This runbook is kept for the
+> loop+udev USB emulation technique it documents.
+
 The harness drives the **PAM auth phase** through a dedicated throwaway
 service (`/etc/pam.d/tessera-roletest`, auth-only) with `pamtester`. It never
 modifies `sshd`/`login`/`sudo`. Role resolution + `allowed_roles` coverage run

@@ -1,10 +1,10 @@
 //! Role selection: the atomic resolve + coverage stage and the session
 //! payload snapshot.
 //!
-//! This module is the security-critical core of the role-format login path
-//! (design.md Decision 6, polkit CVE-2021-3560 lesson). The PAM module
-//! parses the `user+role` suffix early and rewrites `PAM_USER`; once the
-//! certificate is verified the requested role MUST be resolved from the
+//! This module is the security-critical core of the role login path (polkit
+//! CVE-2021-3560 lesson). The PAM module derives the requested role from
+//! `PAM_USER` — the login account name IS the role — and never rewrites it;
+//! once the certificate is verified the requested role MUST be resolved from the
 //! [`RoleStore`] and checked for coverage **in one uninterrupted step**,
 //! with no window in which the role can be swapped before the session is
 //! fixed.
@@ -129,7 +129,7 @@ pub enum Resolution {
 /// - `None` — the cert has no extension; under cert-method coverage this
 ///   means the cert grants no roles, so any requested role is `NotCovered`.
 ///
-/// `requested` is the role id parsed from the login suffix / prompt; `None`
+/// `requested` is the role id derived from the login account name; `None`
 /// means the caller could not obtain one, which denies with
 /// [`RoleDenyReason::Syntax`].
 #[must_use]

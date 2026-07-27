@@ -7,6 +7,14 @@
 # Validated end-to-end on Astra SE 1.8.4 (2026-06-15): all five scenarios
 # (R1–R5) reproduce as asserted below. See vagrant/scripts/README-roles-e2e.md.
 #
+# SUPERSEDED — DO NOT RUN AS IS. Every scenario logs in as `ivanov+serv`, and
+# both mechanisms that made that work are gone: the role is now the login
+# account name (no `<user>+<role>` suffix), and role checking is unconditional
+# (no `[roles].enforce`, so R5 describes a state that cannot exist). The same
+# ground is covered by tests/e2e/cases/30-roles.yaml (ROLE-001…004) against
+# role-account fixtures. Kept for the loop+udev USB emulation technique
+# documented below, which the newer contour reuses.
+#
 # Runs inside the VM after the role fixtures are generated on the build host
 # (tests/fixtures/roles/gen-role-certs.sh) and uploaded, and the .so + CLI are
 # installed (see vagrant/scripts/README-roles-e2e.md).

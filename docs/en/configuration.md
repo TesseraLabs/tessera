@@ -233,14 +233,26 @@ diagnostic naming the removal.
 > **Fail-closed.** An empty or invalid role store leads to refusal of logins,
 > with a "roles not configured" diagnostic.
 
-**Role selection at login.** There is no default role — the role is
-specified explicitly, in two DM-agnostic ways: by the account-name
-suffix `<user>+<role>` (for example `ssh ivanov+serv@device`) or by a
-textual PAM prompt if no suffix is given. Without a specified role (and
-when a prompt cannot be shown) login is refused. The module canonicalizes
-PAM_USER — it rewrites the name to the canonical form (`ivanov`) before
-the rest of the stack's modules; the `+` character is forbidden in
-canonical account names.
+**Role selection at login.** There is no default role. The role is the login
+account name: the engineer logs into a role account named after the role
+(`ssh serv@device`), and the requested role equals `PAM_USER`. There is no
+other source of the role — no name suffix, no PAM prompt, no environment
+variable.
+
+The module never rewrites `PAM_USER`: the name read by the stack is the name
+the decision is made on. An account name that does not match the `role_id`
+format (`^[a-z][a-z0-9-]{0,15}$`) is rejected before the medium is touched.
+
+The engineer's identity is not lost: it lives in the certificate and in the
+issuance log, not in the account name. Role accounts are provisioned
+separately (Census); every way into them other than Tessera's certificate
+authentication is closed.
+
+Admission is checked by two certificate extensions applied to the same name:
+`pam_cert_user_binding` ("the holder may log into this role account") and
+`pam_cert_allowed_roles` ("the holder may activate this role"). A certificate
+that admits the holder into account `serv` but does not allow the role of the
+same name is a legitimate configuration, and such a login is refused.
 
 ### The `[tags]` section
 

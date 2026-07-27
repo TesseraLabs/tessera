@@ -37,17 +37,12 @@ const PAM_SYSTEM_ERR: i32 = 4;
 #[cfg(target_os = "linux")]
 const PAM_ACCT_EXPIRED: i32 = 13;
 
-/// `PAM_PROMPT_ECHO_ON` literal (security/_pam_types.h) — used for the role
-/// prompt where the typed value is not a secret.
-#[cfg(target_os = "linux")]
-const PAM_PROMPT_ECHO_ON: i32 = 2;
-
 /// Owned holder for the role-selection stage: keeps the loaded
 /// [`tessera_core::role::RoleStore`] alive for the lifetime of the flow so
 /// [`crate::flow::Deps`] can borrow it. Built by [`build_role_stage`].
 #[cfg(target_os = "linux")]
 struct RoleStageOwned {
-    /// Requested role parsed from the suffix / prompt.
+    /// Requested role — the name of the account being logged into.
     requested: tessera_core::role::RoleId,
     /// Loaded role store.
     store: tessera_core::role::RoleStore,
@@ -67,64 +62,22 @@ impl RoleStageOwned {
     }
 }
 
-/// Build the role-selection stage from config + the parsed suffix.
+/// Build the role-selection stage from config + the requested role.
 ///
-/// Every login carries a role: when none came from the suffix, prompt for one
-/// via the PAM conversation (`PAM_PROMPT_ECHO_ON`, input only — no role
-/// listing). The on-device store is loaded in standalone mode
-/// (filesystem-permission trust).
+/// The requested role is the login account name, already derived from
+/// `PAM_USER` by the caller; this function only loads the on-device store in
+/// standalone mode (filesystem-permission trust).
 ///
-/// Returns the owned stage, or a PAM return code on a hard failure — no role
-/// could be obtained, or the store could not be loaded. Both are fail-closed:
+/// Returns the owned stage, or a PAM return code when the store could not be
+/// loaded. That is fail-closed: coverage cannot be proven without a store, and
 /// there is no configuration under which the login proceeds without a role.
-///
-/// # Safety
-///
-/// `pamh` must be the live PAM handle for the current callback.
 #[cfg(target_os = "linux")]
 fn build_role_stage(
-    pamh: *mut pam_sys::pam_handle_t,
     roles_cfg: &tessera_core::config::validated::RolesSection,
     device_os: tessera_core::role::RoleOs,
-    suffix_role: Option<tessera_core::role::RoleId>,
+    requested: tessera_core::role::RoleId,
 ) -> Result<RoleStageOwned, i32> {
-    use tessera_core::role::{RoleDenyReason, RoleId, RoleStore, TrustMode};
-
-    // Resolve the requested role: prefer the suffix; otherwise prompt.
-    // The nested match mirrors the two-axis decision (prompt outcome x role
-    // validity); if-let chains would obscure the fail-closed branches.
-    #[allow(clippy::single_match_else)]
-    let requested: RoleId = match suffix_role {
-        Some(r) => r,
-        None => {
-            // SAFETY: `pamh` is the live PAM handle for this callback.
-            match unsafe { prompt_for_role(pamh) } {
-                Ok(Some(raw)) => match RoleId::new(&raw) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        tracing::warn!(
-                            target: "role.audit",
-                            event = "role_deny",
-                            reason = "syntax",
-                            raw_role = %raw,
-                            "role prompt returned an invalid role_id",
-                        );
-                        return Err(PAM_AUTH_ERR);
-                    }
-                },
-                // No conversation / empty input: the login names no role.
-                Ok(None) | Err(()) => {
-                    tracing::warn!(
-                        target: "role.audit",
-                        event = "role_deny",
-                        reason = "syntax",
-                        "role not specified and no usable conversation prompt",
-                    );
-                    return Err(PAM_AUTH_ERR);
-                }
-            }
-        }
-    };
+    use tessera_core::role::{RoleDenyReason, RoleStore, TrustMode};
 
     // Load the on-device role store through the privileged-path validator.
     // OS selection is runtime state now: the same open PAM binary serves
@@ -205,32 +158,6 @@ fn build_device_tags(
             );
             DeviceTags::empty()
         }
-    }
-}
-
-/// Prompt the engineer for a role via the PAM conversation
-/// (`PAM_PROMPT_ECHO_ON`). Returns `Ok(Some(role))` on input, `Ok(None)` on
-/// empty input, `Err(())` when no usable conversation is available. The
-/// prompt is input-only: available roles are deliberately NOT listed (avoids
-/// leaking role names before authentication — design Open Question).
-///
-/// # Safety
-///
-/// `pamh` must be the live PAM handle for the current callback.
-#[cfg(target_os = "linux")]
-unsafe fn prompt_for_role(pamh: *mut pam_sys::pam_handle_t) -> Result<Option<String>, ()> {
-    // SAFETY: forwarded to the conv helper, which upholds the live-handle
-    // contract documented on `prompt_value`.
-    match unsafe { crate::pam_conv::prompt_value(pamh, "Роль (role): ", PAM_PROMPT_ECHO_ON) } {
-        Ok(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_owned()))
-            }
-        }
-        Err(_) => Err(()),
     }
 }
 
@@ -342,7 +269,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
         // 2. PAM_USER / PAM_SERVICE.
         // SAFETY: `pamh` is the live PAM handle for this callback.
-        let raw_pam_user = match unsafe { crate::pam_helpers::pam_get_user_string(pamh) } {
+        let pam_user = match unsafe { crate::pam_helpers::pam_get_user_string(pamh) } {
             Ok(s) => s,
             Err(err) => {
                 tracing::warn!(target: "tessera.auth", error = %err, "pam_get_user failed");
@@ -350,41 +277,26 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             }
         };
 
-        // 2a. Role selection (role-format): parse the `<user>+<role>` suffix
-        // RIGHT AFTER pam_get_user and BEFORE any other work — canonicalise
-        // PAM_USER so every subsequent step and every other stack module sees
-        // the canonical account name (design Decision 6; CVE-2021-3560: no
-        // swap window). Syntax errors abort before authentication, with a
-        // `role_deny reason=syntax` carrying the raw login string. A stray
-        // `+` is illegal in canonical account names regardless of the
-        // enforcement stage, so malformed login strings are always fatal.
-        let (pam_user, requested_role) = match crate::role_selection::parse_user_role(&raw_pam_user)
-        {
-            Ok((canonical, role)) => (canonical, role),
+        // 2a. Role selection: the account being logged into IS the requested
+        // role, so PAM_USER is the only source and the module never rewrites
+        // it — the name the rest of the stack sees is the name we act on, with
+        // no window between the two (polkit CVE-2021-3560 class). A name that
+        // cannot be a role id at all is rejected here, before any credential
+        // material is touched.
+        let requested_role = match crate::role_selection::role_from_account(&pam_user) {
+            Ok(role) => role,
             Err(err) => {
                 tracing::warn!(
                     target: "role.audit",
                     event = "role_deny",
                     reason = "syntax",
-                    raw_user = %raw_pam_user,
+                    pam_user = %pam_user,
                     error = %err,
-                    "login string rejected before authentication",
+                    "account name is not a role; rejected before authentication",
                 );
                 return PAM_AUTH_ERR;
             }
         };
-        // Rewrite PAM_USER to the canonical name when a suffix was stripped.
-        if pam_user != raw_pam_user {
-            // SAFETY: `pamh` is the live PAM handle for this callback.
-            if let Err(err) = unsafe { crate::pam_helpers::pam_set_user(pamh, &pam_user) } {
-                tracing::error!(
-                    target: "tessera.auth",
-                    error = %err,
-                    "pam_set_item(PAM_USER) failed; cannot canonicalise user",
-                );
-                return PAM_SYSTEM_ERR;
-            }
-        }
         // SAFETY: `pamh` is the live PAM handle for this callback.
         let pam_service = unsafe { crate::pam_helpers::pam_get_service_string(pamh) }
             .unwrap_or_else(|err| {
@@ -454,18 +366,16 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         )
         .with_pamh(pamh);
 
-        // 7b. Role-format stage (role-format). When enforcement is on and no
-        // suffix supplied a role, prompt for one via the PAM conversation
-        // (PAM_PROMPT_ECHO_ON; input only, no role listing — see design
-        // Open Question). Then load the on-device role store. The requested
-        // role + store + enforce mode travel atomically through Deps so the
-        // role is resolved together with cert verification (no swap window).
+        // 7b. Role stage: load the on-device role store. The requested role
+        // (the login account name) and the store travel atomically through
+        // Deps so the role is resolved together with cert verification — the
+        // name is never re-read, so there is no swap window.
         let device_os = if wired.cfg.mac.backend.as_deref() == Some("parsec") {
             tessera_core::role::RoleOs::Astra
         } else {
             tessera_core::role::RoleOs::Linux
         };
-        let role_stage = match build_role_stage(pamh, &wired.cfg.roles, device_os, requested_role) {
+        let role_stage = match build_role_stage(&wired.cfg.roles, device_os, requested_role) {
             Ok(s) => s,
             Err(rc) => return rc,
         };
