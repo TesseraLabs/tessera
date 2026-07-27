@@ -185,14 +185,6 @@ cases:
       # входит по имени ролевой учётной записи — так же, как это делает парк.
       - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
       - run: |
-          install -d -m 0755 -o root -g root /var/lib/tessera/roles
-          install -m 0644 -o root -g root {{roles}}/store/serv.toml /var/lib/tessera/roles/serv.toml
-          cat >> /etc/tessera/config.toml <<'EOF'
-
-          [roles]
-          dir = "/var/lib/tessera/roles"
-          EOF
-      - run: |
           rm -rf /tmp/issuer-e2e && install -d -m 0700 /tmp/issuer-e2e
           for k in root leaf; do
             openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \

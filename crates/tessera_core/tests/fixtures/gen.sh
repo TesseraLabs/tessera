@@ -134,12 +134,17 @@ authorityKeyIdentifier = keyid:always
 subjectAltName = email:mallory@example.org
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb_any
 2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub_any
+2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:allowed_roles
 
 [hb_any]
 e0 = UTF8String:*
 
 [ub_any]
 e0 = UTF8String:*
+
+[allowed_roles]
+e0 = UTF8String:serv
+e1 = UTF8String:oper
 EOF
 ) -out revoked_leaf.pem
 
