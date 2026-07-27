@@ -121,7 +121,6 @@ issuer issue-leaf \
     --spki ivanov.spki.der \
     --subject "CN=ivanov,O=Org" \
     --host "sha256:<host_id_hash>" \
-    --user ivanov \
     --role oper \
     --not-before 1750000000 --not-after 1750086400 \
     --max-integrity-level 2 --max-integrity-categories 0x1 \
@@ -137,15 +136,22 @@ issuer issue-leaf \
     --key org-north-ca \
     --parent org-ca.pem \
     --csr ivanov.csr.pem \
-    --host "sha256:<host_id_hash>" --user ivanov --role oper \
+    --host "sha256:<host_id_hash>" --role oper \
     --not-before 1750000000 --not-after 1750086400 \
     --journal issuance.ndjson \
     --out ivanov.pem
 ```
 
-`--host`, `--user` and `--role` repeat. `--max-integrity-level` is optional
+`--host` and `--role` repeat. `--max-integrity-level` is optional
 (without it no integrity ceiling is set); `--max-integrity-categories` (a
 bitmask) is honoured only together with a level.
+
+Admission is carried by two extensions of the issued leaf, and both are built
+from these flags: `pam_cert_host_binding` (`--host`) — the devices on which the
+credential is accepted; `pam_cert_allowed_roles` (`--role`) — the roles its
+holder may activate. The login account name *is* the role, so the second list
+also determines which role accounts the holder is admitted into: there is no
+separate per-account admission list.
 
 ### Issue a CRL
 

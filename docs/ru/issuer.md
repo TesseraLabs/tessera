@@ -118,7 +118,6 @@ issuer issue-leaf \
     --spki ivanov.spki.der \
     --subject "CN=ivanov,O=Org" \
     --host "sha256:<host_id_hash>" \
-    --user ivanov \
     --role oper \
     --not-before 1750000000 --not-after 1750086400 \
     --max-integrity-level 2 --max-integrity-categories 0x1 \
@@ -134,15 +133,22 @@ issuer issue-leaf \
     --key org-north-ca \
     --parent org-ca.pem \
     --csr ivanov.csr.pem \
-    --host "sha256:<host_id_hash>" --user ivanov --role oper \
+    --host "sha256:<host_id_hash>" --role oper \
     --not-before 1750000000 --not-after 1750086400 \
     --journal issuance.ndjson \
     --out ivanov.pem
 ```
 
-`--host`, `--user`, `--role` повторяются. `--max-integrity-level` опционален
+`--host` и `--role` повторяются. `--max-integrity-level` опционален
 (без него потолок целостности не задаётся); `--max-integrity-categories`
 (битовая маска) учитывается только вместе с уровнем.
+
+Допуск задают два расширения выпускаемого листа, и оба собираются из этих
+флагов: `pam_cert_host_binding` (`--host`) — на каких устройствах удостоверение
+принимается, `pam_cert_allowed_roles` (`--role`) — какие роли предъявитель может
+активировать. Имя учётной записи входа и есть роль, поэтому второй список
+одновременно определяет, в какие ролевые учётные записи пущен предъявитель:
+отдельного списка допуска по учётным записям нет.
 
 ### Выпуск CRL
 
