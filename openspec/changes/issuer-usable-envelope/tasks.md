@@ -6,4 +6,4 @@
 - [x] 4. Тест пригодности: CA, выпущенный только с обязательными аргументами, проходит `enforce_delegation` с ролью из своего `allowRoles` — проверка той же функцией, которой пользуется Engine
 - [x] 5. `docs/ru/issuer.md` и `docs/en/issuer.md`: обязательность ролей, смысл и значения умолчаний TTL для двух операций
 - [x] 6. `docs/ru/changelog.md`
-- [ ] 7. Прогон e2e (`--profile ubuntu-container --filter issuer`) — убедиться, что кейсы выпуска не изменили статус по этой причине
+- [x] 7. Прогон e2e (`--profile ubuntu-container --filter issuer`) — ISS-001…004 PASS, ISS-005 красный по нереализованной модели ролевых учётных записей, расхождений с baseline нет
