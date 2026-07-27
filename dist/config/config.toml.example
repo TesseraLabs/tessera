@@ -233,15 +233,27 @@ fallback = "deny"
 custom_command_timeout_seconds = 5
 
 # --- User mappings -----------------------------------------------------------
-# One entry per local UNIX user. Exactly one of cert_subject_cn,
-# cert_san_email, cert_san_upn must be set per entry.
-[[user_mapping]]
-pam_user        = "alice"
-cert_subject_cn = "Alice"
+# Legacy fallback, consulted ONLY for a credential that carries no
+# `pam_cert_user_binding` extension. When the extension is present it decides
+# admission and these entries are never read, so a fleet issuing credentials
+# through the normal path needs no mapping at all — leave the section out.
+#
+# `pam_user` is the account being logged into, which is the requested role: the
+# engineer logs into a role account named after the role. A mapping therefore
+# says "this credential may enter this role account", nothing more. It does NOT
+# stand in for role coverage: `pam_cert_allowed_roles` must still permit the
+# role, or the login is denied whatever the mapping says.
+#
+# Absent mapping and absent extension deny fail-closed. Uncomment and adjust
+# only if you knowingly run credentials without the extension — one entry per
+# account, exactly one of cert_subject_cn, cert_san_email, cert_san_upn.
+# [[user_mapping]]
+# pam_user        = "serv"
+# cert_subject_cn = "service-engineer"
 
 # [[user_mapping]]
-# pam_user      = "bob"
-# cert_san_email = "bob@example.org"
+# pam_user      = "oper"
+# cert_san_email = "operator@example.org"
 
 # --- Roles -------------------------------------------------------------------
 # The role at login is the login account name: the engineer logs into a role
