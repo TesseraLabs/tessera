@@ -13,8 +13,9 @@
 
 /// `role_session_open` — a session was opened with a resolved, covered role.
 pub const EVENT_ROLE_SESSION_OPEN: &str = "role_session_open";
-/// `role_deny` — a login was denied (or, under `warn`, would have been) for a
-/// role reason. Carries the `reason` field (see `RoleDenyReason`).
+/// `role_deny` — a login was denied for a role reason. The denial is always
+/// effective; no configuration downgrades it to an advisory event. Carries
+/// the `reason` field (see `RoleDenyReason`).
 pub const EVENT_ROLE_DENY: &str = "role_deny";
 /// `role_slice_invalid` — a single `*.toml` slice failed to parse/validate
 /// in standalone mode and was skipped (other slices keep working).

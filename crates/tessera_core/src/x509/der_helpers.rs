@@ -1,4 +1,4 @@
-//! Internal DER helpers for the `host_binding_ext` and `user_binding_ext`
+//! Internal DER helpers for the `host_binding_ext` and `allowed_roles_ext`
 //! parsers.
 //!
 //! `openssl` 0.10 does not expose raw extension `extnValue` bytes for arbitrary

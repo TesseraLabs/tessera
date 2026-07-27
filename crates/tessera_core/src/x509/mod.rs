@@ -33,7 +33,6 @@ pub mod sig_alg;
 pub mod signatures;
 #[cfg(test)]
 pub(crate) mod test_utils;
-pub mod user_binding_ext;
 
 pub use error::TrustError;
 pub use ext::BasicConstraintsView;
@@ -395,7 +394,7 @@ impl Certificate {
 /// input has no place in an authentication path.
 ///
 /// The fail-closed discipline exists because these fields feed identity
-/// matching (`subject_cn` -> `mapping::match_user`): a crafted subject such as
+/// matching and audit records (`subject_cn`): a crafted subject such as
 /// `"engineer\0evil"` must never be silently truncated to `"engineer"`
 /// (openssl's `Asn1StringRef::as_utf8` truncates at the first NUL) nor lossily
 /// transformed (`to_string` substitutes U+FFFD for invalid bytes), since either

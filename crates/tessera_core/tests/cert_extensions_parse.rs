@@ -1,8 +1,8 @@
-//! Integration tests for [`host_binding_ext`] and [`user_binding_ext`].
+//! Integration tests for [`host_binding_ext`].
 //!
 //! These tests build self-signed certificates in-memory with explicit raw-DER
-//! extensions and verify the parser produces the expected `HostDescriptor` /
-//! `UserDescriptor` sequences.
+//! extensions and verify the parser produces the expected `HostDescriptor`
+//! sequences.
 #![allow(missing_docs)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
@@ -16,8 +16,7 @@ use openssl::rsa::Rsa;
 use openssl::x509::{X509Builder, X509Extension, X509Name, X509};
 
 use tessera_core::x509::host_binding_ext::{self, HostBindingExtError, HostDescriptor};
-use tessera_core::x509::oids::{HOST_BINDING_OID, USER_BINDING_OID};
-use tessera_core::x509::user_binding_ext::{self, UserBindingExtError, UserDescriptor};
+use tessera_core::x509::oids::HOST_BINDING_OID;
 
 /// DER tags reused by the test helpers.
 const TAG_SEQUENCE: u8 = 0x30;
@@ -137,27 +136,4 @@ fn host_binding_rejects_short_sha256() {
     let cert = build_cert(&[(HOST_BINDING_OID, value)]);
     let err = host_binding_ext::parse(&cert).unwrap_err();
     assert!(matches!(err, HostBindingExtError::Malformed(_)), "{err:?}");
-}
-
-#[test]
-fn user_binding_parses_wildcard_and_two_exact() {
-    let value = encode_seq_of_utf8(&["*", "ivanov", "petrov"]);
-    let cert = build_cert(&[(USER_BINDING_OID, value)]);
-
-    let parsed = user_binding_ext::parse(&cert).unwrap();
-    assert_eq!(
-        parsed,
-        vec![
-            UserDescriptor::Wildcard,
-            UserDescriptor::Exact("ivanov".to_owned()),
-            UserDescriptor::Exact("petrov".to_owned()),
-        ]
-    );
-}
-
-#[test]
-fn user_binding_missing_when_extension_absent() {
-    let cert = build_cert(&[]);
-    let err = user_binding_ext::parse(&cert).unwrap_err();
-    assert!(matches!(err, UserBindingExtError::Missing), "{err:?}");
 }

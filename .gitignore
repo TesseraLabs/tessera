@@ -38,6 +38,18 @@ notes/bootstrap-notes/
 # зависимостей, которые иначе уезжают в коммит при `git add -A`.
 /debian/cargo_home/
 
+# Выхлоп debhelper: staged-дерево пакета и служебные отметки сборки. Опасны не
+# размером, а тем, что это СНИМОК кода на момент последней локальной сборки —
+# собранный модуль и пример конфига из него переживают правку исходников и
+# уезжают в коммит с чужой, уже неверной реализацией.
+/debian/tessera/
+/debian/.debhelper/
+/debian/files
+/debian/debhelper-build-stamp
+/debian/*.substvars
+/debian/*.debhelper
+/debian/*.debhelper.log
+
 # Результаты прогонов e2e-реестра: артефакты конкретного стенда и машины.
 # Регрессия хранится в tests/e2e/BASELINE.md, он под контролем версий.
 /tests/e2e/runs/

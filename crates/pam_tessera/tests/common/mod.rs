@@ -28,18 +28,22 @@ use pam_tessera::flow::{authenticate, Deps, FlowError, FlowOutcome, InMemoryFlow
 use secrecy::SecretString;
 
 /// A complete role stage for the flow: an on-disk store holding the `serv`
-/// role plus a request naming it.
+/// role.
 ///
 /// Every authentication resolves a role, so there is no "no role" stage to
-/// fall back on. The `leaf_*` fixtures carry
+/// fall back on. The requested role is not part of the stage — it is the login
+/// account name, so tests must authenticate as [`RoleFixture::ACCOUNT`] for
+/// this store to resolve. The `leaf_*` fixtures carry
 /// `pam_cert_allowed_roles = [serv, oper]`, which is what proves coverage.
 pub struct RoleFixture {
     _dir: tempfile::TempDir,
     store: tessera_core::role::RoleStore,
-    requested: tessera_core::role::RoleId,
 }
 
 impl RoleFixture {
+    /// The login account name that resolves this fixture's role.
+    pub const ACCOUNT: &'static str = "serv";
+
     pub fn serv() -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -55,16 +59,11 @@ impl RoleFixture {
             tessera_core::role::TrustMode::Standalone,
         )
         .unwrap();
-        Self {
-            _dir: dir,
-            store,
-            requested: tessera_core::role::RoleId::new("serv").unwrap(),
-        }
+        Self { _dir: dir, store }
     }
 
     pub fn stage(&self) -> pam_tessera::flow::RoleStage<'_> {
         pam_tessera::flow::RoleStage {
-            requested: self.requested.clone(),
             store: &self.store,
             default_session_ttl: Duration::from_secs(
                 tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
@@ -178,31 +177,10 @@ journald_priority = false
     ValidatedConfig::try_from(&raw).unwrap()
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct UserMappingKv {
-    pub pam_user: &'static str,
-    pub cn: &'static str,
-}
-
-pub fn cn_mapping(user: &str, cn: &str) -> tessera_core::config::validated::UserMapping {
-    use tessera_core::config::validated::{UserMapping, UserMatchCriteria};
-    UserMapping {
-        pam_user: user.to_string(),
-        criteria: UserMatchCriteria::SubjectCn(cn.to_string()),
-    }
-}
-
-/// Legacy shim retained so existing call sites keep compiling; the cert
-/// scope is verified via cert extensions, not a separate ACL list.
-pub fn host_acl_for(_serial: &str, _hosts: &[&str]) -> () {}
-pub fn host_acl_for_subject(_cn: &str, _serial: &str, _hosts: &[&str]) -> () {}
-
 /// Run the full flow, returning the raw `Result` so individual tests can
 /// match on specific [`FlowError`] variants.
 pub fn run_flow_with(
     p12_name: &str,
-    mappings: Vec<tessera_core::config::validated::UserMapping>,
-    _acl: (),
     pam_user: &str,
     pin: &str,
     crl_pems: Vec<Vec<u8>>,
@@ -222,7 +200,6 @@ pub fn run_flow_with(
         hook_executor: &exec,
         host_id_hash,
         host_id_source: HostIdSourceKind::Override,
-        user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
         role_stage: roles.stage(),
         device_tags: pam_tessera::flow::empty_device_tags(),

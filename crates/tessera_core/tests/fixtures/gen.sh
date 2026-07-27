@@ -37,8 +37,9 @@ openssl genrsa -out leaf_rsa.key 2048
 openssl req -new -key leaf_rsa.key -subj "/CN=alice" \
     -addext "subjectAltName=email:alice@example.org" -out leaf_rsa.csr
 # The serial is pinned: the OCSP fixtures and `ocsp_dispatch.rs` route on it.
-# `pam_cert_allowed_roles` is mandatory material now — every login resolves a
-# role and coverage is proven from this extension, so a leaf without it cannot
+# `pam_cert_allowed_roles` is the leaf's whole admission scope: the login
+# account name IS the role name, so this one list answers both "which account
+# may be entered" and "which role may be activated". A leaf without it cannot
 # authenticate at all.
 openssl x509 -req -in leaf_rsa.csr -CA int.pem -CAkey int.key \
     -set_serial 0x44E056A8B426D4727A82EC2A41EDFFFEA4B3D0E3 \
@@ -51,13 +52,9 @@ subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid:always
 subjectAltName = email:alice@example.org
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb_any
-2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub_any
 2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:allowed_roles
 
 [hb_any]
-e0 = UTF8String:*
-
-[ub_any]
 e0 = UTF8String:*
 
 [allowed_roles]
@@ -81,13 +78,9 @@ subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid:always
 subjectAltName = email:bob@example.org
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb_any
-2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub_any
 2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:allowed_roles
 
 [hb_any]
-e0 = UTF8String:*
-
-[ub_any]
 e0 = UTF8String:*
 
 [allowed_roles]
@@ -95,29 +88,6 @@ e0 = UTF8String:serv
 e1 = UTF8String:oper
 EOF
 ) -out leaf_ecdsa.pem
-
-# Leaf RSA without pam_cert_user_binding (legacy mapping fallback fixture).
-# Used by tests that need to exercise the legacy [[user_mapping]] path:
-# the cert carries host_binding (so cert-scope passes) but no user_binding,
-# so flow.rs Step 10 (subject mapping) runs instead of being skipped.
-openssl genrsa -out leaf_no_user_binding.key 2048
-openssl req -new -key leaf_no_user_binding.key -subj "/CN=alice" \
-    -addext "subjectAltName=email:alice@example.org" -out leaf_no_user_binding.csr
-openssl x509 -req -in leaf_no_user_binding.csr -CA int.pem -CAkey int.key -CAcreateserial \
-    -days 365 -sha256 \
-    -extfile <(cat <<'EOF'
-basicConstraints = critical,CA:FALSE
-keyUsage = critical,digitalSignature
-extendedKeyUsage = clientAuth
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid:always
-subjectAltName = email:alice@example.org
-2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb_any
-
-[hb_any]
-e0 = UTF8String:*
-EOF
-) -out leaf_no_user_binding.pem
 
 # Revoked leaf RSA (signed by Intermediate, with a known serial 0x99)
 openssl genrsa -out revoked_leaf.key 2048
@@ -133,13 +103,9 @@ subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid:always
 subjectAltName = email:mallory@example.org
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb_any
-2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub_any
 2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:allowed_roles
 
 [hb_any]
-e0 = UTF8String:*
-
-[ub_any]
 e0 = UTF8String:*
 
 [allowed_roles]
@@ -160,10 +126,7 @@ distinguished_name = dn
 [user_exts]
 subjectAltName = email:alice@example.org
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb_any_e
-2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub_any_e
 [hb_any_e]
-e0 = UTF8String:*
-[ub_any_e]
 e0 = UTF8String:*
 EOF
 ) -out expired_leaf.csr
@@ -261,15 +224,6 @@ openssl pkcs12 -export \
     -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 \
     -passout pass:correct-pin \
     -out leaf_ecdsa.p12
-
-openssl pkcs12 -export \
-    -inkey leaf_no_user_binding.key \
-    -in leaf_no_user_binding.pem \
-    -certfile int.pem \
-    -name "alice" \
-    -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 \
-    -passout pass:correct-pin \
-    -out leaf_no_user_binding.p12
 
 # PKCS#12 bundle for the revoked leaf (CN=mallory, serial 0x99).
 # The matching CRL `crl_valid.pem` lists this serial as revoked.

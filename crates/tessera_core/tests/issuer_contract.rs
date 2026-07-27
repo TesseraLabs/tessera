@@ -30,7 +30,7 @@ use tessera_core::x509::allowed_roles_ext::extract_allowed_roles;
 use tessera_core::x509::delegation_constraints_ext::extract_delegation_constraints;
 use tessera_core::x509::max_integrity_ext::extract_max_integrity;
 use tessera_core::x509::profile_version_ext::extract_profile_version;
-use tessera_core::x509::{host_binding_ext, user_binding_ext, VerifiedX509};
+use tessera_core::x509::{host_binding_ext, VerifiedX509};
 
 use tessera_ext::delegation::DelegationConstraints;
 use tessera_issuer::sign::{KeyId, SignError, Signature, SignatureAlgorithm, SignatureBackend};
@@ -150,7 +150,6 @@ fn issue_chain(backend: &P256Signer, key: &KeyId) -> (Vec<u8>, Vec<u8>) {
         subject_spki_der: spki_fixture(),
         validity: validity(3_600),
         host_binding: vec!["*".to_owned()],
-        user_binding: vec!["ivanov".to_owned()],
         allowed_roles: vec!["oper".to_owned()],
         max_integrity: Some(IntegrityCeiling {
             level: 4,
@@ -211,10 +210,12 @@ fn engine_parsers_accept_issued_ca_and_leaf() {
     let leaf_x509 = X509::from_der(&leaf).unwrap();
     let hosts = host_binding_ext::parse(&leaf_x509).expect("Engine parses host_binding");
     assert_eq!(hosts, vec![host_binding_ext::HostDescriptor::Wildcard]);
-    let users = user_binding_ext::parse(&leaf_x509).expect("Engine parses user_binding");
-    assert_eq!(
-        users,
-        vec![user_binding_ext::UserDescriptor::Exact("ivanov".to_owned())]
+    assert!(
+        tessera_ext::ext::extract_extension_value(&leaf, tessera_ext::oids::USER_BINDING_OID)
+            .expect("extension lookup")
+            .is_none(),
+        "the issuer no longer emits a separate account list — the role list is \
+         the whole admission scope"
     );
 
     let roles = extract_allowed_roles(&leaf_verified)

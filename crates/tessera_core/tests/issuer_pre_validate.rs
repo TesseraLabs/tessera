@@ -161,7 +161,6 @@ fn issue_chain() -> [Vec<u8>; 3] {
             subject_spki_der: spki_fixture(),
             validity: validity(LEAF_TTL),
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["oper".to_owned()],
             max_integrity: None,
             profile_version: 1,

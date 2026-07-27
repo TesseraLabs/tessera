@@ -12,7 +12,7 @@ use tessera_ext::ext::{
 };
 use tessera_ext::oids::{
     ALLOWED_ROLES_OID, DELEGATION_CONSTRAINTS_OID, HOST_BINDING_OID, MAX_INTEGRITY_OID,
-    PROFILE_VERSION_OID, USER_BINDING_OID,
+    PROFILE_VERSION_OID,
 };
 
 use crate::error::IssueError;
@@ -55,7 +55,7 @@ pub(crate) fn self_check_leaf(
         return Err(reject("leaf carries a delegation_constraints extension"));
     }
 
-    // host_binding / user_binding: present, non-empty, equal to the request.
+    // host_binding: present, non-empty, equal to the request.
     let hosts = parse_seq_of_utf8(&require_extension(
         cert_der,
         HOST_BINDING_OID,
@@ -66,17 +66,6 @@ pub(crate) fn self_check_leaf(
     }
     if hosts != req.host_binding {
         return Err(reject("host_binding does not match the request"));
-    }
-    let users = parse_seq_of_utf8(&require_extension(
-        cert_der,
-        USER_BINDING_OID,
-        "user_binding",
-    )?)?;
-    if users.is_empty() {
-        return Err(reject("user_binding is empty"));
-    }
-    if users != req.user_binding {
-        return Err(reject("user_binding does not match the request"));
     }
 
     // allowed_roles: present, equal to the request, and a subset of the parent.

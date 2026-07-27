@@ -30,8 +30,8 @@ PAM_SERVICE="/etc/pam.d/certauth"
 # Учётная запись входа — ролевая: имя учётной записи и есть запрашиваемая роль.
 # Поэтому имя обязано совпадать с ролью, определение которой раскладывается в
 # хранилище ниже, иначе резолв роли откажет по причине, не имеющей отношения к
-# проверяемой гарантии. Удостоверения фикстур несут user_binding wildcard и
-# allowed_roles, покрывающие эту роль.
+# проверяемой гарантии. Удостоверения фикстур несут allowed_roles, покрывающие
+# эту роль.
 E2E_USER="${TESSERA_E2E_USER:-serv}"
 
 # Каталог ролевых фикстур (определения ролей и ролевые удостоверения). Раннер
@@ -49,7 +49,6 @@ REQUIRED_FIXTURES=(
     leaf_rsa.p12
     expired_leaf.p12
     revoked_leaf.p12
-    leaf_no_user_binding.p12
     crl_valid.pem
 )
 
@@ -134,12 +133,6 @@ allowed_root_spki_sha256 = []
 sources = ["machine_id", "hostname"]
 fallback = "deny"
 custom_command_timeout_seconds = 5
-
-# Удостоверения фикстур несут user_binding, и сопоставление берётся из него.
-# Запись нужна для фикстуры без user_binding: она проверяет именно этот путь.
-[[user_mapping]]
-pam_user = "$E2E_USER"
-cert_subject_cn = "$E2E_USER"
 
 [roles]
 dir = "$ROLE_STORE_DIR"

@@ -71,7 +71,7 @@ flowchart LR
 Установка из `.deb` на Astra Linux SE:
 
 ```bash
-sudo apt install ./tessera_0.4.0-1_amd64.deb
+sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
 Зависимости (`gost-engine`, `pcsc-lite`, `libssl3`, `lsb-base` —
@@ -80,19 +80,19 @@ sudo apt install ./tessera_0.4.0-1_amd64.deb
 
 ## Модель авторизации
 
-Авторизация «какой пользователь на каком хосте» живёт в самом
+Авторизация «в какой роли на каком хосте» живёт в самом
 end-entity сертификате — в двух X.509 v3 расширениях:
 
-| Расширение              | OID                                            | Кодирование             |
-|-------------------------|------------------------------------------------|-------------------------|
-| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098`        | `SEQUENCE OF UTF8String` |
-| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627`        | `SEQUENCE OF UTF8String` |
+| Расширение               | OID                                            | Кодирование             |
+|--------------------------|------------------------------------------------|-------------------------|
+| `pam_cert_host_binding`  | `2.25.183976554325829274683049824615098`        | `SEQUENCE OF UTF8String` |
+| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367`  | `SEQUENCE OF UTF8String` |
 
-Когда оба расширения присутствуют — они и только они определяют, на
-каких хостах и под каким PAM-пользователем сертификат может работать.
-Список `[[user_mapping]]` в `config.toml` оставлен как
-**legacy fallback** для сертификатов, выпущенных без расширения
-`pam_cert_user_binding`. Подробности и готовые рецепты `openssl.cnf`
+Эти два расширения и только они определяют, на каких хостах сертификат
+действует и в какие ролевые учётные записи пускает предъявителя. Имя
+учётной записи входа и есть роль, поэтому список ролей отвечает и на
+вопрос допуска; списка на стороне устройства, который пускал бы по `CN`
+или SAN, не существует. Подробности и готовые рецепты `openssl.cnf`
 — в [docs/ru/cert-issuance.md](docs/ru/cert-issuance.md).
 
 ## Режимы аутентификации
@@ -135,7 +135,7 @@ PAM-cdylib `pam_tessera.so` пишет события `tracing` в syslog
 1. Установить пакет:
 
    ```bash
-   sudo apt install ./tessera_0.4.0-1_amd64.deb
+   sudo apt install ./tessera_0.5.0-1_amd64.deb
    ```
 
 2. Сгенерировать тестовый CA (пример под ГОСТ; полные RSA/ECDSA-варианты —
@@ -174,15 +174,17 @@ PAM-cdylib `pam_tessera.so` пишет события `tracing` в syslog
    sudo "$EDITOR" /etc/tessera/config.toml
    ```
 
-   Минимально: переключить `mode = "pkcs12"`, проверить `[trust].anchors`,
-   указать `[[user_mapping]]` для `alice`.
+   Минимально: переключить `mode = "pkcs12"`, проверить `[trust].anchors`
+   и `[roles].dir` — каталог ролевого хранилища устройства.
 
 6. Уложить корневой сертификат:
    `sudo install -m 0640 -o root -g root /tmp/ca/ca.pem /etc/tessera/ca/bundle.pem`.
 
 7. Сертификаты должны нести X.509 v3 расширения `pam_cert_host_binding`
-   и `pam_cert_user_binding` (см. [`docs/ru/cert-issuance.md`](docs/ru/cert-issuance.md)).
-   Для теста можно выпустить cert с обоими `["*"]` (wildcard).
+   и `pam_cert_allowed_roles` (см. [`docs/ru/cert-issuance.md`](docs/ru/cert-issuance.md)).
+   Для теста в `pam_cert_host_binding` можно поставить `["*"]` (wildcard);
+   в `pam_cert_allowed_roles` подстановка не работает — там перечисляются
+   роли, они же имена учётных записей входа.
 
 8. Включить службу `tessera`:
 

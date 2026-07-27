@@ -20,7 +20,6 @@ mod common;
 
 use common::*;
 use pam_tessera::flow::FlowError;
-use tessera_core::mapping::MappingError;
 use tessera_core::x509::{Certificate, TrustError};
 
 fn leaf_serial(name: &str) -> String {
@@ -35,9 +34,7 @@ fn wrong_pin_three_times_returns_max_tries() {
     let _serial = leaf_serial("leaf_rsa.pem");
     let err = run_flow_with(
         "leaf_rsa.p12",
-        vec![cn_mapping("alice", "alice")],
-        (),
-        "alice",
+        RoleFixture::ACCOUNT,
         "wrong-pin",
         vec![],
         "host-T-hash",
@@ -58,7 +55,6 @@ fn missing_p12_returns_authinfo_unavail() {
     // No `certs/` directory at all.
     let verifier = build_verifier(vec![]);
     let cfg = minimal_cfg();
-    let mappings = vec![cn_mapping("alice", "alice")];
     let monitor = StubClient;
     let exec = tessera_core::hooks::NoopExecutor::new();
     let roles = RoleFixture::serv();
@@ -69,15 +65,19 @@ fn missing_p12_returns_authinfo_unavail() {
         hook_executor: &exec,
         host_id_hash: "host-T-hash",
         host_id_source: HostIdSourceKind::Override,
-        user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
         role_stage: roles.stage(),
         device_tags: pam_tessera::flow::empty_device_tags(),
     };
     let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-    let err = authenticate(deps, &io, "alice", "ssh", "sess-x".into(), |_| {
-        Ok(SecretString::from("correct-pin"))
-    })
+    let err = authenticate(
+        deps,
+        &io,
+        RoleFixture::ACCOUNT,
+        "ssh",
+        "sess-x".into(),
+        |_| Ok(SecretString::from("correct-pin")),
+    )
     .unwrap_err();
     assert!(matches!(
         err,
@@ -86,30 +86,10 @@ fn missing_p12_returns_authinfo_unavail() {
     assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
 }
 
-#[test]
-fn subject_mismatch_returns_perm_denied() {
-    let _serial = leaf_serial("leaf_no_user_binding.pem");
-    let err = run_flow_with(
-        "leaf_no_user_binding.p12",
-        vec![cn_mapping("alice", "ghost")], // expect CN=ghost; cert has CN=alice
-        (),
-        "alice",
-        "correct-pin",
-        vec![],
-        "host-T-hash",
-    )
-    .unwrap_err();
-    assert!(matches!(
-        err,
-        FlowError::Mapping(MappingError::SubjectMismatch { .. })
-    ));
-    assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
-}
-
-// Cert host/user binding scope is exhaustively unit-tested in
-// `tessera_core::host_binding`; the on-disk fixtures all carry
-// `["*"]` for both extensions so end-to-end mismatch tests would need
-// new restrictive fixtures and are deferred.
+// Cert host-binding scope is exhaustively unit-tested in
+// `tessera_core::host_binding`; the on-disk fixtures all carry `["*"]` so an
+// end-to-end mismatch test would need new restrictive fixtures and is deferred.
+// Admission to the login account is role coverage, covered by the role tests.
 
 #[test]
 fn uncovered_leaf_fails_closed_perm_denied() {
@@ -122,9 +102,7 @@ fn uncovered_leaf_fails_closed_perm_denied() {
     let _serial = leaf_serial("leaf_rsa.pem");
     let err = run_flow_with(
         "leaf_rsa.p12",
-        vec![cn_mapping("alice", "alice")],
-        (),
-        "alice",
+        RoleFixture::ACCOUNT,
         "correct-pin",
         vec![read_fixture("crl_foreign.pem")],
         "host-T-hash",
@@ -146,8 +124,6 @@ fn revoked_cert_with_matching_crl_returns_perm_denied() {
     let _serial = leaf_serial("revoked_leaf.pem");
     let err = run_flow_with(
         "revoked_leaf.p12",
-        vec![cn_mapping("mallory", "mallory")],
-        (),
         "mallory",
         "correct-pin",
         vec![read_fixture("crl_valid.pem")],
@@ -168,9 +144,7 @@ fn expired_cert_returns_perm_denied() {
     let _serial = leaf_serial("expired_leaf.pem");
     let err = run_flow_with(
         "expired_leaf.p12",
-        vec![cn_mapping("alice", "alice")],
-        (),
-        "alice",
+        RoleFixture::ACCOUNT,
         "correct-pin",
         vec![],
         "host-T-hash",

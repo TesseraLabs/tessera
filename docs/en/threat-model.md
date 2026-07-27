@@ -33,7 +33,7 @@ The TOE **does not include:**
 | 2.2 | System integrity at install time is controlled (МКЦ + verified boot, if available).        | Replacing `gost-engine.so` or `libpam_tessera.so` bypasses the module.                   |
 | 2.3 | The CA infrastructure works correctly: keys in an HSM, issuance governed by policy.        | Compromise of the CA private key → catastrophic compromise of the whole perimeter.       |
 | 2.4 | User PINs are not disclosed and not written on paper next to the computer.                  | The PIN is the token's only protection under physical access.                            |
-| 2.5 | Certificates are issued by the CA with the mandatory `pam_cert_host_binding` and `pam_cert_user_binding` extensions. | Without the extensions, a certificate authorizes no user on any host — fail-closed. |
+| 2.5 | Certificates are issued by the CA with the mandatory `pam_cert_host_binding` and `pam_cert_allowed_roles` extensions. | Without the extensions, a certificate authorizes no role on any device — fail-closed. |
 | 2.6 | The administrator has a "backup tty" while editing the PAM stack.                          | Protection against lockout on misconfiguration.                                          |
 | 2.7 | A backup user with password authentication has not been removed.                          | Lockout prevention if `tessera` fails.                                                    |
 
@@ -170,25 +170,29 @@ mitigation → evidence (code, config, test).
 ### 3.8 Certificate without extensions or with a forged extension
 
 - **Description:** an attacker tries to use a certificate that has no
-  `pam_cert_host_binding` / `pam_cert_user_binding` extensions at all,
+  `pam_cert_host_binding` / `pam_cert_allowed_roles` extensions at all,
   or attempts to embed "forged" entries bypassing the CA.
 - **STRIDE:** Tampering + Spoofing.
 - **Mitigation:**
   - **Mandatory-extension policy:** the absence of either extension in the
-    leaf certificate is an unconditional denial
-    (`HostExtensionMissing` / `UserExtensionMissing` →
-    `PAM_AUTH_ERR`). There are no "soft" fallbacks.
+    leaf certificate is an unconditional denial: no host extension →
+    `HostExtensionMissing` → `PAM_AUTH_ERR`; no `allowed_roles` → the
+    credential grants no role at all → `PAM_PERM_DENIED`. There are no
+    "soft" fallbacks, and no device-side admission exists: the scope is
+    assigned by the issuer.
   - **Protection by the CA signature:** the extension content is covered by
     the certificate signature. Changing an entry without the CA private key
     is impossible; forging the whole certificate is the task of compromising
     the CA (see 4.8).
   - **Chain verification:** issuing a certificate by a rogue "trusted" CA
     is caught by `[trust].anchors` + optionally `[trust.pinning]`.
-  - **Corrupted DER encoding** (garbage in `extnValue`) →
-    `*ExtensionMalformed` → `PAM_AUTH_ERR`.
+  - **Corrupted DER encoding** (garbage in `extnValue`) → a fail-closed
+    denial: for the host extension `*ExtensionMalformed` →
+    `PAM_AUTH_ERR`; for `allowed_roles` the list is treated as empty (not
+    ignored) → the requested role is not covered → denial.
 - **Evidence:**
   - implementation — `tessera_core::x509::{host_binding_ext,
-    user_binding_ext}` + `verify_cert_scope`;
+    allowed_roles_ext}` + `verify_cert_scope`;
   - semantics table — [docs/cert-issuance.md](cert-issuance.md).
 
 ### 3.9 Substituting `config.toml`
@@ -346,7 +350,7 @@ Compensating controls for `cert-only` (mandatory before deploy):
 - a backup access channel without `tessera` (see install.md §9) —
   a separate sshd stack with `UsePAM=no` or a sudoers rule for an
   emergency account;
-- a spare token with the same `pam_cert_user_binding` for every
+- a spare token with the same `pam_cert_allowed_roles` for every
   privileged user;
 - a documented rescue-recovery procedure (see install.md §11
   "Lockout after a failed PAM edit").
@@ -455,7 +459,7 @@ active image.
 |---------|---------------------------------------------------------------------------|--------------------------------|
 | A1      | External adversary without physical access, without a token, without a PIN. | Zero successes.                |
 | A2      | External adversary who obtained a token but does not know the PIN.        | Zero (PIN protection + attempt limit). |
-| A3      | Internal adversary: a legitimate user tries to use the token on a forbidden machine or for another PAM user. | Zero (host_binding + user_binding in the extensions, protected by the CA signature). |
+| A3      | Internal adversary: a legitimate user tries to use the token on a forbidden machine or to log into another role account. | Zero (host_binding + allowed_roles in the extensions, protected by the CA signature). |
 | A4      | Internal adversary: an administrator with root access.                   | **Not modeled** — the admin is trusted by construction. |
 
 ## 7. Attack tree for threat 3.5 "using a valid token on someone else's machine"
@@ -639,7 +643,7 @@ here is a single ranked registry (impact × likelihood, descending).
 | id | threat | actor | surface | asset | impact | likelihood | status | controls | evidence |
 |---|---|---|---|---|---|---|---|---|---|
 | T1 | Login with a revoked credential: residual revocation degradation (an expired CRL is skipped when crl_strict=false — "revocation is not forever"; a CRL without nextUpdate is bounded only by the opt-in `crl_max_age_hours`) | insider | CRL processing | Authentication decision, revocation state | critical | possible | partially_mitigated | short credential TTL limits the window; the CRL signature is verified mandatorily (fail-closed, `crl/store.rs`); OCSP is implemented (`ocsp`/`crl_then_ocsp`, nonce, issuer-signer check); an empty CRL store with mode=crl is rejected at verifier construction (2026-07); crl_strict=true is opt-in; issuer-DN binding in check_revocation (RFC 5280 §6.3.3) — a CRL applies only to certificates from its own issuer | 14b828e, openspec/revocation, F-001/F-002 (closed) |
-| T2 | Bypassing the authorization policy via fail-open defaults and silent fallback paths: malformed user_binding → fallback to legacy mapping | insider | Chain verification and challenge-response; X.509/PKCS#12 parsing from media; config.toml | Authentication decision, fail-closed invariant | critical | possible | partially_mitigated | mandatory-extension policy (host/user_binding); strict DER parsing of МКЦ labels; since 2026-06 an empty/omitted sig-whitelist is replaced by a safe default (SHA-256/384/512 RSA + ECDSA, without SHA-1/GOST) during config validation — the accept-all default is eliminated; since 2026-06 an extractable PKCS#11 key is rejected by default (`ExtractableKeyRejected`), a WARN remains only under the explicit opt-in `pkcs11_allow_extractable_keys = true`; since 2026-07 omitting the `[trust.revocation]` section or the `mode` key is a config validation error (the silent "revocation not checked" default is eliminated; `none` must be chosen explicitly) | pre_validate.rs:28, flow.rs:662, key_lookup.rs, config/validated.rs, F-002 (closed) |
+| T2 | Bypassing the authorization policy via fail-open defaults and silent fallback paths | insider | Chain verification and challenge-response; X.509/PKCS#12 parsing from media; config.toml | Authentication decision, fail-closed invariant | critical | possible | partially_mitigated | mandatory-extension policy (host_binding/allowed_roles); the silent admission fallback path was eliminated in 2026-07: the `pam_cert_user_binding` extension and the `[[user_mapping]]` section were removed, admission is decided solely by `allowed_roles` of the verified credential, and a config carrying the removed section is rejected at validation; strict DER parsing of МКЦ labels; since 2026-06 an empty/omitted sig-whitelist is replaced by a safe default (SHA-256/384/512 RSA + ECDSA, without SHA-1/GOST) during config validation — the accept-all default is eliminated; since 2026-06 an extractable PKCS#11 key is rejected by default (`ExtractableKeyRejected`), a WARN remains only under the explicit opt-in `pkcs11_allow_extractable_keys = true`; since 2026-07 omitting the `[trust.revocation]` section or the `mode` key is a config validation error (the silent "revocation not checked" default is eliminated; `none` must be chosen explicitly) | pre_validate.rs:28, flow.rs:662, key_lookup.rs, config/validated.rs, F-002 (closed) |
 | T3 | RCE/memory corruption in the root login process while parsing malicious media: DER/PKCS#12 in OpenSSL before verification, and the filesystem image in the kernel at mount(2) | local_user | X.509/PKCS#12 parsing from media; USB mount | Host process integrity | critical | possible | partially_mitigated | Rust wrapping; panic guard (does not save from UB in C); mount with nosuid,nodev,noexec; the CVE history of ASN.1 parsers / filesystem drivers as precedent | |
 | T4 | Evil-maid outside Astra: substitution of config.toml, native .so files (PKCS#11/gost-engine), host_id — without МКЦ labels, DIGSIG, and the immutable bit, Debian/Ubuntu are protected only by DAC | local_user | Dynamic loading of native code; config.toml; Host identity resolution; Package install/removal | Host process integrity, configuration, host identity | critical | possible | partially_mitigated | on Astra: МКЦ ilevel=63, chattr +i, DIGSIG/ЗПС; outside Astra: 0640/0750 root:tessera | |
 | T5 | Build/supply-chain compromise: a backdoor in the login-stack .so across the whole fleet via an unpinned builder-image base, tools without checksums, unsigned .deb, a crates.io dependency | supply_chain | CI / build supply chain; Cargo dependencies | Integrity of release artifacts, Host process integrity | critical | possible | partially_mitigated | reproducible build (.buildinfo), rust-cache pinned by hash, cargo-deny, draft releases; Astra DIGSIG will reject an unsigned .so; GPG signing of .deb and an apt repository are planned | |

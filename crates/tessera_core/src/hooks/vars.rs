@@ -6,9 +6,9 @@
 //! `Option` because at `pre_auth` stage some values (certificate / USB / session)
 //! are not yet known.
 //!
-//! Cert binding (which user on which host) is verified separately via the
-//! cert's `pam_cert_user_binding` / `pam_cert_host_binding` extensions and
-//! is not surfaced as a hook variable.
+//! Cert scope (which account on which device) is verified separately via the
+//! cert's `pam_cert_allowed_roles` / `pam_cert_host_binding` extensions and is
+//! not surfaced as a hook variable.
 
 use crate::hooks::placeholder::PlaceholderVar;
 use crate::hooks::stage::HookStage;

@@ -64,19 +64,23 @@ openssl x509 -in /etc/tessera/<host>.pem -noout -text \
 deployed `[host_identity].sources`. See
 [architecture.md](architecture.md#12-host-identity-chain).
 
-### `user_binding mismatch`
+### A role outside `allowed_roles`
 
-**Symptom:** the cert chain is valid, but a specific user is rejected
-with `UserNotAllowed` / `UserExtensionMissing`.
+**Symptom:** the cert chain is valid, but a login into a specific role
+account is rejected: the requested role (which is also the login account
+name) is not covered by the credential.
 
 **Diagnosis:**
 
 ```bash
-openssl x509 -in /tmp/ca/alice.pem -noout -text \
-    | grep -A1 '2\.25\.215438916728501023845629178354627'
+openssl x509 -in /tmp/ca/serv.pem -noout -text \
+    | grep -A1 '2\.25\.185305973969816596290730578528098241367'
 ```
 
-**Fix:** re-issue the cert with the correct `pam_cert_user_binding`.
+**Fix:** re-issue the credential with the required role in
+`pam_cert_allowed_roles`. There is no separate list of permitted
+accounts: the login account name IS the role, so this list decides
+admission as well.
 
 ### `Authentication failed (PAM_AUTH_ERR)` immediately
 
@@ -253,7 +257,7 @@ the module is integrated into. There is no alternative auth path.
    single token takes the machine out of service.
 2. Prepare **backup** certificates: two physical USB sticks per
    privileged user, both signed by the CA, both with the same
-   `pam_cert_user_binding`.
+   `pam_cert_allowed_roles`.
 3. Document the SLA for re-issuing a lost cert.
 
 **What happens if the token is lost:**
@@ -750,7 +754,7 @@ deliberately (it requires an operator decision + a physical stick).
 1. Revoke the serial (see above).
 2. Wait for CRL propagation.
 3. Issue a replacement token with a new certificate, setting
-   `pam_cert_host_binding` and `pam_cert_user_binding` correctly
+   `pam_cert_host_binding` and `pam_cert_allowed_roles` correctly
    (see [cert-issuance.md](cert-issuance.md)).
 
 ### Loss of the CA private key (worst case)

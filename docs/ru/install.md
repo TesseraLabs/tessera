@@ -131,12 +131,12 @@ sudo dmesg | grep -i digsig | tail   # видны ли отказы по под�
 
 ```bash
 # Ссылка на релиз — placeholder; заменить на реальный URL после
-# публикации v0.4.0 (обычно — GitHub Releases или внутренний репозиторий
+# публикации v0.5.0 (обычно — GitHub Releases или внутренний репозиторий
 # Astra Linux). В релизе публикуются только `.deb` в двух вариантах
 # (`…-astra.deb` и `…-ubuntu.deb`, плюс `.changes` и `.buildinfo`
 # для аудита) — готовых файлов контрольных сумм там нет,
 # их считает оператор на доверенной машине (см. §2.2).
-wget https://example.test/releases/tessera_0.4.0-1_amd64.deb
+wget https://example.test/releases/tessera_0.5.0-1_amd64.deb
 ```
 
 ### 2.2 Генерация контрольных сумм (доверенная машина)
@@ -145,7 +145,7 @@ wget https://example.test/releases/tessera_0.4.0-1_amd64.deb
 машине (не на целевой) скриптом `generate-checksums.sh`:
 
 ```bash
-scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
+scripts/generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
 ```
 
 Скрипт кладёт в каталог `checksums/` файл `checksums.txt` —
@@ -162,7 +162,7 @@ scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
 ### 2.3 Проверка на целевой машине
 
 ```bash
-./verify-checksums.sh tessera_0.4.0-1_amd64.deb checksums.txt
+./verify-checksums.sh tessera_0.5.0-1_amd64.deb checksums.txt
 ```
 
 Ожидание: `OK: N checksum(s) verified`. Скрипт (описан в
@@ -176,7 +176,7 @@ scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
 ### 2.4 Установка
 
 ```bash
-sudo apt install ./tessera_0.4.0-1_amd64.deb
+sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
 `apt` подтянет недостающие зависимости (`libgost-engine | gost-engine`,
@@ -272,7 +272,7 @@ test -d /run/tessera && echo "runtime dir OK"
 test -S /run/tessera/monitord.sock && echo "socket OK"
 ```
 
-Ожидание: версия `0.4.0`, обе строки `OK`.
+Ожидание: версия `0.5.0`, обе строки `OK`.
 
 ## 3. Создание тестового CA (ГОСТ)
 
@@ -353,31 +353,29 @@ openssl req -new -engine gost -key serv.key -out serv.csr \
 
 ### 4.3 Подпись CSR
 
-Лист обязан нести **три** расширения:
+Лист обязан нести **два** расширения:
 
 | Расширение | OID | Отвечает на вопрос |
 |------------|-----|--------------------|
 | `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | на каких устройствах предъявитель вправе входить |
-| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | пущен ли предъявитель в эту учётную запись |
-| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | разрешено ли ему активировать эту роль |
+| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | какие роли предъявитель вправе активировать |
 
 Каждое — `SEQUENCE OF UTF8String`; `pam_cert_allowed_roles` выпускается
 некритичным. OID и ASN.1-синтаксис — из
 [cert-issuance.md](cert-issuance.md).
 
-`user_binding` и `allowed_roles` — разные утверждения выпускающего, и в
-целевой модели они применяются к одному и тому же имени. Первое
-разрешает вход в учётную запись, второе — активацию роли. Удостоверение,
-пускающее в УЗ `serv`, но не разрешающее роль `serv`, — законная
-конфигурация: такое удостоверение обязано отказать во входе, потому что
-покрытие роли доказывается именно `pam_cert_allowed_roles`.
+Отдельного списка разрешённых учётных записей нет и не нужно. Имя
+учётной записи входа и есть роль, поэтому `pam_cert_allowed_roles`
+отвечает сразу на оба вопроса — «какие роли предъявитель вправе
+активировать» и «в какие учётные записи он пущен»: это одна и та же
+строка. Два списка над одной строкой описывали бы нереализуемое
+состояние «пущен в `serv`, но не вправе быть `serv`».
 
-Без любого из трёх модуль отклоняет аутентификацию **fail-closed**:
-отсутствие host/user-расширения даёт `HostExtensionMissing` /
-`UserExtensionMissing`, отсутствие `pam_cert_allowed_roles` означает, что
-удостоверение не даёт ни одной роли, — а роль требуется на каждом входе.
-В обоих случаях §7 не найдёт OID в удостоверении, а `pamtester` в §10
-не пройдёт.
+Без любого из двух модуль отклоняет аутентификацию **fail-closed**:
+отсутствие host-расширения даёт `HostExtensionMissing`, отсутствие
+`pam_cert_allowed_roles` означает, что удостоверение не даёт ни одной
+роли, — а роль требуется на каждом входе. В обоих случаях §7 не найдёт
+OID в удостоверении, а `pamtester` в §10 не пройдёт.
 
 Сначала узнаём `host_id_hash` этой машины — тот источник, что демон
 использует сейчас (строка с `active_under_current_config=yes`,
@@ -388,8 +386,8 @@ HOST_HASH=$(sudo tessera dump-host-id | awk -F'\t' '$7 == "yes" { print $3 }')
 echo "host_id_hash = ${HOST_HASH}"   # 64 hex-символа
 ```
 
-Собираем `extfile` со всеми тремя расширениями (хост — только эта
-машина, учётная запись — только `serv`, роль — только `serv`):
+Собираем `extfile` с обоими расширениями (хост — только эта машина,
+роль, она же учётная запись входа, — только `serv`):
 
 ```bash
 cat > serv.ext <<EOF
@@ -398,16 +396,11 @@ keyUsage = critical,digitalSignature
 
 # Хост: только эта машина (host_id_hash получен выше)
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb
-# Учётная запись входа: только serv
-2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub
-# Роли, которые удостоверение вправе активировать: только serv
+# Роли, они же учётные записи входа: только serv
 2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:ar
 
 [ hb ]
 e0 = UTF8String:sha256:${HOST_HASH}
-
-[ ub ]
-e0 = UTF8String:serv
 
 [ ar ]
 e0 = UTF8String:serv
@@ -581,20 +574,21 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 
 ## 7. Авторизация: расширения удостоверения
 
-Привязка «кто, на каком устройстве и в какой роли» живёт в самом
-удостоверении. PAM-модуль читает три X.509 v3 расширения листа:
+Привязка «на каком устройстве и в какой роли» живёт в самом
+удостоверении. PAM-модуль читает два X.509 v3 расширения листа:
 
 - `pam_cert_host_binding` (OID `2.25.183976554325829274683049824615098`)
   — список разрешённых устройств;
-- `pam_cert_user_binding` (OID `2.25.215438916728501023845629178354627`)
-  — список разрешённых учётных записей входа;
 - `pam_cert_allowed_roles`
   (OID `2.25.185305973969816596290730578528098241367`, некритичное)
   — список ролей, которые удостоверение вправе активировать.
 
-Два последних проверяются независимо, хотя в модели ролевых учётных
-записей относятся к одному имени: `user_binding` разрешает вход в УЗ,
-`allowed_roles` — активацию роли. Отказ по любому из трёх — fail-closed.
+Это две независимые оси: первая отвечает «где», вторая — «кем». Списка
+разрешённых учётных записей отдельно нет: имя учётной записи входа и
+есть роль, поэтому `pam_cert_allowed_roles` заодно отвечает и на вопрос
+допуска к УЗ. Допуск решается только удостоверением — механизма, которым
+устройство разрешало бы вход по своим правилам, в конфигурации не
+существует. Отказ по любому из двух — fail-closed.
 
 Готовые рецепты `openssl.cnf` для выдачи удостоверений с правильными
 расширениями приведены в [cert-issuance.md](cert-issuance.md).
@@ -603,10 +597,10 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 
 ```bash
 openssl x509 -in /tmp/ca/serv.pem -noout -text \
-    | grep -E '2\.25\.(183976554325829274683049824615098|215438916728501023845629178354627|185305973969816596290730578528098241367)'
+    | grep -E '2\.25\.(183976554325829274683049824615098|185305973969816596290730578528098241367)'
 ```
 
-Ожидание: все три строки с дотированными OID присутствуют в выводе.
+Ожидание: обе строки с дотированными OID присутствуют в выводе.
 
 ## 8. Ролевое хранилище устройства
 
@@ -761,7 +755,7 @@ sudo journalctl -u tessera -n 20 -g 'medium absent'
 
 Полный справочник по диагностике — **[docs/troubleshooting.md](troubleshooting.md)**:
 
-- Cert/auth-ошибки (`host_binding mismatch`, `user_binding mismatch`, общий чек-лист)
+- Cert/auth-ошибки (`host_binding mismatch`, роль вне `allowed_roles`, общий чек-лист)
 - USB и токены (`pcscd`, `Token PIN locked`, USBGuard, ЗПС)
 - monitord и демон (`monitord not reachable`, `failed`-старт)
 - PAM-стек и lockout (`Logout requested but session has no logind id`, recovery из rescue.target)
@@ -788,8 +782,7 @@ sudo service tessera start
 - [docs/configuration.md](configuration.md) — справочник по всем
   параметрам `config.toml`.
 - [docs/cert-issuance.md](cert-issuance.md) — выдача удостоверений с
-  расширениями `pam_cert_host_binding`, `pam_cert_user_binding` и
-  `pam_cert_allowed_roles`.
+  расширениями `pam_cert_host_binding` и `pam_cert_allowed_roles`.
 - [docs/operations.md](operations.md) — runbook эксплуатации и
   процедуры incident response.
 - [docs/threat-model.md](threat-model.md) — модель угроз и какие

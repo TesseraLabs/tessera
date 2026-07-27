@@ -25,7 +25,7 @@ use tessera_ext::ext::{
 };
 use tessera_ext::oids::{
     ALLOWED_ROLES_OID, DELEGATION_CONSTRAINTS_OID, HOST_BINDING_OID, MAX_INTEGRITY_OID,
-    PROFILE_VERSION_OID, USER_BINDING_OID,
+    PROFILE_VERSION_OID,
 };
 
 use crate::error::IssueError;
@@ -69,7 +69,7 @@ fn encode_extension(oid: &str, critical: bool, extn_value: &[u8]) -> Result<Vec<
 
 /// Builds the concatenated `Extension` elements for a shift-leaf: `basic
 /// Constraints` (cA=FALSE, critical), `keyUsage` (digitalSignature, critical),
-/// `extendedKeyUsage` (clientAuth), host/user binding, allowed-roles,
+/// `extendedKeyUsage` (clientAuth), host binding, allowed-roles,
 /// `profile_version` (critical), and the optional `max_integrity`.
 ///
 /// `keyUsage` and `extendedKeyUsage` are what make the certificate usable for
@@ -104,11 +104,6 @@ pub(crate) fn leaf_extensions(req: &LeafRequest) -> Result<Vec<u8>, IssueError> 
         HOST_BINDING_OID,
         false,
         &encode_seq_of_utf8(&req.host_binding),
-    )?);
-    out.extend_from_slice(&encode_extension(
-        USER_BINDING_OID,
-        false,
-        &encode_seq_of_utf8(&req.user_binding),
     )?);
     out.extend_from_slice(&encode_extension(
         ALLOWED_ROLES_OID,

@@ -16,9 +16,6 @@ pub enum IssueError {
     /// and must bind at least one host descriptor.
     #[error("leaf profile is missing a host_binding entry")]
     MissingHostBinding,
-    /// A leaf request had an empty `user_binding` — the extension is mandatory.
-    #[error("leaf profile is missing a user_binding entry")]
-    MissingUserBinding,
     /// `not_after` was not strictly after `not_before`.
     #[error("validity is empty or inverted: not_before {not_before} .. not_after {not_after}")]
     InvalidValidity {

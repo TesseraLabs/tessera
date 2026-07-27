@@ -13,4 +13,4 @@ description = "Fixture enforcement plugin used by open-core CI."
 crate-type = ["cdylib"]
 
 [dependencies]
-tessera_core = { path = "../tessera_core", version = "0.4.0" }
+tessera_core = { path = "../tessera_core", version = "0.5.0" }

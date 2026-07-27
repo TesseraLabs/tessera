@@ -46,7 +46,7 @@ Issued by the CA tools in bootstrap mode (see §6.1). The certificate must
 contain the extensions:
 
 - `pam_cert_host_binding = "installation"` (a marker string, **not** a hash);
-- `pam_cert_user_binding = <service_user>`;
+- `pam_cert_allowed_roles = <service_role>`;
 - the standard `extendedKeyUsage = clientAuth, emailProtection`.
 
 `emailProtection` is required not by `tessera` but by the **stock Astra
@@ -217,7 +217,7 @@ The admin reads the `active_under_current_config=yes` row from the TSV, takes
 The certificate receives the extensions:
 
 - `pam_cert_host_binding = <host_id_hash>` (binding to the workstation);
-- `pam_cert_user_binding = service`;
+- `pam_cert_allowed_roles = service`;
 - `pam_cert_max_integrity = <level>` if applicable (МКЦ).
 
 ### 6.3 Packing onto the USB

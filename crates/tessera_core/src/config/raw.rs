@@ -93,9 +93,10 @@ pub struct RawConfig {
     pub trust_override: Vec<RawTrustOverride>,
     /// Host identity.
     pub host_identity: RawHostIdentity,
-    /// User mappings.
+    /// Removed legacy admission list. Accepted at parse time in any shape only
+    /// so the validated layer can name the reason it is gone.
     #[serde(default)]
-    pub user_mapping: Vec<RawUserMapping>,
+    pub user_mapping: Option<RemovedKey>,
     /// Logging.
     pub logging: RawLogging,
     /// Hooks.
@@ -170,13 +171,14 @@ pub struct RawTags {
     pub source: Option<PathBuf>,
 }
 
-/// A key that no longer exists, kept in the raw layer only so validation can
-/// reject it by name.
+/// A key or section that no longer exists, kept in the raw layer only so
+/// validation can reject it by name.
 ///
 /// The whole config is `deny_unknown_fields`, so a dropped key would otherwise
 /// surface as a generic "unknown field" error indistinguishable from a typo.
-/// Deserialising accepts any value shape: the diagnostic must not depend on the
-/// operator having written a still-parseable value.
+/// Deserialising accepts any value shape — a scalar, a table, or an array of
+/// tables — because the diagnostic must not depend on the operator having
+/// written a still-parseable value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemovedKey;
 
@@ -552,23 +554,6 @@ pub enum RawHostIdFallback {
     Warn,
     /// Allow.
     Allow,
-}
-
-/// User mapping.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawUserMapping {
-    /// PAM user.
-    pub pam_user: String,
-    /// Subject CN.
-    #[serde(default)]
-    pub cert_subject_cn: Option<String>,
-    /// SAN email.
-    #[serde(default)]
-    pub cert_san_email: Option<String>,
-    /// SAN UPN.
-    #[serde(default)]
-    pub cert_san_upn: Option<String>,
 }
 
 /// Logging section.

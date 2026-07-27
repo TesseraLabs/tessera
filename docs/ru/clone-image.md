@@ -47,7 +47,7 @@ Astra SE раскатывается на десятки/сотни устрой�
 Сертификат должен содержать расширения:
 
 - `pam_cert_host_binding = "installation"` (строка-маркер, **не** хеш);
-- `pam_cert_user_binding = <service_user>`;
+- `pam_cert_allowed_roles = <service_role>`;
 - стандартные `extendedKeyUsage = clientAuth, emailProtection`.
 
 `emailProtection` требует не `tessera`, а **штатный валидатор Astra**
@@ -223,7 +223,7 @@ CA-машине (HSM/Vault host).
 Сертификат получает расширения:
 
 - `pam_cert_host_binding = <host_id_hash>` (привязка к устройству);
-- `pam_cert_user_binding = service`;
+- `pam_cert_allowed_roles = service`;
 - `pam_cert_max_integrity = <level>` если применимо (МКЦ).
 
 ### 6.3 Упаковка на USB

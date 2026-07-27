@@ -159,11 +159,12 @@ tessera installed.
 
 Next steps:
   1. cp /etc/tessera/config.toml.example /etc/tessera/config.toml
-     and edit it for your site (CA bundle, host_identity, user_mapping).
+     and edit it for your site (CA bundle, host_identity, roles).
   2. Drop CA bundle into /etc/tessera/ca/bundle.pem (mode 0640).
   3. Authorisation is cert-driven (X.509 v3 extensions on the leaf):
-     pam_cert_host_binding + pam_cert_user_binding control which hosts
-     and which local accounts a cert may sign in to. See README.
+     pam_cert_host_binding + pam_cert_allowed_roles control which hosts
+     a cert is valid on and which role accounts it admits into — a login
+     account name IS a role name. See README.
   4. systemctl enable --now tessera.service
   5. Integrate the PAM stack:
         sudo /usr/share/tessera/integrate-pam.sh /etc/pam.d/sudo

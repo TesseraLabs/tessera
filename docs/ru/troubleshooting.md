@@ -60,19 +60,23 @@ openssl x509 -in /etc/tessera/<host>.pem -noout -text \
 развёрнутым `[host_identity].sources`. См.
 [architecture.md](architecture.md#12-host-identity-chain).
 
-### `user_binding mismatch`
+### Роль вне `allowed_roles`
 
-**Симптом:** цепь cert валидна, конкретный user отвергается
-`UserNotAllowed` / `UserExtensionMissing`.
+**Симптом:** цепь cert валидна, вход в конкретную ролевую учётную запись
+отвергается: запрошенная роль (она же имя учётной записи входа) не покрыта
+удостоверением.
 
 **Диагностика:**
 
 ```bash
-openssl x509 -in /tmp/ca/alice.pem -noout -text \
-    | grep -A1 '2\.25\.215438916728501023845629178354627'
+openssl x509 -in /tmp/ca/serv.pem -noout -text \
+    | grep -A1 '2\.25\.185305973969816596290730578528098241367'
 ```
 
-**Фикс:** перевыпустить cert с правильным `pam_cert_user_binding`.
+**Фикс:** перевыпустить удостоверение с нужной ролью в
+`pam_cert_allowed_roles`. Отдельного списка разрешённых учётных записей нет:
+имя учётной записи входа и есть роль, поэтому этот список решает и вопрос
+допуска.
 
 ### `Authentication failed (PAM_AUTH_ERR)` сразу
 
@@ -246,7 +250,7 @@ sudo systemctl daemon-reload
    блокировка единственного токена выводит машину из строя.
 2. Готовить **резервные** сертификаты: каждому privileged user —
    две физические флешки, обе подписаны CA, обе с одинаковым
-   `pam_cert_user_binding`.
+   `pam_cert_allowed_roles`.
 3. Документировать SLA на перевыпуск утерянного cert.
 
 **Что произойдёт при потере токена:**
@@ -734,7 +738,7 @@ sudo systemctl restart fly-dm           # подхватит новый JPG
 1. Revoke серийника (см. выше).
 2. Дождаться распространения CRL.
 3. Выпустить токен на замену с новым сертификатом, корректно
-   проставив `pam_cert_host_binding` и `pam_cert_user_binding`
+   проставив `pam_cert_host_binding` и `pam_cert_allowed_roles`
    (см. [cert-issuance.md](cert-issuance.md)).
 
 ### Утрата CA private key (worst-case)

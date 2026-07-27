@@ -36,9 +36,9 @@ pub struct IntegrityCeiling {
 
 /// A request to issue an engineer shift-leaf.
 ///
-/// `host_binding` and `user_binding` MUST be non-empty; `allowed_roles` and
-/// `profile_version` are always emitted (an empty role list is a valid "grants
-/// no roles" leaf). `max_integrity` is optional.
+/// `host_binding` MUST be non-empty; `allowed_roles` and `profile_version` are
+/// always emitted (an empty role list is a valid "grants no roles" leaf).
+/// `max_integrity` is optional.
 #[derive(Debug, Clone)]
 pub struct LeafRequest {
     /// Subject distinguished name, RFC 4514 (e.g. `CN=ivanov,O=Org`).
@@ -49,9 +49,8 @@ pub struct LeafRequest {
     pub validity: Validity,
     /// Host descriptors (`"*"`, `"sha256:<hex>"`, or a raw `machine_id`).
     pub host_binding: Vec<String>,
-    /// User descriptors (`"*"` or exact PAM usernames).
-    pub user_binding: Vec<String>,
-    /// Roles the leaf may activate.
+    /// Roles the leaf may activate. A role name is also the name of the login
+    /// account it unlocks, so this list is the leaf's whole admission scope.
     pub allowed_roles: Vec<String>,
     /// Optional integrity ceiling.
     pub max_integrity: Option<IntegrityCeiling>,

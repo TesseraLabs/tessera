@@ -31,7 +31,8 @@ use super::store::RoleStore;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleDenyReason {
     /// The requested role is not present in the on-device store, or the
-    /// store is empty / unconfigured under `require`.
+    /// store is empty / unconfigured — which denies every login, since a
+    /// role must always be resolved.
     NotFound,
     /// The requested role is not a member of the certificate's
     /// `allowed_roles` list.

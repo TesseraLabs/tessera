@@ -143,7 +143,6 @@ fn leaf_request() -> LeafRequest {
         subject_spki_der: spki_fixture(),
         validity: validity(3_600),
         host_binding: vec!["*".to_owned()],
-        user_binding: vec!["oper".to_owned()],
         allowed_roles: vec!["oper".to_owned()],
         max_integrity: Some(IntegrityCeiling {
             level: 5,
@@ -487,13 +486,13 @@ fn issued_artifacts_are_accepted_by_shared_parsers() {
     )
     .unwrap();
     assert_eq!(hosts, req.host_binding);
-    let users = parse_seq_of_utf8(
-        &extract_extension_value(&leaf, USER_BINDING_OID)
+    assert!(
+        extract_extension_value(&leaf, USER_BINDING_OID)
             .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(users, req.user_binding);
+            .is_none(),
+        "the leaf profile no longer carries a separate account list: the role \
+         name is the account name, so allowed_roles answers both questions"
+    );
     let roles = parse_seq_of_utf8(
         &extract_extension_value(&leaf, ALLOWED_ROLES_OID)
             .unwrap()
@@ -784,7 +783,6 @@ mod csr {
         LeafScope {
             validity: super::validity(3_600),
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["oper".to_owned()],
             max_integrity: Some(crate::IntegrityCeiling {
                 level: 5,

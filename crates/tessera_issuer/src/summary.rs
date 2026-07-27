@@ -24,7 +24,7 @@ use tessera_ext::ext::{
 };
 use tessera_ext::oids::{
     ALLOWED_ROLES_OID, DELEGATION_CONSTRAINTS_OID, HOST_BINDING_OID, MAX_INTEGRITY_OID,
-    PROFILE_VERSION_OID, USER_BINDING_OID,
+    PROFILE_VERSION_OID,
 };
 
 use crate::l10n::{Caption, Locale};
@@ -265,7 +265,6 @@ fn parse_certificate_summary(tbs_der: &[u8]) -> Result<OperationSummary, Summary
         OperationKind::OrgCa
     } else {
         push_seq_line(&cert_like, HOST_BINDING_OID, Caption::Hosts, &mut lines)?;
-        push_seq_line(&cert_like, USER_BINDING_OID, Caption::Users, &mut lines)?;
         push_seq_line(&cert_like, ALLOWED_ROLES_OID, Caption::Roles, &mut lines)?;
         if let Some(value) = extract_extension_value(&cert_like, MAX_INTEGRITY_OID)
             .map_err(|_| SummaryError::Malformed)?
@@ -534,7 +533,6 @@ mod tests {
                 not_after: 1_600_003_600,
             },
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["oper".to_owned()],
             max_integrity: Some(IntegrityCeiling {
                 level: 5,
@@ -638,7 +636,7 @@ mod tests {
             not_before: "a".to_owned(),
             not_after: "b".to_owned(),
             lines: vec![SummaryLine {
-                caption: Caption::Users,
+                caption: Caption::Roles,
                 value: "\u{2066}root\u{2069}".to_owned(),
             }],
         };

@@ -215,10 +215,10 @@ certificate itself through X.509 extensions and is verified in code:
 - `crates/tessera_core/src/x509/host_binding_ext.rs` — parsing of the
   `pam_cert_host_binding` extension (the OID and ASN.1 structure are in
   `x509/oids.rs`).
-- `crates/tessera_core/src/x509/user_binding_ext.rs` — parsing of the
-  `pam_cert_user_binding` extension.
+- `crates/tessera_core/src/x509/allowed_roles_ext.rs` — parsing of the
+  `pam_cert_allowed_roles` extension.
 - `verify_cert_scope` — the final matching of the parsed entries against
-  `host_id_hash` and `pam_user`. See also
+  `host_id_hash` and the requested role, which is also `pam_user`. See also
   [docs/cert-issuance.md](cert-issuance.md) for the semantics of the entries.
 
 ## 9. Versioning

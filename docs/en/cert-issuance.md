@@ -1,4 +1,4 @@
-# Certificate issuance: host_binding and user_binding
+# Certificate issuance: host_binding and allowed_roles
 
 ## Introduction
 
@@ -7,24 +7,24 @@ extensions to embed in a Tessera leaf certificate, and provides ready-made
 `openssl.cnf` fragments from which the certificate is issued with a stock
 `openssl x509 -req`.
 
-There are six extensions. Two are mandatory: they encode the "which user on
+There are five extensions. Two are mandatory: they encode the "in which role on
 which host" authorization and are checked by the PAM module at the
 authentication phase:
 
 - `pam_cert_host_binding` — on which hosts the certificate is valid;
-- `pam_cert_user_binding` — for which PAM user.
+- `pam_cert_allowed_roles` — which roles the certificate may activate.
 
-When both extensions are present, they and they alone define the certificate's
-scope. The `[[user_mapping]]` list in `config.toml` remains as a **legacy
-fallback** for certificates issued without the `pam_cert_user_binding`
-extension; for new issuance the extensions must always be set by the CA (see
-`docs/threat-model.md`, the mandatory-extension policy).
+These two extensions and they alone define the certificate's scope. There is no
+separate list of permitted accounts: the name of the login account IS the role,
+so `pam_cert_allowed_roles` also answers the question "into which account is the
+bearer admitted". There is no device-side fallback — no mechanism by which the
+device could permit a login on its own terms: the scope is assigned by the
+issuer, not by the party being constrained.
 
-The remaining four are optional, for specific capabilities; each is covered in
+The remaining three are optional, for specific capabilities; each is covered in
 its own section below:
 
 - `pam_cert_max_integrity` — the integrity-label ceiling on Astra МКЦ hosts;
-- `pam_cert_allowed_roles` — the roles the certificate may activate at login;
 - `pam_cert_profile_version` — the certificate format version (version-gate);
 - `pam_cert_delegation_constraints` — the delegation envelope for an
   intermediate CA.
@@ -34,7 +34,6 @@ its own section below:
 | Extension name | Dotted OID | ASN.1 syntax | Criticality |
 |---|---|---|---|
 | `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | `extnValue ::= SEQUENCE OF UTF8String` | non-critical |
-| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | `extnValue ::= SEQUENCE OF UTF8String` | non-critical |
 | `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | `extnValue ::= SEQUENCE OF UTF8String` | non-critical |
 | `pam_cert_max_integrity` | `2.25.273824307386008814506455310913083078403` | `extnValue ::= SEQUENCE { level INTEGER, categories BIT STRING }` | non-critical |
 | `pam_cert_profile_version` | `2.25.107983357797077476746994938370032043240` | `extnValue ::= INTEGER` | **critical** |
@@ -55,16 +54,18 @@ Each `UTF8String` entry in `pam_cert_host_binding` is interpreted as follows:
 | `sha256:<HEX>` | allowed only on the host whose `host_id_hash` matches the given 64-character lowercase-hex value (case-insensitive) |
 | Any other UTF-8 string | the string is interpreted as a "raw" `machine_id` and the comparison goes through SHA-256 of the string |
 
-In `pam_cert_user_binding` an entry is either `*` (any PAM user) or an exact
-username (case-sensitive — Linux usernames are case-sensitive).
+In `pam_cert_allowed_roles` an entry is a `role_id` that must match
+`^[a-z][a-z0-9-]{0,15}$`. A `*` wildcard is not supported here: the role list is
+always enumerated explicitly. For details see
+[The `allowed_roles` extension](#the-allowed_roles-extension-role-selection-at-login).
 
-To authorize a certificate on a specific host/user, **at least one matching
-entry** is required in each of the two extensions.
+To authorize a certificate on a specific host and in a specific role account,
+**at least one matching entry** is required in each of the two extensions.
 
-## Scenario 1 — workstation: one host, one user
+## Scenario 1 — workstation: one host, one role
 
 A specific operator's workplace. The certificate can be used only on the machine
-with the known `machine_id` and only for the specific PAM user.
+with the known `machine_id` and only to log into the role account `oper`.
 
 ```ini
 # openssl.cnf — fragment
@@ -76,15 +77,19 @@ subjectAltName         = email:ivanov@example.org
 
 # Host: SHA-256 of the operator workstation's machine-id
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb_one
-# User: the single name
-2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub_one
+# Role, which is also the login account: the single one
+2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:ar_one
 
 [ hb_one ]
 e0 = UTF8String:sha256:a1b2c3d4e5f6...64charsTotal...
 
-[ ub_one ]
-e0 = UTF8String:ivanov
+[ ar_one ]
+e0 = UTF8String:oper
 ```
+
+The engineer's identity (`CN`, `subjectAltName`) does not affect admission: it
+serves the issuance journal and incident analysis, while the decision is made
+from the two extensions above.
 
 Issuance command:
 
@@ -96,7 +101,7 @@ openssl x509 -req -in user.csr -CA int.pem -CAkey int.key \
     -extfile openssl.cnf -extensions user_exts -out user.pem
 ```
 
-## Scenario 2 — terminal operator: several hosts, one user
+## Scenario 2 — terminal operator: several hosts, one role
 
 ```ini
 [ hb_three_hosts ]
@@ -104,22 +109,23 @@ e0 = UTF8String:sha256:111111111111111111111111111111111111111111111111111111111
 e1 = UTF8String:sha256:2222222222222222222222222222222222222222222222222222222222222222
 e2 = UTF8String:sha256:3333333333333333333333333333333333333333333333333333333333333333
 
-[ ub_operator ]
-e0 = UTF8String:operator
+[ ar_operator ]
+e0 = UTF8String:oper
 ```
 
-## Scenario 3 — mobile administrator: any host, exact user
+## Scenario 3 — mobile administrator: any host, exact role
 
 ```ini
 [ hb_any ]
 e0 = UTF8String:*
 
-[ ub_admin ]
+[ ar_admin ]
 e0 = UTF8String:admin
 ```
 
-`*` in host_binding lets the certificate work on any machine; in user_binding a
-hard restriction on the username still remains.
+`*` in host_binding lets the certificate work on any machine; in allowed_roles a
+hard restriction on the role — that is, on the login account name — still
+remains.
 
 ## Verifying an issued certificate
 
@@ -132,21 +138,21 @@ The output must contain both lines with the dotted OIDs:
 ```
 2.25.183976554325829274683049824615098:
     0...sha256:a1b2c3d4...
-2.25.215438916728501023845629178354627:
-    0...ivanov
+2.25.185305973969816596290730578528098241367:
+    0...oper
 ```
 
 ## Verification table
 
 | Entry | Matches… |
 |---|---|
-| `*` | any host / any user |
+| `*` (host_binding) | any host |
 | `sha256:<HEX>` | the host whose `host_id_hash` equals `HEX` (case-insensitive) |
 | `<raw>` (host_binding) | the host whose `host_id_hash` equals `sha256(raw)` |
-| `<name>` (user_binding) | the PAM user with the exact name `<name>` |
-| Extension absent | **deny** (`HostExtensionMissing` / `UserExtensionMissing`) |
+| `<role>` (allowed_roles) | a login into the role account with the exact name `<role>` |
+| Extension absent | **deny** (`HostExtensionMissing`; for allowed_roles — the role is not covered) |
 | Extension empty or DER-broken | **deny** (`*ExtensionMalformed`) |
-| Entries present but none matched | **deny** (`HostNotAllowed` / `UserNotAllowed`) |
+| Entries present but none matched | **deny** (`HostNotAllowed` / the role is not covered) |
 
 See also [`docs/configuration.md`](configuration.md).
 
@@ -202,15 +208,16 @@ requested role is the login account name (`ssh serv@device`). The semantics
 are authorization-oriented: a role is covered if its `role_id` is present in
 the list.
 
-This is not the same as `pam_cert_user_binding`: that one answers "may the
-holder log into this account", while `allowed_roles` answers "may the holder
-activate this role". In the role-account model both checks apply to the same
-string, but they stay separate: a certificate with `user_binding = [serv]` and
-`allowed_roles = [oper]` does not admit a login into `serv`.
+This is the sole admission list. It answers "into which account is the holder
+admitted" with the very same enumeration, because the login account name IS the
+role: a certificate with `allowed_roles = [oper]` does not admit a login into
+`serv`. There is no separate list of accounts — two lists over one string would
+describe an unrealizable state, "admitted into `serv`, but not entitled to be
+`serv`".
 
 OID: `2.25.185305973969816596290730578528098241367`
 
-Structure (DER) — the same as host/user binding:
+Structure (DER) — the same as host_binding:
 
 ```asn1
 extnValue ::= SEQUENCE OF UTF8String
@@ -391,7 +398,7 @@ The `hash_hex` is fed into the CA issuance tool (see
 in this repository).
 
 The cert receives `pam_cert_host_binding = <hash_hex>`,
-`pam_cert_user_binding = <service_user>` and the standard
+`pam_cert_allowed_roles = <role>` and the standard
 `extendedKeyUsage = clientAuth, emailProtection` (`emailProtection` is required
 by the stock Astra validator — openssl `CMS_verify`; `tessera` itself does not
 check this EKU). On a МКЦ workstation, additionally

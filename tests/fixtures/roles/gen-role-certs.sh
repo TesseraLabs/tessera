@@ -14,8 +14,13 @@
 # SUPERSEDED: these leaves bind to a human account (`ivanov`) and were driven
 # by the `<user>+<role>` login suffix, which no longer exists — the role is now
 # the login account name. Use gen-role-account-certs.sh for anything that has
-# to authenticate. Kept only because the allowed_roles DER shapes below are
-# still the reference encoding.
+# to authenticate. Kept for two reasons: the allowed_roles DER shapes below are
+# still the reference encoding, and the leaves also carry the withdrawn
+# pam_cert_user_binding extension, which makes them the pre-change credential
+# shape — the fixture behind the claim that a certificate issued before
+# admission collapsed onto one list still verifies, the withdrawn extension
+# being skipped like any unknown non-critical one. That extension stays in the
+# .cnf files on purpose; never add it to a newly issued leaf.
 #
 # Leaves:
 #   role-serv       pam_cert_allowed_roles = [serv]

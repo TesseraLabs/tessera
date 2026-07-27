@@ -136,12 +136,12 @@ not go through — `pam_tessera.so` simply does not load. See also
 
 ```bash
 # The release link is a placeholder; replace it with the real URL after
-# v0.4.0 is published (usually GitHub Releases or the Astra Linux
+# v0.5.0 is published (usually GitHub Releases or the Astra Linux
 # internal repository). The release publishes only the `.deb` in two
 # variants (`…-astra.deb` and `…-ubuntu.deb`, plus `.changes` and
 # `.buildinfo` for audit) — there are no ready-made checksum files there;
 # the operator computes them on a trusted machine (see §2.2).
-wget https://example.test/releases/tessera_0.4.0-1_amd64.deb
+wget https://example.test/releases/tessera_0.5.0-1_amd64.deb
 ```
 
 ### 2.2 Generating the checksums (trusted machine)
@@ -151,7 +151,7 @@ The checksums are computed by the builder or the operator on a
 script:
 
 ```bash
-scripts/generate-checksums.sh tessera_0.4.0-1_amd64.deb checksums
+scripts/generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
 ```
 
 The script puts a `checksums.txt` file into the `checksums/` directory —
@@ -169,7 +169,7 @@ self-contained — the only external thing it needs is `openssl` with
 ### 2.3 Verifying on the target machine
 
 ```bash
-./verify-checksums.sh tessera_0.4.0-1_amd64.deb checksums.txt
+./verify-checksums.sh tessera_0.5.0-1_amd64.deb checksums.txt
 ```
 
 Expected: `OK: N checksum(s) verified`. The script (described in
@@ -184,7 +184,7 @@ cause is understood.
 ### 2.4 Installation
 
 ```bash
-sudo apt install ./tessera_0.4.0-1_amd64.deb
+sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
 `apt` will pull in the missing dependencies (`libgost-engine | gost-engine`,
@@ -282,7 +282,7 @@ test -d /run/tessera && echo "runtime dir OK"
 test -S /run/tessera/monitord.sock && echo "socket OK"
 ```
 
-Expected: version `0.4.0`, both `OK` lines.
+Expected: version `0.5.0`, both `OK` lines.
 
 ## 3. Creating a test CA (GOST)
 
@@ -363,32 +363,30 @@ authorization: the decision is made from the extensions in §4.3.
 
 ### 4.3 Signing the CSR
 
-The leaf must carry **three** extensions:
+The leaf must carry **two** extensions:
 
 | Extension | OID | Question it answers |
 |-----------|-----|---------------------|
 | `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | on which devices the bearer may log in |
-| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | is the bearer admitted into this account |
-| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | is the bearer allowed to activate this role |
+| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | which roles the bearer may activate |
 
 Each is a `SEQUENCE OF UTF8String`; `pam_cert_allowed_roles` is issued
 non-critical. The OIDs and the ASN.1 syntax are from
 [cert-issuance.md](cert-issuance.md).
 
-`user_binding` and `allowed_roles` are two different statements by the
-issuer, and in the target model both apply to the same name. The first
-permits entry into the account, the second permits activation of the
-role. A credential that admits into the account `serv` but does not
-permit the role `serv` is a legitimate configuration: such a credential
-must refuse the login, because role coverage is proven precisely by
-`pam_cert_allowed_roles`.
+There is no separate list of permitted accounts, and none is needed. The
+name of the login account IS the role, so `pam_cert_allowed_roles`
+answers both questions at once — "which roles the bearer may activate"
+and "into which accounts the bearer is admitted": it is the same string.
+Two lists over one string would describe an unrealizable state:
+"admitted into `serv`, but not entitled to be `serv`".
 
-Without any one of the three the module rejects authentication
-**fail-closed**: a missing host/user extension yields
-`HostExtensionMissing` / `UserExtensionMissing`, and a missing
-`pam_cert_allowed_roles` means the credential grants no role at all —
-while a role is required at every login. In both cases §7 will not find
-the OID in the credential, and `pamtester` in §10 will not pass.
+Without either of the two the module rejects authentication
+**fail-closed**: a missing host extension yields `HostExtensionMissing`,
+and a missing `pam_cert_allowed_roles` means the credential grants no
+role at all — while a role is required at every login. In both cases §7
+will not find the OID in the credential, and `pamtester` in §10 will not
+pass.
 
 First find out this machine's `host_id_hash` — the source the daemon uses
 right now (the row with `active_under_current_config=yes`, column
@@ -399,8 +397,8 @@ HOST_HASH=$(sudo tessera dump-host-id | awk -F'\t' '$7 == "yes" { print $3 }')
 echo "host_id_hash = ${HOST_HASH}"   # 64 hex characters
 ```
 
-Assemble the `extfile` with all three extensions (host — only this
-machine, account — only `serv`, role — only `serv`):
+Assemble the `extfile` with both extensions (host — only this machine,
+role, which is also the login account, — only `serv`):
 
 ```bash
 cat > serv.ext <<EOF
@@ -409,16 +407,11 @@ keyUsage = critical,digitalSignature
 
 # Host: only this machine (host_id_hash obtained above)
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb
-# Login account: only serv
-2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub
-# Roles the credential may activate: only serv
+# Roles, which are also the login accounts: only serv
 2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:ar
 
 [ hb ]
 e0 = UTF8String:sha256:${HOST_HASH}
-
-[ ub ]
-e0 = UTF8String:serv
 
 [ ar ]
 e0 = UTF8String:serv
@@ -597,22 +590,22 @@ Expected: the output contains a `Private Key Object` and a
 
 ## 7. Authorization: credential extensions
 
-The binding of "who, on which device, in which role" lives in the
-credential itself. The PAM module reads three X.509 v3 extensions of the
-leaf:
+The binding of "on which device, in which role" lives in the credential
+itself. The PAM module reads two X.509 v3 extensions of the leaf:
 
 - `pam_cert_host_binding` (OID `2.25.183976554325829274683049824615098`)
   — the list of allowed devices;
-- `pam_cert_user_binding` (OID `2.25.215438916728501023845629178354627`)
-  — the list of allowed login accounts;
 - `pam_cert_allowed_roles`
   (OID `2.25.185305973969816596290730578528098241367`, non-critical)
   — the list of roles the credential may activate.
 
-The last two are checked independently, even though in the role-account
-model they refer to the same name: `user_binding` permits entry into the
-account, `allowed_roles` permits activation of the role. A rejection by
-any of the three is fail-closed.
+These are two independent axes: the first answers "where", the second
+"as whom". There is no separate list of permitted accounts: the name of
+the login account IS the role, so `pam_cert_allowed_roles` also answers
+the question of admission into the account. Admission is decided by the
+credential alone — the configuration holds no mechanism by which the
+device could admit a login on its own terms. A rejection by either of
+the two is fail-closed.
 
 Ready-made `openssl.cnf` recipes for issuing credentials with the
 correct extensions are given in [cert-issuance.md](cert-issuance.md).
@@ -621,10 +614,10 @@ correct extensions are given in [cert-issuance.md](cert-issuance.md).
 
 ```bash
 openssl x509 -in /tmp/ca/serv.pem -noout -text \
-    | grep -E '2\.25\.(183976554325829274683049824615098|215438916728501023845629178354627|185305973969816596290730578528098241367)'
+    | grep -E '2\.25\.(183976554325829274683049824615098|185305973969816596290730578528098241367)'
 ```
 
-Expected: all three dotted-OID lines are present in the output.
+Expected: both dotted-OID lines are present in the output.
 
 ## 8. The device role store
 
@@ -781,7 +774,7 @@ sudo journalctl -u tessera -n 20 -g 'medium absent'
 
 The full diagnostics reference is **[docs/troubleshooting.md](troubleshooting.md)**:
 
-- Cert/auth errors (`host_binding mismatch`, `user_binding mismatch`, a general checklist)
+- Cert/auth errors (`host_binding mismatch`, a role outside `allowed_roles`, a general checklist)
 - USB and tokens (`pcscd`, `Token PIN locked`, USBGuard, ЗПС)
 - monitord and the daemon (`monitord not reachable`, a `failed` start)
 - The PAM stack and lockout (`Logout requested but session has no logind id`, recovery from rescue.target)
@@ -808,8 +801,7 @@ Details (caveats, the absence of logind logout) —
 - [docs/configuration.md](configuration.md) — a reference to all
   `config.toml` parameters.
 - [docs/cert-issuance.md](cert-issuance.md) — issuing credentials with
-  the `pam_cert_host_binding`, `pam_cert_user_binding` and
-  `pam_cert_allowed_roles` extensions.
+  the `pam_cert_host_binding` and `pam_cert_allowed_roles` extensions.
 - [docs/operations.md](operations.md) — the operations runbook and
   incident-response procedures.
 - [docs/threat-model.md](threat-model.md) — the threat model and which

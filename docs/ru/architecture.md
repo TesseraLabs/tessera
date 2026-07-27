@@ -15,9 +15,9 @@
 
 - Аутентифицирует локального UNIX-пользователя по X.509-сертификату на
   USB-носителе или PKCS#11-токене.
-- Привязывает пользователя к машине (host-binding) через X.509 v3
-  расширения `pam_cert_host_binding` и `pam_cert_user_binding`,
-  встроенные в сам leaf-сертификат.
+- Привязывает предъявителя к машине и к ролевой учётной записи через
+  X.509 v3 расширения `pam_cert_host_binding` и
+  `pam_cert_allowed_roles`, встроенные в сам leaf-сертификат.
 - Мониторит состояние USB-носителя в течение сессии и реагирует на
   его извлечение (lock / logout / hook / shutdown).
 - Корректно обрабатывает suspend/resume.
@@ -65,8 +65,9 @@ DER-кодеки), используется и ядром, и инструмен
 - Хуки (`hooks/`).
 - Host identity chain (`host_identity/`).
 - Cert-scope verification — парсинг расширений
-  `pam_cert_host_binding` / `pam_cert_user_binding` и сверка их
-  записей с `host_id_hash` и `pam_user` (`x509/`, `verify_cert_scope`).
+  `pam_cert_host_binding` / `pam_cert_allowed_roles` и сверка их
+  записей с `host_id_hash` и запрошенной ролью, она же `pam_user`
+  (`x509/`, `verify_cert_scope`).
 - IPC client side (`ipc/`).
 
 Без `tokio`, без асинхронности. Все операции блокирующие — это
@@ -184,13 +185,14 @@ PAM-стек делает несколько вызовов в порядке `a
    - найти сертификат, проверить цепь и revocation;
    - challenge-response с приватным ключом;
    - извлечь расширения `pam_cert_host_binding` и
-     `pam_cert_user_binding` из leaf-сертификата и сверить их с
-     `host_id_hash` и `pam_user` через `verify_cert_scope`.
-     **Когда `pam_cert_user_binding` присутствует, это единственный
-     источник авторизации для PAM-пользователя** — список
-     `[[user_mapping]]` из `config.toml` тогда не читается; при
-     отсутствии расширения модуль откатывается на legacy-сравнение
-     через `[[user_mapping]]` (коды отказов обоих путей — в §13).
+     `pam_cert_allowed_roles` из leaf-сертификата и сверить их с
+     `host_id_hash` и запрошенной ролью через `verify_cert_scope`.
+     **`pam_cert_allowed_roles` — единственный источник допуска к
+     учётной записи**: `PAM_USER` и есть роль, поэтому один список
+     отвечает и на вопрос «в какую учётную запись пущен предъявитель».
+     Отката к конфигурации устройства не существует; отсутствие
+     расширения — отказ, а не переход на иной механизм (коды отказов —
+     в §13).
 8. При успехе — построить `AuthContext` и сохранить через
    `pam_set_data`.
 9. Отправить `Hello` + `SessionOpen` в monitord (получить `Ack`).
@@ -617,15 +619,13 @@ PAM-коды, которые получает стек; единственное
 | 5  | сертификат не проходит chain verification                      | `PAM_PERM_DENIED` (6)  |
 | 6  | revocation check провалился (`crl`: серийник в CRL, CRL отсутствует/несвежа; `ocsp`/`crl_then_ocsp`: responder недоступен, таймаут, статус `unknown`/`revoked`, подпись ответа невалидна) | `PAM_PERM_DENIED` (6) |
 | 7  | challenge-response не сошёлся                                  | `PAM_PERM_DENIED` (6)  |
-| 8  | legacy `[[user_mapping]]` не дал совпадения                    | `PAM_PERM_DENIED` (6)  |
+| 8  | запрошенная роль не покрыта `pam_cert_allowed_roles` — расширение отсутствует, невалидно (список считается пустым) либо роли в нём нет | `PAM_PERM_DENIED` (6)  |
 | 9  | исчерпан лимит попыток PIN (`MaxTries`, `PinLocked`)           | `PAM_MAXTRIES` (11)    |
 | 10 | расширение `pam_cert_host_binding` отсутствует или невалидно   | `PAM_AUTH_ERR` (7)     |
 | 11 | host_id_hash не входит в записи `pam_cert_host_binding`        | `PAM_AUTH_ERR` (7)     |
-| 12 | расширение `pam_cert_user_binding` отсутствует или невалидно   | `PAM_AUTH_ERR` (7)     |
-| 13 | `pam_user` не входит в записи `pam_cert_user_binding`          | `PAM_AUTH_ERR` (7)     |
-| 14 | единичная ошибка PIN, ошибка PAM conversation, отказ хука      | `PAM_AUTH_ERR` (7)     |
-| 15 | нарушение внутренних инвариантов (`Internal`)                  | `PAM_SYSTEM_ERR` (4)   |
-| 16 | `Error` из monitord с `code = DEVICE_GONE` / `UNAUTHORIZED`    | пробрасывается всегда, даже в `permissive` |
+| 12 | единичная ошибка PIN, ошибка PAM conversation, отказ хука      | `PAM_AUTH_ERR` (7)     |
+| 13 | нарушение внутренних инвариантов (`Internal`)                  | `PAM_SYSTEM_ERR` (4)   |
+| 14 | `Error` из monitord с `code = DEVICE_GONE` / `UNAUTHORIZED`    | пробрасывается всегда, даже в `permissive` |
 
 Полная таблица соответствия `FlowError` → PAM-код — doc-comment
 `FlowError::pam_code` в
@@ -636,10 +636,9 @@ PAM-коды, которые получает стек; единственное
 - panic'и и инфраструктурные ошибки → `PAM_AUTHINFO_UNAVAIL`
   (сообщает PAM-стеку: «следующий модуль может попробовать»).
 - Отказы криптографической проверки (цепь, revocation,
-  challenge-response, mapping) → `PAM_PERM_DENIED`; отказы
-  cert-scope (`pam_cert_host_binding` / `pam_cert_user_binding`) и
-  прочие auth-ошибки → `PAM_AUTH_ERR`; исчерпанный PIN-бюджет →
-  `PAM_MAXTRIES`.
+  challenge-response) и отказ по роли → `PAM_PERM_DENIED`; отказы
+  host-scope (`pam_cert_host_binding`) и прочие auth-ошибки →
+  `PAM_AUTH_ERR`; исчерпанный PIN-бюджет → `PAM_MAXTRIES`.
 - Регистрация в monitord входит в вердикт аутентификации. При
   `monitor_fail_mode = "strict"` транспортная ошибка IPC или отказ
   регистрации закрывает вход: сессию не удалось поставить под enforcement

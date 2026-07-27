@@ -142,13 +142,15 @@ monitor_fail_mode = "permissive"
 # max_concurrent_connections = 64
 
 # --- Cert binding ------------------------------------------------------------
-# In 1.0.2 the host ACL is gone. Authorisation ("which user on which host")
-# is encoded in two X.509 extensions on each end-entity certificate:
-#   - 2.25.183976554325829274683049824615098  (pam_cert_host_binding)
-#   - 2.25.215438916728501023845629178354627  (pam_cert_user_binding)
-# Each is a SEQUENCE OF UTF8String. The cert alone decides which hosts /
-# users it authorises. See docs/cert-issuance.md for the openssl.cnf
-# cookbook used at issuance time.
+# The host ACL is gone. Authorisation ("which account on which device") is
+# encoded in two X.509 extensions on each end-entity certificate:
+#   - 2.25.183976554325829274683049824615098        (pam_cert_host_binding)
+#   - 2.25.185305973969816596290730578528098241367  (pam_cert_allowed_roles)
+# Each is a SEQUENCE OF UTF8String. The certificate alone decides which
+# devices it is valid on and which accounts it admits — a login account name
+# IS a role name, so the role list answers the second question. There is no
+# device-side list that admits a certificate by its CN or SAN. See
+# docs/cert-issuance.md for the openssl.cnf cookbook used at issuance time.
 
 # --- Trust -------------------------------------------------------------------
 [trust]
@@ -231,29 +233,6 @@ fallback = "deny"
 # custom_command = "/usr/local/sbin/host-id"
 # Bound on how long the custom command may take. Clamped to 1..=30 seconds.
 custom_command_timeout_seconds = 5
-
-# --- User mappings -----------------------------------------------------------
-# Legacy fallback, consulted ONLY for a credential that carries no
-# `pam_cert_user_binding` extension. When the extension is present it decides
-# admission and these entries are never read, so a fleet issuing credentials
-# through the normal path needs no mapping at all — leave the section out.
-#
-# `pam_user` is the account being logged into, which is the requested role: the
-# engineer logs into a role account named after the role. A mapping therefore
-# says "this credential may enter this role account", nothing more. It does NOT
-# stand in for role coverage: `pam_cert_allowed_roles` must still permit the
-# role, or the login is denied whatever the mapping says.
-#
-# Absent mapping and absent extension deny fail-closed. Uncomment and adjust
-# only if you knowingly run credentials without the extension — one entry per
-# account, exactly one of cert_subject_cn, cert_san_email, cert_san_upn.
-# [[user_mapping]]
-# pam_user        = "serv"
-# cert_subject_cn = "service-engineer"
-
-# [[user_mapping]]
-# pam_user      = "oper"
-# cert_san_email = "operator@example.org"
 
 # --- Roles -------------------------------------------------------------------
 # The role at login is the login account name: the engineer logs into a role

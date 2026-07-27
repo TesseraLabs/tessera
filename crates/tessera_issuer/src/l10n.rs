@@ -101,8 +101,6 @@ pub enum Caption {
     RequiredTags,
     /// The host-binding field label.
     Hosts,
-    /// The user-binding field label (the allowed role accounts).
-    Users,
     /// The leaf integrity-ceiling field label.
     Integrity,
     /// The profile-version field label.
@@ -146,7 +144,6 @@ impl Caption {
             Caption::MaxTtl => "max TTL",
             Caption::RequiredTags => "required tags",
             Caption::Hosts => "hosts",
-            Caption::Users => "role accounts",
             Caption::Integrity => "integrity",
             Caption::Profile => "profile",
             Caption::CrlNumber => "crlNumber",
@@ -171,7 +168,6 @@ impl Caption {
             Caption::MaxTtl => "макс. TTL",
             Caption::RequiredTags => "требуемые метки",
             Caption::Hosts => "узлы",
-            Caption::Users => "ролевые УЗ",
             Caption::Integrity => "целостность",
             Caption::Profile => "профиль",
             // An X.509 field name — a technical identifier, not translated.

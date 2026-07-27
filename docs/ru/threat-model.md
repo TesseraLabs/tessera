@@ -54,7 +54,7 @@
 | 2.2 | Целостность системы на момент установки контролируется (МКЦ + verified boot, если есть).   | Подмена `gost-engine.so` или `libpam_tessera.so` обходит модуль.                         |
 | 2.3 | CA-инфраструктура работает корректно: ключи в HSM, выпуск контролируется регламентом.      | Компрометация CA private key → катастрофическая компрометация контура.                  |
 | 2.4 | PIN-коды пользователей не разглашаются, не записываются на бумаге у компьютера.            | PIN — единственная защита токена при физическом доступе.                                |
-| 2.5 | Сертификаты выпускаются УЦ с обязательными расширениями `pam_cert_host_binding` и `pam_cert_user_binding`. | Без расширений сертификат не авторизует ни одного пользователя ни на одном хосте — fail-closed. |
+| 2.5 | Сертификаты выпускаются УЦ с обязательными расширениями `pam_cert_host_binding` и `pam_cert_allowed_roles`. | Без расширений сертификат не авторизует ни одной роли ни на одном устройстве — fail-closed. |
 | 2.6 | Администратор имеет «backup-tty» во время правки PAM-стека.                                | Защита от lockout при ошибочной конфигурации.                                            |
 | 2.7 | Резервный пользователь с парольной аутентификацией не удалён.                              | Lockout-prevention при сбое в `tessera`.                                            |
 
@@ -194,14 +194,16 @@ mitigation → evidence (код, конфиг, тест).
 ### 3.8 Сертификат без расширений или с подделанным расширением
 
 - **Описание:** атакующий пытается использовать сертификат, в котором
-  расширений `pam_cert_host_binding` / `pam_cert_user_binding` нет
+  расширений `pam_cert_host_binding` / `pam_cert_allowed_roles` нет
   совсем, либо пробует встраивать «подделанные» записи в обход УЦ.
 - **STRIDE:** Tampering + Spoofing.
 - **Mitigation:**
   - **Mandatory-extension policy:** отсутствие любого из расширений
-    в leaf-сертификате — это безусловный отказ
-    (`HostExtensionMissing` / `UserExtensionMissing` →
-    `PAM_AUTH_ERR`). Никаких «мягких» fallback'ов нет.
+    в leaf-сертификате — это безусловный отказ: нет host-расширения →
+    `HostExtensionMissing` → `PAM_AUTH_ERR`; нет `allowed_roles` →
+    удостоверение не даёт ни одной роли → `PAM_PERM_DENIED`. Никаких
+    «мягких» fallback'ов нет, и допуска на стороне устройства не
+    существует: рамки назначает выпускающий.
   - **Защита подписью CA:** содержимое расширения покрыто подписью
     сертификата. Изменить запись без приватного ключа CA невозможно;
     подделать сертификат полностью — задача компрометации УЦ
@@ -209,17 +211,14 @@ mitigation → evidence (код, конфиг, тест).
   - **Проверка цепочки:** при выпуске сертификата нештатным
     «доверенным» CA срабатывает `[trust].anchors` + опционально
     `[trust.pinning]`.
-  - **Повреждённое DER-кодирование** (мусор в `extnValue`) →
-    `*ExtensionMalformed` → `PAM_AUTH_ERR`.
+  - **Повреждённое DER-кодирование** (мусор в `extnValue`) → отказ
+    fail-closed: для host-расширения `*ExtensionMalformed` →
+    `PAM_AUTH_ERR`, для `allowed_roles` список считается пустым (а не
+    игнорируется) → запрошенная роль не покрыта → отказ.
 - **Evidence:**
   - реализация — парсеры `tessera_core::x509::{host_binding_ext,
-    user_binding_ext}` + `verify_cert_scope` в модуле
+    allowed_roles_ext}` + `verify_cert_scope` в модуле
     `tessera_core::host_binding`;
-  - отказ при отсутствии расширения — юнит-тесты
-    `missing_host_extension_rejected` / `missing_user_extension_rejected`
-    в [`crates/tessera_core/src/host_binding.rs`](../../crates/tessera_core/src/host_binding.rs);
-    parse-уровень —
-    [`crates/tessera_core/tests/cert_extensions_parse.rs`](../../crates/tessera_core/tests/cert_extensions_parse.rs);
   - таблица семантики — [docs/cert-issuance.md](cert-issuance.md).
 
 ### 3.9 Подмена `config.toml`
@@ -379,7 +378,7 @@ PAM-стек, в который интегрирован `tessera`, превра
 - резервный канал доступа без `tessera` (см. install.md §9) —
   отдельный sshd-stack `UsePAM=no` или sudoers-правило для
   аварийной учётной записи;
-- запасной токен с тем же `pam_cert_user_binding` для каждого
+- запасной токен с тем же `pam_cert_allowed_roles` для каждого
   привилегированного пользователя;
 - задокументированная процедура rescue-recovery (см. install.md §11
   «Замок-аут после неудачной правки PAM»).
@@ -484,7 +483,7 @@ runtime-плагинами**: один открытый бинарь загру�
 |---------|---------------------------------------------------------------------------|--------------------------------|
 | Н1      | Внешний нарушитель без физического доступа, без токена, без PIN.          | Ноль успехов.                  |
 | Н2      | Внешний нарушитель добыл токен, но не знает PIN.                          | Ноль (защита PIN-кодом + лимит попыток). |
-| Н3      | Внутренний нарушитель: легитимный пользователь пытается использовать токен на запрещённой машине или для чужого PAM-пользователя. | Ноль (host_binding + user_binding в расширениях, защищённых подписью CA). |
+| Н3      | Внутренний нарушитель: легитимный пользователь пытается использовать токен на запрещённой машине или для входа в чужую ролевую учётную запись. | Ноль (host_binding + allowed_roles в расширениях, защищённых подписью CA). |
 | Н4      | Внутренний нарушитель: администратор с root-доступом.                     | **Не моделируется** — admin доверен по построению. |
 
 ## 7. Атак-tree для угрозы 3.5 «использование валидного токена на чужой машине»
@@ -667,7 +666,7 @@ THREAT_MODEL.md (downstream-инструменты парсят таблицу �
 | id | threat | actor | surface | asset | impact | likelihood | status | controls | evidence |
 |---|---|---|---|---|---|---|---|---|---|
 | T1 | Вход по отозванному удостоверению: остаточная деградация отзыва (просроченная CRL пропускается при crl_strict=false — «отзыв не вечен»; CRL без nextUpdate ограничена только opt-in `crl_max_age_hours`) | insider | Обработка CRL | Решение об аутентификации, состояние отзыва | critical | possible | partially_mitigated | короткий TTL удостоверений ограничивает окно; подпись CRL проверяется обязательно (fail-closed, `crl/store.rs`); OCSP реализован (`ocsp`/`crl_then_ocsp`, nonce, issuer-signer проверка); пустой CRL-store при mode=crl отклоняется на конструировании verifier'а (2026-07); crl_strict=true opt-in; issuer-DN binding в check_revocation (RFC 5280 §6.3.3) — CRL применяется только к сертификатам своего издателя | 14b828e, openspec/revocation (закрыто: обязательная проверка подписи CRL; issuer-DN binding против ложного отзыва при cross-CA коллизии серийников; тихий дефолт «отзыв не проверяется» устранён) |
-| T2 | Обход авторизационной политики через fail-open дефолты и тихие fallback-пути: malformed user_binding → fallback в legacy mapping | insider | Проверка цепи и challenge-response; Парсинг X.509/PKCS#12 с носителя; config.toml | Решение об аутентификации, fail-closed инвариант | critical | possible | partially_mitigated | mandatory-extension policy (host/user_binding); строгий DER-парсинг МКЦ-меток; пустой/опущенный sig-whitelist с 2026-06 подменяется безопасным дефолтом (SHA-256/384/512 RSA + ECDSA, без SHA-1/ГОСТ) на этапе валидации конфига — accept-all дефолт устранён; extractable PKCS#11-ключ с 2026-06 отклоняется по умолчанию (`ExtractableKeyRejected`), WARN остаётся только при явном opt-in `pkcs11_allow_extractable_keys = true`; пропуск секции `[trust.revocation]` или ключа `mode` с 2026-07 — ошибка валидации конфига (тихий дефолт «отзыв не проверяется» устранён; `none` выбирается только явно) | pre_validate.rs:28, flow.rs:662, key_lookup.rs, config/validated.rs (закрыто: тихий дефолт «отзыв не проверяется» устранён — revocation-mode обязателен) |
+| T2 | Обход авторизационной политики через fail-open дефолты и тихие fallback-пути | insider | Проверка цепи и challenge-response; Парсинг X.509/PKCS#12 с носителя; config.toml | Решение об аутентификации, fail-closed инвариант | critical | possible | partially_mitigated | mandatory-extension policy (host_binding/allowed_roles); тихий fallback-путь допуска устранён с 2026-07: расширение `pam_cert_user_binding` и секция `[[user_mapping]]` удалены, допуск решается только `allowed_roles` верифицированного удостоверения, а конфиг с удалённой секцией отвергается при валидации; строгий DER-парсинг МКЦ-меток; пустой/опущенный sig-whitelist с 2026-06 подменяется безопасным дефолтом (SHA-256/384/512 RSA + ECDSA, без SHA-1/ГОСТ) на этапе валидации конфига — accept-all дефолт устранён; extractable PKCS#11-ключ с 2026-06 отклоняется по умолчанию (`ExtractableKeyRejected`), WARN остаётся только при явном opt-in `pkcs11_allow_extractable_keys = true`; пропуск секции `[trust.revocation]` или ключа `mode` с 2026-07 — ошибка валидации конфига (тихий дефолт «отзыв не проверяется» устранён; `none` выбирается только явно) | pre_validate.rs:28, flow.rs:662, key_lookup.rs, config/validated.rs (закрыто: тихий дефолт «отзыв не проверяется» устранён — revocation-mode обязателен) |
 | T3 | RCE/повреждение памяти в root-логин-процессе при парсинге злонамеренного носителя: DER/PKCS#12 в OpenSSL до верификации и образ ФС в ядре при mount(2) | local_user | Парсинг X.509/PKCS#12 с носителя; USB mount | Host process integrity | critical | possible | partially_mitigated | Rust-обвязка; panic guard (не спасает от UB в C); mount с nosuid,nodev,noexec; история CVE парсеров ASN.1/ФС-драйверов как прецедент | |
 | T4 | Evil-maid вне Astra: подмена config.toml, нативных .so (PKCS#11/gost-engine), host_id — без МКЦ-меток, DIGSIG и immutable-бита Debian/Ubuntu защищены только DAC | local_user | Динамическая загрузка нативного кода; config.toml; Host identity резолв; Установка/удаление пакета | Host process integrity, конфигурация, host identity | critical | possible | partially_mitigated | на Astra: МКЦ ilevel=63, chattr +i, DIGSIG/ЗПС; вне Astra: 0640/0750 root:tessera | |
 | T5 | Компрометация цепочки сборки/поставки: бэкдор в .so логин-стека всего парка через незапиненную базу builder-image, инструменты без checksum, неподписанные .deb, crates.io-зависимость | supply_chain | CI / supply chain сборки; Зависимости Cargo | Целостность release-артефактов, Host process integrity | critical | possible | partially_mitigated | reproducible build (.buildinfo), rust-cache pinned by hash, cargo-deny, draft-релизы; Astra DIGSIG отклонит неподписанный .so; GPG-подпись .deb и apt-репозиторий запланированы | |
