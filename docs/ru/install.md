@@ -2,9 +2,9 @@
 
 Этот документ — пошаговый сценарий установки и базовой настройки
 `tessera` на чистой машине Astra Linux SE 1.7+. В конце — рабочий
-вход по сертификату, проверенный через `pamtester` (§9). Каждый
+вход по удостоверению, проверенный через `pamtester` (§10). Каждый
 раздел заканчивается командой проверки; если проверка не прошла —
-см. §10 «Troubleshooting» и [troubleshooting.md](troubleshooting.md).
+см. §11 «Troubleshooting» и [troubleshooting.md](troubleshooting.md).
 
 > Все команды выполняются от имени `root` или с `sudo`. На время
 > правки PAM-стека держите открытый рут-shell в **другом** терминале.
@@ -74,7 +74,7 @@ openssl dgst -engine gost -md_gost12_256 /etc/hostname
 Ожидание: 64-символьный шестнадцатеричный хеш в выводе. Если получили
 `engine "gost" set.` без хеша — `gost-engine` подключился, но что-то
 пошло не так с алгоритмом; вероятно, версия `gost-engine` рассинхронна
-с системным OpenSSL. См. §10 «Troubleshooting».
+с системным OpenSSL. См. §11 «Troubleshooting».
 
 ### 1.5 Preflight: USBGuard и Astra ЗПС (DIGSIG)
 
@@ -321,31 +321,63 @@ openssl verify -CAfile ca.pem ca.pem
 
 Ожидание: `ca.pem: OK`.
 
-## 4. Создание тестового пользователя
+## 4. Создание тестовой ролевой учётной записи
 
-### 4.1 Ключ alice
+Роль на логине — это имя учётной записи входа: инженер входит в
+**ролевую учётную запись**, названную по роли (`ssh serv@device`), и
+запрошенная роль равна имени этой УЗ. Отдельного запроса роли нет.
+
+Дальше по сценарию используется роль `serv` («сервисный инженер») — для
+неё в пакете есть готовый срез `dist/roles/serv.toml`, он понадобится
+в §8. Учётная запись входа тоже называется `serv`; заводим её в §8,
+вместе с ролевым хранилищем.
+
+### 4.1 Ключ
 
 ```bash
 openssl genpkey -engine gost -algorithm gost2012_256 \
-    -pkeyopt paramset:A -out alice.key
-chmod 0600 alice.key
+    -pkeyopt paramset:A -out serv.key
+chmod 0600 serv.key
 ```
 
 ### 4.2 CSR
 
 ```bash
-openssl req -new -engine gost -key alice.key -out alice.csr \
-    -subj "/CN=Alice/UID=alice"
+openssl req -new -engine gost -key serv.key -out serv.csr \
+    -subj "/CN=service-engineer/UID=serv"
 ```
+
+Личность инженера живёт в удостоверении и в журнале выдачи, а не в
+имени учётной записи входа. На допуск `CN` не влияет: решение
+принимается по расширениям из §4.3.
 
 ### 4.3 Подпись CSR
 
-Leaf-сертификат обязан нести два binding-расширения —
-`pam_cert_host_binding` и `pam_cert_user_binding`. Без них модуль
-отклоняет аутентификацию **fail-closed** (`HostExtensionMissing` /
-`UserExtensionMissing`): §7 не найдёт OID в сертификате, а `pamtester`
-в §9 не пройдёт. OID и ASN.1-синтаксис расширений — из
+Лист обязан нести **три** расширения:
+
+| Расширение | OID | Отвечает на вопрос |
+|------------|-----|--------------------|
+| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | на каких устройствах предъявитель вправе входить |
+| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | пущен ли предъявитель в эту учётную запись |
+| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | разрешено ли ему активировать эту роль |
+
+Каждое — `SEQUENCE OF UTF8String`; `pam_cert_allowed_roles` выпускается
+некритичным. OID и ASN.1-синтаксис — из
 [cert-issuance.md](cert-issuance.md).
+
+`user_binding` и `allowed_roles` — разные утверждения выпускающего, и в
+целевой модели они применяются к одному и тому же имени. Первое
+разрешает вход в учётную запись, второе — активацию роли. Удостоверение,
+пускающее в УЗ `serv`, но не разрешающее роль `serv`, — законная
+конфигурация: такое удостоверение обязано отказать во входе, потому что
+покрытие роли доказывается именно `pam_cert_allowed_roles`.
+
+Без любого из трёх модуль отклоняет аутентификацию **fail-closed**:
+отсутствие host/user-расширения даёт `HostExtensionMissing` /
+`UserExtensionMissing`, отсутствие `pam_cert_allowed_roles` означает, что
+удостоверение не даёт ни одной роли, — а роль требуется на каждом входе.
+В обоих случаях §7 не найдёт OID в удостоверении, а `pamtester` в §10
+не пройдёт.
 
 Сначала узнаём `host_id_hash` этой машины — тот источник, что демон
 использует сейчас (строка с `active_under_current_config=yes`,
@@ -356,53 +388,58 @@ HOST_HASH=$(sudo tessera dump-host-id | awk -F'\t' '$7 == "yes" { print $3 }')
 echo "host_id_hash = ${HOST_HASH}"   # 64 hex-символа
 ```
 
-Собираем `extfile` с обоими расширениями (хост — только эта машина,
-пользователь — только `alice`):
+Собираем `extfile` со всеми тремя расширениями (хост — только эта
+машина, учётная запись — только `serv`, роль — только `serv`):
 
 ```bash
-cat > alice.ext <<EOF
+cat > serv.ext <<EOF
 extendedKeyUsage = clientAuth
 keyUsage = critical,digitalSignature
 
 # Хост: только эта машина (host_id_hash получен выше)
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb
-# Пользователь: только alice
+# Учётная запись входа: только serv
 2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub
+# Роли, которые удостоверение вправе активировать: только serv
+2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:ar
 
 [ hb ]
 e0 = UTF8String:sha256:${HOST_HASH}
 
 [ ub ]
-e0 = UTF8String:alice
+e0 = UTF8String:serv
+
+[ ar ]
+e0 = UTF8String:serv
 EOF
 ```
 
 Подписываем CSR с этим `extfile`:
 
 ```bash
-openssl x509 -req -engine gost -in alice.csr \
+openssl x509 -req -engine gost -in serv.csr \
     -CA ca.pem -CAkey ca.key -CAcreateserial \
-    -out alice.pem -days 365 \
-    -extfile alice.ext
+    -out serv.pem -days 365 \
+    -extfile serv.ext
 ```
 
 ### 4.4 Упаковка в P12
 
 ```bash
-openssl pkcs12 -export -engine gost -inkey alice.key -in alice.pem \
-    -out alice.p12 -name alice -passout pass:test
-chmod 0600 alice.p12
+openssl pkcs12 -export -engine gost -inkey serv.key -in serv.pem \
+    -out serv.p12 -name serv -passout pass:test
+chmod 0600 serv.p12
 ```
 
 ### Verification (раздел 4)
 
 ```bash
-openssl pkcs12 -in alice.p12 -nokeys -passin pass:test \
+openssl pkcs12 -in serv.p12 -nokeys -passin pass:test \
     | openssl x509 -noout -subject
 ```
 
-Ожидание: `subject=CN=Alice, UID=alice` (точный порядок RDN зависит
-от версии OpenSSL).
+Ожидание: `subject=CN=service-engineer, UID=serv` (точный порядок RDN
+зависит от версии OpenSSL).
 
 ## 5. Подготовка USB-носителя (режим `pkcs12` / Mode A)
 
@@ -455,7 +492,7 @@ udev и монтирует whole-device напрямую.
 
 ```bash
 sudo mkdir -p /mnt/usb/certs
-sudo cp /tmp/ca/alice.p12  /mnt/usb/certs/user.p12
+sudo cp /tmp/ca/serv.p12   /mnt/usb/certs/user.p12
 sudo cp /tmp/ca/ca.pem     /mnt/usb/certs/chain.pem
 sudo touch /mnt/usb/tessera.marker
 sudo umount /mnt/usb
@@ -491,7 +528,7 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so -L
 
 ```bash
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
-    --init-token --label "alice-token" \
+    --init-token --label "serv-token" \
     --so-pin '12345678'
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
     --init-pin --so-pin '12345678' --pin '1234567890'
@@ -500,33 +537,33 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 ### 6.4 Импорт ключа и сертификата
 
 `pkcs11-tool` ждёт ключ и сертификат отдельными объектами в DER/PEM, а не
-PKCS#12-контейнером. Сначала извлекаем их из `alice.p12` (пароль — из §4.4):
+PKCS#12-контейнером. Сначала извлекаем их из `serv.p12` (пароль — из §4.4):
 
 ```bash
-openssl pkcs12 -in alice.p12 -nocerts -nodes -passin pass:test \
-    -out alice.token.key            # приватный ключ, PEM, без пароля
-openssl pkcs12 -in alice.p12 -clcerts -nokeys -passin pass:test \
-    -out alice.token.crt            # сертификат, PEM
+openssl pkcs12 -in serv.p12 -nocerts -nodes -passin pass:test \
+    -out serv.token.key             # приватный ключ, PEM, без пароля
+openssl pkcs12 -in serv.p12 -clcerts -nokeys -passin pass:test \
+    -out serv.token.crt             # удостоверение, PEM
 # Часть токенов принимает только DER — при необходимости конвертируем:
-#   openssl pkey -in alice.token.key -outform DER -out alice.token.key.der
-#   openssl x509 -in alice.token.crt -outform DER -out alice.token.crt.der
+#   openssl pkey -in serv.token.key -outform DER -out serv.token.key.der
+#   openssl x509 -in serv.token.crt -outform DER -out serv.token.crt.der
 ```
 
-Импортируем сертификат и приватный ключ в токен:
+Импортируем удостоверение и приватный ключ в токен:
 
 ```bash
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
     --login --pin '1234567890' \
-    --write-object alice.token.crt --type cert --label alice --id 01
+    --write-object serv.token.crt --type cert --label serv --id 01
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
     --login --pin '1234567890' \
-    --write-object alice.token.key --type privkey --label alice --id 01
+    --write-object serv.token.key --type privkey --label serv --id 01
 ```
 
 Стираем временный приватный ключ, лежавший открытым на диске:
 
 ```bash
-shred -u alice.token.key alice.token.key.der 2>/dev/null || shred -u alice.token.key
+shred -u serv.token.key serv.token.key.der 2>/dev/null || shred -u serv.token.key
 ```
 
 > Поведение `--write-object` для ГОСТ-ключей зависит от модели токена и
@@ -540,31 +577,126 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 ```
 
 Ожидание: в выводе присутствуют `Private Key Object` и
-`Certificate Object` с `label=alice`.
+`Certificate Object` с `label=serv`.
 
-## 7. Авторизация: расширения сертификата
+## 7. Авторизация: расширения удостоверения
 
-Привязка «какой пользователь на каком хосте» живёт в самом
-сертификате. PAM-модуль читает два X.509 v3 расширения leaf-сертификата:
+Привязка «кто, на каком устройстве и в какой роли» живёт в самом
+удостоверении. PAM-модуль читает три X.509 v3 расширения листа:
 
 - `pam_cert_host_binding` (OID `2.25.183976554325829274683049824615098`)
-  — список разрешённых хостов;
+  — список разрешённых устройств;
 - `pam_cert_user_binding` (OID `2.25.215438916728501023845629178354627`)
-  — список разрешённых PAM-пользователей.
+  — список разрешённых учётных записей входа;
+- `pam_cert_allowed_roles`
+  (OID `2.25.185305973969816596290730578528098241367`, некритичное)
+  — список ролей, которые удостоверение вправе активировать.
 
-Готовые рецепты `openssl.cnf` для выпуска сертификатов с правильными
+Два последних проверяются независимо, хотя в модели ролевых учётных
+записей относятся к одному имени: `user_binding` разрешает вход в УЗ,
+`allowed_roles` — активацию роли. Отказ по любому из трёх — fail-closed.
+
+Готовые рецепты `openssl.cnf` для выдачи удостоверений с правильными
 расширениями приведены в [cert-issuance.md](cert-issuance.md).
 
 ### Verification (раздел 7)
 
 ```bash
-openssl x509 -in /tmp/ca/alice.pem -noout -text \
-    | grep -E '2\.25\.(183976554325829274683049824615098|215438916728501023845629178354627)'
+openssl x509 -in /tmp/ca/serv.pem -noout -text \
+    | grep -E '2\.25\.(183976554325829274683049824615098|215438916728501023845629178354627|185305973969816596290730578528098241367)'
 ```
 
-Ожидание: обе строки с дотированными OID присутствуют в выводе.
+Ожидание: все три строки с дотированными OID присутствуют в выводе.
 
-## 8. Правка `/etc/pam.d/*`
+## 8. Ролевое хранилище устройства
+
+Роль требуется на каждом входе, и её описание модуль берёт из **ролевого
+хранилища** — каталога со срезами `<role>.toml` на самом устройстве.
+Пока хранилище пусто или недоступно, устройство не пускает никого:
+это намеренное fail-closed-поведение, а не ошибка настройки.
+
+### 8.1 Установка среза роли
+
+Готовый образец среза `serv` лежит в репозитории — `dist/roles/serv.toml`;
+в `.deb` образцы ролей не входят, поэтому на чистой машине срез
+проще создать на месте:
+
+```bash
+sudo install -d -m 0755 -o root -g root /var/lib/tessera/roles
+sudo tee /var/lib/tessera/roles/serv.toml >/dev/null <<'EOF'
+role = "serv"
+version = 1
+os = "linux"
+name = "Service Engineer"
+level = 5
+description = "Service engineer with sudo and higher resource limits."
+
+[payload]
+groups = ["service", "wheel"]
+sudo_role = "service"
+
+[payload.limits]
+nofile = 4096
+
+[session]
+max_ttl_seconds = 14400
+memory_max = "2G"
+tasks_max = 512
+EOF
+sudo chown root:root /var/lib/tessera/roles/serv.toml
+sudo chmod 0644 /var/lib/tessera/roles/serv.toml
+```
+
+Если репозиторий доступен на этой машине, то же самое одной командой:
+
+```bash
+sudo install -m 0644 -o root -g root \
+    dist/roles/serv.toml /var/lib/tessera/roles/serv.toml
+```
+
+Доверие к хранилищу держится на правах файловой системы — той же
+модели, что у `sudoers.d`: каталог, все срезы и все родительские
+каталоги обязаны принадлежать `root:root` и не быть доступны на запись
+группе или всем. Срез, лежащий в каталоге непривилегированного
+пользователя, продукт отвергает: иначе роль (а с ней группы, sudo и
+лимиты сессии) мог бы переопределить тот, кого она ограничивает.
+
+### 8.2 Настройка `[roles]` в `/etc/tessera/config.toml`
+
+```toml
+[roles]
+dir = "/var/lib/tessera/roles"
+# Потолок сессии, когда его не задают ни удостоверение, ни роль.
+# default_session_ttl_seconds = 43200   # 12 ч, значение по умолчанию
+```
+
+Полное описание секции — [configuration.md](configuration.md).
+
+### 8.3 Учётная запись входа
+
+Имя учётной записи и есть роль, поэтому на устройстве должна
+существовать системная УЗ `serv`. В парке ролевые учётные записи
+провижинятся отдельно; для лабораторного стенда достаточно:
+
+```bash
+sudo useradd --system --create-home --shell /bin/bash serv
+```
+
+Пароль ей не задаётся: вход в ролевую учётную запись открыт только
+через cert-аутентификацию Tessera.
+
+### Verification (раздел 8)
+
+```bash
+ls -la /var/lib/tessera/roles/
+id serv
+sudo tessera check
+```
+
+Ожидание: `serv.toml` присутствует с правами `-rw-r--r-- root root`,
+`id serv` печатает uid/gid, `tessera check` завершается без ERROR.
+
+## 9. Правка `/etc/pam.d/*`
 
 Правка PAM-стека вынесена в отдельный документ —
 **[docs/pam-integration.md](pam-integration.md)**:
@@ -580,7 +712,7 @@ openssl x509 -in /tmp/ca/alice.pem -noout -text \
 > **ВАЖНО.** Перед правкой PAM открыть второй рут-shell.
 > Подробности — [pam-integration.md §8 «Безопасность правки»](pam-integration.md#8-безопасность-правки).
 
-### Verification (раздел 8)
+### Verification (раздел 9)
 
 ```bash
 sudo tessera check
@@ -588,32 +720,35 @@ sudo tessera check
 
 `tessera check` ловит ошибки порядка PAM-стека (например
 `pam_stack_session_misorder`). Полный smoke-тест аутентификации через
-`pamtester` — в разделе 9.
-## 9. Smoke-тест через `pamtester`
+`pamtester` — в разделе 10.
+## 10. Smoke-тест через `pamtester`
 
-### 9.1 Авторизация
+Имя, передаваемое `pamtester`, — это имя ролевой учётной записи, оно же
+запрошенная роль.
+
+### 10.1 Авторизация
 
 ```bash
-pamtester sudo alice authenticate
+pamtester sudo serv authenticate
 ```
 
 Положительный результат: `pamtester: successfully authenticated`.
 
-### 9.2 Сессия
+### 10.2 Сессия
 
 ```bash
-pamtester sudo alice open_session
-pamtester sudo alice close_session
+pamtester sudo serv open_session
+pamtester sudo serv close_session
 ```
 
 Положительный результат: оба вызова возвращают `pamtester: successfully ...`.
 
-### 9.3 Negative-тест: извлечь USB
+### 10.3 Negative-тест: извлечь USB
 
 В одном терминале запустить:
 
 ```bash
-pamtester sudo alice authenticate
+pamtester sudo serv authenticate
 ```
 
 Сразу после ввода извлечь USB. Ожидание: `monitord` пишет в журнал:
@@ -622,7 +757,7 @@ pamtester sudo alice authenticate
 sudo journalctl -u tessera -n 20 -g 'medium absent'
 ```
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 Полный справочник по диагностике — **[docs/troubleshooting.md](troubleshooting.md)**:
 
@@ -635,7 +770,7 @@ sudo journalctl -u tessera -n 20 -g 'medium absent'
 - Clone-image / golden image (`dump-host-id` пуст, повторный flip) — см. также [clone-image.md](clone-image.md)
 - Инциденты безопасности (компрометация cert, потеря токена, CA worst-case, DIGSIG)
 - Установка / `gost-engine`
-## 11. Хосты без systemd: SysV init
+## 12. Хосты без systemd: SysV init
 
 Пакет ставит **оба** init-варианта: `tessera.service` (systemd)
 и `/etc/init.d/tessera` (SysV). На systemd-хостах SysV-скрипт
@@ -652,8 +787,9 @@ sudo service tessera start
 
 - [docs/configuration.md](configuration.md) — справочник по всем
   параметрам `config.toml`.
-- [docs/cert-issuance.md](cert-issuance.md) — выпуск сертификатов с
-  расширениями `pam_cert_host_binding` и `pam_cert_user_binding`.
+- [docs/cert-issuance.md](cert-issuance.md) — выдача удостоверений с
+  расширениями `pam_cert_host_binding`, `pam_cert_user_binding` и
+  `pam_cert_allowed_roles`.
 - [docs/operations.md](operations.md) — runbook эксплуатации и
   процедуры incident response.
 - [docs/threat-model.md](threat-model.md) — модель угроз и какие

@@ -113,7 +113,7 @@ sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sudo
 The legacy flags `--strict` / `--optional` are still accepted as
 deprecated aliases for `--mode=2fa` / `--mode=optional`. Before
 deploying `cert-only`, read the lockout warning in
-[docs/en/install.md §8](docs/en/install.md) and
+[docs/en/install.md §9](docs/en/install.md) and
 [docs/en/operations.md §3.6](docs/en/operations.md).
 
 ## Logging

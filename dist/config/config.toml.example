@@ -243,6 +243,24 @@ cert_subject_cn = "Alice"
 # pam_user      = "bob"
 # cert_san_email = "bob@example.org"
 
+# --- Roles -------------------------------------------------------------------
+# The role at login is the login account name: the engineer logs into a role
+# account named after the role (`ssh serv@device`) and the requested role
+# equals PAM_USER. A role is required at EVERY login; there is no key that
+# disables the check or weakens it to a warning.
+#
+# The role definition is read from the on-device role store: one <role>.toml
+# slice per role. The store MUST be populated — an empty or unreadable store
+# denies every login fail-closed. Trust in the store rests on filesystem
+# permissions (the sudoers.d model): the directory, every slice and every
+# parent must be root-owned and not group/world-writable.
+[roles]
+# On-device role-store directory. Absolute path. Default:
+dir = "/var/lib/tessera/roles"
+# Session TTL used when neither the credential nor the role slice sets one.
+# Seconds, must be > 0; a session cap is never unbounded. Default 43200 (12h).
+# default_session_ttl_seconds = 43200
+
 # --- Logging -----------------------------------------------------------------
 [logging]
 # error | warn | info | debug | trace.  Applied by the daemon's tracing

@@ -3,8 +3,8 @@
 This document is a step-by-step scenario for installing and doing the
 basic configuration of `tessera` on a clean Astra Linux SE 1.7+
 machine. At the end — a working certificate login, verified via
-`pamtester` (§9). Every section ends with a verification command; if the
-check fails, see §10 "Troubleshooting" and
+`pamtester` (§10). Every section ends with a verification command; if the
+check fails, see §11 "Troubleshooting" and
 [troubleshooting.md](troubleshooting.md).
 
 > All commands are run as `root` or with `sudo`. While editing the PAM
@@ -330,31 +330,65 @@ openssl verify -CAfile ca.pem ca.pem
 
 Expected: `ca.pem: OK`.
 
-## 4. Creating a test user
+## 4. Creating a test role account
 
-### 4.1 alice's key
+The role at login is the name of the login account: the engineer logs
+into a **role account** named after the role (`ssh serv@device`), and the
+requested role equals the name of that account. There is no separate
+role prompt.
+
+The rest of the scenario uses the role `serv` ("service engineer") — the
+repository ships a ready-made role slice for it, `dist/roles/serv.toml`,
+which is needed in §8. The login account is called `serv` as well; it is
+created in §8, together with the role store.
+
+### 4.1 Key
 
 ```bash
 openssl genpkey -engine gost -algorithm gost2012_256 \
-    -pkeyopt paramset:A -out alice.key
-chmod 0600 alice.key
+    -pkeyopt paramset:A -out serv.key
+chmod 0600 serv.key
 ```
 
 ### 4.2 CSR
 
 ```bash
-openssl req -new -engine gost -key alice.key -out alice.csr \
-    -subj "/CN=Alice/UID=alice"
+openssl req -new -engine gost -key serv.key -out serv.csr \
+    -subj "/CN=service-engineer/UID=serv"
 ```
+
+The engineer's identity lives in the credential and in the issuance
+journal, not in the name of the login account. The `CN` does not affect
+authorization: the decision is made from the extensions in §4.3.
 
 ### 4.3 Signing the CSR
 
-The leaf certificate must carry two binding extensions —
-`pam_cert_host_binding` and `pam_cert_user_binding`. Without them the
-module rejects authentication **fail-closed** (`HostExtensionMissing` /
-`UserExtensionMissing`): §7 will not find the OID in the certificate, and
-`pamtester` in §9 will not pass. The OIDs and the ASN.1 syntax of the
-extensions are from [cert-issuance.md](cert-issuance.md).
+The leaf must carry **three** extensions:
+
+| Extension | OID | Question it answers |
+|-----------|-----|---------------------|
+| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | on which devices the bearer may log in |
+| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | is the bearer admitted into this account |
+| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | is the bearer allowed to activate this role |
+
+Each is a `SEQUENCE OF UTF8String`; `pam_cert_allowed_roles` is issued
+non-critical. The OIDs and the ASN.1 syntax are from
+[cert-issuance.md](cert-issuance.md).
+
+`user_binding` and `allowed_roles` are two different statements by the
+issuer, and in the target model both apply to the same name. The first
+permits entry into the account, the second permits activation of the
+role. A credential that admits into the account `serv` but does not
+permit the role `serv` is a legitimate configuration: such a credential
+must refuse the login, because role coverage is proven precisely by
+`pam_cert_allowed_roles`.
+
+Without any one of the three the module rejects authentication
+**fail-closed**: a missing host/user extension yields
+`HostExtensionMissing` / `UserExtensionMissing`, and a missing
+`pam_cert_allowed_roles` means the credential grants no role at all —
+while a role is required at every login. In both cases §7 will not find
+the OID in the credential, and `pamtester` in §10 will not pass.
 
 First find out this machine's `host_id_hash` — the source the daemon uses
 right now (the row with `active_under_current_config=yes`, column
@@ -365,53 +399,58 @@ HOST_HASH=$(sudo tessera dump-host-id | awk -F'\t' '$7 == "yes" { print $3 }')
 echo "host_id_hash = ${HOST_HASH}"   # 64 hex characters
 ```
 
-Assemble the `extfile` with both extensions (host — only this machine,
-user — only `alice`):
+Assemble the `extfile` with all three extensions (host — only this
+machine, account — only `serv`, role — only `serv`):
 
 ```bash
-cat > alice.ext <<EOF
+cat > serv.ext <<EOF
 extendedKeyUsage = clientAuth
 keyUsage = critical,digitalSignature
 
 # Host: only this machine (host_id_hash obtained above)
 2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb
-# User: only alice
+# Login account: only serv
 2.25.215438916728501023845629178354627 = ASN1:SEQUENCE:ub
+# Roles the credential may activate: only serv
+2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:ar
 
 [ hb ]
 e0 = UTF8String:sha256:${HOST_HASH}
 
 [ ub ]
-e0 = UTF8String:alice
+e0 = UTF8String:serv
+
+[ ar ]
+e0 = UTF8String:serv
 EOF
 ```
 
 Sign the CSR with this `extfile`:
 
 ```bash
-openssl x509 -req -engine gost -in alice.csr \
+openssl x509 -req -engine gost -in serv.csr \
     -CA ca.pem -CAkey ca.key -CAcreateserial \
-    -out alice.pem -days 365 \
-    -extfile alice.ext
+    -out serv.pem -days 365 \
+    -extfile serv.ext
 ```
 
 ### 4.4 Packing into P12
 
 ```bash
-openssl pkcs12 -export -engine gost -inkey alice.key -in alice.pem \
-    -out alice.p12 -name alice -passout pass:test
-chmod 0600 alice.p12
+openssl pkcs12 -export -engine gost -inkey serv.key -in serv.pem \
+    -out serv.p12 -name serv -passout pass:test
+chmod 0600 serv.p12
 ```
 
 ### Verification (section 4)
 
 ```bash
-openssl pkcs12 -in alice.p12 -nokeys -passin pass:test \
+openssl pkcs12 -in serv.p12 -nokeys -passin pass:test \
     | openssl x509 -noout -subject
 ```
 
-Expected: `subject=CN=Alice, UID=alice` (the exact RDN order depends on
-the OpenSSL version).
+Expected: `subject=CN=service-engineer, UID=serv` (the exact RDN order
+depends on the OpenSSL version).
 
 ## 5. Preparing the USB media (`pkcs12` mode / Mode A)
 
@@ -467,7 +506,7 @@ the udev `ID_FS_TYPE` and mounts the whole device directly.
 
 ```bash
 sudo mkdir -p /mnt/usb/certs
-sudo cp /tmp/ca/alice.p12  /mnt/usb/certs/user.p12
+sudo cp /tmp/ca/serv.p12   /mnt/usb/certs/user.p12
 sudo cp /tmp/ca/ca.pem     /mnt/usb/certs/chain.pem
 sudo touch /mnt/usb/tessera.marker
 sudo umount /mnt/usb
@@ -504,7 +543,7 @@ model.
 
 ```bash
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
-    --init-token --label "alice-token" \
+    --init-token --label "serv-token" \
     --so-pin '12345678'
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
     --init-pin --so-pin '12345678' --pin '1234567890'
@@ -513,34 +552,34 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 ### 6.4 Importing the key and certificate
 
 `pkcs11-tool` expects the key and certificate as separate DER/PEM objects,
-not as a PKCS#12 container. First extract them from `alice.p12` (the
+not as a PKCS#12 container. First extract them from `serv.p12` (the
 password is from §4.4):
 
 ```bash
-openssl pkcs12 -in alice.p12 -nocerts -nodes -passin pass:test \
-    -out alice.token.key            # private key, PEM, no password
-openssl pkcs12 -in alice.p12 -clcerts -nokeys -passin pass:test \
-    -out alice.token.crt            # certificate, PEM
+openssl pkcs12 -in serv.p12 -nocerts -nodes -passin pass:test \
+    -out serv.token.key             # private key, PEM, no password
+openssl pkcs12 -in serv.p12 -clcerts -nokeys -passin pass:test \
+    -out serv.token.crt             # credential, PEM
 # Some tokens accept only DER — convert if needed:
-#   openssl pkey -in alice.token.key -outform DER -out alice.token.key.der
-#   openssl x509 -in alice.token.crt -outform DER -out alice.token.crt.der
+#   openssl pkey -in serv.token.key -outform DER -out serv.token.key.der
+#   openssl x509 -in serv.token.crt -outform DER -out serv.token.crt.der
 ```
 
-Import the certificate and the private key into the token:
+Import the credential and the private key into the token:
 
 ```bash
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
     --login --pin '1234567890' \
-    --write-object alice.token.crt --type cert --label alice --id 01
+    --write-object serv.token.crt --type cert --label serv --id 01
 pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
     --login --pin '1234567890' \
-    --write-object alice.token.key --type privkey --label alice --id 01
+    --write-object serv.token.key --type privkey --label serv --id 01
 ```
 
 Wipe the temporary private key that was lying in the clear on disk:
 
 ```bash
-shred -u alice.token.key alice.token.key.der 2>/dev/null || shred -u alice.token.key
+shred -u serv.token.key serv.token.key.der 2>/dev/null || shred -u serv.token.key
 ```
 
 > The behavior of `--write-object` for GOST keys depends on the token model
@@ -554,32 +593,129 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 ```
 
 Expected: the output contains a `Private Key Object` and a
-`Certificate Object` with `label=alice`.
+`Certificate Object` with `label=serv`.
 
-## 7. Authorization: certificate extensions
+## 7. Authorization: credential extensions
 
-The binding of "which user on which host" lives in the certificate
-itself. The PAM module reads two X.509 v3 extensions of the leaf
-certificate:
+The binding of "who, on which device, in which role" lives in the
+credential itself. The PAM module reads three X.509 v3 extensions of the
+leaf:
 
 - `pam_cert_host_binding` (OID `2.25.183976554325829274683049824615098`)
-  — the list of allowed hosts;
+  — the list of allowed devices;
 - `pam_cert_user_binding` (OID `2.25.215438916728501023845629178354627`)
-  — the list of allowed PAM users.
+  — the list of allowed login accounts;
+- `pam_cert_allowed_roles`
+  (OID `2.25.185305973969816596290730578528098241367`, non-critical)
+  — the list of roles the credential may activate.
 
-Ready-made `openssl.cnf` recipes for issuing certificates with the
+The last two are checked independently, even though in the role-account
+model they refer to the same name: `user_binding` permits entry into the
+account, `allowed_roles` permits activation of the role. A rejection by
+any of the three is fail-closed.
+
+Ready-made `openssl.cnf` recipes for issuing credentials with the
 correct extensions are given in [cert-issuance.md](cert-issuance.md).
 
 ### Verification (section 7)
 
 ```bash
-openssl x509 -in /tmp/ca/alice.pem -noout -text \
-    | grep -E '2\.25\.(183976554325829274683049824615098|215438916728501023845629178354627)'
+openssl x509 -in /tmp/ca/serv.pem -noout -text \
+    | grep -E '2\.25\.(183976554325829274683049824615098|215438916728501023845629178354627|185305973969816596290730578528098241367)'
 ```
 
-Expected: both dotted-OID lines are present in the output.
+Expected: all three dotted-OID lines are present in the output.
 
-## 8. Editing `/etc/pam.d/*`
+## 8. The device role store
+
+A role is required at every login, and the module takes its definition
+from the **role store** — a directory of `<role>.toml` slices on the
+device itself. While the store is empty or unreadable, the device admits
+nobody: this is deliberate fail-closed behavior, not a misconfiguration.
+
+### 8.1 Installing the role slice
+
+A ready-made sample of the `serv` slice lives in the repository —
+`dist/roles/serv.toml`; role samples are not part of the `.deb`, so on a
+clean machine it is easier to create the slice in place:
+
+```bash
+sudo install -d -m 0755 -o root -g root /var/lib/tessera/roles
+sudo tee /var/lib/tessera/roles/serv.toml >/dev/null <<'EOF'
+role = "serv"
+version = 1
+os = "linux"
+name = "Service Engineer"
+level = 5
+description = "Service engineer with sudo and higher resource limits."
+
+[payload]
+groups = ["service", "wheel"]
+sudo_role = "service"
+
+[payload.limits]
+nofile = 4096
+
+[session]
+max_ttl_seconds = 14400
+memory_max = "2G"
+tasks_max = 512
+EOF
+sudo chown root:root /var/lib/tessera/roles/serv.toml
+sudo chmod 0644 /var/lib/tessera/roles/serv.toml
+```
+
+If the repository is available on this machine, the same in one command:
+
+```bash
+sudo install -m 0644 -o root -g root \
+    dist/roles/serv.toml /var/lib/tessera/roles/serv.toml
+```
+
+Trust in the store rests on filesystem permissions — the same model as
+`sudoers.d`: the directory, every slice and every parent directory must
+be owned by `root:root` and must not be group- or world-writable. A
+slice living in an unprivileged user's directory is rejected by the
+product: otherwise the role — and with it the groups, sudo and session
+limits — could be redefined by the very person it constrains.
+
+### 8.2 Configuring `[roles]` in `/etc/tessera/config.toml`
+
+```toml
+[roles]
+dir = "/var/lib/tessera/roles"
+# Session cap used when neither the credential nor the role sets one.
+# default_session_ttl_seconds = 43200   # 12h, the default value
+```
+
+The full description of the section is in
+[configuration.md](configuration.md).
+
+### 8.3 The login account
+
+The account name *is* the role, so the system account `serv` must exist
+on the device. Across a fleet, role accounts are provisioned separately;
+for a lab bench this is enough:
+
+```bash
+sudo useradd --system --create-home --shell /bin/bash serv
+```
+
+No password is set for it: entry into a role account is open only
+through Tessera certificate authentication.
+
+### Verification (section 8)
+
+```bash
+ls -la /var/lib/tessera/roles/
+id serv
+sudo tessera check
+```
+
+Expected: `serv.toml` is present with `-rw-r--r-- root root`, `id serv`
+prints uid/gid, `tessera check` finishes with no ERROR.
+
+## 9. Editing `/etc/pam.d/*`
 
 PAM-stack editing is split into a separate document —
 **[docs/pam-integration.md](pam-integration.md)**:
@@ -595,7 +731,7 @@ PAM-stack editing is split into a separate document —
 > **IMPORTANT.** Open a second root shell before editing PAM.
 > Detail — [pam-integration.md §8 "Safety of the edit"](pam-integration.md#8-safety-of-the-edit).
 
-### Verification (section 8)
+### Verification (section 9)
 
 ```bash
 sudo tessera check
@@ -603,32 +739,35 @@ sudo tessera check
 
 `tessera check` catches PAM-stack ordering errors (for example
 `pam_stack_session_misorder`). The full authentication smoke test via
-`pamtester` is in section 9.
-## 9. Smoke test via `pamtester`
+`pamtester` is in section 10.
+## 10. Smoke test via `pamtester`
 
-### 9.1 Authentication
+The name passed to `pamtester` is the name of the role account, which is
+also the requested role.
+
+### 10.1 Authentication
 
 ```bash
-pamtester sudo alice authenticate
+pamtester sudo serv authenticate
 ```
 
 Positive result: `pamtester: successfully authenticated`.
 
-### 9.2 Session
+### 10.2 Session
 
 ```bash
-pamtester sudo alice open_session
-pamtester sudo alice close_session
+pamtester sudo serv open_session
+pamtester sudo serv close_session
 ```
 
 Positive result: both calls return `pamtester: successfully ...`.
 
-### 9.3 Negative test: remove the USB
+### 10.3 Negative test: remove the USB
 
 In one terminal, run:
 
 ```bash
-pamtester sudo alice authenticate
+pamtester sudo serv authenticate
 ```
 
 Right after entering it, remove the USB. Expected: `monitord` writes to
@@ -638,7 +777,7 @@ the journal:
 sudo journalctl -u tessera -n 20 -g 'medium absent'
 ```
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 The full diagnostics reference is **[docs/troubleshooting.md](troubleshooting.md)**:
 
@@ -651,7 +790,7 @@ The full diagnostics reference is **[docs/troubleshooting.md](troubleshooting.md
 - Clone-image / golden image (`dump-host-id` empty, a repeated flip) — see also [clone-image.md](clone-image.md)
 - Security incidents (a compromised cert, a lost token, CA worst-case, DIGSIG)
 - Installation / `gost-engine`
-## 11. Hosts without systemd: SysV init
+## 12. Hosts without systemd: SysV init
 
 The package installs **both** init variants: `tessera.service` (systemd)
 and `/etc/init.d/tessera` (SysV). On systemd hosts the SysV script does
@@ -668,8 +807,9 @@ Details (caveats, the absence of logind logout) —
 
 - [docs/configuration.md](configuration.md) — a reference to all
   `config.toml` parameters.
-- [docs/cert-issuance.md](cert-issuance.md) — issuing certificates with
-  the `pam_cert_host_binding` and `pam_cert_user_binding` extensions.
+- [docs/cert-issuance.md](cert-issuance.md) — issuing credentials with
+  the `pam_cert_host_binding`, `pam_cert_user_binding` and
+  `pam_cert_allowed_roles` extensions.
 - [docs/operations.md](operations.md) — the operations runbook and
   incident-response procedures.
 - [docs/threat-model.md](threat-model.md) — the threat model and which
