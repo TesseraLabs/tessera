@@ -62,9 +62,8 @@ pub struct LeafScope {
     pub validity: Validity,
     /// Host descriptors (`"*"`, `"sha256:<hex>"`, or a raw `machine_id`).
     pub host_binding: Vec<String>,
-    /// User descriptors (`"*"` or exact PAM usernames).
-    pub user_binding: Vec<String>,
-    /// Roles the leaf may activate.
+    /// Roles the leaf may activate. A role name is also the name of the login
+    /// account it unlocks, so this list is the leaf's whole admission scope.
     pub allowed_roles: Vec<String>,
     /// Optional integrity ceiling.
     pub max_integrity: Option<IntegrityCeiling>,
@@ -244,7 +243,6 @@ pub fn issue_leaf_from_csr<B: SignatureBackend, S: JournalStorage>(
         subject_spki_der: csr.subject_spki_der,
         validity: req.scope.validity,
         host_binding: req.scope.host_binding.clone(),
-        user_binding: req.scope.user_binding.clone(),
         allowed_roles: req.scope.allowed_roles.clone(),
         max_integrity: req.scope.max_integrity,
         profile_version: req.scope.profile_version,

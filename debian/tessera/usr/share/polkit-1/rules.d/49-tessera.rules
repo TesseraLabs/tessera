@@ -1,0 +1,30 @@
+// /usr/share/polkit-1/rules.d/49-tessera.rules
+//
+// Allow the dedicated `tessera` system user to invoke the small set
+// of org.freedesktop.login1.Manager methods that Tessera
+// needs to enforce the configured `on_usb_removed` action:
+//
+//   * LockSession / UnlockSession  — for `on_usb_removed = "lock"`
+//   * TerminateSession             — for `on_usb_removed = "logout"`
+//   * PowerOff                     — for `on_usb_removed = "shutdown"`
+//
+// All other privileged logind methods (Reboot, Suspend, Hibernate,
+// Inhibit, etc.) are NOT granted; the rule is an explicit allowlist.
+//
+// This file replaces the previous `User=root` setup so the daemon can run
+// as an unprivileged system user (postinst creates it). The polkit
+// allowlist is the only privilege-elevation surface left.
+
+polkit.addRule(function(action, subject) {
+    if (subject.user !== "tessera") return undefined;
+    var allow = [
+        "org.freedesktop.login1.lock-sessions",
+        "org.freedesktop.login1.manage",
+        "org.freedesktop.login1.power-off",
+        "org.freedesktop.login1.power-off-multiple-sessions"
+    ];
+    if (allow.indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+    return undefined;
+});

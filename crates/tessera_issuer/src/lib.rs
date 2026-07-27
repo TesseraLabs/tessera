@@ -55,15 +55,14 @@
 //! let ca = self_signed_ca(&signer, &key, &ca_req, &Serial::generate(), &mut journal, now).unwrap();
 //!
 //! // Issue a leaf under it. Login happens *into a role account* named for the
-//! // role (`oper@host`), so `user_binding` lists the allowed role accounts
-//! // (mirroring `allowed_roles`), not a person — the engineer's identity lives
-//! // in the subject CN and the journal.
+//! // role (`oper@host`), so `allowed_roles` names both the roles the holder may
+//! // activate and the accounts they may log into — not a person; the engineer's
+//! // identity lives in the subject CN and the journal.
 //! let leaf_req = LeafRequest {
 //!     subject: "CN=ivanov".to_owned(),
 //!     subject_spki_der: spki,
 //!     validity: Validity { not_before: 1_600_000_000, not_after: 1_600_003_600 },
 //!     host_binding: vec!["*".to_owned()],
-//!     user_binding: vec!["oper".to_owned()],
 //!     allowed_roles: vec!["oper".to_owned()],
 //!     max_integrity: None,
 //!     profile_version: 1,
@@ -224,7 +223,7 @@ fn sign_and_assemble<B: SignatureBackend>(
 
 /// Issues an engineer shift-leaf under the parent CA in `parent_der`.
 ///
-/// The request's `host_binding` and `user_binding` must be non-empty, the
+/// The request's `host_binding` must be non-empty, the
 /// validity must be well-ordered, and the leaf scope must stay inside the parent
 /// CA's delegation envelope (`allowed_roles`, `max_integrity` level, and
 /// validity duration). The finished certificate is self-checked before it is
@@ -257,9 +256,6 @@ pub fn issue_leaf<B: SignatureBackend, S: JournalStorage>(
 ) -> Result<IssuedCert, IssueError> {
     if req.host_binding.is_empty() {
         return Err(IssueError::MissingHostBinding);
-    }
-    if req.user_binding.is_empty() {
-        return Err(IssueError::MissingUserBinding);
     }
     check_validity(req.validity)?;
 

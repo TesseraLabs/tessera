@@ -293,7 +293,6 @@ fn leaf_request() -> LeafRequest {
             not_after: NOW + 3_600,
         },
         host_binding: vec!["*".to_owned()],
-        user_binding: vec!["ivanov".to_owned()],
         allowed_roles: vec!["oper".to_owned()],
         max_integrity: None,
         profile_version: 1,

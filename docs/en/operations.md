@@ -106,7 +106,7 @@ mv "$TMP" /var/lib/node_exporter/textfile_collector/tessera.prom
    - into `/etc/tessera/ca/bundle.pem` (via the organization's apt
      repository or ansible/puppet).
 4. Reissue the user certificates with the new CA pair, preserving the
-   correct `pam_cert_host_binding` and `pam_cert_user_binding`
+   correct `pam_cert_host_binding` and `pam_cert_allowed_roles`
    extensions in them (see [cert-issuance.md](cert-issuance.md)).
 5. After the full transition — revoke the old CA via CRL and remove it
    from `[trust].anchors`.
@@ -161,11 +161,11 @@ openssl crl -in /etc/tessera/crl/staff.crl -noout -lastupdate -nextupdate
 
 ### 2.3 Changing a certificate's scope
 
-**When:** when adding/removing a user or a machine from the scope of a
+**When:** when adding/removing a role or a machine from the scope of a
 specific certificate.
 
 Because authorization is described in the X.509 extensions themselves
-(`pam_cert_host_binding`, `pam_cert_user_binding`), there is no separate
+(`pam_cert_host_binding`, `pam_cert_allowed_roles`), there is no separate
 configuration to update. The lifecycle goes through the CA:
 
 1. Revoke the current certificate via CRL (the revocation procedure is
@@ -394,7 +394,7 @@ sudo journalctl -t pam_tessera | grep -E 'role_(deny|session_open)' | grep alice
 - Full certificate DNs at the `info` level — only the CN is shown. At
   the `debug` level — the full DN.
 - The full contents of the `pam_cert_host_binding` /
-  `pam_cert_user_binding` X.509 extensions — at the `info` level only
+  `pam_cert_allowed_roles` X.509 extensions — at the `info` level only
   the matched entry is logged; the full list — at the `debug` level.
 
 ## 7. МКЦ (MAC integrity)

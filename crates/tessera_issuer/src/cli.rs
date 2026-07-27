@@ -282,10 +282,8 @@ struct IssueLeafArgs {
     /// A host descriptor the leaf binds (repeat for several).
     #[arg(long = "host")]
     host_binding: Vec<String>,
-    /// A user descriptor the leaf binds (repeat for several).
-    #[arg(long = "user")]
-    user_binding: Vec<String>,
-    /// A role the leaf may activate (repeat for several).
+    /// A role the leaf may activate — and, since the account name is the role,
+    /// the account it admits its holder into (repeat for several).
     #[arg(long = "role")]
     allowed_roles: Vec<String>,
     /// `notBefore`, Unix seconds.
@@ -851,7 +849,6 @@ pub fn issue_leaf_cmd<B: SignatureBackend, S: JournalStorage>(
                 subject_spki_der: spki.clone(),
                 validity: scope.validity,
                 host_binding: scope.host_binding.clone(),
-                user_binding: scope.user_binding.clone(),
                 allowed_roles: scope.allowed_roles.clone(),
                 max_integrity: scope.max_integrity,
                 profile_version: scope.profile_version,
@@ -993,7 +990,6 @@ fn leaf_scope(args: &IssueLeafArgs) -> LeafScope {
             not_after: args.not_after,
         },
         host_binding: args.host_binding.clone(),
-        user_binding: args.user_binding.clone(),
         allowed_roles: args.allowed_roles.clone(),
         max_integrity: args.max_integrity_level.map(|level| IntegrityCeiling {
             level,
@@ -1551,7 +1547,6 @@ mod tests {
                 not_after: 1_600_003_600,
             },
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["root".to_owned()],
             max_integrity: None,
             profile_version: 1,
@@ -1573,7 +1568,6 @@ mod tests {
             subject_spki_der: spki.clone(),
             validity: scope.validity,
             host_binding: scope.host_binding.clone(),
-            user_binding: scope.user_binding.clone(),
             allowed_roles: scope.allowed_roles.clone(),
             max_integrity: scope.max_integrity,
             profile_version: scope.profile_version,
@@ -1681,7 +1675,6 @@ mod tests {
                 not_after: 1_600_003_600,
             },
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["oper".to_owned()],
             allowed_roles: vec!["oper".to_owned()],
             max_integrity: None,
             profile_version: 1,

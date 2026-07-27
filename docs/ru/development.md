@@ -203,10 +203,10 @@ cargo test --workspace
 - `crates/tessera_core/src/x509/host_binding_ext.rs` — парсинг
   расширения `pam_cert_host_binding` (OID и ASN.1-структура — в
   `x509/oids.rs`).
-- `crates/tessera_core/src/x509/user_binding_ext.rs` — парсинг
-  расширения `pam_cert_user_binding`.
+- `crates/tessera_core/src/x509/allowed_roles_ext.rs` — парсинг
+  расширения `pam_cert_allowed_roles`.
 - `verify_cert_scope` — финальная сверка распарсенных записей с
-  `host_id_hash` и `pam_user`. См. также
+  `host_id_hash` и запрошенной ролью, она же `pam_user`. См. также
   [docs/cert-issuance.md](cert-issuance.md) для семантики записей.
 
 ## 8. Версионирование

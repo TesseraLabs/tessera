@@ -125,7 +125,6 @@ fn a_chain_issued_with_default_envelopes_passes_engine_enforcement() {
             subject_spki_der: spki_fixture(),
             validity: validity(ORG_CA_MAX_TTL_SECS),
             host_binding: vec!["*".to_owned()],
-            user_binding: vec!["ivanov".to_owned()],
             allowed_roles: vec![NAMED_ROLE.to_owned()],
             max_integrity: None,
             profile_version: 0,

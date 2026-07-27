@@ -28,7 +28,7 @@ see [../ru/changelog.md](../ru/changelog.md) (Russian).
 ### CA admin (certificate issuance)
 
 1. [cert-issuance.md](cert-issuance.md) — the
-   `pam_cert_host_binding`, `pam_cert_user_binding`, and
+   `pam_cert_host_binding`, `pam_cert_allowed_roles`, and
    `pam_cert_max_integrity` extensions, and issuance scenarios.
 2. [issuer.md](issuer.md) — the issuer tooling (`tessera_issuer`):
    the `issuer` CLI, the `serve` agent, the CSR flow, the PKCS#11 and

@@ -86,7 +86,6 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
 
     // 3. Wire dependencies.
     let _leaf = Certificate::from_pem(&fixture_bytes("leaf_rsa.pem")).unwrap();
-    let mappings = vec![cn_mapping("alice", "alice")];
 
     let verifier = build_verifier(vec![]);
     let monitor = StubClient;
@@ -99,7 +98,6 @@ fn pre_auth_hook_runs_and_writes_marker_file() {
         hook_executor: &executor,
         host_id_hash: "host-T-hash",
         host_id_source: HostIdSourceKind::Override,
-        user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
         role_stage: roles.stage(),
         device_tags: empty_device_tags(),

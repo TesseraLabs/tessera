@@ -1,0 +1,5 @@
+/etc/init.d/tessera
+/etc/pam.d/tessera
+/etc/pam.d/tessera-only
+/etc/pam.d/tessera-optional
+/etc/tessera/config.toml.example

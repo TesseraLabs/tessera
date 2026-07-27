@@ -1,49 +1,38 @@
-//! Cert-driven host & user authorisation scope.
+//! Cert-driven host authorisation scope.
 //!
-//! As of 1.0.2 the certificate alone decides "which user on which host":
-//! the previous TOML host ACL, signed-ACL verifier, roles, and
-//! `cert_roles` field have been retired in favour of two X.509
-//! extensions parsed by [`crate::x509::host_binding_ext`] and
-//! [`crate::x509::user_binding_ext`].
+//! The certificate alone decides which devices its holder may use: the
+//! previous TOML host ACL and signed-ACL verifier were retired in favour of
+//! the `pam_cert_host_binding` X.509 extension parsed by
+//! [`crate::x509::host_binding_ext`].
 //!
-//! [`verify_cert_scope`] is the single entry point: it requires both
-//! extensions to be present and demands at least one descriptor in each
-//! to match the running host's id hash and the requested PAM user.
+//! The other axis — which account the holder may log into — lives in
+//! `pam_cert_allowed_roles` (see [`crate::x509::allowed_roles_ext`]): a login
+//! account name IS a role name, so one list answers both "which role may be
+//! activated" and "which account may be entered".
 //!
 //! Wildcard semantics:
-//! - `host_binding` `Wildcard` (`"*"`) → any host;
-//! - `host_binding` `Sha256Hex(hex)` → case-insensitive hex equality with
-//!   the resolved host id hash;
-//! - `host_binding` `Raw(s)` → SHA-256 of `s` is compared against the host
-//!   id hash, case-insensitively;
-//! - `user_binding` `Wildcard` (`"*"`) → any PAM user;
-//! - `user_binding` `Exact(s)` → byte-equality with the PAM user
-//!   (case-sensitive — Linux usernames are case-sensitive).
+//! - `Wildcard` (`"*"`) → any host;
+//! - `Sha256Hex(hex)` → case-insensitive hex equality with the resolved host
+//!   id hash;
+//! - `Raw(s)` → SHA-256 of `s` is compared against the host id hash,
+//!   case-insensitively.
 
 use crate::x509::host_binding_ext::{self, HostBindingExtError, HostDescriptor};
-use crate::x509::user_binding_ext::{self, UserBindingExtError, UserDescriptor};
 use openssl::x509::X509Ref;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use thiserror::Error;
 use tracing::warn;
 
-/// Errors raised by [`verify_host_binding`], [`verify_user_binding`] and
-/// [`verify_cert_scope`].
+/// Errors raised by [`verify_host_binding`].
 #[derive(Debug, Error)]
 pub enum HostBindingError {
     /// The certificate does not carry the `pam_cert_host_binding` extension.
     #[error("cert lacks host_binding extension")]
     HostExtensionMissing,
-    /// The certificate does not carry the `pam_cert_user_binding` extension.
-    #[error("cert lacks user_binding extension")]
-    UserExtensionMissing,
     /// The `host_binding` extension is present but its DER content is invalid.
     #[error("host_binding extension malformed: {0}")]
     HostExtensionMalformed(String),
-    /// The `user_binding` extension is present but its DER content is invalid.
-    #[error("user_binding extension malformed: {0}")]
-    UserExtensionMalformed(String),
     /// The cert is well-formed but no host descriptor matches this host.
     ///
     /// `host_id_hash_prefix` is the first 8 hex chars of the resolved
@@ -52,12 +41,6 @@ pub enum HostBindingError {
     HostNotAllowed {
         /// First 8 chars of the host id hash.
         host_id_hash_prefix: String,
-    },
-    /// The cert is well-formed but no user descriptor matches `pam_user`.
-    #[error("user {pam_user} not in cert user_binding")]
-    UserNotAllowed {
-        /// PAM user we attempted to authenticate.
-        pam_user: String,
     },
 }
 
@@ -68,18 +51,6 @@ impl From<HostBindingExtError> for HostBindingError {
             HostBindingExtError::Malformed(m) => Self::HostExtensionMalformed(m),
             HostBindingExtError::Empty => {
                 Self::HostExtensionMalformed("extension has no entries".into())
-            }
-        }
-    }
-}
-
-impl From<UserBindingExtError> for HostBindingError {
-    fn from(value: UserBindingExtError) -> Self {
-        match value {
-            UserBindingExtError::Missing => Self::UserExtensionMissing,
-            UserBindingExtError::Malformed(m) => Self::UserExtensionMalformed(m),
-            UserBindingExtError::Empty => {
-                Self::UserExtensionMalformed("extension has no entries".into())
             }
         }
     }
@@ -130,54 +101,6 @@ pub fn verify_host_binding(cert: &X509Ref, host_id_hash: &str) -> Result<(), Hos
     })
 }
 
-/// Verify that the cert's `user_binding` extension authorises `pam_user`.
-///
-/// # Errors
-///
-/// - [`HostBindingError::UserExtensionMissing`] — extension absent.
-/// - [`HostBindingError::UserExtensionMalformed`] — extension malformed.
-/// - [`HostBindingError::UserNotAllowed`] — extension present and well
-///   formed but no descriptor matches `pam_user`.
-pub fn verify_user_binding(cert: &X509Ref, pam_user: &str) -> Result<(), HostBindingError> {
-    let descriptors = user_binding_ext::parse(cert)?;
-    for d in &descriptors {
-        let matched = match d {
-            UserDescriptor::Wildcard => true,
-            UserDescriptor::Exact(s) => s == pam_user,
-        };
-        if matched {
-            return Ok(());
-        }
-    }
-    warn!(
-        target: "tessera.host_binding",
-        event = "user_binding_violation",
-        pam_user = %pam_user,
-        "cert user_binding does not authorise this user"
-    );
-    Err(HostBindingError::UserNotAllowed {
-        pam_user: pam_user.to_owned(),
-    })
-}
-
-/// Verify both extensions; combined cert authorisation gate.
-///
-/// Calls [`verify_host_binding`] first, then [`verify_user_binding`].
-/// Returns the first error encountered.
-///
-/// # Errors
-///
-/// Any [`HostBindingError`] variant.
-pub fn verify_cert_scope(
-    cert: &X509Ref,
-    host_id_hash: &str,
-    pam_user: &str,
-) -> Result<(), HostBindingError> {
-    verify_host_binding(cert, host_id_hash)?;
-    verify_user_binding(cert, pam_user)?;
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -189,41 +112,31 @@ mod tests {
     use super::*;
     use openssl::x509::X509;
 
-    use crate::x509::oids::{HOST_BINDING_OID, USER_BINDING_OID};
+    use crate::x509::oids::{ALLOWED_ROLES_OID, HOST_BINDING_OID};
     use crate::x509::test_utils::{build_cert, encode_seq_of_utf8};
 
-    fn cert_with(host: &[&str], user: &[&str]) -> X509 {
-        build_cert(&[
-            (HOST_BINDING_OID, encode_seq_of_utf8(host)),
-            (USER_BINDING_OID, encode_seq_of_utf8(user)),
-        ])
+    fn cert_with(host: &[&str]) -> X509 {
+        build_cert(&[(HOST_BINDING_OID, encode_seq_of_utf8(host))])
     }
 
     #[test]
-    fn exact_host_match_with_exact_user_match_ok() {
+    fn exact_host_match_ok() {
         let host_hash = sha256_hex("machine-A");
-        let cert = cert_with(&["machine-A"], &["alice"]);
-        verify_cert_scope(&cert, &host_hash, "alice").unwrap();
+        let cert = cert_with(&["machine-A"]);
+        verify_host_binding(&cert, &host_hash).unwrap();
     }
 
     #[test]
-    fn wildcard_host_with_exact_user_ok() {
-        let cert = cert_with(&["*"], &["alice"]);
-        verify_cert_scope(&cert, "any-host-hash", "alice").unwrap();
-    }
-
-    #[test]
-    fn exact_host_with_wildcard_user_ok() {
-        let host_hash = sha256_hex("machine-A");
-        let cert = cert_with(&["machine-A"], &["*"]);
-        verify_cert_scope(&cert, &host_hash, "any-user").unwrap();
+    fn wildcard_host_ok() {
+        let cert = cert_with(&["*"]);
+        verify_host_binding(&cert, "any-host-hash").unwrap();
     }
 
     #[test]
     fn host_mismatch_rejected() {
         let host_hash = sha256_hex("machine-A");
-        let cert = cert_with(&["machine-B"], &["*"]);
-        let err = verify_cert_scope(&cert, &host_hash, "alice").unwrap_err();
+        let cert = cert_with(&["machine-B"]);
+        let err = verify_host_binding(&cert, &host_hash).unwrap_err();
         match err {
             HostBindingError::HostNotAllowed {
                 host_id_hash_prefix,
@@ -236,67 +149,26 @@ mod tests {
     }
 
     #[test]
-    fn user_mismatch_rejected() {
-        let host_hash = sha256_hex("machine-A");
-        let cert = cert_with(&["machine-A"], &["bob"]);
-        let err = verify_cert_scope(&cert, &host_hash, "alice").unwrap_err();
-        match err {
-            HostBindingError::UserNotAllowed { pam_user } => {
-                assert_eq!(pam_user, "alice");
-            }
-            other => panic!("expected UserNotAllowed, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn missing_host_extension_rejected() {
-        let cert = build_cert(&[(USER_BINDING_OID, encode_seq_of_utf8(&["alice"]))]);
-        let err = verify_cert_scope(&cert, "h", "alice").unwrap_err();
+        // A certificate carrying only the admission list still has to name the
+        // devices it is valid on: the two axes are independent.
+        let cert = build_cert(&[(ALLOWED_ROLES_OID, encode_seq_of_utf8(&["oper"]))]);
+        let err = verify_host_binding(&cert, "h").unwrap_err();
         assert!(matches!(err, HostBindingError::HostExtensionMissing));
-    }
-
-    #[test]
-    fn missing_user_extension_rejected() {
-        let cert = build_cert(&[(HOST_BINDING_OID, encode_seq_of_utf8(&["*"]))]);
-        let err = verify_cert_scope(&cert, "h", "alice").unwrap_err();
-        assert!(matches!(err, HostBindingError::UserExtensionMissing));
     }
 
     #[test]
     fn raw_machine_id_is_hashed_and_matched() {
         let raw = "raw-machine-id-xyz";
         let host_hash = sha256_hex(raw);
-        let cert = cert_with(&[raw], &["alice"]);
-        verify_cert_scope(&cert, &host_hash, "alice").unwrap();
+        let cert = cert_with(&[raw]);
+        verify_host_binding(&cert, &host_hash).unwrap();
     }
 
     #[test]
     fn sha256_hex_descriptor_matches_case_insensitively() {
         let host_hash = sha256_hex("zzz");
-        let cert = cert_with(
-            &[&format!("sha256:{}", host_hash.to_uppercase())],
-            &["alice"],
-        );
-        verify_cert_scope(&cert, &host_hash, "alice").unwrap();
-    }
-
-    #[test]
-    fn user_match_is_case_sensitive() {
-        let cert = cert_with(&["*"], &["Alice"]);
-        let err = verify_cert_scope(&cert, "h", "alice").unwrap_err();
-        assert!(matches!(err, HostBindingError::UserNotAllowed { .. }));
-    }
-
-    #[test]
-    fn verify_host_binding_alone_succeeds() {
-        let host_hash = sha256_hex("m");
-        let cert = cert_with(&["m"], &["alice"]);
+        let cert = cert_with(&[&format!("sha256:{}", host_hash.to_uppercase())]);
         verify_host_binding(&cert, &host_hash).unwrap();
-    }
-
-    #[test]
-    fn verify_user_binding_alone_succeeds() {
-        let cert = cert_with(&["*"], &["alice"]);
-        verify_user_binding(&cert, "alice").unwrap();
     }
 }

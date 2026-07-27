@@ -12,10 +12,15 @@
 /// descriptor (`"*"`, `"sha256:<hex>"`, or a raw `machine_id`).
 pub const HOST_BINDING_OID: &str = "2.25.183976554325829274683049824615098";
 
-/// OID of the `pam_cert_user_binding` X.509 extension.
+/// OID of the retired `pam_cert_user_binding` X.509 extension.
 ///
-/// `extnValue ::= SEQUENCE OF UTF8String`, where each entry is either `"*"`
-/// (matches any user) or an exact PAM username.
+/// It listed the accounts a holder was admitted into. Since a login account IS
+/// a role, `ALLOWED_ROLES_OID` answers that question about the same string, and
+/// the extension is no longer issued or read.
+///
+/// The arc stays allocated and MUST NOT be reused under a different meaning:
+/// a certificate issued before the removal still carries it, and reassigning
+/// the OID would silently give that old certificate a new meaning.
 pub const USER_BINDING_OID: &str = "2.25.215438916728501023845629178354627";
 
 /// OID of the `pam_cert_max_integrity` X.509 extension.

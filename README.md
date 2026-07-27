@@ -78,19 +78,20 @@ step-by-step walkthrough: [docs/en/install.md](docs/en/install.md).
 
 ## Authorisation model
 
-Authorisation ("which user on which host") lives **inside each
+Authorisation ("in which role on which host") lives **inside each
 end-entity certificate** as two private X.509 v3 extensions:
 
-| Extension              | OID                                            | Encoding                |
-|------------------------|------------------------------------------------|-------------------------|
-| `pam_cert_host_binding`| `2.25.183976554325829274683049824615098`        | `SEQUENCE OF UTF8String` |
-| `pam_cert_user_binding`| `2.25.215438916728501023845629178354627`        | `SEQUENCE OF UTF8String` |
+| Extension               | OID                                            | Encoding                |
+|-------------------------|------------------------------------------------|-------------------------|
+| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098`        | `SEQUENCE OF UTF8String` |
+| `pam_cert_allowed_roles`| `2.25.185305973969816596290730578528098241367`  | `SEQUENCE OF UTF8String` |
 
-When present, these extensions are the **sole source** of authorisation
-— they decide which hosts and which PAM users a certificate may sign in
-to. The `[[user_mapping]]` list in `config.toml` is a **legacy fallback**
-used only for certificates that ship without `pam_cert_user_binding`.
-See [docs/en/cert-issuance.md](docs/en/cert-issuance.md) for the
+These extensions are the **sole source** of authorisation — they decide
+which hosts a certificate is valid on and which role accounts it admits
+the bearer into. A login account name IS a role name, so the role list
+answers the admission question too; there is no device-side list that
+would admit a certificate by its CN or SAN. See
+[docs/en/cert-issuance.md](docs/en/cert-issuance.md) for the
 `openssl.cnf` cookbook.
 
 ## Authentication modes

@@ -28,10 +28,9 @@ use tessera_core::challenge::{challenge_response, CryptoError};
 use tessera_core::config::ValidatedConfig;
 use tessera_core::discovery::{discover_credentials, DiscoveredCreds, DiscoveryError};
 use tessera_core::hooks::{run_hooks_for_stage, HookError, HookExecutor, HookStage, HookVars};
-use tessera_core::host_binding::{verify_host_binding, verify_user_binding, HostBindingError};
+use tessera_core::host_binding::{verify_host_binding, HostBindingError};
 use tessera_core::host_identity::HostIdSourceKind;
 use tessera_core::ipc::{MonitorClient, OpenSessionInfo};
-use tessera_core::mapping::{match_user, MappingError, MatchedMapping};
 use tessera_core::mount::usb::MountError;
 use tessera_core::mount_guard::{MountGuard, MountOps};
 use tessera_core::pam_conv::PamConvError;
@@ -109,11 +108,7 @@ pub enum FlowError {
     #[error("trust: {0}")]
     Trust(#[from] TrustError),
 
-    /// `pam_user` does not match any subject in the cert.
-    #[error("subject mapping: {0}")]
-    Mapping(#[from] MappingError),
-
-    /// Cert scope (host/user binding extension) rejected the auth.
+    /// Cert scope (host binding extension) rejected the auth.
     #[error("cert scope: {0}")]
     CertScope(#[from] HostBindingError),
 
@@ -237,7 +232,7 @@ impl FlowError {
     /// | `CertScope`                                            | `PAM_AUTH_ERR` (7)         |
     /// | `MaxIntegrityMalformed`                                | `PAM_PERM_DENIED` (6)      |
     /// | `Pkcs12` / `Crypto` / `Trust`                          | `PAM_PERM_DENIED` (6)      |
-    /// | `Mapping` / `MonitorRegistration`                      | `PAM_PERM_DENIED` (6)      |
+    /// | `MonitorRegistration`                                  | `PAM_PERM_DENIED` (6)      |
     /// | other `Pkcs11(...)` / `Pkcs11Acquire(Pkcs11)`          | `PAM_AUTH_ERR` (7)         |
     /// | `Internal`                                             | `PAM_SYSTEM_ERR` (4)       |
     #[must_use]
@@ -277,7 +272,6 @@ impl FlowError {
             Self::Pkcs12(_)
             | Self::Crypto(_)
             | Self::Trust(_)
-            | Self::Mapping(_)
             | Self::MaxIntegrityMalformed(_)
             | Self::RoleDenied(_)
             | Self::DelegationDenied(_)
@@ -404,8 +398,6 @@ pub struct Deps<'a> {
     pub host_id_hash: &'a str,
     /// Source kind that produced the host id, recorded into [`AuthContext`].
     pub host_id_source: HostIdSourceKind,
-    /// Subject mapping table from validated config.
-    pub user_mappings: &'a [tessera_core::config::validated::UserMapping],
     /// Where the active session lives — passed to monitord on a successful
     /// authentication so the daemon knows which logind session, tty, or X
     /// display to act on. The cdylib derives this from `PAM_TTY`; tests
@@ -786,11 +778,8 @@ where
     // Step 9 — cert scope (cert authorises this host).
     //
     // `pam_cert_host_binding` is mandatory: the cert MUST authorise the
-    // running host. `pam_cert_user_binding`, if present, also takes
-    // precedence over the legacy TOML mapping; if absent, Step 10 falls
-    // back to `[[user_mapping]]`. Runs BEFORE Step 10 so that cert-
-    // extension errors (e.g. missing `pam_cert_host_binding`) surface
-    // as the real cause instead of being masked by a stale mapping.
+    // running host. The other axis — which account may be entered — is the
+    // role coverage check in Step 10b, since the account name IS the role.
     if let Err(e) = verify_host_binding(loaded.end_entity.x509(), deps.host_id_hash) {
         // Surface an admin-actionable diagnostic on the lock screen /
         // terminal: the host_id_hash of this machine + the source kind
@@ -818,12 +807,6 @@ where
         ));
         return Err(FlowError::CertScope(e));
     }
-
-    // Step 10 — user authorisation. Cert-driven path (user_binding
-    // extension present) wins over the legacy `[[user_mapping]]`. Only
-    // certs without `pam_cert_user_binding` fall through to TOML; a
-    // present-but-broken extension fails closed (see `authorize_user`).
-    authorize_user(&loaded.end_entity, pam_user, deps.user_mappings)?;
 
     // Step 11 — assemble AuthContext.
     let cert_cn = loaded.end_entity.subject_cn().ok();
@@ -1196,16 +1179,9 @@ where
     let verified = deps.trust.verify(&cert.certificate, &presented_chain)?;
 
     // Step 9 — cert scope (cert authorises this host).
-    // `pam_cert_host_binding` is mandatory; user_binding is checked in
-    // Step 10. Runs BEFORE the legacy TOML mapping so cert-extension
-    // errors (e.g. missing `pam_cert_host_binding`) surface as the real
-    // cause.
+    // `pam_cert_host_binding` is mandatory. Admission to the login account is
+    // the role coverage check in Step 10b — the account name IS the role.
     verify_host_binding(cert.certificate.x509(), deps.host_id_hash)?;
-
-    // Step 10 — user authorisation. Cert path (user_binding present)
-    // wins over `[[user_mapping]]`; legacy path used when ext absent; a
-    // present-but-broken extension fails closed (see `authorize_user`).
-    authorize_user(&cert.certificate, pam_user, deps.user_mappings)?;
 
     // Step 11 — assemble AuthContext.  The token serial replaces the
     // USB serial in this mode (monitord uses the same field).
@@ -1675,50 +1651,6 @@ impl FlowIo for InMemoryFlowIo {
 /// the cert was issued for, which is the actionable information for a
 /// "wrong flash" mix-up. When the cert is also encrypted (legacy bundles)
 /// we degrade gracefully to a generic password-wrong message.
-/// Step 10 user authorisation, shared by the PKCS#12 and PKCS#11 paths.
-///
-/// The cert-driven path (`pam_cert_user_binding` extension present and
-/// well-formed) takes precedence over the legacy `[[user_mapping]]`
-/// TOML; only certs *without* the extension fall through to the legacy
-/// mapping. An extension that is present but malformed (or empty) fails
-/// closed: silently routing such a cert through the legacy mapping
-/// would let a certificate that was meant to restrict users
-/// authenticate via a stale TOML entry instead.
-// This is one of TWO checks applied to the same name, and they must stay
-// separate. Here: "is the holder allowed into this role account" —
-// `pam_cert_user_binding` (or the legacy `[[user_mapping]]` for certs without
-// the extension). Separately, in `resolve_role_stage` after cert verification:
-// "is the holder allowed to activate this role" — store resolve plus
-// `pam_cert_allowed_roles` coverage. A certificate that admits its holder into
-// account `serv` but does not list role `serv` is a legitimate configuration,
-// and such a login must be refused — merging the two would silently permit it.
-fn authorize_user(
-    cert: &Certificate,
-    pam_user: &str,
-    user_mappings: &[tessera_core::config::validated::UserMapping],
-) -> Result<(), FlowError> {
-    use tessera_core::x509::user_binding_ext::UserBindingExtError;
-    match tessera_core::x509::user_binding_ext::parse(cert.x509()) {
-        Ok(_) => verify_user_binding(cert.x509(), pam_user)?,
-        Err(UserBindingExtError::Missing) => {
-            let _matched: MatchedMapping = match_user(cert, pam_user, user_mappings)?;
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "tessera.flow",
-                event = "user_binding_unparseable",
-                error = %e,
-                pam_user = %pam_user,
-                cert_serial = %cert.serial_hex().to_lowercase(),
-                "pam_cert_user_binding present but unparseable; failing closed \
-                 (legacy mapping fallback is not allowed for broken extensions)"
-            );
-            return Err(FlowError::CertScope(e.into()));
-        }
-    }
-    Ok(())
-}
-
 /// Atomic resolve + coverage stage (role-format, tasks 4.3/4.4).
 ///
 /// Runs **after** the cert chain is verified and **before** the session
@@ -2022,22 +1954,14 @@ fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
             .join(", "),
         Err(_) => "<не указан>".to_string(),
     };
-    let user = match tessera_core::x509::user_binding_ext::parse(cert.x509()) {
-        Ok(entries) => entries
-            .iter()
-            .map(|e| match e {
-                tessera_core::x509::user_binding_ext::UserDescriptor::Wildcard => "*".to_string(),
-                tessera_core::x509::user_binding_ext::UserDescriptor::Exact(u) => u.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        Err(_) => "<не указан>".to_string(),
-    };
+    // Only host_binding is shown. The admission list (`pam_cert_allowed_roles`)
+    // may be read only from a verified certificate, and nothing here is
+    // verified yet — this is a pre-authentication hint for a "wrong flash"
+    // mix-up, and the host descriptor already identifies the bundle.
     format!(
         "Пароль .p12 неверный.\n\
          Этот сертификат выпущен для:\n\
            host_id_hash: {host}\n\
-           пользователь: {user}\n\
          Проверьте, что вставлена нужная флешка."
     )
 }
@@ -2055,7 +1979,6 @@ fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tessera_core::config::validated::{UserMapping, UserMatchCriteria};
     use tessera_core::host_identity::HostIdSourceKind;
     use tessera_core::ipc::{FailModeWrapper, MonitorFailMode, StubClient};
     use tessera_core::trust::openssl_verifier::{OpensslVerifier, OpensslVerifierConfig};
@@ -2153,13 +2076,6 @@ mod tests {
         .unwrap()
     }
 
-    fn cn_mapping(user: &str, cn: &str) -> UserMapping {
-        UserMapping {
-            pam_user: user.to_string(),
-            criteria: UserMatchCriteria::SubjectCn(cn.to_string()),
-        }
-    }
-
     /// Path to a real PEM fixture usable as a `[trust].anchors` entry —
     /// config validation rejects empty anchor lists.
     fn anchor_path_toml() -> String {
@@ -2218,7 +2134,6 @@ level = "info"
 
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
@@ -2230,7 +2145,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2257,7 +2171,6 @@ level = "info"
 
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("bob", "bob")];
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
@@ -2269,7 +2182,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2294,7 +2206,6 @@ level = "info"
         let cfg = minimal_cfg();
         let leaf = Certificate::from_pem(&fixture_bytes("leaf_rsa.pem")).unwrap();
         let _serial = leaf.serial_hex().to_lowercase();
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
@@ -2306,7 +2217,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2330,7 +2240,6 @@ level = "info"
         // Note: certs/ directory not created.
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
@@ -2342,7 +2251,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2369,7 +2277,6 @@ level = "info"
         let verifier = build_verifier();
         let mut cfg = minimal_cfg();
         cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
@@ -2381,7 +2288,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2409,7 +2315,6 @@ level = "info"
             cfg.monitor.fail_mode,
             tessera_core::config::validated::MonitorFailMode::Permissive
         );
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
@@ -2421,7 +2326,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2437,152 +2341,16 @@ level = "info"
         assert!(outcome.auth_ctx.usb_serial.is_none());
     }
 
-    #[test]
-    fn subject_mismatch_is_perm_denied() {
-        let tmp = stage_p12_mount("leaf_no_user_binding.p12", false);
-        let leaf = Certificate::from_pem(&fixture_bytes("leaf_no_user_binding.pem")).unwrap();
-        let _serial = leaf.serial_hex().to_lowercase();
-
-        let verifier = build_verifier();
-        let cfg = minimal_cfg();
-        // mapping says alice's CN should be "ghost" — does not match
-        let mappings = vec![cn_mapping("alice", "ghost")];
-
-        let monitor = StubClient;
-        let exec = tessera_core::hooks::NoopExecutor::new();
-        let roles = RoleFixture::serv();
-        let deps = Deps {
-            cfg: &cfg,
-            trust: &verifier,
-            monitor: &monitor,
-            hook_executor: &exec,
-            host_id_hash: "host-T-hash",
-            host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
-            pam_target: tessera_proto::SessionTarget::Unknown,
-            role_stage: roles.stage(),
-            device_tags: empty_device_tags(),
-        };
-        let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
-        let err = authenticate(deps, &io, "alice", "ssh", "sess-5".into(), |_| {
-            Ok(SecretString::from("correct-pin".to_string()))
-        })
-        .unwrap_err();
-        assert!(matches!(err, FlowError::Mapping(_)));
-        assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
-    }
-
-    // Cert host/user binding scope is exhaustively tested in
-    // `tessera_core::host_binding::tests`; we don't re-test the
-    // matrix end-to-end here because every fixture cert has `["*"]` for
-    // both extensions (max-permissive). The `authorize_user` dispatch
-    // (cert path vs legacy mapping vs fail-closed) is unit-tested below
-    // with locally built certs.
-
-    /// Builds a self-signed cert whose `pam_cert_user_binding` extension
-    /// carries `der_value` verbatim (possibly garbage DER).
-    fn cert_with_user_binding_ext(der_value: &[u8]) -> Certificate {
-        use openssl::asn1::{Asn1Integer, Asn1Object, Asn1OctetString, Asn1Time};
-        use openssl::bn::BigNum;
-        use openssl::hash::MessageDigest;
-        use openssl::pkey::PKey;
-        use openssl::rsa::Rsa;
-        use openssl::x509::{X509Builder, X509Extension, X509Name};
-
-        let pkey = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
-        let mut nb = X509Name::builder().unwrap();
-        nb.append_entry_by_text("CN", "alice").unwrap();
-        let name = nb.build();
-
-        let mut b = X509Builder::new().unwrap();
-        b.set_version(2).unwrap();
-        let serial = {
-            let mut bn = BigNum::new().unwrap();
-            bn.rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
-                .unwrap();
-            Asn1Integer::from_bn(&bn).unwrap()
-        };
-        b.set_serial_number(&serial).unwrap();
-        b.set_subject_name(&name).unwrap();
-        b.set_issuer_name(&name).unwrap();
-        b.set_pubkey(&pkey).unwrap();
-        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
-            .unwrap();
-        b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
-            .unwrap();
-        let oid = Asn1Object::from_str(tessera_core::x509::oids::USER_BINDING_OID).unwrap();
-        let octet = Asn1OctetString::new_from_bytes(der_value).unwrap();
-        b.append_extension(X509Extension::new_from_der(&oid, false, &octet).unwrap())
-            .unwrap();
-        b.sign(&pkey, MessageDigest::sha256()).unwrap();
-        Certificate::from_der(&b.build().to_der().unwrap()).unwrap()
-    }
+    // Cert host-binding scope is exhaustively tested in
+    // `tessera_core::host_binding::tests`; every fixture cert carries `["*"]`,
+    // so the matrix is not re-tested end-to-end here.
+    //
+    // Admission to the login account has no separate check: the account name IS
+    // the role name, so the `allowed_roles` coverage below is the whole
+    // decision. The tests use the same `resolve_and_cover` call the flow makes.
 
     #[test]
-    fn malformed_user_binding_fails_closed() {
-        // 0x04 0x00 is an OCTET STRING, not the `SEQUENCE OF UTF8String`
-        // the extension requires → parse() yields Malformed, not Missing.
-        let cert = cert_with_user_binding_ext(&[0x04, 0x00]);
-        // A legacy mapping that WOULD authorise alice — it must NOT be
-        // consulted when the extension is present but broken.
-        let mappings = vec![cn_mapping("alice", "alice")];
-        let err = authorize_user(&cert, "alice", &mappings).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                FlowError::CertScope(HostBindingError::UserExtensionMalformed(_))
-            ),
-            "got {err:?}"
-        );
-        assert_eq!(err.pam_code(), 7, "PAM_AUTH_ERR — denied, no fallback");
-    }
-
-    #[test]
-    fn empty_user_binding_fails_closed() {
-        // Well-formed but empty SEQUENCE — present yet authorises nobody;
-        // must not fall back to the legacy mapping either.
-        let cert = cert_with_user_binding_ext(&[0x30, 0x00]);
-        let mappings = vec![cn_mapping("alice", "alice")];
-        let err = authorize_user(&cert, "alice", &mappings).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                FlowError::CertScope(HostBindingError::UserExtensionMalformed(_))
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn valid_user_binding_wins_over_legacy_mapping() {
-        // SEQUENCE { UTF8String "alice" }
-        let cert =
-            cert_with_user_binding_ext(&[0x30, 0x07, 0x0C, 0x05, b'a', b'l', b'i', b'c', b'e']);
-        // No mappings at all: the cert path must authorise alice on its own.
-        authorize_user(&cert, "alice", &[]).expect("alice allowed by cert");
-        // ...and deny bob even though a mapping would have allowed him.
-        let mappings = vec![cn_mapping("bob", "alice")];
-        let err = authorize_user(&cert, "bob", &mappings).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                FlowError::CertScope(HostBindingError::UserNotAllowed { .. })
-            ),
-            "got {err:?}"
-        );
-    }
-
-    /// `SEQUENCE { UTF8String "serv" }` — a `user_binding` admitting exactly
-    /// the `serv` role account.
-    const USER_BINDING_SERV_DER: &[u8] = &[0x30, 0x06, 0x0C, 0x04, b's', b'e', b'r', b'v'];
-
-    #[test]
-    fn role_account_login_passes_both_checks() {
-        // The engineer logs into `serv`, so the same string is checked twice:
-        // admission into the account, then permission to activate the role.
-        let cert = cert_with_user_binding_ext(USER_BINDING_SERV_DER);
-        authorize_user(&cert, "serv", &[]).expect("serv account admitted by cert");
-
+    fn login_into_a_covered_role_account_is_admitted() {
         let roles = RoleFixture::serv();
         let resolution = tessera_core::role::resolve_and_cover(
             &roles.store,
@@ -2597,14 +2365,8 @@ level = "info"
     }
 
     #[test]
-    fn account_admission_does_not_grant_the_same_named_role() {
-        // A certificate that admits its holder into the `serv` account but
-        // lists only `oper` among the allowed roles is a legitimate
-        // configuration, and the login into `serv` must be refused. The two
-        // checks therefore cannot be merged into one.
-        let cert = cert_with_user_binding_ext(USER_BINDING_SERV_DER);
-        authorize_user(&cert, "serv", &[]).expect("account admission still succeeds");
-
+    fn login_into_an_account_the_cert_does_not_name_is_refused() {
+        // `ssh serv@device` against a certificate granting only `oper`.
         let roles = RoleFixture::serv();
         let oper = tessera_core::role::RoleId::new("oper").unwrap();
         let resolution = tessera_core::role::resolve_and_cover(
@@ -2625,16 +2387,24 @@ level = "info"
     }
 
     #[test]
-    fn role_account_outside_user_binding_is_refused() {
-        // `ssh admin@device` against a certificate bound to `serv` only.
-        let cert = cert_with_user_binding_ext(USER_BINDING_SERV_DER);
-        let err = authorize_user(&cert, "admin", &[]).unwrap_err();
+    fn certificate_without_allowed_roles_admits_no_account() {
+        // The extension is absent, which the flow passes down as `None`. There
+        // is no device-side list to fall back on, so the login is refused.
+        let roles = RoleFixture::serv();
+        let resolution = tessera_core::role::resolve_and_cover(
+            &roles.store,
+            Some(&roles.requested),
+            None,
+            "serv",
+        );
         assert!(
             matches!(
-                err,
-                FlowError::CertScope(HostBindingError::UserNotAllowed { .. })
+                resolution,
+                tessera_core::role::Resolution::Denied {
+                    reason: tessera_core::role::RoleDenyReason::NotCovered
+                }
             ),
-            "got {err:?}"
+            "got {resolution:?}"
         );
     }
 
@@ -2643,7 +2413,6 @@ level = "info"
         let tmp = stage_p12_mount("leaf_rsa.p12", false);
         let verifier = build_verifier();
         let cfg = minimal_cfg(); // sets pkcs12_pin_prompt = "PIN: "
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
@@ -2655,7 +2424,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2791,7 +2559,6 @@ level = "info"
     fn dispatcher_routes_pkcs11_openssl_to_not_implemented() {
         let cfg = pkcs11_openssl_cfg();
         let verifier = build_verifier();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -2802,7 +2569,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2823,7 +2589,6 @@ level = "info"
         // dispatcher tries to load it and surfaces `Pkcs11(ModulePathMissing)`.
         let cfg = pkcs11_native_cfg();
         let verifier = build_verifier();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -2834,7 +2599,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2857,7 +2621,6 @@ level = "info"
         let mut cfg = pkcs11_native_cfg();
         cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
         let verifier = build_verifier();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -2868,7 +2631,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2894,7 +2656,6 @@ level = "info"
         let mut cfg = pkcs11_native_cfg();
         cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
         let verifier = build_verifier();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -2905,7 +2666,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2935,7 +2695,6 @@ level = "info"
     fn pkcs11_path_propagates_acquire_max_attempts_as_max_tries() {
         let cfg = pkcs11_native_cfg();
         let verifier = build_verifier();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -2946,7 +2705,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -2980,7 +2738,6 @@ level = "info"
     fn pkcs11_path_propagates_token_wait_timeout_as_authinfo_unavail() {
         let cfg = pkcs11_native_cfg();
         let verifier = build_verifier();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -2991,7 +2748,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3021,7 +2777,6 @@ level = "info"
     fn pkcs11_path_propagates_serial_missing_after_wait_ok() {
         let cfg = pkcs11_native_cfg();
         let verifier = build_verifier();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -3032,7 +2787,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3160,7 +2914,6 @@ level = "info"
             dummy_stage5_hook(Stage5HookStage::PreAuth, OnFailure::Abort),
             dummy_stage5_hook(Stage5HookStage::PostAuthSuccess, OnFailure::Abort),
         ];
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = MockExec::new(Vec::new());
@@ -3172,7 +2925,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3199,7 +2951,6 @@ level = "info"
             Stage5HookStage::PreAuth,
             OnFailure::Abort,
         )];
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = MockExec::new(vec![Ok(nonzero_outcome(Stage5HookStage::PreAuth, 7))]);
@@ -3211,7 +2962,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3242,7 +2992,6 @@ level = "info"
             Stage5HookStage::PostAuthSuccess,
             OnFailure::Warn,
         )];
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         let monitor = StubClient;
         let exec = MockExec::new(vec![Ok(nonzero_outcome(
@@ -3257,7 +3006,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3287,7 +3035,6 @@ level = "info"
         )];
 
         let verifier = build_verifier();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = MockExec::new(vec![Ok(nonzero_outcome(Stage5HookStage::PreAuth, 1))]);
         let roles = RoleFixture::serv();
@@ -3298,7 +3045,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3446,7 +3192,6 @@ level = "info"
 
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -3457,7 +3202,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3503,7 +3247,6 @@ level = "info"
 
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -3514,7 +3257,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3568,7 +3310,6 @@ level = "info"
 
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -3579,7 +3320,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3624,7 +3364,6 @@ level = "info"
 
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("alice", "alice")];
         let monitor = StubClient;
         let exec = tessera_core::hooks::NoopExecutor::new();
         let roles = RoleFixture::serv();
@@ -3635,7 +3374,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3798,7 +3536,6 @@ level = "info"
         let tmp = stage_p12_mount("leaf_rsa.p12", false);
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         // Strict fail mode: a monitord that cannot record the session must
         // turn the otherwise-successful cert auth into a definitive denial.
@@ -3812,7 +3549,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),
@@ -3835,7 +3571,6 @@ level = "info"
         let tmp = stage_p12_mount("leaf_rsa.p12", false);
         let verifier = build_verifier();
         let cfg = minimal_cfg();
-        let mappings = vec![cn_mapping("alice", "alice")];
 
         // Permissive fail mode: the wrapper converts the transport error to
         // Ok(()) before the flow ever sees it, so auth still succeeds.
@@ -3849,7 +3584,6 @@ level = "info"
             hook_executor: &exec,
             host_id_hash: "host-T-hash",
             host_id_source: HostIdSourceKind::Override,
-            user_mappings: &mappings,
             pam_target: tessera_proto::SessionTarget::Unknown,
             role_stage: roles.stage(),
             device_tags: empty_device_tags(),

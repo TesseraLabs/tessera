@@ -502,6 +502,44 @@ fn validated_config_rejects_absent_revocation_section() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn validated_config_rejects_removed_user_mapping_section() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    // Every shape an operator could plausibly leave behind. The rejection must
+    // not depend on the leftover still being a parseable mapping entry.
+    // Table forms have to follow the fixture; a bare key has to precede it, or
+    // TOML would read it as belonging to the last section.
+    for (before, after) in [
+        (
+            "",
+            "[[user_mapping]]\npam_user = \"serv\"\ncert_subject_cn = \"engineer\"\n",
+        ),
+        ("", "[user_mapping]\npam_user = \"serv\"\n"),
+        ("user_mapping = []\n", ""),
+        ("user_mapping = \"serv\"\n", ""),
+    ] {
+        let leftover = format!("{before}{after}");
+        let body = format!("{before}{}\n{after}", fixture_with_anchor(&anchor));
+        let raw: RawConfig = toml::from_str(&body).expect("leftover must still parse");
+        let err = ValidatedConfig::try_from(&raw)
+            .expect_err("a config carrying user_mapping must be rejected");
+        let Error::ConfigInvalid { reason } = err else {
+            return Err(format!("expected ConfigInvalid for {leftover:?}, got {err:?}").into());
+        };
+        assert!(
+            reason.contains("[[user_mapping]] has been removed"),
+            "diagnostic must name the removed section, got: {reason}"
+        );
+        assert!(
+            reason.contains("pam_cert_allowed_roles"),
+            "diagnostic must point at what decides admission now, got: {reason}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn validated_config_rejects_revocation_section_without_mode(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;

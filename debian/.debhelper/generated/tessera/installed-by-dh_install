@@ -1,0 +1,11 @@
+./dist/systemd/tessera.service
+./dist/tmpfiles/tessera.conf
+./dist/config/config.toml.example
+./dist/pam.d/tessera
+./dist/pam.d/tessera-optional
+./dist/pam.d/tessera-only
+./dist/pam.d/tessera.example
+./dist/polkit/49-tessera.rules
+./dist/scripts/integrate-pam.sh
+./dist/scripts/finish-bootstrap.sh
+./dist/systemd/tessera.service.d/mac-integrity.conf.example

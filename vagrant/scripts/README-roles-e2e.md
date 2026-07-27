@@ -9,12 +9,14 @@ for per-PR runs.
 (R1–R5) reproduce as asserted (results table below).
 
 > **Superseded — do not run as is.** Every scenario logs in as `ivanov+serv`,
-> and both mechanisms behind that are gone: the role is now the login account
-> name (the `user+role` suffix and the PAM prompt were removed), and role
-> checking is unconditional (`[roles].enforce` no longer exists, so R5
-> describes an impossible state). The equivalent coverage lives in
-> `tests/e2e/cases/30-roles.yaml` (ROLE-001…004). This runbook is kept for the
-> loop+udev USB emulation technique it documents.
+> and the mechanisms behind that are gone: the role is now the login account
+> name (the `user+role` suffix and the PAM prompt were removed), role checking
+> is unconditional (`[roles].enforce` no longer exists, so R5 describes an
+> impossible state), and the `pam_cert_user_binding` extension together with
+> the `[[user_mapping]]` config section was removed altogether — admission is
+> decided by `pam_cert_allowed_roles` alone. The equivalent coverage lives in
+> `tests/e2e/cases/30-roles.yaml`. This runbook is kept for the loop+udev USB
+> emulation technique it documents.
 
 The harness drives the **PAM auth phase** through a dedicated throwaway
 service (`/etc/pam.d/tessera-roletest`, auth-only) with `pamtester`. It never
@@ -57,7 +59,7 @@ of this; an `EXIT` trap detaches the loop, removes the udev rule, and reloads
 rules. It never touches `sshd`/`login`/`sudo`.
 
 > The same loop+udev USB-emulation technique applies to the MAC harness
-> (`test-mac.sh`), whose fixtures share the missing host/user-binding gap —
+> (`test-mac.sh`), whose fixtures share the missing host-binding gap —
 > their leaves also need the mandatory cert extensions (below) and a USB to be
 > presented on. Reuse this block when wiring per-scenario leaves there.
 
@@ -70,17 +72,17 @@ harness feeds it on stdin: `printf '%s\n' "$PIN" | pamtester ... authenticate`.
 ## Mandatory cert extensions on every leaf
 
 `verify_host_binding` is **fail-closed on a missing extension**
-(`crates/pam_tessera/src/flow.rs`), so each leaf `.cnf` carries **three**
+(`crates/pam_tessera/src/flow.rs`), so each leaf `.cnf` carries **two**
 extensions (see `tests/fixtures/roles/*.cnf`):
 
 | Extension | OID | DER (test value) |
 |-----------|-----|------------------|
 | `pam_cert_host_binding` (**mandatory**) | `2.25.183976554325829274683049824615098` | `DER:30:03:0c:01:2a` — `["*"]` wildcard host |
-| `pam_cert_user_binding` | `2.25.215438916728501023845629178354627` | `DER:30:08:0c:06:69:76:61:6e:6f:76` — `["ivanov"]` |
 | `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | `[serv]` / `[oper]` / malformed per file |
 
-The cert-driven `user_binding` (`ivanov`) wins, so no `[[user_mapping]]` entry
-is needed in the config.
+Admission into the login account follows from `pam_cert_allowed_roles`: the
+account name IS the role, so no second list — in the cert or in the config —
+takes part in the decision.
 
 ## OID and DER (locked)
 

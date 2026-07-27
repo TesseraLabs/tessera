@@ -6,15 +6,13 @@ configuration file:
 - `/etc/tessera/config.toml` — the main configuration of the `tessera`
   module and daemon.
 
-The "which user on which host" authorization lives inside the
-certificate itself — in the X.509 extensions `pam_cert_host_binding` and
-`pam_cert_user_binding`. When the `pam_cert_user_binding` extension is
-present on the leaf certificate, it fully determines which PAM user is
-allowed to log in, and the `[[user_mapping]]` array from this file is
-**ignored**. `[[user_mapping]]` is kept in the schema as a legacy
-fallback — it applies only to certificates issued without the
-`pam_cert_user_binding` extension. See
-[docs/cert-issuance.md](cert-issuance.md).
+The "in which role and on which device" authorization lives inside the
+credential itself — in the X.509 extensions `pam_cert_host_binding` and
+`pam_cert_allowed_roles`. The name of the login account IS the role, so
+the role list also answers the question of admission into the account.
+This file holds no mechanism by which the device could admit a login on
+its own terms: the scope is assigned by the issuer, not by the party
+being constrained. See [docs/cert-issuance.md](cert-issuance.md).
 
 Each field is described in the format "type → default value →
 allowed values → effect on behavior → security implication".
@@ -61,11 +59,11 @@ the example really validates through `ValidatedConfig::try_from`.
 | `suspend_grace_seconds`    | integer            | `0`         | `0..=600`                                                      | Window after resume during which USB removal is ignored.     | Hubs often make noise during suspend; `30` seconds is a typical value.               |
 | `monitor_fail_mode`        | string             | `"strict"`  | `"strict"`, `"permissive"`                                     | Whether to propagate non-fatal `monitord` IPC errors to the calling code (`strict`) or swallow them with a WARN (`permissive`). | `DeviceGone`/`Unauthorized` are always fatal. Strict mode currently rejects PKCS#11 authentication because native token-removal observation is not implemented. |
 
-> **Authorization (host + user) is described in the certificate itself
+> **Authorization (device + role) is described in the credential itself
 > via X.509 v3 extensions** `pam_cert_host_binding` and
-> `pam_cert_user_binding`. This file contains only trust + identity +
-> monitor + hooks; see [cert-issuance.md](cert-issuance.md) for issuing
-> certificates with the required extensions.
+> `pam_cert_allowed_roles`. This file contains only trust + identity +
+> roles + monitor + hooks; see [cert-issuance.md](cert-issuance.md) for
+> issuing credentials with the required extensions.
 
 The PAM authentication entry point validates its configuration and every
 configured trust anchor, intermediate, CRL, PKCS#11 module, and GOST engine
@@ -181,28 +179,6 @@ The chain implementation is in
 The `fallback = "deny"` behavior guarantees fail-closed: if no source
 yields a value, authentication does not pass.
 
-### The `[[user_mapping]]` section (legacy fallback)
-
-> **Only for certificates without the `pam_cert_user_binding` extension.**
-> If the `pam_cert_user_binding` extension is present on the leaf
-> certificate, the `[[user_mapping]]` array is **fully ignored** — the
-> certificate itself determines authorization. New issuances must always
-> set the extension (mandatory-extension policy, see
-> [docs/threat-model.md §3.8](threat-model.md)).
-
-An array of tables. Each entry is a "PAM user → certificate criterion"
-pair.
-
-| Field              | Type   | Default | Allowed values                    | Effect                                                   | Security implication                                                |
-|--------------------|--------|---------|-----------------------------------|----------------------------------------------------------|----------------------------------------------------------------------|
-| `pam_user`         | string | —       | UNIX user name                    | Which UNIX user is presented to the PAM stack.          | Must be a local account.                                            |
-| `cert_subject_cn`  | string | `None`  | the `CN` value from the subject DN | Match by `CN`.                                          | Exactly one of the three criteria must be set.                     |
-| `cert_san_email`   | string | `None`  | RFC822 name from the SAN          | Match by `subjectAltName`.                              | Exact string, no regex.                                            |
-| `cert_san_upn`     | string | `None`  | UPN name from the SAN OtherName   | Match by UPN (Microsoft AD).                           | Applicable to mixed AD environments.                              |
-
-> Exactly one of `cert_subject_cn`/`cert_san_email`/`cert_san_upn` must
-> be set in each entry. Failing this is a validation error.
-
 ### The `[logging]` section
 
 | Field               | Type   | Default  | Allowed values                                            | Effect                                                 | Security implication                                                  |
@@ -248,11 +224,19 @@ issuance log, not in the account name. Role accounts are provisioned
 separately (Census); every way into them other than Tessera's certificate
 authentication is closed.
 
-Admission is checked by two certificate extensions applied to the same name:
-`pam_cert_user_binding` ("the holder may log into this role account") and
-`pam_cert_allowed_roles` ("the holder may activate this role"). A certificate
-that admits the holder into account `serv` but does not allow the role of the
-same name is a legitimate configuration, and such a login is refused.
+Admission is checked by a single credential extension —
+`pam_cert_allowed_roles` ("the holder may activate these roles"). It also
+answers the question "into which account is the holder admitted", because it
+is the same string. There is no separate list of permitted accounts: two lists
+over one name would describe an unrealizable state, "admitted into `serv`, but
+not entitled to be `serv`".
+
+No other source of admission exists. The device configuration holds no
+mechanism that would permit a login by credential attributes (`CN`, SAN) the
+issuer never meant for admission: the scope is carried by the credential, and
+a path where the constrained party assigns it undermines the model itself. A
+config containing the removed `[[user_mapping]]` section is rejected at
+validation with a diagnostic naming the removal.
 
 ### The `[tags]` section
 
@@ -379,31 +363,33 @@ mode = "none"
 sources  = ["machine_id", "hostname"]
 fallback = "deny"
 
-[[user_mapping]]
-pam_user        = "alice"
-cert_subject_cn = "Alice"
+[roles]
+dir = "/var/lib/tessera/roles"
 
 [logging]
 level = "info"
 ```
 
-## Authorization in the certificate
+## Authorization in the credential
 
-The certificate's binding to hosts and users is fully described by two
-X.509 v3 extensions of the leaf certificate:
+The credential's binding to devices and role accounts is fully described
+by two X.509 v3 extensions of the leaf:
 
 - `pam_cert_host_binding` (OID `2.25.183976554325829274683049824615098`)
   — a `SEQUENCE OF UTF8String`, where each entry is either `*`, or
   `sha256:<HEX>`, or a "raw" `machine_id` value (in which case the
   comparison goes through SHA-256 of the string).
-- `pam_cert_user_binding` (OID `2.25.215438916728501023845629178354627`)
-  — a `SEQUENCE OF UTF8String`, where each entry is either `*` or an
-  exact PAM user name.
+- `pam_cert_allowed_roles`
+  (OID `2.25.185305973969816596290730578528098241367`)
+  — a `SEQUENCE OF UTF8String`, where each entry is a role identifier
+  (`^[a-z][a-z0-9-]{0,15}$`). It is also the login account name, so the
+  list answers the question of admission into the account as well.
 
-To authorize a certificate for a specific `host_id` / `pam_user`, **at
-least one matching entry in each** of the extensions is required. The
-absence of either extension, a corrupt DER encoding, or a complete
-absence of matches is a rejection (`PAM_AUTH_ERR`).
+To authorize a credential for a specific `host_id` and in a specific
+role account, **at least one matching entry in each** of the extensions
+is required. The absence of either extension, a corrupt DER encoding, or
+a complete absence of matches is a rejection (`PAM_AUTH_ERR`); no
+fallback to any device-side mechanism exists.
 
 Details and ready-made `openssl.cnf` recipes are in
 [cert-issuance.md](cert-issuance.md).
@@ -452,9 +438,8 @@ allowed_root_spki_sha256 = [
 sources  = ["dmi_board_serial", "machine_id"]
 fallback = "deny"
 
-[[user_mapping]]
-pam_user      = "operator"
-cert_san_upn  = "operator@terminal.example.test"
+[roles]
+dir = "/var/lib/tessera/roles"
 
 [logging]
 level = "warn"
@@ -511,9 +496,8 @@ crl_max_age_hours  = 24
 sources  = ["machine_id", "hostname"]
 fallback = "deny"
 
-[[user_mapping]]
-pam_user        = "staff"
-cert_subject_cn = "Staff Operator"
+[roles]
+dir = "/var/lib/tessera/roles"
 
 [logging]
 level = "info"
@@ -560,9 +544,8 @@ mode = "none"
 sources  = ["hostname"]
 fallback = "warn"
 
-[[user_mapping]]
-pam_user        = "alice"
-cert_subject_cn = "Alice"
+[roles]
+dir = "/var/lib/tessera/roles"
 
 [logging]
 level = "debug"

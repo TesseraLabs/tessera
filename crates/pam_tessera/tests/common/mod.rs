@@ -178,31 +178,10 @@ journald_priority = false
     ValidatedConfig::try_from(&raw).unwrap()
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct UserMappingKv {
-    pub pam_user: &'static str,
-    pub cn: &'static str,
-}
-
-pub fn cn_mapping(user: &str, cn: &str) -> tessera_core::config::validated::UserMapping {
-    use tessera_core::config::validated::{UserMapping, UserMatchCriteria};
-    UserMapping {
-        pam_user: user.to_string(),
-        criteria: UserMatchCriteria::SubjectCn(cn.to_string()),
-    }
-}
-
-/// Legacy shim retained so existing call sites keep compiling; the cert
-/// scope is verified via cert extensions, not a separate ACL list.
-pub fn host_acl_for(_serial: &str, _hosts: &[&str]) -> () {}
-pub fn host_acl_for_subject(_cn: &str, _serial: &str, _hosts: &[&str]) -> () {}
-
 /// Run the full flow, returning the raw `Result` so individual tests can
 /// match on specific [`FlowError`] variants.
 pub fn run_flow_with(
     p12_name: &str,
-    mappings: Vec<tessera_core::config::validated::UserMapping>,
-    _acl: (),
     pam_user: &str,
     pin: &str,
     crl_pems: Vec<Vec<u8>>,
@@ -222,7 +201,6 @@ pub fn run_flow_with(
         hook_executor: &exec,
         host_id_hash,
         host_id_source: HostIdSourceKind::Override,
-        user_mappings: &mappings,
         pam_target: tessera_proto::SessionTarget::Unknown,
         role_stage: roles.stage(),
         device_tags: pam_tessera::flow::empty_device_tags(),

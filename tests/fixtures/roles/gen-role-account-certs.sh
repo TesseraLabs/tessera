@@ -2,7 +2,8 @@
 # Generate role-account test leaves for the target role model
 # ("role = role account"): the engineer logs into the role account by name
 # (`ssh serv@device`), the requested role equals the login account name, and
-# admission is decided by pam_cert_user_binding plus pam_cert_allowed_roles.
+# admission is decided by pam_cert_allowed_roles alone — the account name IS
+# the role name, so one list answers both questions.
 #
 # These leaves are the only ones the module can be exercised with: the suffix
 # form `<user>+<role>` that gen-role-certs.sh produces leaves for no longer
@@ -20,12 +21,10 @@
 # (PIN 123456, same as the suffix-model bundles).
 #
 # Leaves:
-#   acct-serv             user_binding=[serv] allowed_roles=[serv]
+#   acct-serv             allowed_roles=[serv]
 #                         -> login into `serv`, role covered: admit
-#   acct-serv-oper-only   user_binding=[serv] allowed_roles=[oper]
-#                         -> login into `serv` permitted, role NOT covered
-#   acct-foreign          user_binding=[oper] allowed_roles=[oper]
-#                         -> login into `serv` refused by user_binding
+#   acct-serv-oper-only   allowed_roles=[oper]
+#                         -> login into `serv` refused, role NOT covered
 #
 # All leaves carry host_binding = ["*"] so they admit on any test stand.
 #
@@ -58,7 +57,6 @@ fi
 CASES=(
     acct-serv
     acct-serv-oper-only
-    acct-foreign
 )
 
 for name in "${CASES[@]}"; do
@@ -98,5 +96,5 @@ for name in "${CASES[@]}"; do
 done
 
 echo "[+] done. inspect with:"
-echo "      openssl x509 -in ${OUT_DIR}/acct-serv.crt.pem -noout -text | grep -A2 2.25.2154"
+echo "      openssl x509 -in ${OUT_DIR}/acct-serv.crt.pem -noout -text | grep -A2 2.25.1853"
 echo "      openssl pkcs12 -in ${OUT_DIR}/acct-serv.p12 -noout -passin pass:${P12_PASS}"

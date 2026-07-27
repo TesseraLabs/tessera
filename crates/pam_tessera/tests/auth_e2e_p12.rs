@@ -26,8 +26,6 @@ fn happy_path_rsa() {
         .to_lowercase();
     let outcome = run_flow_with(
         "leaf_rsa.p12",
-        vec![cn_mapping("alice", "alice")],
-        (),
         "alice",
         "correct-pin",
         vec![],
@@ -50,8 +48,6 @@ fn happy_path_ecdsa() {
         .to_lowercase();
     let outcome = run_flow_with(
         "leaf_ecdsa.p12",
-        vec![cn_mapping("bob", "bob")],
-        (),
         "bob",
         "correct-pin",
         vec![],

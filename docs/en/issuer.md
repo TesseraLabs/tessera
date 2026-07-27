@@ -33,7 +33,7 @@ subordinate organisation CAs and engineers' shift-leaves — strictly inside its
 delegation envelope, which can only narrow at every step. There is no separate
 "mode by job title".
 
-The semantics of the extensions themselves (`host_binding`, `user_binding`,
+The semantics of the extensions themselves (`host_binding`,
 `allowed_roles`, `max_integrity`, `profile_version`, `delegation_constraints`)
 and their OIDs are in [cert-issuance.md](cert-issuance.md) — this document
 describes the tool, not the format. The attack surface of the issuer tooling is

@@ -15,8 +15,8 @@ reading it, an engineer should be able to answer correctly:
 
 - Authenticates a local UNIX user with an X.509 certificate on a USB medium
   or a PKCS#11 token.
-- Binds the user to the machine (host binding) through the X.509 v3
-  extensions `pam_cert_host_binding` and `pam_cert_user_binding`, embedded in
+- Binds the bearer to the machine and to the role account through the X.509 v3
+  extensions `pam_cert_host_binding` and `pam_cert_allowed_roles`, embedded in
   the leaf certificate itself.
 - Monitors the state of the USB medium throughout the session and reacts to
   its removal (lock / logout / hook / shutdown).
@@ -67,8 +67,9 @@ The synchronous core. It contains:
 - Hooks (`hooks/`).
 - Host identity chain (`host_identity/`).
 - Cert-scope verification — parsing of the `pam_cert_host_binding` /
-  `pam_cert_user_binding` extensions and matching their entries against
-  `host_id_hash` and `pam_user` (`x509/`, `verify_cert_scope`).
+  `pam_cert_allowed_roles` extensions and matching their entries against
+  `host_id_hash` and the requested role, which is also `pam_user` (`x509/`,
+  `verify_cert_scope`).
 - IPC client side (`ipc/`).
 
 No `tokio`, no async. All operations are blocking — and this is justified: the
@@ -185,17 +186,14 @@ The PAM stack makes several calls in the order `auth → account → session`.
    - mount the USB or open a PKCS#11 session;
    - find the certificate, verify the chain and revocation;
    - challenge-response with the private key;
-   - extract the `pam_cert_host_binding` and `pam_cert_user_binding`
+   - extract the `pam_cert_host_binding` and `pam_cert_allowed_roles`
      extensions from the leaf certificate and match them against
-     `host_id_hash` and `pam_user` via `verify_cert_scope`.
-     **When `pam_cert_user_binding` is present, it is the sole source of
-     authorization for the PAM user**; the `[[user_mapping]]` list from
-     `config.toml` is not read in that case. If `pam_cert_user_binding` is
-     absent, the module falls back to the legacy comparison via
-     `[[user_mapping]]`. This behavior is pinned by a test in
-     `crates/pam_tessera/tests/negative_auth.rs` on the fixture
-     `leaf_no_user_binding` (see also the unit test in
-     `crates/pam_tessera/src/flow.rs`).
+     `host_id_hash` and the requested role via `verify_cert_scope`.
+     **`pam_cert_allowed_roles` is the sole source of admission into the
+     account**: `PAM_USER` IS the role, so one list also answers the question
+     "into which account is the bearer admitted". No fallback to the device
+     configuration exists; an absent extension is a denial, not a switch to
+     another mechanism (return codes — see §13).
 8. On success — build the `AuthContext` and store it via `pam_set_data`.
 9. Send `Hello` + `SessionOpen` to monitord (receive `Ack`).
 10. Return `PAM_SUCCESS`. Any error maps to
@@ -616,15 +614,13 @@ is set out in "Principles" below the table.
 | 5  | the certificate fails chain verification                      | `PAM_PERM_DENIED` (6)  |
 | 6  | revocation check failed (`crl`: serial in the CRL, CRL absent/stale; `ocsp`/`crl_then_ocsp`: responder unreachable, timeout, status `unknown`/`revoked`, invalid response signature) | `PAM_PERM_DENIED` (6) |
 | 7  | challenge-response did not match                              | `PAM_PERM_DENIED` (6)  |
-| 8  | legacy `[[user_mapping]]` produced no match                   | `PAM_PERM_DENIED` (6)  |
+| 8  | the requested role is not covered by `pam_cert_allowed_roles` — the extension is absent, invalid (the list is treated as empty), or does not contain the role | `PAM_PERM_DENIED` (6)  |
 | 9  | PIN attempt limit exhausted (`MaxTries`, `PinLocked`)         | `PAM_MAXTRIES` (11)    |
 | 10 | the `pam_cert_host_binding` extension is absent or invalid    | `PAM_AUTH_ERR` (7)     |
 | 11 | host_id_hash is not among the `pam_cert_host_binding` entries | `PAM_AUTH_ERR` (7)     |
-| 12 | the `pam_cert_user_binding` extension is absent or invalid    | `PAM_AUTH_ERR` (7)     |
-| 13 | `pam_user` is not among the `pam_cert_user_binding` entries   | `PAM_AUTH_ERR` (7)     |
-| 14 | a single PIN error, a PAM conversation error, a hook refusal  | `PAM_AUTH_ERR` (7)     |
-| 15 | a violation of internal invariants (`Internal`)               | `PAM_SYSTEM_ERR` (4)   |
-| 16 | an `Error` from monitord with `code = DEVICE_GONE` / `UNAUTHORIZED` | propagated always, even in `permissive` |
+| 12 | a single PIN error, a PAM conversation error, a hook refusal  | `PAM_AUTH_ERR` (7)     |
+| 13 | a violation of internal invariants (`Internal`)               | `PAM_SYSTEM_ERR` (4)   |
+| 14 | an `Error` from monitord with `code = DEVICE_GONE` / `UNAUTHORIZED` | propagated always, even in `permissive` |
 
 The full mapping table of `FlowError` → PAM code is the doc-comment on
 `FlowError::pam_code` in
@@ -634,10 +630,10 @@ Principles:
 
 - panics and infrastructure errors → `PAM_AUTHINFO_UNAVAIL` (which tells the
   PAM stack: "the next module may try").
-- Failures of a cryptographic check (chain, revocation, challenge-response,
-  mapping) → `PAM_PERM_DENIED`; cert-scope failures
-  (`pam_cert_host_binding` / `pam_cert_user_binding`) and other auth errors →
-  `PAM_AUTH_ERR`; an exhausted PIN budget → `PAM_MAXTRIES`.
+- Failures of a cryptographic check (chain, revocation, challenge-response)
+  and a role denial → `PAM_PERM_DENIED`; host-scope failures
+  (`pam_cert_host_binding`) and other auth errors → `PAM_AUTH_ERR`; an
+  exhausted PIN budget → `PAM_MAXTRIES`.
 - Monitord registration is part of the authentication verdict. With
   `monitor_fail_mode = "strict"`, an IPC transport or registration failure
   denies the login because the session could not be placed under removal

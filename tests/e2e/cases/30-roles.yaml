@@ -5,7 +5,9 @@ setup: [install-package, deploy-fixtures]
 # Кейсы написаны от ЦЕЛЕВОЙ модели «роль = ролевая учётная запись» (решение
 # 2026-06-19, зафиксировано в openspec/specs/role-selection/spec.md): инженер
 # входит в учётную запись с именем роли (`ssh serv@device`), запрошенная роль
-# равна имени этой записи, допуск проверяется расширением user_binding.
+# равна имени этой записи, а допуск к ней проверяется расширением
+# pam_cert_allowed_roles — одна строка отвечает и «в какую запись пущен», и
+# «какую роль вправе активировать».
 # Личность инженера живёт в удостоверении и журнале выпусков, а не в имени входа.
 #
 # Код v0.4.x реализует только депрекейт-механизм — суффикс `<пользователь>+<роль>`;
@@ -56,27 +58,6 @@ cases:
       - expect_journal:
           identifier: pam_tessera
           matches: 'reason="?not_covered"?'
-    teardown:
-      - run: helpers/usb-loop.sh detach
-      - run: rm -f /var/lib/tessera/roles/serv.toml
-      - run: helpers/setup/deploy-fixtures.sh
-
-  - id: ROLE-003
-    title: Ролевая учётная запись вне user_binding закрывает доступ
-    requirement: openspec/specs/cert-scope-binding/spec.md
-    requires: [service-manager, usb]
-    steps:
-      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
-      # Удостоверение допускает вход только в oper: попытка войти в serv должна
-      # отклоняться самим user_binding. Роль serv покрыта удостоверением намеренно,
-      # чтобы отказать могла ровно одна проверка: иначе кейс проходил бы и при
-      # сломанном user_binding — за него отработала бы проверка покрытия роли.
-      # Класс CertScope по таблице маппинга даёт 7 PAM_AUTH_ERR, а не 6.
-      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-foreign.p12
-      - run: pam-drive certauth serv authenticate
-        stdin: "123456"
-        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
-        timeout: 60
     teardown:
       - run: helpers/usb-loop.sh detach
       - run: rm -f /var/lib/tessera/roles/serv.toml

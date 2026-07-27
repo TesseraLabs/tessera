@@ -1,0 +1,29 @@
+# /etc/pam.d/tessera — STRICT mode (default).
+#
+# Tessera stack snippet. Include from a host PAM config like:
+#     @include tessera
+# in /etc/pam.d/sudo BEFORE the `pam_unix.so` line. The `required` control
+# below means: USB cert auth MUST succeed; password fallback is denied.
+# This is the safe default for production deployments where the operator
+# has already issued tokens to every authorised user.
+#
+# To allow password fallback (e.g. during phased rollout) install
+# `tessera-optional` instead — that file uses `sufficient` and falls
+# through to pam_unix.so when the token is absent or fails.
+#
+# Account: required — denial here propagates regardless of subsequent
+# modules.
+#
+# NOTE (0.3.12+): the `session` phase intentionally lives OUTSIDE this
+# snippet. `pam_sm_open_session` of Tessera needs `XDG_SESSION_ID`
+# pushed into the PAM environment by `pam_systemd.so` (delivered via
+# `@include common-session` on Debian/Astra), and `common-session`
+# almost always sits at the bottom of the host PAM file — i.e. AFTER
+# wherever this snippet ends up included in the auth/account block.
+# `integrate-pam.sh` therefore inserts an explicit
+# `session required pam_tessera.so` line AFTER `@include common-session`
+# instead of bundling it here. If you wire this snippet in by hand,
+# remember to add that session line yourself.
+
+auth        required     pam_tessera.so
+account     required     pam_tessera.so

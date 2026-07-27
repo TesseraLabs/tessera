@@ -64,10 +64,6 @@ sources = ["hostname"]
 fallback = "warn"
 custom_command_timeout_seconds = 5
 
-[[user_mapping]]
-pam_user = "alice"
-cert_subject_cn = "Alice"
-
 [logging]
 level = "info"
 syslog_facility = "auth"

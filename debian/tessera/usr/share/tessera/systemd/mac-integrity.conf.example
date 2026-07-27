@@ -1,0 +1,55 @@
+# Drop-in for МКЦ (MAC integrity) on Astra Linux SE strict-mode.
+#
+# Activation procedure (full walkthrough in docs/install.md):
+#
+#   1. Grant the daemon's user the PARSEC_CAP_CHMAC capability in capdb:
+#
+#          sudo /sbin/usercaps -m "+3" tessera
+#
+#   2. Install the shipped PAM stack example for the daemon login session:
+#
+#          sudo install -m 0644 \
+#              /usr/share/tessera/pam.d/tessera.example \
+#              /etc/pam.d/tessera
+#
+#      systemd will invoke this PAM stack because of `PAMName=tessera`
+#      below. The stack must include `pam_parsec_cap.so` (transfers parsec
+#      capabilities from /etc/parsec/capdb/<uid> into the process credential
+#      set) and `pam_parsec_mac.so` (sets the process ilevel from
+#      /etc/parsec/micdb/<uid>).
+#
+#   3. Copy this drop-in into place, reload, restart:
+#
+#          sudo install -m 0644 \
+#              /usr/share/tessera/systemd/mac-integrity.conf.example \
+#              /etc/systemd/system/tessera.service.d/mac-integrity.conf
+#          sudo systemctl daemon-reload
+#          sudo systemctl restart tessera.service
+#
+# After restart the daemon process runs at ilevel=63 with PARSEC_CAP_CHMAC
+# in its effective set and CAP_MAC_ADMIN in CapEff, which is the minimum
+# required for `pdp_set_fd` labelling of /run/tessera/sessions.json.
+#
+# Without this drop-in the daemon still runs (User=tessera, no MAC
+# caps), but PDP labelling is best-effort and `[mac] cert_integrity =
+# "required"` will deny sessions because `pdp_set_fd` returns EPERM.
+#
+# Historical note: an earlier exploration used `execaps -c 0x8 -- ...` to
+# transfer the parsec capability into the daemon. That approach is
+# abandoned because the daemon under User=tessera lacks
+# PARSEC_CAP_CAP, which execaps itself needs to call `parsec_capset` on
+# its child — EPERM at startup. The PAMName-based path is the production
+# approach.
+
+[Service]
+# Linux capabilities: allow the daemon to set MAC labels on file
+# descriptors (CAP_MAC_ADMIN) and to open files across integrity levels
+# (CAP_MAC_OVERRIDE). DAC_READ_SEARCH is already in the base unit.
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_MAC_ADMIN CAP_MAC_OVERRIDE
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_MAC_ADMIN CAP_MAC_OVERRIDE
+
+# Have systemd open a PAM session for the daemon using /etc/pam.d/tessera.
+# The session-phase modules in that stack (pam_parsec_cap.so,
+# pam_parsec_mac.so) read capdb/micdb for the tessera user and apply
+# parsec caps + ilevel to the daemon process before ExecStart fires.
+PAMName=tessera

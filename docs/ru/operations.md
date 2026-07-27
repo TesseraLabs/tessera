@@ -105,7 +105,7 @@ mv "$TMP" /var/lib/node_exporter/textfile_collector/tessera.prom
      организации или ansible/puppet).
 4. Перевыпустить пользовательские сертификаты новой CA-парой,
    сохраняя в них корректные расширения `pam_cert_host_binding` и
-   `pam_cert_user_binding` (см. [cert-issuance.md](cert-issuance.md)).
+   `pam_cert_allowed_roles` (см. [cert-issuance.md](cert-issuance.md)).
 5. После полного перехода — отозвать старый CA через CRL и удалить
    из `[trust].anchors`.
 
@@ -159,11 +159,11 @@ openssl crl -in /etc/tessera/crl/staff.crl -noout -lastupdate -nextupdate
 
 ### 2.3 Изменение области действия сертификата
 
-**Когда:** при добавлении/удалении пользователя или машины из
+**Когда:** при добавлении/удалении роли или машины из
 области действия конкретного сертификата.
 
 Так как авторизация описана в самих X.509-расширениях
-(`pam_cert_host_binding`, `pam_cert_user_binding`), отдельной
+(`pam_cert_host_binding`, `pam_cert_allowed_roles`), отдельной
 конфигурации обновлять не нужно. Жизненный цикл — через УЦ:
 
 1. Отозвать текущий сертификат через CRL (процедура отзыва —
@@ -390,7 +390,7 @@ sudo journalctl -t pam_tessera | grep -E 'role_(deny|session_open)' | grep alice
 - Полные DN сертификатов на уровне `info` — отображаются только CN.
   На уровне `debug` — полный DN.
 - Полное содержимое X.509-расширений `pam_cert_host_binding` /
-  `pam_cert_user_binding` — на уровне `info` логируется только
+  `pam_cert_allowed_roles` — на уровне `info` логируется только
   совпавшая запись; полный список — на уровне `debug`.
 
 ## 7. МКЦ (MAC integrity)

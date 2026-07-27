@@ -31,7 +31,7 @@ PKCS#11 и Vault инструмент — **не кастодиан**: прив�
 которые на каждом шаге могут только сужаться. Отдельного «режима по
 должности» нет.
 
-Семантику самих расширений (`host_binding`, `user_binding`, `allowed_roles`,
+Семантику самих расширений (`host_binding`, `allowed_roles`,
 `max_integrity`, `profile_version`, `delegation_constraints`) и их OID см. в
 [cert-issuance.md](cert-issuance.md) — здесь описан инструмент, а не формат.
 Поверхность атаки инструментов выпуска разобрана в

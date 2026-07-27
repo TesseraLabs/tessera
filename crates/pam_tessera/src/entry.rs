@@ -396,7 +396,6 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             hook_executor: &hook_executor,
             host_id_hash: &host_id_hash,
             host_id_source,
-            user_mappings: &wired.cfg.user_mappings,
             pam_target,
             role_stage: role_stage.as_deps(),
             device_tags: &device_tags,

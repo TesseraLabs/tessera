@@ -1,6 +1,6 @@
 //! Validated config.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use crate::config::raw::{
     RawCertIntegrityMode, RawConfig, RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback,
     RawHostIdentity, RawLogging, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor,
     RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocation, RawRevocationMode,
-    RawRoles, RawTags, RawTagsMode, RawTrust, RawTrustOverride, RawUserMapping,
+    RawRoles, RawTags, RawTagsMode, RawTrust, RawTrustOverride,
 };
 use crate::error::TrustError;
 use crate::hooks::{validate_hook, HookConfig};
@@ -79,8 +79,6 @@ pub struct ValidatedConfig {
     pub trust_overrides: Vec<TrustOverride>,
     /// Host identity.
     pub host_identity: HostIdentitySection,
-    /// User mappings.
-    pub user_mappings: Vec<UserMapping>,
     /// Logging.
     pub logging: LoggingSection,
     /// Hooks.
@@ -473,26 +471,6 @@ pub enum HostIdFallback {
     Allow,
 }
 
-/// User mapping.
-#[derive(Debug, Clone)]
-pub struct UserMapping {
-    /// PAM user.
-    pub pam_user: String,
-    /// Criteria.
-    pub criteria: UserMatchCriteria,
-}
-
-/// User match criteria.
-#[derive(Debug, Clone)]
-pub enum UserMatchCriteria {
-    /// Subject CN.
-    SubjectCn(String),
-    /// SAN email.
-    SanEmail(String),
-    /// SAN UPN.
-    SanUpn(String),
-}
-
 /// Logging section.
 ///
 /// The deprecated `syslog_facility` / `journald_priority` raw keys are
@@ -529,9 +507,13 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
     type Error = Error;
 
     fn try_from(raw: &RawConfig) -> Result<Self, Self::Error> {
+        if raw.user_mapping.is_some() {
+            return Err(Error::ConfigInvalid {
+                reason: USER_MAPPING_REMOVED.to_string(),
+            });
+        }
         let trust = validate_trust(&raw.trust)?;
         let host_identity = validate_host_identity(&raw.host_identity)?;
-        let user_mappings = validate_user_mappings(&raw.user_mapping)?;
         let logging = validate_logging(&raw.logging)?;
         let hooks = raw
             .hooks
@@ -588,7 +570,6 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             trust,
             trust_overrides: validate_trust_overrides(&raw.trust_override)?,
             host_identity,
-            user_mappings,
             logging,
             hooks,
             mac: validate_mac(&raw.mac)?,
@@ -646,6 +627,22 @@ fn validate_tags(raw: &RawTags, roles: &RawRoles) -> Result<TagsSection, Error> 
         source,
     })
 }
+
+/// Rejection message for the removed `[[user_mapping]]` section.
+///
+/// The section let the device itself decide who was admitted, matching a
+/// certificate's CN or SAN against a locally written table. That inverts the
+/// model: the scope a holder gets must be stated by the issuer inside the
+/// certificate, not assigned by the party being restricted. Naming the removal
+/// explicitly matters for the same reason as `[roles].enforce` — an operator
+/// upgrading a fleet must be able to tell a deliberate behaviour change from a
+/// typo, which the generic `deny_unknown_fields` error cannot convey.
+const USER_MAPPING_REMOVED: &str =
+    "[[user_mapping]] has been removed: admission to a login account is decided solely by the \
+     certificate's pam_cert_allowed_roles extension, since the account name is the role name; \
+     there is no device-side fallback that admits a certificate by its CN or SAN — delete the \
+     section from config.toml and re-issue any certificate that relied on it with the \
+     appropriate --role list";
 
 /// Rejection message for the removed `[roles].enforce` key.
 ///
@@ -1483,48 +1480,6 @@ fn validate_host_identity(raw: &RawHostIdentity) -> Result<HostIdentitySection, 
             raw.custom_command_timeout_seconds.clamp(1, 30),
         ),
     })
-}
-
-fn validate_user_mappings(raw: &[RawUserMapping]) -> Result<Vec<UserMapping>, Error> {
-    let re = regex::Regex::new(r"^[a-z_][a-z0-9_-]{0,31}$").map_err(|source| Error::Other {
-        reason: source.to_string(),
-    })?;
-    let mut seen = BTreeSet::new();
-    raw.iter()
-        .map(|mapping| {
-            if !re.is_match(&mapping.pam_user) || !seen.insert(mapping.pam_user.clone()) {
-                return Err(Error::ConfigInvalid {
-                    reason: "invalid or duplicate pam_user".to_string(),
-                });
-            }
-            let mut criteria = BTreeMap::new();
-            if let Some(v) = &mapping.cert_subject_cn {
-                criteria.insert("cn", v.clone());
-            }
-            if let Some(v) = &mapping.cert_san_email {
-                criteria.insert("email", v.clone());
-            }
-            if let Some(v) = &mapping.cert_san_upn {
-                criteria.insert("upn", v.clone());
-            }
-            if criteria.len() != 1 {
-                return Err(Error::ConfigInvalid {
-                    reason: "user_mapping must set exactly one criterion".to_string(),
-                });
-            }
-            let criteria = if let Some(v) = criteria.remove("cn") {
-                UserMatchCriteria::SubjectCn(v)
-            } else if let Some(v) = criteria.remove("email") {
-                UserMatchCriteria::SanEmail(v)
-            } else {
-                UserMatchCriteria::SanUpn(criteria.remove("upn").unwrap_or_default())
-            };
-            Ok(UserMapping {
-                pam_user: mapping.pam_user.clone(),
-                criteria,
-            })
-        })
-        .collect()
 }
 
 /// Maximum byte length of any `CKA_LABEL`-style filter accepted by the
