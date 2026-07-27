@@ -12,9 +12,9 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 | [trust-chain-validation](trust-chain-validation/spec.md) | Pre-validate, chain build, подписи, constraints, pinning |
 | [revocation](revocation/spec.md) | CRL с верификацией подписи (fail-closed); OCSP (4 режима, кэш, fail-closed) |
 | [gost-crypto](gost-crypto/spec.md) | Делегация в gost-engine, ленивая загрузка |
-| [cert-scope-binding](cert-scope-binding/spec.md) | host/user_binding + max_integrity + allowed_roles extensions, OID-контракт |
+| [cert-scope-binding](cert-scope-binding/spec.md) | host_binding + max_integrity + allowed_roles extensions, OID-контракт |
 | [host-identity](host-identity/spec.md) | first-working-wins, normalize+sha256, override, fallback |
-| [role-selection](role-selection/spec.md) | Выбор роли на логине (`user+role`/prompt, без дефолта), канонизация PAM_USER, покрытие удостоверением, TTL сессии |
+| [role-selection](role-selection/spec.md) | Роль = имя ролевой УЗ входа (без дефолта, PAM_USER не переписывается), покрытие удостоверением, фаза сессии от аутентифицированной УЗ, TTL сессии |
 | [role-store](role-store/spec.md) | База ролей `/var/lib/tessera/roles/`, формат среза TOML, standalone (права ФС) + managed (подписанный manifest, anti-rollback), атомарное обновление |
 
 ### Носители
@@ -57,7 +57,7 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 Security-класс (закрыто в коде):
 - **Подпись CRL верифицируется** против issuer-сертификата, fail-closed (`TrustError::CrlSignatureInvalid`); issuer-DN сверка байт-в-байт — с f542df5.
 - **Extractable PKCS#11-ключ отклоняется** (fail-closed); ослабление только явным opt-in `pkcs11_allow_extractable_keys`.
-- **Malformed user_binding** — fail-closed (отказ вместо тихого fallback в legacy mapping).
+- **Malformed allowed_roles** — fail-closed (список считается пустым, роль не покрыта; отказ вместо игнорирования расширения).
 - **Пустой sig-alg whitelist** подменяется безопасным дефолтом `DEFAULT_SIGNATURE_ALGORITHMS` (f542df5) вместо accept-all.
 
 Функциональный класс (закрыто в коде): `pkcs12_pin_prompt` пробрасывается в PIN-prompt PKCS#12-пути; `monitor.idle_timeout_seconds`/`max_concurrent_connections` доходят до accept-loop (`AcceptConfig::from_monitor`); `[logging].level` применяется демоном (`apply_config_level`, приоритет `TESSERA_LOG` env > config > info); `clock_skew_seconds` — дефолт 0, диапазон 0..=600; startup sweep stale-маунтов после crash; VID/PID и anchors-валидация — по спекам. Также добавлен daemon-singleton через flock (ec4185b, [daemon-lifecycle](daemon-lifecycle/spec.md)).
@@ -66,7 +66,7 @@ Docs-класс (закрыто в docs): configuration.md, architecture.md (PRO
 
 Testing-класс: автоматизация оставшихся ручных проверок (ГОСТ E2E, libpdp runtime, hook-security, USB/токен) — proposal [ci-hardening](../changes/ci-hardening/); release-профиль тестов уже покрыт nightly workflow (`.github/workflows/nightly.yml`).
 
-Нереализованная функциональность — proposals: GOST через PKCS#11 — [gost-pkcs11](../changes/gost-pkcs11/). OCSP реализован (change [ocsp-support](../changes/ocsp-support/), осталась ручная проверка на Astra VM — task 5.3). Формат роли и выбор роли на логине реализованы (change [role-format](../changes/role-format/) — capabilities [role-selection](role-selection/spec.md), [role-store](role-store/spec.md); осталась ручная E2E-проверка на Astra VM — task 6.3, поэтому change ещё не заархивирован).
+Нереализованная функциональность — proposals: GOST через PKCS#11 — [gost-pkcs11](../changes/gost-pkcs11/). OCSP реализован (change [ocsp-support](../changes/ocsp-support/), осталась ручная проверка на Astra VM — task 5.3). Формат роли и выбор роли на логине реализованы; ролевой E2E автоматизирован (`tests/e2e/cases/30-roles.yaml`, профиль ubuntu-container).
 
 ## Чего НЕТ в текущей реализации (чтобы не путать со спеками 0.2.x / продуктовыми планами)
 

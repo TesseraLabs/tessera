@@ -57,12 +57,22 @@ PAM-cdylib ДОЛЖЕН (MUST) перечитывать конфиг с диск
 - `[trust.pinning]`: enabled (false), allowed_root_spki_sha256 (64 hex, валидируется только при enabled).
 - `[[trust_override]]`: when_host_id_in (непустой) + anchors/intermediates.
 - `[host_identity]`: sources (обязателен, непустой, без дублей), fallback (deny), override, custom_command (absolute) + timeout (clamp 1..30).
-- `[[user_mapping]]`: pam_user (`^[a-z_][a-z0-9_-]{0,31}$`, без дублей) + ровно один из cert_subject_cn/cert_san_email/cert_san_upn. Legacy fallback при отсутствии user_binding ext.
 - `[logging]`: level (trace..error; применяется демоном к tracing-фильтру после загрузки конфига, env `TESSERA_LOG` приоритетнее — см. [logging-audit](../logging-audit/spec.md)); syslog_facility (deprecated, ignored + WARN при валидации; значение всё ещё валидируется: auth|authpriv|user|daemon, прочие — включая local0..7 — отклоняются) и journald_priority (deprecated, ignored + WARN) в ValidatedConfig не пробрасываются.
 - `[[hooks]]` — см. [hooks](../hooks/spec.md).
 - `[mac]` — см. [mac-integrity](../mac-integrity/spec.md). Дефолты: cert_integrity=**optional**, runtime=auto.
-- `[roles]`: enforce (`false`|`warn`|`require`, дефолт `false`), dir (`/var/lib/tessera/roles`), default_session_ttl (duration, `12h`) — детали см. требование «Секция [roles]» ниже и [role-selection](../role-selection/spec.md) / [role-store](../role-store/spec.md).
+- `[roles]`: dir (`/var/lib/tessera/roles`), default_session_ttl (duration, `12h`) — детали см. требование «Секция [roles]» ниже и [role-selection](../role-selection/spec.md) / [role-store](../role-store/spec.md).
 - `[fly_dm_greeter]` — см. [fly-dm-greeter](../fly-dm-greeter/spec.md).
+
+Секции `[[user_mapping]]` в конфиге существовать НЕ ДОЛЖНО (MUST NOT): допуск к
+учётной записи решается расширением удостоверения, а не конфигурацией
+устройства. Конфиг, содержащий её, ДОЛЖЕН (MUST) отвергаться с диагностикой,
+называющей причину, — общей ошибки «неизвестное поле» недостаточно, поскольку
+администратор, обновляющий парк, должен отличить намеренное изменение поведения
+от опечатки.
+
+#### Scenario: Конфиг с удалённой секцией user_mapping
+- **WHEN** конфиг содержит `[[user_mapping]]` в любом виде
+- **THEN** валидация отвергает конфиг с диагностикой об удалении секции и о том, что допуск решает удостоверение
 
 #### Scenario: Пустой [trust].anchors
 - **WHEN** `[trust].anchors` — пустой список
@@ -118,19 +128,26 @@ PAM-cdylib ДОЛЖЕН (MUST) перечитывать конфиг с диск
 
 | Поле | Тип | Дефолт | Семантика |
 |---|---|---|---|
-| `enforce` | `"false" \| "warn" \| "require"` | `"false"` | этап миграции: `false` — роли не проверяются (поведение v0.3.19); `warn` — проверка с логом, без отказов; `require` — полный enforcement |
 | `dir` | путь | `/var/lib/tessera/roles` | каталог базы ролей |
 | `default_session_ttl` | duration | `12h` | TTL сессии, когда ни удостоверение, ни роль его не задают |
 
-`enforce = "require"` при пустой/невалидной базе ролей ДОЛЖЕН (MUST) приводить к отказу
-входов, требующих роль (fail-closed), с диагностикой «роли не настроены».
+Проверка ролей НЕ ДОЛЖНА (MUST NOT) быть управляемой конфигурацией: поля,
+отключающего проверку или ослабляющего её до предупреждения, существовать не
+должно. Пустая или невалидная база ролей ДОЛЖНА (MUST) приводить к отказу входов
+(fail-closed) с диагностикой «роли не настроены».
 
-#### Scenario: enforce=false — поведение прежней версии
-- **WHEN** `roles.enforce = "false"` (или секция отсутствует)
-- **THEN** суффикс/prompt не запрашиваются, покрытие не проверяется, вход работает как в v0.3.19
+Конфиг, содержащий удалённый ключ `[roles].enforce`, ДОЛЖЕН (MUST) отвергаться
+при валидации с диагностикой, называющей причину: ключ удалён, проверка ролей
+безусловна. Общей ошибки «неизвестное поле» здесь недостаточно — администратор,
+обновляющий парк, должен из текста понять, что поведение изменилось намеренно, а
+не что он опечатался.
 
-#### Scenario: enforce=require при пустой базе
-- **WHEN** `roles.enforce = "require"` и каталог ролей пуст
+#### Scenario: Конфиг с удалённым ключом enforce
+- **WHEN** конфиг содержит `[roles].enforce` в любом значении
+- **THEN** валидация отвергает конфиг с диагностикой об удалении ключа и безусловности проверки ролей
+
+#### Scenario: Пустая база ролей
+- **WHEN** каталог ролей пуст или невалиден
 - **THEN** вход отклоняется с диагностикой «роли не настроены», audit `role_deny reason=not_found`
 
 ### Requirement: Конфигурация version-gate и источника тегов

@@ -5,9 +5,7 @@
 Оркестрация аутентификации в `pam_sm_authenticate`: от загрузки конфига до выдачи PAM-кода. Два пути — PKCS#12 (USB-носитель) и PKCS#11 (аппаратный токен). Описывает intended-поведение v0.4.0.
 
 Код: `crates/pam_tessera/src/entry.rs`, `crates/pam_tessera/src/flow.rs`.
-
 ## Requirements
-
 ### Requirement: Порядок шагов pam_sm_authenticate
 
 Модуль ДОЛЖЕН (MUST) выполнять в `pam_sm_authenticate` строго упорядоченную последовательность: init logging → парсинг argv (только `config=<path>`, дефолт `/etc/tessera/config.toml`) → загрузка+валидация конфига → self_check → чтение PAM_USER → резолюция host identity → DI-граф → генерация session_id (32 hex из OS RNG, формат `sess-<hex>`) → `flow::authenticate` (entry.rs:119–260).
@@ -76,18 +74,6 @@
 - **WHEN** `flow::authenticate` завершился `FlowError` (например, MaxTries)
 - **THEN** возвращается соответствующий классу PAM rc (для MaxTries — 8 PAM_MAXTRIES), а не единый PAM_AUTH_ERR
 
-### Requirement: User-авторизация — приоритет cert-driven
-
-Результат `user_binding_ext::parse(x509)` ДОЛЖЕН (MUST) различаться по трём исходам: Ok → cert-driven `verify_user_binding`; расширение ОТСУТСТВУЕТ → legacy `[[user_mapping]]` из конфига; расширение присутствует, но malformed/empty → отказ (fail-closed), БЕЗ отката в legacy-mapping (соответствует docs/architecture.md:540).
-
-#### Scenario: malformed user_binding extension → отказ
-- **WHEN** расширение `pam_cert_user_binding` присутствует, но malformed/empty
-- **THEN** auth отклоняется (fail-closed); legacy TOML-mapping НЕ применяется — fallback в legacy допустим только при полном отсутствии расширения
-
-#### Scenario: user_binding отсутствует
-- **WHEN** в серте нет расширения `pam_cert_user_binding`
-- **THEN** авторизация идёт через legacy `[[user_mapping]]` из конфига
-
 ### Requirement: Mount живёт только в auth-фазе
 
 `pam_sm_authenticate` ДОЛЖЕН (MUST) дропать MountGuard сразу после успешного auth (entry.rs) — USB размонтируется по завершении auth-фазы. Re-mount в session-фазе ОТСУТСТВУЕТ by design и не планируется: после auth `.p12` больше не нужен (ключ уже использован для challenge, контекст аутентификации передаётся в open_session через pam_data).
@@ -107,3 +93,32 @@
 #### Scenario: Сбой на метаданном шаге
 - **WHEN** падает шаг метаданных/диагностики (PAM_SERVICE/PAM_TTY, mkdir mountpoint, show_info, извлечение `cert_max_integrity`, monitord open_session)
 - **THEN** auth продолжается (fail-open), сбой только логируется
+
+### Requirement: Допуск к учётной записи — только из удостоверения
+
+Допуск к учётной записи входа ДОЛЖЕН (MUST) решаться исключительно
+расширением `pam_cert_allowed_roles` верифицированного удостоверения:
+`PAM_USER` (он же запрошенная роль) входит в список → допуск, иначе отказ
+fail-closed.
+
+Иных источников допуска существовать НЕ ДОЛЖНО (MUST NOT). В частности,
+конфигурация устройства НЕ ДОЛЖНА (MUST NOT) содержать механизма, разрешающего
+вход по признакам удостоверения (CN, SAN), которые выпускающий не предназначал
+для допуска. Рамки несёт удостоверение; путь, где их назначает ограничиваемая
+сторона, подрывает саму модель.
+
+Отсутствие расширения — отказ, а не откат к иному механизму: удостоверение,
+не называющее ролей, не даёт доступа ни к одной.
+
+#### Scenario: Роль вне списка удостоверения
+- **WHEN** `PAM_USER = admin`, а `allowed_roles` удостоверения содержит только `oper` и `serv`
+- **THEN** вход отклоняется fail-closed, audit deny
+
+#### Scenario: Удостоверение без allowed_roles
+- **WHEN** удостоверение не несёт расширения `allowed_roles`
+- **THEN** вход отклоняется; отката к конфигурации устройства не существует
+
+#### Scenario: Malformed allowed_roles
+- **WHEN** расширение присутствует, но DER некорректен
+- **THEN** вход отклоняется fail-closed — список считается пустым, а не игнорируется
+
