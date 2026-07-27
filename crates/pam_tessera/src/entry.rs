@@ -241,10 +241,10 @@ fn parse_pam_tty(tty: Option<&str>) -> tessera_proto::SessionTarget {
 ///
 /// `pamh` must be the live PAM handle for the current callback.
 #[cfg(target_os = "linux")]
-unsafe fn verified_session_account<'ctx>(
+unsafe fn verified_session_account(
     pamh: *mut pam_sys::pam_handle_t,
-    ctx: &'ctx tessera_core::pam_data::AuthContext,
-) -> Option<&'ctx str> {
+    ctx: &tessera_core::pam_data::AuthContext,
+) -> Option<&str> {
     // SAFETY: `pamh` is the live PAM handle (caller contract).
     let observed = match unsafe { crate::pam_helpers::pam_get_user_string(pamh) } {
         Ok(user) => user,
