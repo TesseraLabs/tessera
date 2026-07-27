@@ -165,8 +165,10 @@ pub enum FlowError {
     PostAuthHook(#[source] HookError),
 
     /// Role selection denied the login (role-format): the requested role was
-    /// not found / not covered by the cert / needs an absent backend, and
-    /// `[roles].enforce = require`. Carries the audit deny reason.
+    /// not found / not covered by the cert / needs an absent backend. Every
+    /// login resolves a role and the check is unconditional — there is no
+    /// configuration that turns it off or downgrades it to a warning.
+    /// Carries the audit deny reason.
     #[error("role denied: {0}")]
     RoleDenied(tessera_core::role::RoleDenyReason),
 
@@ -266,9 +268,10 @@ impl FlowError {
             | Self::Pkcs11Acquire(P11Acquire::PinLocked | P11Acquire::MaxAttemptsExceeded) => 11,
             // PAM_PERM_DENIED — cert chain rejected the auth, the requested
             // role was denied (not found / not covered / needs an absent
-            // backend) under `[roles].enforce = require`, or a strict-mode
-            // monitord registration failure denied a session that could not
-            // be placed under continuous-presence enforcement.
+            // backend) — the role check is unconditional, no config relaxes
+            // it — or a strict-mode monitord registration failure denied a
+            // session that could not be placed under continuous-presence
+            // enforcement.
             Self::Pkcs12(_)
             | Self::Crypto(_)
             | Self::Trust(_)
@@ -280,11 +283,15 @@ impl FlowError {
             Self::Internal(_) => 4,
             // PAM_AUTH_ERR — every other authentication-side failure
             // (PAM conv, single PIN error, generic PKCS#11 error, cert
-            // host/user binding scope, ...).
+            // host-binding scope, ...).
             //
-            // Hook failures are mapped to PAM_AUTH_ERR per the Stage 5
-            // brief — operators can lower the impact via on_failure=warn
-            // / ignore in the config.
+            // Hook failures land here too. A hook error only survives to
+            // this point under `on_failure = abort` (`warn` / `ignore`
+            // swallow it), so it is a site-policy refusal of the attempt —
+            // not a verdict on what the certificate is authorised for
+            // (PAM_PERM_DENIED) and not a broken internal invariant
+            // (PAM_SYSTEM_ERR). It therefore shares the generic
+            // authentication-failure code with the arms above.
             Self::Conv(_)
             | Self::Pkcs11Acquire(_)
             | Self::Pkcs11(_)
@@ -824,7 +831,8 @@ where
 
     // Step 10b — atomic role resolve + coverage (role-format). Runs right
     // after cert verification and before the session payload is fixed, with
-    // no swap window (CVE-2021-3560). A `require`-mode denial aborts here.
+    // no swap window (CVE-2021-3560). A denial always aborts here — the
+    // stage has no advisory mode.
     let role = resolve_role_stage(
         &verified_leaf,
         &deps.role_stage,

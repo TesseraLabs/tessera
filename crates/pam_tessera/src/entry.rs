@@ -336,8 +336,10 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         };
 
         // 5. (Removed) Host ACL loading is gone — the cert's
-        // `pam_cert_host_binding` and `pam_cert_user_binding` extensions
-        // are the sole source of authorisation. See docs/ru/cert-issuance.md.
+        // `pam_cert_host_binding` (which device) and `pam_cert_allowed_roles`
+        // (which login account, since the account name is the role name)
+        // extensions are the sole source of authorisation.
+        // See docs/ru/cert-issuance.md.
 
         // 6. Build the PIN prompter against the live PAM handle.
         // SAFETY: `pamh` is the live PAM handle; the closure does not outlive
