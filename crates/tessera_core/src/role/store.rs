@@ -14,6 +14,13 @@
 //!   the entire base (fail-closed). Slices are only loaded after the manifest
 //!   verifies.
 //!
+//! Both modes consult a [`SystemAccounts`] view: a slice whose name is an
+//! account this device already owns (uid below
+//! [`crate::role::FIRST_REGULAR_UID`]) never becomes a role. Because the role
+//! is the login account, such a slice would turn `root` or `daemon` into an
+//! ordinary role login; catching it at load puts the provisioning mistake in
+//! front of the administrator instead of leaving it to the login path.
+//!
 //! Calling [`RoleStore::load`] with [`TrustMode::Managed`] is a hard error
 //! ([`RoleStoreError::ManagedRequiresManifest`]): managed loads need a
 //! trusted key and persist dir, so they must go through `load_managed`.
@@ -26,6 +33,7 @@ use std::path::{Path, PathBuf};
 use super::audit;
 use super::manifest::{self, ManifestError, MANIFEST_FILENAME};
 use super::schema::{parse_slice, RoleId, RoleOs, RoleSlice};
+use super::system_account::{SystemAccountError, SystemAccounts};
 
 /// Hard cap on the number of roles in a single base. A base larger than this
 /// is a validation error, not a silent truncation.
@@ -80,6 +88,15 @@ pub enum RoleStoreError {
     /// policy.
     #[error("standalone role-store path is not root-controlled: {0}")]
     UntrustedPath(#[from] crate::privileged_path::PrivilegedPathError),
+    /// A slice's role id names a system account of this device.
+    #[error("role slice `{role}` cannot be loaded: {source}")]
+    SystemAccount {
+        /// The role id (slice file stem).
+        role: String,
+        /// Why the name cannot be a role.
+        #[source]
+        source: SystemAccountError,
+    },
 }
 
 impl RoleStore {
@@ -92,9 +109,10 @@ impl RoleStore {
     /// Standalone behaviour: iterate `*.toml` files in `dir` (skip subdirs,
     /// non-`.toml`, and `manifest.toml`). The role id is the file stem. Each
     /// slice is parsed via [`parse_slice`]; a per-slice error (bad schema,
-    /// foreign OS, non-role-id stem, role/stem mismatch) is skipped with a
-    /// `role_slice_invalid` audit event. If the count of *valid* slices
-    /// exceeds [`MAX_ROLES`], the whole load fails with
+    /// foreign OS, non-role-id stem, role/stem mismatch, or a stem that names
+    /// a system account of this device per `accounts`) is skipped with a
+    /// `role_slice_invalid` audit event naming the reason. If the count of
+    /// *valid* slices exceeds [`MAX_ROLES`], the whole load fails with
     /// [`RoleStoreError::TooManyRoles`]. An empty directory yields an empty
     /// store. A missing/unreadable directory is [`RoleStoreError::Io`].
     ///
@@ -102,10 +120,15 @@ impl RoleStore {
     ///
     /// [`RoleStoreError::Io`], [`RoleStoreError::TooManyRoles`], or
     /// [`RoleStoreError::ManagedRequiresManifest`].
-    pub fn load(dir: &Path, device_os: RoleOs, trust: TrustMode) -> Result<Self, RoleStoreError> {
+    pub fn load(
+        dir: &Path,
+        device_os: RoleOs,
+        trust: TrustMode,
+        accounts: SystemAccounts,
+    ) -> Result<Self, RoleStoreError> {
         match trust {
             TrustMode::Managed => Err(RoleStoreError::ManagedRequiresManifest),
-            TrustMode::Standalone => Self::load_slices(dir, device_os, false),
+            TrustMode::Standalone => Self::load_slices(dir, device_os, false, accounts),
         }
     }
 
@@ -124,10 +147,11 @@ impl RoleStore {
         dir: &Path,
         device_os: RoleOs,
         trust: TrustMode,
+        accounts: SystemAccounts,
     ) -> Result<Self, RoleStoreError> {
         match trust {
             TrustMode::Managed => Err(RoleStoreError::ManagedRequiresManifest),
-            TrustMode::Standalone => Self::load_slices(dir, device_os, true),
+            TrustMode::Standalone => Self::load_slices(dir, device_os, true, accounts),
         }
     }
 
@@ -145,13 +169,18 @@ impl RoleStore {
     /// # Errors
     ///
     /// [`RoleStoreError::Manifest`] on any verification failure,
-    /// [`RoleStoreError::Io`] reading a slice, or
-    /// [`RoleStoreError::TooManyRoles`].
+    /// [`RoleStoreError::Io`] reading a slice,
+    /// [`RoleStoreError::TooManyRoles`], or
+    /// [`RoleStoreError::SystemAccount`] when a listed role names a system
+    /// account of this device — a signed bundle that claims such a role is
+    /// internally wrong about the device, and the whole base is refused
+    /// (fail-closed, as everywhere on the managed path).
     pub fn load_managed(
         dir: &Path,
         device_os: RoleOs,
         trusted_pubkey: &[u8],
         persist_dir: &Path,
+        accounts: SystemAccounts,
     ) -> Result<Self, RoleStoreError> {
         let verified = manifest::verify_manifest(dir, device_os, trusted_pubkey, persist_dir)?;
         if verified.manifest.roles.len() > MAX_ROLES {
@@ -166,6 +195,12 @@ impl RoleStore {
         // hard error (a hash-matching slice that fails schema means the
         // signed bundle is internally inconsistent → fail-closed).
         for role_id in verified.manifest.roles.keys() {
+            accounts
+                .check(role_id.as_str())
+                .map_err(|source| RoleStoreError::SystemAccount {
+                    role: role_id.to_string(),
+                    source,
+                })?;
             let slice_path = dir.join(format!("{role_id}.toml"));
             let bytes = fs::read(&slice_path).map_err(|e| RoleStoreError::Io {
                 path: slice_path.display().to_string(),
@@ -190,6 +225,7 @@ impl RoleStore {
         dir: &Path,
         device_os: RoleOs,
         privileged: bool,
+        accounts: SystemAccounts,
     ) -> Result<Self, RoleStoreError> {
         let load_dir: PathBuf = if privileged {
             crate::privileged_path::validate_directory(
@@ -237,6 +273,13 @@ impl RoleStore {
                 );
                 continue;
             };
+            // A slice named after an account the system already owns is
+            // refused here, where the administrator sees it, instead of at the
+            // first login attempt. The login path refuses it again on its own.
+            if let Err(e) = accounts.check(stem) {
+                audit::emit_role_slice_invalid(&path.display().to_string(), &e.to_string());
+                continue;
+            }
             let bytes = if privileged {
                 crate::privileged_path::read_file(&path, crate::privileged_path::ExecTrust::Root)?
             } else {
@@ -303,6 +346,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::role::system_account::PasswdLookup;
     use std::fs;
     use tempfile::TempDir;
 
@@ -330,7 +374,13 @@ mod tests {
             b"role = \"serv\"\nversion = 1\nos = \"linux\"\nname = \"s\"\nlevel = 1\nbogus = 1\n",
         )
         .unwrap();
-        let store = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap();
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
         assert_eq!(store.len(), 1);
         assert!(store.get(&RoleId::new("oper").unwrap()).is_some());
         assert!(store.get(&RoleId::new("serv").unwrap()).is_none());
@@ -341,7 +391,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_slice(&dir, "oper", 1, "linux");
         write_slice(&dir, "admin", 1, "astra"); // foreign OS for a linux device
-        let store = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap();
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
         assert_eq!(store.len(), 1);
         assert!(store.get(&RoleId::new("admin").unwrap()).is_none());
     }
@@ -357,7 +413,13 @@ mod tests {
             slice_doc("oper", 1, "linux").as_bytes(),
         )
         .unwrap();
-        let store = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap();
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
         assert_eq!(store.len(), 1);
     }
 
@@ -369,7 +431,13 @@ mod tests {
             let role = format!("r{i}");
             write_slice(&dir, &role, 1, "linux");
         }
-        let err = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap_err();
+        let err = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             RoleStoreError::TooManyRoles {
@@ -382,7 +450,13 @@ mod tests {
     #[test]
     fn empty_dir_empty_store() {
         let dir = tempfile::tempdir().unwrap();
-        let store = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap();
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
     }
@@ -391,7 +465,13 @@ mod tests {
     fn missing_dir_is_io_error() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        let err = RoleStore::load(&missing, RoleOs::Linux, TrustMode::Standalone).unwrap_err();
+        let err = RoleStore::load(
+            &missing,
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap_err();
         assert!(matches!(err, RoleStoreError::Io { .. }));
     }
 
@@ -400,7 +480,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_slice(&dir, "oper", 3, "linux");
         write_slice(&dir, "serv", 7, "linux");
-        let store = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap();
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
         assert_eq!(store.len(), 2);
         let oper = store.get(&RoleId::new("oper").unwrap()).unwrap();
         assert_eq!(oper.version, 3);
@@ -415,15 +501,90 @@ mod tests {
         write_slice(&dir, "oper", 1, "linux");
         // A stray manifest.toml must be ignored (not parsed as a slice).
         fs::write(dir.path().join(MANIFEST_FILENAME), b"bundle_version = 1\n").unwrap();
-        let store = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap();
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
         assert_eq!(store.len(), 1);
     }
 
     #[test]
     fn managed_via_load_guard_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let err = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Managed).unwrap_err();
+        let err = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Managed,
+            SystemAccounts::empty(),
+        )
+        .unwrap_err();
         assert!(matches!(err, RoleStoreError::ManagedRequiresManifest));
+    }
+
+    /// A passwd view of a device where `root` and `mail` are system accounts
+    /// and `serv` is a provisioned role account. Tests must not consult the
+    /// passwd file of the machine running them.
+    fn device_accounts() -> SystemAccounts {
+        SystemAccounts::with_lookup(|account| match account {
+            "root" => PasswdLookup::Uid(0),
+            "mail" => PasswdLookup::Uid(8),
+            "serv" => PasswdLookup::Uid(4000),
+            _ => PasswdLookup::NoEntry,
+        })
+    }
+
+    #[test]
+    fn slice_named_after_a_system_account_is_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        // A provisioning typo or a copied sample: `root.toml` next to a real
+        // role. The good slice must still load; `root` must not.
+        write_slice(&dir, "root", 1, "linux");
+        write_slice(&dir, "serv", 1, "linux");
+
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            device_accounts(),
+        )
+        .unwrap();
+
+        assert!(store.get(&RoleId::new("root").unwrap()).is_none());
+        assert!(store.get(&RoleId::new("serv").unwrap()).is_some());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn packaged_system_account_name_is_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        // `mail` is a legal role id and a Debian system account at once; what
+        // decides is the uid this device gives it, not the name.
+        write_slice(&dir, "mail", 1, "linux");
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            device_accounts(),
+        )
+        .unwrap();
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn role_account_outside_the_system_range_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        write_slice(&dir, "serv", 2, "linux");
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            device_accounts(),
+        )
+        .unwrap();
+        assert_eq!(store.get(&RoleId::new("serv").unwrap()).unwrap().version, 2);
     }
 
     #[test]
@@ -431,8 +592,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_slice(&dir, "oper", 1, "linux");
 
-        let err = RoleStore::load_privileged(dir.path(), RoleOs::Linux, TrustMode::Standalone)
-            .expect_err("temporary user-controlled role base must be rejected");
+        let err = RoleStore::load_privileged(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .expect_err("temporary user-controlled role base must be rejected");
 
         assert!(matches!(err, RoleStoreError::UntrustedPath(_)));
     }

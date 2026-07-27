@@ -220,9 +220,25 @@ the decision is made on. An account name that does not match the `role_id`
 format (`^[a-z][a-z0-9-]{0,15}$`) is rejected before the medium is touched.
 
 The engineer's identity is not lost: it lives in the certificate and in the
-issuance log, not in the account name. Role accounts are provisioned
-separately (Census); every way into them other than Tessera's certificate
-authentication is closed.
+issuance log, not in the account name.
+
+Role accounts are provisioned separately (Census). Closing the remaining ways
+into them — `~/.ssh/authorized_keys`, `su`, `sudo -u`, password login, PAM
+stacks without the module — is the job of provisioning and of the device
+administrator, not of the product: it manages neither `sshd_config` nor
+`sudoers` nor anybody else's PAM stacks. The explicit commands and their
+verification are in
+[install.md §8.4](install.md#84-closing-the-remaining-ways-into-a-role-account).
+
+What the product does guarantee here it guarantees unconditionally: the login
+is refused if the account named in `PAM_USER` is a system account by uid
+(below 1000 — the boundary of regular users on Debian, Ubuntu and Astra). The
+refusal does not depend on the contents of the role store or on what the
+credential permits: `ssh root@device` will not become a role login even with a
+`root` slice present and a credential covering that role. The same rule makes
+a slice named after a system account fail to load, both in the store and in
+`tessera-cli role lint` — so that a provisioning mistake is seen by the
+administrator rather than by the first engineer to log in.
 
 Admission is checked by a single credential extension —
 `pam_cert_allowed_roles` ("the holder may activate these roles"). It also

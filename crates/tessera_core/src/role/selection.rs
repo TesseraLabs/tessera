@@ -27,7 +27,7 @@ use super::store::RoleStore;
 
 /// Reason a role login was denied. Matches the `role_deny` audit dictionary
 /// (logging-audit spec): `not_found` / `not_covered` / `backend_unavailable`
-/// / `mask_exceeds_ceiling` / `syntax`.
+/// / `mask_exceeds_ceiling` / `syntax` / `system_account`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleDenyReason {
     /// The requested role is not present in the on-device store, or the
@@ -47,6 +47,12 @@ pub enum RoleDenyReason {
     /// The login string was syntactically invalid, or no role was supplied
     /// where one is required.
     Syntax,
+    /// The login account is a system account of this device (uid below
+    /// [`crate::role::FIRST_REGULAR_UID`]) and can never be a role, or the
+    /// passwd database could not be consulted to establish otherwise. Both
+    /// land here because the verdict is the same: the account was not cleared
+    /// as a role account, so the login is refused before any right is granted.
+    SystemAccount,
 }
 
 impl RoleDenyReason {
@@ -59,6 +65,7 @@ impl RoleDenyReason {
             RoleDenyReason::BackendUnavailable => "backend_unavailable",
             RoleDenyReason::MaskExceedsCeiling => "mask_exceeds_ceiling",
             RoleDenyReason::Syntax => "syntax",
+            RoleDenyReason::SystemAccount => "system_account",
         }
     }
 }
@@ -324,7 +331,13 @@ mod tests {
     fn store_with(role: &str, body: &str) -> (TempDir, RoleStore) {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, role, body);
-        let store = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap();
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            crate::role::SystemAccounts::empty(),
+        )
+        .unwrap();
         (dir, store)
     }
 
@@ -507,6 +520,7 @@ mod tests {
             "mask_exceeds_ceiling"
         );
         assert_eq!(RoleDenyReason::Syntax.as_str(), "syntax");
+        assert_eq!(RoleDenyReason::SystemAccount.as_str(), "system_account");
         assert_eq!(CoverageMethod::Cert.as_str(), "cert");
         assert_eq!(CoverageMethod::Code.as_str(), "code");
     }

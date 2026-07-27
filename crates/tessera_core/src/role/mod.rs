@@ -16,6 +16,7 @@ pub mod manifest;
 pub mod schema;
 pub mod selection;
 pub mod store;
+pub mod system_account;
 pub mod update;
 
 pub use manifest::{
@@ -29,4 +30,5 @@ pub use selection::{
     RoleDenyReason, SessionFixError, SessionRolePayload,
 };
 pub use store::{RoleStore, RoleStoreError, TrustMode, DEFAULT_ROLES_DIR, MAX_ROLES};
+pub use system_account::{PasswdLookup, SystemAccountError, SystemAccounts, FIRST_REGULAR_UID};
 pub use update::{atomic_update, cleanup_staged, UpdateTrust};

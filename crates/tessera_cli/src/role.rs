@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use clap::{Args, Subcommand};
 
 use tessera_core::role::store::{RoleStore, TrustMode, DEFAULT_ROLES_DIR, MAX_ROLES};
-use tessera_core::role::{parse_slice, RoleOs};
+use tessera_core::role::{parse_slice, RoleOs, SystemAccounts};
 
 /// CLI arguments for `tessera role`.
 #[derive(Debug, Args)]
@@ -100,8 +100,12 @@ impl LintReport {
 
 /// Lint every `*.toml` slice in `dir` strictly. The directory read itself
 /// failing is reported as a single error entry. `manifest.toml` is ignored.
+///
+/// `accounts` is the passwd view a slice name is checked against: a slice
+/// named after an account the system already owns can never be a role, and
+/// lint is where that provisioning mistake should surface.
 #[must_use]
-pub fn lint_dir(dir: &Path, os: RoleOs) -> LintReport {
+pub fn lint_dir(dir: &Path, os: RoleOs, accounts: SystemAccounts) -> LintReport {
     let mut report = LintReport::default();
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
@@ -137,12 +141,15 @@ pub fn lint_dir(dir: &Path, os: RoleOs) -> LintReport {
             .and_then(OsStr::to_str)
             .unwrap_or("")
             .to_owned();
-        let result = match fs::read(&path) {
-            Ok(bytes) => match parse_slice(&bytes, &stem, os) {
-                Ok(slice) => Ok(slice.version),
-                Err(e) => Err(e.to_string()),
+        let result = match accounts.check(&stem) {
+            Ok(()) => match fs::read(&path) {
+                Ok(bytes) => match parse_slice(&bytes, &stem, os) {
+                    Ok(slice) => Ok(slice.version),
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(format!("read error: {e}")),
             },
-            Err(e) => Err(format!("read error: {e}")),
+            Err(e) => Err(e.to_string()),
         };
         report.entries.push(LintEntry {
             path,
@@ -162,7 +169,7 @@ fn run_lint(args: &RoleLintArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = lint_dir(&args.dir, os);
+    let report = lint_dir(&args.dir, os, SystemAccounts::passwd());
     let mut fail = 0usize;
     for entry in &report.entries {
         match &entry.result {
@@ -187,8 +194,15 @@ fn run_lint(args: &RoleLintArgs) -> ExitCode {
 }
 
 /// Roles that would load, sorted by role id, as `(role, version, name)`.
-pub fn list_roles(dir: &Path, os: RoleOs) -> Result<Vec<(String, u32, String)>, String> {
-    let store = RoleStore::load(dir, os, TrustMode::Standalone)
+///
+/// `accounts` is the passwd view slice names are checked against; slices named
+/// after a system account of the device never load and therefore never appear.
+pub fn list_roles(
+    dir: &Path,
+    os: RoleOs,
+    accounts: SystemAccounts,
+) -> Result<Vec<(String, u32, String)>, String> {
+    let store = RoleStore::load(dir, os, TrustMode::Standalone, accounts)
         .map_err(|e| format!("failed to load role base: {e}"))?;
     let mut rows: Vec<(String, u32, String)> = store
         .list()
@@ -207,7 +221,7 @@ fn run_list(args: &RoleListArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match list_roles(&args.dir, os) {
+    match list_roles(&args.dir, os, SystemAccounts::passwd()) {
         Ok(rows) => {
             for (role, version, name) in &rows {
                 println!("{role}\t{version}\t{name}");
@@ -246,6 +260,7 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+    use tessera_core::role::PasswdLookup;
 
     fn slice_doc(role: &str, version: u32) -> String {
         format!(
@@ -266,7 +281,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_slice(&dir, "oper", 1);
         write_slice(&dir, "serv", 2);
-        let report = lint_dir(dir.path(), RoleOs::Linux);
+        let report = lint_dir(dir.path(), RoleOs::Linux, SystemAccounts::empty());
         assert!(report.is_clean());
         assert_eq!(report.entries.len(), 2);
         // Sorted by role id.
@@ -284,10 +299,33 @@ mod tests {
             b"role = \"serv\"\nversion = 1\nos = \"linux\"\nname = \"s\"\nlevel = 1\nbogus = 1\n",
         )
         .unwrap();
-        let report = lint_dir(dir.path(), RoleOs::Linux);
+        let report = lint_dir(dir.path(), RoleOs::Linux, SystemAccounts::empty());
         assert!(!report.is_clean());
         let fails = report.entries.iter().filter(|e| e.result.is_err()).count();
         assert_eq!(fails, 1);
+    }
+
+    #[test]
+    fn lint_flags_a_slice_named_after_a_system_account() {
+        let dir = tempfile::tempdir().unwrap();
+        write_slice(&dir, "oper", 1);
+        write_slice(&dir, "root", 1);
+        // The device's passwd view, not the one of the machine running tests.
+        let accounts = SystemAccounts::with_lookup(|account| match account {
+            "root" => PasswdLookup::Uid(0),
+            _ => PasswdLookup::NoEntry,
+        });
+
+        let report = lint_dir(dir.path(), RoleOs::Linux, accounts);
+
+        assert!(!report.is_clean());
+        let root = report
+            .entries
+            .iter()
+            .find(|e| e.role == "root")
+            .expect("root slice is reported");
+        let message = root.result.as_ref().unwrap_err();
+        assert!(message.contains("system account"), "{message}");
     }
 
     #[test]
@@ -295,7 +333,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_slice(&dir, "oper", 1);
         fs::write(dir.path().join("manifest.toml"), b"bundle_version = 1\n").unwrap();
-        let report = lint_dir(dir.path(), RoleOs::Linux);
+        let report = lint_dir(dir.path(), RoleOs::Linux, SystemAccounts::empty());
         assert!(report.is_clean());
         assert_eq!(report.entries.len(), 1);
     }
@@ -306,7 +344,7 @@ mod tests {
         write_slice(&dir, "serv", 7);
         write_slice(&dir, "oper", 3);
         write_slice(&dir, "admin", 1);
-        let rows = list_roles(dir.path(), RoleOs::Linux).unwrap();
+        let rows = list_roles(dir.path(), RoleOs::Linux, SystemAccounts::empty()).unwrap();
         let ids: Vec<&str> = rows.iter().map(|(r, _, _)| r.as_str()).collect();
         assert_eq!(ids, vec!["admin", "oper", "serv"]);
         assert_eq!(rows[1], ("oper".to_string(), 3, "oper role".to_string()));
@@ -317,7 +355,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_slice(&dir, "oper", 1);
         fs::write(dir.path().join("serv.toml"), b"not valid toml {{{").unwrap();
-        let rows = list_roles(dir.path(), RoleOs::Linux).unwrap();
+        let rows = list_roles(dir.path(), RoleOs::Linux, SystemAccounts::empty()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "oper");
     }

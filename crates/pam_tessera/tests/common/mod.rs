@@ -57,6 +57,7 @@ impl RoleFixture {
             dir.path(),
             tessera_core::role::RoleOs::Linux,
             tessera_core::role::TrustMode::Standalone,
+            test_accounts(),
         )
         .unwrap();
         Self { _dir: dir, store }
@@ -68,8 +69,22 @@ impl RoleFixture {
             default_session_ttl: Duration::from_secs(
                 tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
             ),
+            accounts: test_accounts(),
         }
     }
+}
+
+/// The device's passwd view these tests authenticate against.
+///
+/// The real passwd file of the machine running the tests is never
+/// consulted: `root` must be a system account and `serv` a provisioned
+/// role account regardless of where the suite runs.
+fn test_accounts() -> tessera_core::role::SystemAccounts {
+    tessera_core::role::SystemAccounts::with_lookup(|account| match account {
+        "root" => tessera_core::role::PasswdLookup::Uid(0),
+        "serv" => tessera_core::role::PasswdLookup::Uid(4000),
+        _ => tessera_core::role::PasswdLookup::NoEntry,
+    })
 }
 
 /// Repository path to the shared X.509/p12 fixtures pile.

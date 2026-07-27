@@ -58,6 +58,8 @@ struct RoleStageOwned {
     store: tessera_core::role::RoleStore,
     /// Global default TTL from `[roles].default_session_ttl`.
     default_session_ttl: std::time::Duration,
+    /// The device's passwd view, used to refuse a login into a system account.
+    accounts: tessera_core::role::SystemAccounts,
 }
 
 #[cfg(target_os = "linux")]
@@ -67,6 +69,7 @@ impl RoleStageOwned {
         crate::flow::RoleStage {
             store: &self.store,
             default_session_ttl: self.default_session_ttl,
+            accounts: self.accounts,
         }
     }
 }
@@ -86,12 +89,21 @@ fn build_role_stage(
     roles_cfg: &tessera_core::config::validated::RolesSection,
     device_os: tessera_core::role::RoleOs,
 ) -> Result<RoleStageOwned, i32> {
-    use tessera_core::role::{RoleDenyReason, RoleStore, TrustMode};
+    use tessera_core::role::{RoleDenyReason, RoleStore, SystemAccounts, TrustMode};
+
+    // The device's real passwd database: on a live device that is the only
+    // honest source for "is this account the system's own".
+    let accounts = SystemAccounts::passwd();
 
     // Load the on-device role store through the privileged-path validator.
     // OS selection is runtime state now: the same open PAM binary serves
     // Linux and Astra, with the Parsec plugin identifying the Astra contour.
-    let store = match RoleStore::load_privileged(&roles_cfg.dir, device_os, TrustMode::Standalone) {
+    let store = match RoleStore::load_privileged(
+        &roles_cfg.dir,
+        device_os,
+        TrustMode::Standalone,
+        accounts,
+    ) {
         Ok(s) => s,
         Err(err) => {
             // A store that cannot be loaded is "roles not configured" —
@@ -111,6 +123,7 @@ fn build_role_stage(
     Ok(RoleStageOwned {
         store,
         default_session_ttl: roles_cfg.default_session_ttl,
+        accounts,
     })
 }
 
