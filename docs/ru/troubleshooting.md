@@ -93,7 +93,8 @@ pamtester sudo alice authenticate
 authentication failed` — категория отказа в поле `error=…`. Ролевые
 отказы идут отдельно, таргетом `role.audit`: событие `role_deny` с
 полем `reason=…` (`not_found` / `not_covered` /
-`backend_unavailable` / `mask_exceeds_ceiling` / `syntax`). Список
+`backend_unavailable` / `mask_exceeds_ceiling` / `syntax` /
+`system_account`). Список
 причин — [architecture.md](architecture.md#13-fail-closed-правила).
 
 ### Сертификат не принимается на терминале (общий чек-лист)

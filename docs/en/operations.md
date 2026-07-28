@@ -362,7 +362,7 @@ targets:
   - `close_session: running session_close hooks` (`session_id=…`).
 - `role.audit` — a role denial/grant: `role_deny` with a `reason=…`
   field (`not_found` / `not_covered` / `backend_unavailable` /
-  `mask_exceeds_ceiling` / `syntax`), `role_session_open`.
+  `mask_exceeds_ceiling` / `syntax` / `system_account`), `role_session_open`.
 
 ### 6.3 Useful `grep` filters
 

@@ -358,7 +358,7 @@ sudo journalctl -t pam_tessera
   - `close_session: running session_close hooks` (`session_id=…`).
 - `role.audit` — ролевой отказ/выдача: `role_deny` с полем `reason=…`
   (`not_found` / `not_covered` / `backend_unavailable` /
-  `mask_exceeds_ceiling` / `syntax`), `role_session_open`.
+  `mask_exceeds_ceiling` / `syntax` / `system_account`), `role_session_open`.
 
 ### 6.3 Полезные `grep`-фильтры
 

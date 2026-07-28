@@ -200,6 +200,7 @@ extension).
 |------------------------------|--------|--------------------------|---------------------------------|--------------------------------------------------------------------------|------------------------------------------------------------------------|
 | `dir`                        | path   | `/var/lib/tessera/roles` | absolute path to a directory     | Role-store directory (`<role>.toml` slices).                            | Standalone loads enforce `root:root` on the directory, every slice, and all ancestors; no group/world write. |
 | `default_session_ttl_seconds`| integer| `43200` (12 h)           | seconds                          | Session TTL when neither the credential nor the role sets one.          | No unbounded session arises — the ceiling is always finite.          |
+| `account_lookup_timeout_seconds`| integer| `10`                  | `1`–`60` (seconds)               | How long name resolution may take while checking whether the login account is a system one. | Running out means the login proceeds on the local file rather than being refused; `0` is rejected so the check cannot be silently disabled. |
 
 **Role checking is unconditional.** A role is required on every login, and no
 setting disables the check or downgrades it to a warning. A config that still
@@ -231,14 +232,28 @@ verification are in
 [install.md §8.4](install.md#84-closing-the-remaining-ways-into-a-role-account).
 
 What the product does guarantee here it guarantees unconditionally: the login
-is refused if the account named in `PAM_USER` is a system account by uid
-(below 1000 — the boundary of regular users on Debian, Ubuntu and Astra). The
+is refused if the uid of the account named in `PAM_USER` falls outside the
+regular-user range — below 1000 (where the accounts of the distribution and
+its packages live) or above 61183 (where the uids systemd hands to units with
+`DynamicUser=yes` begin, with `nobody` and `nogroup` beyond them). Both
+boundaries, and why the upper one differs from `UID_MAX`, are in
+[install.md §8.3](install.md#83-the-login-account). The
 refusal does not depend on the contents of the role store or on what the
 credential permits: `ssh root@device` will not become a role login even with a
 `root` slice present and a credential covering that role. The same rule makes
 a slice named after a system account fail to load, both in the store and in
 `tessera-cli role lint` — so that a provisioning mistake is seen by the
 administrator rather than by the first engineer to log in.
+
+**The check needs no network.** The uid comes from the local `/etc/passwd`,
+and that alone is enough for a login to proceed. Name resolution (NSS) is
+consulted in addition, and only to catch accounts no file holds by
+construction — systemd's `DynamicUser=` identities, which `nss-systemd`
+synthesises. That source can only ADD a refusal: if the directory does not
+answer, answers with an error, or exceeds
+`account_lookup_timeout_seconds`, the verdict stays the one the local file
+reached. An unreachable LDAP does not close a login — including the emergency
+console one.
 
 Admission is checked by a single credential extension —
 `pam_cert_allowed_roles` ("the holder may activate these roles"). It also

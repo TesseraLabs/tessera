@@ -97,7 +97,8 @@ In the log (ident `pam_tessera`) look for the line `tessera.auth:
 authentication failed` — the denial category is in the `error=…` field.
 Role denials go separately, under the `role.audit` target: a `role_deny`
 event with a `reason=…` field (`not_found` / `not_covered` /
-`backend_unavailable` / `mask_exceeds_ceiling` / `syntax`). The list of
+`backend_unavailable` / `mask_exceeds_ceiling` / `syntax` /
+`system_account`). The list of
 reasons is in [architecture.md](architecture.md#13-fail-closed-rules).
 
 ### Certificate not accepted on the terminal (general checklist)
