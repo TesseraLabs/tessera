@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use super::audit;
 use super::manifest::{self, ManifestError, MANIFEST_FILENAME};
 use super::schema::{parse_slice, RoleId, RoleOs, RoleSlice};
-use super::system_account::{SystemAccountError, SystemAccounts};
+use super::system_account::{AccountSnapshot, SystemAccountError, SystemAccounts};
 
 /// Hard cap on the number of roles in a single base. A base larger than this
 /// is a validation error, not a silent truncation.
@@ -55,6 +55,24 @@ pub enum TrustMode {
 pub struct RoleStore {
     /// Validated slices, one per role id.
     roles: HashMap<RoleId, RoleSlice>,
+    /// What both account sources said about the slice names while this base was
+    /// being loaded, kept so a caller judging one of those names does not have
+    /// to ask again. `None` for a store that was not built from a directory.
+    accounts: Option<AccountSnapshot>,
+    /// The view [`Self::accounts`] was taken through.
+    ///
+    /// Kept beside the snapshot because a snapshot alone says nothing about the
+    /// device it describes: a load against a view that knows no accounts clears
+    /// every name, `root` included, and a caller that paired such verdicts with
+    /// the device's real view would be letting a login into an account the
+    /// system owns. Handing both out together
+    /// ([`super::AccountCheck::from_store`]) is what makes that pair
+    /// unbuildable.
+    ///
+    /// A store that was not built from a directory has no verdicts to offer,
+    /// and its view is the device's own — the answer that refuses rather than
+    /// the one that clears.
+    view: SystemAccounts,
 }
 
 /// Errors from loading a role store. Per-slice schema failures in standalone
@@ -125,8 +143,9 @@ impl RoleStore {
     /// slice is parsed via [`parse_slice`]; a per-slice error (bad schema,
     /// foreign OS, non-role-id stem, role/stem mismatch, or a stem that names
     /// a system account of this device per `accounts`) is skipped with a
-    /// `role_slice_invalid` audit event naming the reason. If the count of
-    /// *valid* slices exceeds [`MAX_ROLES`], the whole load fails with
+    /// `role_slice_invalid` audit event naming the reason. If the number of
+    /// candidate files — or, after parsing, the count of *valid* slices —
+    /// exceeds [`MAX_ROLES`], the whole load fails with
     /// [`RoleStoreError::TooManyRoles`]. An empty directory yields an empty
     /// store. A missing/unreadable directory is [`RoleStoreError::Io`].
     ///
@@ -259,7 +278,11 @@ impl RoleStore {
         // Everything checked out: only now is this bundle_version the one the
         // device stands on.
         manifest::accept_bundle_version(persist_dir, &verified)?;
-        Ok(Self { roles })
+        Ok(Self {
+            roles,
+            accounts: Some(device_accounts),
+            view: accounts,
+        })
     }
 
     /// Standalone slice iteration (shared by [`Self::load`]).
@@ -318,6 +341,21 @@ impl RoleStore {
             candidates.push((path, stem));
         }
 
+        // The cap is applied to the candidates, before anything is done with
+        // their names. A directory holding thousands of files is a
+        // provisioning fault, and every name in it would otherwise become a
+        // word on the resolver's command line: the run would fail inside the
+        // child on an argument list the kernel refuses, and reach the log as
+        // silence indistinguishable from a resolver that is simply broken.
+        // The count of *valid* slices is checked again after parsing — this
+        // one is about what the load is allowed to attempt.
+        if candidates.len() > MAX_ROLES {
+            return Err(RoleStoreError::TooManyRoles {
+                count: candidates.len(),
+                max: MAX_ROLES,
+            });
+        }
+
         // Both account sources are asked once for the whole base. This load
         // runs on every login, before any credential is presented, so a source
         // consulted per slice would put the number of slices as a multiplier on
@@ -371,7 +409,45 @@ impl RoleStore {
                 max: MAX_ROLES,
             });
         }
-        Ok(Self { roles })
+        Ok(Self {
+            roles,
+            accounts: Some(device_accounts),
+            view: accounts,
+        })
+    }
+
+    /// The account view this base was loaded through.
+    ///
+    /// Only meaningful together with [`Self::account_snapshot`], which is why
+    /// [`super::AccountCheck::from_store`] is what callers use: the verdicts and
+    /// the view they were reached under are one thing, and pairing a snapshot
+    /// with some other view is how a name the device refuses becomes a name it
+    /// clears.
+    #[must_use]
+    pub(super) const fn account_view(&self) -> SystemAccounts {
+        self.view
+    }
+
+    /// What the account sources said about the slice names while this base was
+    /// loaded, for a caller that has to judge one of those names again.
+    ///
+    /// The load asks both sources — the second of them by running a process —
+    /// about every name in the base. On the login path the account being logged
+    /// into is normally one of them, so the verdict is already paid for; asking
+    /// again would make a login into a role wait out the additive source's
+    /// bound twice.
+    ///
+    /// A name the snapshot was not taken for ([`AccountSnapshot::covers`]) must
+    /// still be asked about separately: the mandatory source answers about it in
+    /// full, but the additive one was never asked, and it is the only source
+    /// that sees an account no local file holds.
+    ///
+    /// To *judge* a name, take [`super::AccountCheck::from_store`] instead: it
+    /// carries these verdicts together with the view they were reached under
+    /// and applies both rules on its own.
+    #[must_use]
+    pub const fn account_snapshot(&self) -> Option<&AccountSnapshot> {
+        self.accounts.as_ref()
     }
 
     /// Look up a role by id.
@@ -503,6 +579,34 @@ mod tests {
             SystemAccounts::empty(),
         )
         .unwrap_err();
+        assert!(matches!(
+            err,
+            RoleStoreError::TooManyRoles {
+                count,
+                max: MAX_ROLES
+            } if count == MAX_ROLES + 1
+        ));
+    }
+
+    #[test]
+    fn more_candidates_than_the_cap_are_refused_before_their_names_are_used() {
+        // None of these files parses, so the count of valid slices stays zero
+        // and the load would once have succeeded with an empty base — after
+        // handing every one of those names to the account check, which puts
+        // them on a command line. The refusal has to name the real fault.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..=MAX_ROLES {
+            std::fs::write(dir.path().join(format!("r{i}.toml")), b"not a slice").unwrap();
+        }
+
+        let err = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap_err();
+
         assert!(matches!(
             err,
             RoleStoreError::TooManyRoles {

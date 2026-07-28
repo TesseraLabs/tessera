@@ -63,8 +63,6 @@ struct RoleStageOwned {
     store: tessera_core::role::RoleStore,
     /// Global default TTL from `[roles].default_session_ttl`.
     default_session_ttl: std::time::Duration,
-    /// The device's account view, used to refuse a login into a system account.
-    accounts: tessera_core::role::SystemAccounts,
 }
 
 #[cfg(target_os = "linux")]
@@ -74,7 +72,11 @@ impl RoleStageOwned {
         crate::flow::RoleStage {
             store: &self.store,
             default_session_ttl: self.default_session_ttl,
-            accounts: self.accounts,
+            // View and verdicts both come from the store's own load, so what it
+            // asked both account sources about every slice name is what this
+            // stage would ask again — at the cost of another resolver run, and
+            // of another wait on a directory that is not answering.
+            accounts: tessera_core::role::AccountCheck::from_store(&self.store),
         }
     }
 }
@@ -134,7 +136,6 @@ fn build_role_stage(
     Ok(RoleStageOwned {
         store,
         default_session_ttl: roles_cfg.default_session_ttl,
-        accounts,
     })
 }
 

@@ -32,7 +32,8 @@ pub use selection::{
 };
 pub use store::{RoleStore, RoleStoreError, TrustMode, DEFAULT_ROLES_DIR, MAX_ROLES};
 pub use system_account::{
-    AccountSnapshot, PasswdLookup, SystemAccountError, SystemAccounts,
-    DEFAULT_ACCOUNT_LOOKUP_TIMEOUT, FIRST_REGULAR_UID, MAX_ACCOUNT_LOOKUP_TIMEOUT,
+    AccountCheck, AccountSnapshot, PasswdLookup, SystemAccountError, SystemAccounts,
+    DEFAULT_ACCOUNT_LOOKUP_TIMEOUT, FIRST_REGULAR_UID, LAST_REGULAR_UID,
+    MAX_ACCOUNT_LOOKUP_TIMEOUT,
 };
 pub use update::{atomic_update, cleanup_staged, UpdateTrust};

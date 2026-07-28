@@ -58,14 +58,21 @@
 //! outlives the unloading of that module. Exhausting the bound therefore ends
 //! the child rather than abandoning it.
 //!
+//! An exhausted bound also quiets the additive source for a while
+//! ([`NAME_RESOLUTION_COOLDOWN`]), so a directory that has stopped answering is
+//! waited out once rather than once per attempt. The quiet expires on its own:
+//! in a resident greeter the process outlives many logins, and a source shut
+//! for good there would turn one transient failure into a device that never
+//! sees a `DynamicUser=` account again.
+//!
 //! Both sources are asked **once per set of names** ([`SystemAccounts::snapshot`]).
 //! The role-store loader runs on every login and holds up to a few hundred
 //! slices; reading the local file — let alone spawning a resolver — per slice
 //! would multiply the cost of a login by the size of the base.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Lowest uid a regular account can have; anything below it belongs to the
 /// system.
@@ -145,20 +152,34 @@ pub const DEFAULT_ACCOUNT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// hung.
 pub const MAX_ACCOUNT_LOOKUP_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Set once the additive source has failed to answer inside its bound.
+/// How long the additive source is left alone after it failed to answer inside
+/// its bound.
 ///
 /// A directory that did not answer in the time it was given will not answer any
 /// faster to the next question, and that time is paid on every login attempt,
-/// before any credential is presented. So the first exhausted bound is the last
-/// one this process pays: from then on the additive source is treated as
-/// silent, and the local file decides alone — which is the same verdict the
-/// exhausted bound produced, reached without the wait.
+/// before any credential is presented. A run of attempts during an outage would
+/// otherwise pay the full bound each time.
 ///
-/// A plain flag rather than a `OnceLock`: there is no value to publish and no
-/// initialisation to serialise, only a one-way switch. `Relaxed` is enough for
-/// the same reason — nothing else is published alongside it, and a read that
-/// misses a concurrent set merely costs one more bounded wait.
-static NAME_RESOLUTION_TIMED_OUT: AtomicBool = AtomicBool::new(false);
+/// The suppression expires rather than lasting, because the process asking is
+/// not always short-lived. `sshd`, `login` and `su` are gone by the next login,
+/// but a graphical greeter is resident for as long as the device is on: a
+/// permanent switch there would let one transient failure — a directory not yet
+/// up after a reboot — close the additive source until the daemon is
+/// restarted, and with it the only source that sees a `DynamicUser=` account.
+///
+/// Five minutes is the trade: long enough that a burst of attempts against a
+/// dead directory costs one wait rather than one per attempt, short enough that
+/// a directory coming back is consulted again while the same operator is still
+/// standing at the device.
+const NAME_RESOLUTION_COOLDOWN: Duration = Duration::from_mins(5);
+
+/// When the additive source may be consulted again after an exhausted bound.
+///
+/// A [`Mutex`] rather than an atomic: what has to be stored is a point in time,
+/// and there is no contention worth avoiding — the cell is touched once per
+/// snapshot, on a path that has just spent milliseconds reading a file or
+/// seconds waiting for a directory.
+static NAME_RESOLUTION_SUPPRESSED: Suppression = Suppression::new();
 
 /// What one account source says about a login name.
 ///
@@ -407,7 +428,8 @@ impl SystemAccounts {
                     &unsettled,
                     self.nss_timeout,
                     super::getent::resolve,
-                    &NAME_RESOLUTION_TIMED_OUT,
+                    &NAME_RESOLUTION_SUPPRESSED,
+                    NAME_RESOLUTION_COOLDOWN,
                 ),
                 NameSource::Answers(answers) => NameResolution::answered(
                     unsettled
@@ -418,7 +440,14 @@ impl SystemAccounts {
             }
         };
 
-        AccountSnapshot { local, resolved }
+        AccountSnapshot {
+            local,
+            resolved,
+            asked: accounts
+                .iter()
+                .map(|account| (*account).to_owned())
+                .collect(),
+        }
     }
 
     /// Decide whether `account` may be used as a role name on this device.
@@ -441,15 +470,28 @@ impl SystemAccounts {
 ///
 /// Held by the caller for as long as it judges that set: the answers were paid
 /// for once and are not asked for again per name.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AccountSnapshot {
     /// The local database as it was when the snapshot was taken.
     local: LocalAccounts,
     /// What name resolution answered about the names still open then.
     resolved: NameResolution,
+    /// The names this snapshot was taken for.
+    asked: Vec<String>,
 }
 
 impl AccountSnapshot {
+    /// Whether this snapshot was taken for `account`.
+    ///
+    /// A caller that has to judge a name has a complete verdict for it only if
+    /// the name was in the set: for any other name the mandatory source still
+    /// answers in full, but the additive one was never asked, and reusing such
+    /// a verdict would silently drop the only source that sees an account no
+    /// local file holds.
+    #[must_use]
+    pub fn covers(&self, account: &str) -> bool {
+        self.asked.iter().any(|name| name == account)
+    }
     /// Decide whether `account` may be used as a role name on this device.
     ///
     /// An account neither source knows is *not* a system account: it is simply
@@ -514,8 +556,82 @@ impl AccountSnapshot {
     }
 }
 
+/// A device's account view together with the verdicts already reached *under
+/// that view*, for a caller that has to judge one name.
+///
+/// The pairing is the whole point of the type. An [`AccountSnapshot`] carries
+/// no trace of the view it was taken with, and a snapshot taken under a view
+/// that knows no accounts clears every name — including `root`. Handing such a
+/// snapshot to a login that means to judge against the device's real accounts
+/// would let the login into an account the system owns, so there is no way to
+/// build that pair here: a check either has no snapshot at all
+/// ([`Self::from_view`]) or takes both halves from the one place they were
+/// paired, the store's own load ([`Self::from_store`]).
+///
+/// It stays [`Copy`] and borrows the snapshot rather than owning it, so passing
+/// it costs no more than passing the view did.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountCheck<'a> {
+    /// The view every name is judged against.
+    view: SystemAccounts,
+    /// Verdicts this very view already reached, if any.
+    settled: Option<&'a AccountSnapshot>,
+}
+
+impl<'a> AccountCheck<'a> {
+    /// A check that asks `view` about every name afresh.
+    ///
+    /// For a caller with no load of its own to draw on, and for one whose load
+    /// ran against a different view than the one it now means to judge by: the
+    /// answers cost a lookup each, and cost nothing in trust.
+    #[must_use]
+    pub const fn from_view(view: SystemAccounts) -> Self {
+        Self {
+            view,
+            settled: None,
+        }
+    }
+
+    /// A check that reuses what loading `store` established, under the view
+    /// that load ran against.
+    ///
+    /// Loading a base asks both sources about every slice name — the additive
+    /// one by running a process, and on an unanswering directory by waiting out
+    /// the whole configured bound. A login into one of those names would
+    /// otherwise pay that a second time, and the bound the configuration states
+    /// would not be the bound one login costs.
+    ///
+    /// Both halves come from the store, so they cannot be mismatched: the view
+    /// is the one the snapshot was taken with, by construction.
+    #[must_use]
+    pub fn from_store(store: &'a super::store::RoleStore) -> Self {
+        Self {
+            view: store.account_view(),
+            settled: store.account_snapshot(),
+        }
+    }
+
+    /// Decide whether `account` may be used as a role name on this device.
+    ///
+    /// A name the snapshot was taken for is answered from it; any other name is
+    /// asked about afresh, because the snapshot's mandatory source would answer
+    /// about it but its additive one was never asked — and that is the only
+    /// source that sees an account no local file holds.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`AccountSnapshot::check`], which the verdict comes from
+    /// either way.
+    pub fn check(&self, account: &str) -> Result<(), SystemAccountError> {
+        match self.settled {
+            Some(snapshot) if snapshot.covers(account) => snapshot.check(account),
+            Some(_) | None => self.view.check(account),
+        }
+    }
+}
+
 /// The mandatory source as it stood when a snapshot was taken.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum LocalAccounts {
     /// The account database read in one go; `None` when it could not be read,
     /// which refuses every name.
@@ -573,7 +689,7 @@ const fn local_leaves_open(lookup: PasswdLookup) -> bool {
 }
 
 /// What the additive source answered about a set of names, in one pass.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct NameResolution {
     /// One answer per name the source was asked about.
     answers: Vec<(String, PasswdLookup)>,
@@ -621,28 +737,61 @@ impl NameResolution {
     }
 }
 
-/// Run `resolve` unless the bound has already been exhausted once, and latch
-/// the source shut when it is.
+/// Whether the additive source is currently being left alone, and until when.
 ///
-/// `resolve` and the latch are parameters so both halves of that rule can be
-/// exercised without a directory and without waiting.
+/// `None` means it is consulted as usual.
+#[derive(Debug)]
+struct Suppression(Mutex<Option<Instant>>);
+
+impl Suppression {
+    /// A source that is being consulted.
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Whether the source should be skipped at `now`.
+    ///
+    /// A poisoned lock is read through: the only thing behind it is a
+    /// timestamp, a panic cannot have left it half-written, and refusing to
+    /// look would either wait out the bound on every login or skip the source
+    /// forever — the two failures this cell exists to avoid.
+    fn suppressed(&self, now: Instant) -> bool {
+        let until = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        until.is_some_and(|until| now < until)
+    }
+
+    /// Leave the source alone until `until`.
+    fn suppress(&self, until: Instant) {
+        let mut cell = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *cell = Some(until);
+    }
+}
+
+/// Run `resolve` unless an exhausted bound is still being waited out, and start
+/// waiting one out when the bound runs out here.
+///
+/// `resolve`, the cell and the cooldown are all parameters so every half of
+/// that rule can be exercised without a directory and without waiting.
 fn bounded_resolution(
     accounts: &[&str],
     timeout: Duration,
     resolve: fn(&[&str], Duration) -> NameResolution,
-    timed_out: &'static AtomicBool,
+    suppressed: &Suppression,
+    cooldown: Duration,
 ) -> NameResolution {
-    if timed_out.load(Ordering::Relaxed) {
+    if suppressed.suppressed(Instant::now()) {
         return NameResolution::silent();
     }
     let resolution = resolve(accounts, timeout);
     if resolution.exhausted_its_bound() {
-        timed_out.store(true, Ordering::Relaxed);
+        suppressed.suppress(Instant::now() + cooldown);
         tracing::warn!(
             target: "tessera.role",
             timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            cooldown_ms = u64::try_from(cooldown.as_millis()).unwrap_or(u64::MAX),
             "name resolution did not answer within its limit and was stopped; the local account \
-             database decides on its own, and it will not be consulted again in this process"
+             database decides on its own, and the source is left alone for the cooldown before \
+             it is consulted again"
         );
     }
     resolution
@@ -789,6 +938,8 @@ fn no_such_account_resolved(_account: &str, _timeout: Duration) -> PasswdLookup 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::missing_docs_in_private_items)]
+
+    use std::sync::atomic::Ordering;
 
     use super::*;
 
@@ -1183,7 +1334,7 @@ mod tests {
 
     #[test]
     fn an_answer_inside_the_limit_is_the_one_that_counts() {
-        static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+        static SUPPRESSED: Suppression = Suppression::new();
 
         fn prompt_resolver(accounts: &[&str], _timeout: Duration) -> NameResolution {
             NameResolution::answered(
@@ -1198,7 +1349,8 @@ mod tests {
             &["dyn-service"],
             Duration::from_secs(10),
             prompt_resolver,
-            &TIMED_OUT,
+            &SUPPRESSED,
+            NAME_RESOLUTION_COOLDOWN,
         );
 
         assert_eq!(
@@ -1206,8 +1358,8 @@ mod tests {
             PasswdLookup::Uid(61184)
         );
         assert!(
-            !TIMED_OUT.load(Ordering::Relaxed),
-            "an answer in time must not latch the source shut"
+            !SUPPRESSED.suppressed(Instant::now()),
+            "an answer in time must not quiet the source"
         );
     }
 
@@ -1222,19 +1374,20 @@ mod tests {
         NameResolution::stopped()
     }
 
-    /// The latch, proven on a resolver whose bound always runs out.
+    /// The cooldown, proven on a resolver whose bound always runs out.
     ///
-    /// The first exhausted bound must end in silence rather than a refusal, and
-    /// it must be the only one this process pays.
+    /// The exhausted bound must end in silence rather than a refusal, and the
+    /// attempts that follow it inside the cooldown must not pay the wait again.
     #[test]
-    fn a_name_service_past_the_limit_falls_silent_and_is_not_asked_again() {
-        static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+    fn a_name_service_past_the_limit_falls_silent_and_is_left_alone_for_a_while() {
+        static SUPPRESSED: Suppression = Suppression::new();
 
         let first = bounded_resolution(
             &["serv"],
             Duration::from_millis(20),
             stopped_resolver,
-            &TIMED_OUT,
+            &SUPPRESSED,
+            Duration::from_mins(5),
         );
         assert_eq!(
             first.answer_for("serv"),
@@ -1242,8 +1395,8 @@ mod tests {
             "an exhausted bound says nothing about the name"
         );
         assert!(
-            TIMED_OUT.load(Ordering::Relaxed),
-            "the exhausted limit must latch the source shut"
+            SUPPRESSED.suppressed(Instant::now()),
+            "the exhausted limit must quiet the source"
         );
         assert_eq!(STOPPED_RESOLVER_RUNS.load(Ordering::Relaxed), 1);
 
@@ -1251,30 +1404,88 @@ mod tests {
             &["serv"],
             Duration::from_millis(20),
             stopped_resolver,
-            &TIMED_OUT,
+            &SUPPRESSED,
+            Duration::from_mins(5),
         );
         assert_eq!(second.answer_for("serv"), PasswdLookup::Unavailable);
         assert_eq!(
             STOPPED_RESOLVER_RUNS.load(Ordering::Relaxed),
             1,
-            "once the limit has run out the resolver must not be run again: the directory that \
-             did not answer in time will not answer faster to the next login"
+            "inside the cooldown the resolver must not be run again: the directory that did not \
+             answer in time will not answer faster to the next login"
         );
     }
 
+    /// How many times [`recovering_resolver`] was run.
+    static RECOVERING_RESOLVER_RUNS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// A resolver whose bound runs out once and answers afterwards — a
+    /// directory that was not up yet when the first login was attempted.
+    fn recovering_resolver(accounts: &[&str], _timeout: Duration) -> NameResolution {
+        if RECOVERING_RESOLVER_RUNS.fetch_add(1, Ordering::Relaxed) == 0 {
+            return NameResolution::stopped();
+        }
+        NameResolution::answered(
+            accounts
+                .iter()
+                .map(|account| ((*account).to_owned(), PasswdLookup::Uid(61184)))
+                .collect(),
+        )
+    }
+
     #[test]
-    fn a_latched_source_leaves_the_local_verdict_alone() {
-        // What the latch must never do is change the answer: with the source
-        // shut, the file decides — a role account still passes and a system
+    fn the_source_is_consulted_again_once_the_cooldown_is_over() {
+        // The half that a permanent switch got wrong. A resident greeter keeps
+        // one process across every login of the day: an outage during the first
+        // one must not blind the device to `DynamicUser=` accounts until the
+        // daemon is restarted. A zero cooldown stands in for one that has run
+        // out, so the test does not have to wait for it.
+        static SUPPRESSED: Suppression = Suppression::new();
+
+        let first = bounded_resolution(
+            &["dyn-service"],
+            Duration::from_millis(20),
+            recovering_resolver,
+            &SUPPRESSED,
+            Duration::ZERO,
+        );
+        assert_eq!(first.answer_for("dyn-service"), PasswdLookup::Unavailable);
+
+        let second = bounded_resolution(
+            &["dyn-service"],
+            Duration::from_millis(20),
+            recovering_resolver,
+            &SUPPRESSED,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            second.answer_for("dyn-service"),
+            PasswdLookup::Uid(61184),
+            "a directory that came back must be seen again"
+        );
+        assert_eq!(RECOVERING_RESOLVER_RUNS.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_quieted_source_leaves_the_local_verdict_alone() {
+        // What the cooldown must never do is change the answer: with the source
+        // quiet, the file decides — a role account still passes and a system
         // account is still refused.
-        static TIMED_OUT: AtomicBool = AtomicBool::new(true);
+        static SUPPRESSED: Suppression = Suppression::new();
 
         fn never_run(_accounts: &[&str], _timeout: Duration) -> NameResolution {
-            unreachable!("a latched source must not be run");
+            unreachable!("a quieted source must not be run");
         }
 
-        let resolution =
-            bounded_resolution(&["serv"], Duration::from_millis(20), never_run, &TIMED_OUT);
+        SUPPRESSED.suppress(Instant::now() + Duration::from_mins(5));
+        let resolution = bounded_resolution(
+            &["serv"],
+            Duration::from_millis(20),
+            never_run,
+            &SUPPRESSED,
+            Duration::from_mins(5),
+        );
         assert_eq!(resolution.answer_for("serv"), PasswdLookup::Unavailable);
 
         let snapshot = AccountSnapshot {
@@ -1283,11 +1494,106 @@ mod tests {
                 _ => PasswdLookup::Uid(4000),
             }),
             resolved: resolution,
+            asked: vec!["serv".to_owned(), "root".to_owned()],
         };
         snapshot
             .check("serv")
             .expect("a limit that ran out is silence: the local file's verdict stands");
         assert!(snapshot.check("root").is_err());
+    }
+
+    // ---- the pairing of a view with its own verdicts ------------------------
+
+    /// A one-slice base on disk, loaded through `view`.
+    fn store_loaded_through(view: SystemAccounts) -> (tempfile::TempDir, super::super::RoleStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("serv.toml"),
+            b"role = \"serv\"\nversion = 4\nos = \"linux\"\nname = \"serv\"\nlevel = 1\n"
+                .as_slice(),
+        )
+        .expect("write slice");
+        let store = super::super::RoleStore::load(
+            dir.path(),
+            super::super::RoleOs::Linux,
+            super::super::TrustMode::Standalone,
+            view,
+        )
+        .expect("the base loads");
+        (dir, store)
+    }
+
+    #[test]
+    fn a_check_judges_by_the_view_its_verdicts_were_reached_under() {
+        // The verdicts of a load and the view that load ran against are one
+        // thing, and this is why: a base loaded through a view that knows no
+        // accounts clears every name, `root` among them. Pairing those verdicts
+        // with a device view that refuses `root` would be a login into the
+        // system's own account, so both halves come from the same place — the
+        // store — and the pair cannot be assembled by hand.
+        let (_lenient_dir, lenient) = store_loaded_through(SystemAccounts::empty());
+        let (_device_dir, device) = store_loaded_through(fixture());
+
+        AccountCheck::from_store(&lenient)
+            .check("root")
+            .expect("a view that knows no accounts clears every name, and says so about itself");
+        assert!(
+            AccountCheck::from_store(&device).check("root").is_err(),
+            "a load through the device's own view carries that view's refusal"
+        );
+        assert!(
+            AccountCheck::from_view(fixture()).check("root").is_err(),
+            "a view asked afresh refuses it too, whatever any load concluded"
+        );
+    }
+
+    /// How many times [`counted_names`] was asked.
+    static PAIRED_NAME_LOOKUPS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// The additive source of the view below, counting its questions.
+    fn counted_names(_account: &str, _timeout: Duration) -> PasswdLookup {
+        PAIRED_NAME_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        PasswdLookup::NoEntry
+    }
+
+    /// Its mandatory half: every name is a regular account, so the additive
+    /// source is always worth asking.
+    fn open_local(_account: &str) -> PasswdLookup {
+        PasswdLookup::NoEntry
+    }
+
+    #[test]
+    fn a_name_the_load_asked_about_is_not_asked_about_twice() {
+        // The other half of the pairing: verdicts travel with the check so a
+        // login into a slice name does not pay the additive source's cost — a
+        // process, and on an unanswering directory the whole bound — again. A
+        // name that load never saw is still asked about in full.
+        let view = SystemAccounts::with_sources(open_local, counted_names);
+        PAIRED_NAME_LOOKUPS.store(0, Ordering::Relaxed);
+        let (_dir, store) = store_loaded_through(view);
+        assert_eq!(
+            PAIRED_NAME_LOOKUPS.load(Ordering::Relaxed),
+            1,
+            "the load asks about the one slice name"
+        );
+
+        let check = AccountCheck::from_store(&store);
+        check.check("serv").expect("a role account passes");
+        assert_eq!(
+            PAIRED_NAME_LOOKUPS.load(Ordering::Relaxed),
+            1,
+            "the verdict the load reached is the verdict the check uses"
+        );
+
+        check
+            .check("oper")
+            .expect("an absent account is not refused");
+        assert_eq!(
+            PAIRED_NAME_LOOKUPS.load(Ordering::Relaxed),
+            2,
+            "a name the load never saw has to be asked about"
+        );
     }
 
     #[test]

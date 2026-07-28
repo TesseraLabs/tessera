@@ -35,14 +35,14 @@
 //! device without a network must still let its engineer in.
 
 use std::ffi::CString;
-use std::io::Read as _;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{ForkResult, Pid};
@@ -51,6 +51,8 @@ use crate::hooks::child_setup::child_setup;
 use crate::hooks::rlimit::default_caps_for_timeout;
 use crate::privileged_path::{validate_path, ExecTrust};
 
+use super::schema::RoleId;
+use super::store::MAX_ROLES;
 use super::system_account::{lookup_in_passwd_bytes, NameResolution};
 
 /// Where `getent` lives on the distributions this product targets.
@@ -63,6 +65,16 @@ const GETENT_CANDIDATES: [&str; 2] = ["/usr/bin/getent", "/bin/getent"];
 /// The database `getent` is asked about; the one that answers with uids.
 const PASSWD_DATABASE: &str = "passwd";
 
+/// The end-of-options marker every name is passed after.
+///
+/// `getent` parses its command line with argp, which recognises options
+/// wherever they appear — including after the database name and in between
+/// keys. The names asked about come from the file stems of a role directory,
+/// and a stem like `--service=evil` would otherwise stop being a key and become
+/// a request to load a different NSS module into a process running as root.
+/// After this marker every remaining word is a key, whatever it looks like.
+const END_OF_OPTIONS: &str = "--";
+
 /// `getent`'s status for "one or more of the requested keys was not found".
 ///
 /// Asking about several names at once makes this status ordinary rather than
@@ -71,15 +83,40 @@ const PASSWD_DATABASE: &str = "passwd";
 /// exactly as trustworthy as under a zero status.
 const KEY_NOT_FOUND: i32 = 2;
 
+/// Largest one `passwd` record is taken to be.
+///
+/// Five of the seven fields are a name, two ids, a home and a shell, all short;
+/// only the gecos field is free text, and a directory that fills it generously
+/// still stays orders of magnitude below this.
+const MAX_RECORD_BYTES: usize = 16 * 1024;
+
 /// Largest answer that still counts as an answer.
 ///
-/// One `passwd` record per name asked about is a few dozen bytes; the whole
-/// role base cannot exceed a few hundred names. The cap is far above that and
+/// One record per name asked about, and no more names are asked about than a
+/// role base may hold — so the cap is that product, and an answer of the
+/// largest shape a real directory could produce still fits inside it whole. It
 /// exists only so a resolver that streams without end cannot make the login
 /// path allocate without bound.
-const MAX_ANSWER_BYTES: usize = 256 * 1024;
+const MAX_ANSWER_BYTES: usize = MAX_NAMES_PER_RUN * MAX_RECORD_BYTES;
 
-/// How often the parent looks at the child while the bound runs.
+/// Most names one run may be asked about.
+///
+/// Every name becomes a word on the child's command line, and `execve` refuses
+/// an argument list past the kernel's limit — with an errno the child can only
+/// turn into silence, indistinguishable from a broken resolver. A directory
+/// holding more slices than a role base may contain is a provisioning fault its
+/// own diagnostic already names, so the bound here is the same one the base has.
+const MAX_NAMES_PER_RUN: usize = MAX_ROLES;
+
+/// How long a killed child is waited for before the login path moves on.
+///
+/// `SIGKILL` cannot be caught, so this is the scheduling delay between the
+/// signal and the process being gone — never a wait on the resolver itself.
+/// Past it the login proceeds and the worst that is left behind is one zombie
+/// the host reaps when it next waits.
+const REAP_GRACE: Duration = Duration::from_secs(1);
+
+/// How often the parent looks at the child once the answer is complete.
 ///
 /// Short enough that the answer is not held back noticeably on a healthy
 /// device, long enough that the wait costs no measurable CPU.
@@ -129,12 +166,54 @@ fn program() -> Option<PathBuf> {
 
 /// [`resolve`] against a named program, so the shape of every failure can be
 /// exercised without the machine's own `getent`.
+///
+/// Only names that could be role ids at all are asked about. The check is
+/// cheap and it is the second of the two belts that keep a file stem from
+/// steering the resolver: a name outside the grammar can never name a role, so
+/// nothing is lost by leaving it out of the command line, and what is not on
+/// the command line cannot be read as an option. A name left out is a name the
+/// source says nothing about, which is the one answer that never refuses.
 fn resolve_with(program: &Path, accounts: &[&str], timeout: Duration) -> NameResolution {
-    let mut args: Vec<&str> = Vec::with_capacity(accounts.len() + 1);
-    args.push(PASSWD_DATABASE);
-    args.extend_from_slice(accounts);
+    let Some(askable) = askable(accounts) else {
+        return NameResolution::silent();
+    };
+    let args = command_line(&askable);
 
-    interpret(&run(program, &args, timeout), accounts)
+    interpret(&run(program, &args, timeout), &askable)
+}
+
+/// The names of `accounts` this run will actually ask about, or `None` when
+/// there is no run worth making.
+fn askable<'a>(accounts: &[&'a str]) -> Option<Vec<&'a str>> {
+    let askable: Vec<&str> = accounts
+        .iter()
+        .copied()
+        .filter(|account| RoleId::new(account).is_ok())
+        .collect();
+    if askable.is_empty() {
+        return None;
+    }
+    if askable.len() > MAX_NAMES_PER_RUN {
+        tracing::warn!(
+            target: "tessera.role",
+            names = askable.len(),
+            max = MAX_NAMES_PER_RUN,
+            "more names to resolve than a role base may hold; \
+             the local account database decides on its own"
+        );
+        return None;
+    }
+    Some(askable)
+}
+
+/// The words the resolver is run with: the database, the end-of-options
+/// marker, then one name per key.
+fn command_line<'a>(askable: &[&'a str]) -> Vec<&'a str> {
+    let mut args: Vec<&str> = Vec::with_capacity(askable.len() + 2);
+    args.push(PASSWD_DATABASE);
+    args.push(END_OF_OPTIONS);
+    args.extend_from_slice(askable);
+    args
 }
 
 /// Turn one run of the resolver into what it said about each name.
@@ -143,18 +222,35 @@ fn interpret(run: &Run, accounts: &[&str]) -> NameResolution {
         // A name the answer does not mention resolves to "no entry", which is
         // as harmless to the verdict as silence: only a uid outside the
         // regular range can add a refusal.
-        Outcome::Exited(0 | KEY_NOT_FOUND) => NameResolution::answered(
-            accounts
-                .iter()
-                .map(|account| {
-                    (
-                        (*account).to_owned(),
-                        lookup_in_passwd_bytes(&run.stdout, account, &"getent passwd"),
-                    )
-                })
-                .collect(),
-        ),
+        //
+        // An end without a status is read the same way. The child wrote its
+        // answer and closed the pipe; that it could not be collected afterwards
+        // says something about the host process, not about the answer. A
+        // half-written record cannot invent a uid either — a line short of its
+        // fields is not a record to this parser.
+        Outcome::Exited(0 | KEY_NOT_FOUND) | Outcome::EndedWithoutStatus => {
+            NameResolution::answered(
+                accounts
+                    .iter()
+                    .map(|account| {
+                        (
+                            (*account).to_owned(),
+                            lookup_in_passwd_bytes(&run.stdout, account, &"getent passwd"),
+                        )
+                    })
+                    .collect(),
+            )
+        }
         Outcome::TimedOut => NameResolution::stopped(),
+        Outcome::Overlong => {
+            tracing::warn!(
+                target: "tessera.role",
+                max_bytes = MAX_ANSWER_BYTES,
+                "name resolution wrote more than an answer can be; \
+                 the local account database decides on its own"
+            );
+            NameResolution::silent()
+        }
         Outcome::Exited(code) => {
             tracing::warn!(
                 target: "tessera.role",
@@ -180,9 +276,22 @@ fn interpret(run: &Run, accounts: &[&str]) -> NameResolution {
 enum Outcome {
     /// The program ran to its own end and left this status.
     Exited(i32),
+    /// The program ran to its end — it closed the answer pipe — but no status
+    /// was left for this code to collect.
+    ///
+    /// The ordinary cause is a host process that has set `SIGCHLD` to
+    /// `SIG_IGN`: the kernel then reaps children by itself, and the wait that
+    /// would have read the status returns `ECHILD` instead. The other is a
+    /// bound that ran out in the moment between the child's `_exit` and its
+    /// status becoming collectable. Neither says anything about the run: the
+    /// answer already in hand is the answer.
+    EndedWithoutStatus,
     /// The bound ran out; the child was killed and reaped.
     TimedOut,
-    /// The program could not be started, or its end could not be established.
+    /// More was written than an answer can be; the child was killed and reaped.
+    Overlong,
+    /// The program could not be started, or ended in a way that leaves the
+    /// answer untrustworthy.
     Unstartable,
 }
 
@@ -214,10 +323,13 @@ impl Run {
 /// ([`child_setup`]) does all of that, plus the resource caps that bound the
 /// child a second way if the wall clock somehow does not.
 ///
-/// Output is read only after the child has ended, which is safe because the
-/// answer to a `passwd` query is far smaller than a pipe buffer: a child that
-/// nevertheless wrote enough to fill the pipe would block, run out of its
-/// bound, and be killed — silence, which is the safe direction.
+/// Output is read *while* the child runs, never after it. A pipe holds 64 KiB
+/// on Linux, and one `passwd` record per name in a full role base is of that
+/// order: a parent that waited for the child before reading would deadlock
+/// against a child blocked writing into a pipe nobody is emptying, every time,
+/// on exactly the devices with the largest role bases. The end of the answer is
+/// therefore end-of-file on the pipe, and the child's status only refines what
+/// that already established.
 fn run(program: &Path, args: &[&str], timeout: Duration) -> Run {
     let Some(storage) = argv_storage(program, args) else {
         return Run::unstartable();
@@ -274,7 +386,7 @@ fn run(program: &Path, args: &[&str], timeout: Duration) -> Run {
             // reaches end-of-file.
             drop(answer_write);
             drop(discard);
-            supervise(child, answer_read, timeout)
+            supervise(child, &answer_read, timeout)
         }
     }
 }
@@ -312,38 +424,181 @@ fn cloexec_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
     }
 }
 
-/// Wait for `child` up to `timeout`, then read what it left behind.
+/// Read what `child` writes as it writes it, up to `timeout`, and establish how
+/// it ended.
+///
+/// The pipe is emptied as the child fills it, so a child writing more than the
+/// pipe buffer holds keeps making progress instead of stalling against a parent
+/// that is not reading yet. The waiting happens in `poll` against what is left
+/// of the bound rather than inside `read`, so every idle moment is one the
+/// deadline is checked in. End-of-file is what says the run is over — the child
+/// has either `execve`d and exited or died, and in both cases it is the closing
+/// of its last descriptor that lets the read return zero.
 ///
 /// Exhausting the bound kills the child and reaps it. That is the whole point
 /// of running the lookup elsewhere: the request stops, rather than being left
-/// to finish in a library the caller may already have unloaded.
-fn supervise(child: Pid, answer: OwnedFd, timeout: Duration) -> Run {
+/// to finish in a library the caller may already have unloaded. Where the bound
+/// runs out decides what the run is worth: before end-of-file there is no answer
+/// to keep, while after it the answer is complete and only the status is
+/// missing.
+fn supervise(child: Pid, answer: &OwnedFd, timeout: Duration) -> Run {
+    supervise_with(child, answer, timeout, set_nonblocking)
+}
+
+/// [`supervise`] against a named way of unblocking the pipe, so the one failure
+/// that would leave the read unbounded can be exercised.
+fn supervise_with(
+    child: Pid,
+    answer: &OwnedFd,
+    timeout: Duration,
+    unblock: fn(&OwnedFd) -> nix::Result<()>,
+) -> Run {
     let deadline = Instant::now() + timeout;
+    // The whole bound rests on this call. `fill` reports "nothing yet" from
+    // `EAGAIN` and from nothing else, and a blocking descriptor never produces
+    // one: the parent would sit inside `read` until a writer speaks or every
+    // writer closes, and the deadline below would never be looked at. A
+    // descendant that inherited the write end could then park the login path
+    // for as long as it cared to. So a pipe that could not be unblocked is not
+    // read at all.
+    if let Err(error) = unblock(answer) {
+        tracing::warn!(
+            target: "tessera.role",
+            error = %error,
+            "the answer pipe cannot be given a bound; \
+             the local account database decides on its own"
+        );
+        kill_and_reap(child);
+        return Run::unstartable();
+    }
+
+    let mut collected: Vec<u8> = Vec::new();
     loop {
-        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => {
-                if Instant::now() >= deadline {
+        match fill(answer, &mut collected) {
+            Filling::Ended => break,
+            Filling::Overlong => {
+                // Past the cap it is not an answer any more, and guessing at a
+                // truncated one on an authentication path is worse than having
+                // none.
+                kill_and_reap(child);
+                return Run {
+                    stdout: Vec::new(),
+                    outcome: Outcome::Overlong,
+                };
+            }
+            Filling::Waiting => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
                     kill_and_reap(child);
                     return Run {
                         stdout: Vec::new(),
                         outcome: Outcome::TimedOut,
                     };
                 }
-                std::thread::sleep(CHILD_POLL_INTERVAL);
+                wait_readable(answer, left);
             }
-            Ok(WaitStatus::Exited(_, code)) => {
-                return Run {
-                    stdout: drain(answer),
-                    outcome: Outcome::Exited(code),
+        }
+    }
+
+    Run {
+        outcome: collect_status(child, deadline),
+        stdout: collected,
+    }
+}
+
+/// Put the read end into non-blocking mode, through an interruption.
+///
+/// An interrupted `fcntl` has changed nothing, so the only way to know the
+/// descriptor is unblocked is to ask again; every other failure is reported,
+/// because the caller's bound cannot be enforced without it.
+fn set_nonblocking(answer: &OwnedFd) -> nix::Result<()> {
+    loop {
+        match nix::fcntl::fcntl(
+            answer,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        ) {
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// What one attempt at emptying the pipe found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Filling {
+    /// Nothing more is coming: every writer has closed its end.
+    Ended,
+    /// The pipe is empty for now and a writer is still holding it open.
+    Waiting,
+    /// More has arrived than an answer can be.
+    Overlong,
+}
+
+/// Move whatever is in the pipe right now into `collected`.
+fn fill(answer: &OwnedFd, collected: &mut Vec<u8>) -> Filling {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match nix::unistd::read(answer, &mut buffer) {
+            Ok(0) => return Filling::Ended,
+            Ok(read) => {
+                collected.extend_from_slice(buffer.get(..read).unwrap_or_default());
+                if collected.len() > MAX_ANSWER_BYTES {
+                    return Filling::Overlong;
                 }
             }
             Err(Errno::EINTR) => {}
-            // A child killed by someone else, a status this wait was not
-            // asking for, or `ECHILD` — a PAM host that reaps in its own
-            // `SIGCHLD` handler may have collected this child before we
-            // looked. Nothing is left running in any of these cases, and an
-            // answer that cannot be tied to a status is not used.
-            Ok(_) | Err(_) => return Run::unstartable(),
+            Err(Errno::EAGAIN) => return Filling::Waiting,
+            // Any other error on the read end is not something a further read
+            // would recover from, and an incomplete answer is treated as the
+            // end of one: what was collected still parses, and what is missing
+            // from it can only cost a refusal, never cause one.
+            Err(_) => return Filling::Ended,
+        }
+    }
+}
+
+/// Block until the pipe has something to say, or `budget` runs out.
+///
+/// An interrupted or failed wait is not distinguished from a timely one: the
+/// caller re-reads either way, and the bound is enforced by the deadline it
+/// keeps, not by this call.
+fn wait_readable(answer: &OwnedFd, budget: Duration) {
+    let mut watched = [PollFd::new(answer.as_fd(), PollFlags::POLLIN)];
+    let budget = PollTimeout::try_from(budget).unwrap_or(PollTimeout::MAX);
+    let _readable = poll(&mut watched, budget);
+}
+
+/// Establish how the child that has finished writing ended.
+///
+/// The answer is already in hand by the time this runs, so the status only
+/// refines it and can never take it away. `ECHILD` is not a failure: a host
+/// process with `SIGCHLD` set to `SIG_IGN` has the kernel reap its children, so
+/// there is no status left to read and nothing left running either.
+///
+/// The bound is still enforced — the child is stopped when it runs out — but
+/// running out here is not a timeout in the sense the caller acts on: a
+/// resolver that streamed a whole answer and closed its pipe has answered, and
+/// throwing that away for a status that was a few microseconds late would both
+/// discard a complete verdict and quiet the source for its whole cooldown.
+fn collect_status(child: Pid, deadline: Instant) -> Outcome {
+    loop {
+        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(_, code)) => return Outcome::Exited(code),
+            Ok(WaitStatus::StillAlive) => {
+                // The pipe is closed and the process is not gone yet: normally
+                // the last moments between `_exit` and the status being ready.
+                if Instant::now() >= deadline {
+                    kill_and_reap(child);
+                    return Outcome::EndedWithoutStatus;
+                }
+                std::thread::sleep(CHILD_POLL_INTERVAL);
+            }
+            Err(Errno::EINTR) => {}
+            Err(Errno::ECHILD) => return Outcome::EndedWithoutStatus,
+            // A child killed by a signal, or a status this wait was not asking
+            // for: the answer cannot be trusted to be whole, so it is not used.
+            Ok(_) | Err(_) => return Outcome::Unstartable,
         }
     }
 }
@@ -352,48 +607,31 @@ fn supervise(child: Pid, answer: OwnedFd, timeout: Duration) -> Run {
 ///
 /// `SIGKILL` without a polite stage: the resolver has no state to flush and
 /// nothing to clean up, and every millisecond spent here is spent on the login
-/// path. The wait afterwards has no bound of its own because the signal cannot
-/// be caught or ignored — the child is already on its way out, and giving up on
-/// collecting it would leave a zombie behind on every slow login.
+/// path.
+///
+/// The wait afterwards polls rather than blocks, and gives up after
+/// [`REAP_GRACE`]. A blocking wait would be the shorter code, but on a host
+/// that has set `SIGCHLD` to `SIG_IGN` it does not mean "wait for this child":
+/// it means "wait until every child of this process has ended", and a greeter
+/// with a long-running child of its own would hold the login there for as long
+/// as that child lives. A signal that cannot be caught leaves nothing to wait
+/// for anyway — the grace is for the moment between the kill and the kernel
+/// getting round to it.
 fn kill_and_reap(child: Pid) {
     let _signalled = kill(child, Signal::SIGKILL);
+    let deadline = Instant::now() + REAP_GRACE;
     loop {
-        match waitpid(child, None) {
-            Err(Errno::EINTR) => {}
-            _ => return,
-        }
-    }
-}
-
-/// Read everything the ended child wrote, without ever blocking on it.
-///
-/// The read end is switched to non-blocking first: should a descendant have
-/// inherited the write end, a blocking read would park the login path on a pipe
-/// nobody is going to close.
-fn drain(answer: OwnedFd) -> Vec<u8> {
-    let _nonblocking = nix::fcntl::fcntl(
-        &answer,
-        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    );
-    let mut source = std::fs::File::from(answer);
-    let mut collected = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match source.read(&mut buffer) {
-            Ok(0) => return collected,
-            Ok(read) => {
-                collected.extend_from_slice(buffer.get(..read).unwrap_or_default());
-                if collected.len() > MAX_ANSWER_BYTES {
-                    // Past the cap it is not an answer any more, and guessing
-                    // at a truncated one on an authentication path is worse
-                    // than having none.
-                    return Vec::new();
+        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                if Instant::now() >= deadline {
+                    return;
                 }
+                std::thread::sleep(CHILD_POLL_INTERVAL);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            // Anything else, `WouldBlock` included, means nothing more is
-            // coming: the writer is gone.
-            Err(_) => return collected,
+            Err(Errno::EINTR) => {}
+            // Collected — by this wait, or by a kernel reaping for a host that
+            // ignores `SIGCHLD` (`ECHILD`). Either way nothing is left behind.
+            Ok(_) | Err(_) => return,
         }
     }
 }
@@ -401,6 +639,8 @@ fn drain(answer: OwnedFd) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::missing_docs_in_private_items)]
+
+    use std::fmt::Write as _;
 
     use super::*;
 
@@ -412,6 +652,108 @@ mod tests {
             .map(PathBuf::from)
             .find(|path| path.is_file())
             .expect("one of these programs exists on every supported dev host")
+    }
+
+    /// A live child and a pipe nothing is ever going to close: the shape in
+    /// which a read on a blocking descriptor would never return.
+    ///
+    /// The write end is handed back so the caller keeps it open; the child is
+    /// only there to be waited for and killed.
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the child is collected the way the supervised one is — by \
+                  `waitpid` on its pid, which this code under test does"
+    )]
+    fn unending_pipe_and_child() -> (Pid, OwnedFd, OwnedFd) {
+        let sleep = first_existing(&["/bin/sleep", "/usr/bin/sleep"]);
+        let child = std::process::Command::new(sleep)
+            .arg("30")
+            .spawn()
+            .expect("a sleep can be started");
+        let (read_end, write_end) = cloexec_pipe().expect("a pipe can be made");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("a pid fits in an i32"));
+        (pid, read_end, write_end)
+    }
+
+    #[test]
+    fn a_pipe_that_cannot_be_bounded_is_never_read() {
+        // The bound lives entirely in the non-blocking descriptor: without it
+        // the read below would sit there until a writer spoke, and this test
+        // would not finish at all. So a refused unblocking must end the run
+        // before the first read — as silence, which leaves the local database
+        // deciding on its own.
+        fn refused(_answer: &OwnedFd) -> nix::Result<()> {
+            Err(Errno::EPERM)
+        }
+
+        let (child, read_end, _write_end) = unending_pipe_and_child();
+        let started = Instant::now();
+
+        let run = supervise_with(child, &read_end, Duration::from_secs(30), refused);
+
+        assert_eq!(run.outcome, Outcome::Unstartable);
+        assert!(run.stdout.is_empty(), "nothing was read");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the run must end at the refusal, not on the pipe: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            kill(child, None),
+            Err(Errno::ESRCH),
+            "the child is stopped and collected even though nothing was read"
+        );
+    }
+
+    #[test]
+    fn an_unblocked_pipe_reports_emptiness_instead_of_waiting_on_it() {
+        // What the flag buys, stated as the property the deadline depends on:
+        // an empty pipe with a writer still holding it open answers at once.
+        let (child, read_end, _write_end) = unending_pipe_and_child();
+
+        set_nonblocking(&read_end).expect("a pipe read end can be unblocked");
+
+        let mut collected = Vec::new();
+        assert_eq!(fill(&read_end, &mut collected), Filling::Waiting);
+        assert!(collected.is_empty());
+        kill_and_reap(child);
+    }
+
+    #[test]
+    fn an_answer_complete_at_the_deadline_is_kept() {
+        // The child wrote everything and closed the pipe; only its status was
+        // not ready before the bound ran out. The answer is complete, so it
+        // stands — and the source is not quieted, because it did answer.
+        let (child, _read_end, _write_end) = unending_pipe_and_child();
+
+        let outcome = collect_status(child, Instant::now());
+
+        assert_eq!(
+            outcome,
+            Outcome::EndedWithoutStatus,
+            "a status that came too late is not a lost answer"
+        );
+        assert_eq!(
+            kill(child, None),
+            Err(Errno::ESRCH),
+            "the bound still ends the process, whatever it does to the answer"
+        );
+
+        let resolution = interpret(
+            &Run {
+                stdout: b"serv:x:4000:4000::/home/serv:/bin/sh\n".to_vec(),
+                outcome,
+            },
+            &["serv"],
+        );
+        assert!(
+            !resolution.exhausted_its_bound(),
+            "a source that answered must not be quieted for its cooldown"
+        );
+        assert_eq!(
+            resolution.answer_for("serv"),
+            super::super::system_account::PasswdLookup::Uid(4000)
+        );
     }
 
     #[test]
@@ -451,10 +793,10 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_resolver_is_silence_and_does_not_latch() {
+    fn a_missing_resolver_is_silence_and_does_not_quiet_the_source() {
         // A device without `getent`, or with one the path check refuses: the
-        // source says nothing, and it is not the kind of nothing that closes
-        // the source for the rest of the process — no bound was exhausted.
+        // source says nothing, and it is not the kind of nothing that quiets
+        // the source for a while — no bound was exhausted.
         let resolution = resolve_with(
             Path::new("/nonexistent/getent"),
             &["serv"],
@@ -510,7 +852,7 @@ mod tests {
     #[test]
     fn a_run_stopped_at_its_bound_reports_the_bound_as_exhausted() {
         // What the killed child must turn into: silence about every name, and
-        // the one signal that closes the source for the rest of the process.
+        // the one signal that quiets the source until its cooldown is over.
         let stopped = Run {
             stdout: Vec::new(),
             outcome: Outcome::TimedOut,
@@ -520,11 +862,224 @@ mod tests {
 
         assert!(
             resolution.exhausted_its_bound(),
-            "an exhausted bound is what closes the source for the rest of the process"
+            "an exhausted bound is what quiets the source until the cooldown is over"
         );
         assert_eq!(
             resolution.answer_for("serv"),
             super::super::system_account::PasswdLookup::Unavailable
+        );
+    }
+
+    #[test]
+    fn an_answer_larger_than_the_pipe_is_read_whole() {
+        // The pipe holds 64 KiB on Linux. A parent that waited for the child
+        // before reading would deadlock against a child blocked writing, and
+        // the bound would run out on an answer that was ready all along — on
+        // exactly the devices with the largest role bases. Two hundred records
+        // of a plausible length put the answer well past the buffer.
+        let printf = first_existing(&["/usr/bin/printf", "/bin/printf"]);
+        let padding = "x".repeat(300);
+        let mut answer = String::new();
+        for index in 0..250 {
+            let _written = writeln!(
+                answer,
+                "serv{index:03}:x:{uid}:{uid}:{padding}:/home/serv{index:03}:/bin/sh",
+                uid = 4000 + index,
+            );
+        }
+        assert!(
+            answer.len() > 80 * 1024,
+            "the answer must be past a pipe buffer to prove anything: {}",
+            answer.len()
+        );
+
+        let run = run(&printf, &[&answer], Duration::from_secs(30));
+
+        assert_eq!(
+            run.outcome,
+            Outcome::Exited(0),
+            "a resolver that fills the pipe still ends normally"
+        );
+        assert_eq!(run.stdout.len(), answer.len(), "the answer is read whole");
+        assert_eq!(
+            lookup_in_passwd_bytes(&run.stdout, "serv249", &"getent passwd"),
+            super::super::system_account::PasswdLookup::Uid(4249),
+            "the last record — the one past the pipe buffer — is there"
+        );
+    }
+
+    #[test]
+    fn a_resolver_that_never_stops_writing_is_cut_off_and_says_nothing() {
+        // The cap only became reachable once the pipe is emptied while the
+        // child runs. Past it the output is not an answer, and a stream with
+        // no end must not be allowed to grow the login path's memory.
+        let yes = first_existing(&["/usr/bin/yes", "/bin/yes"]);
+        let started = Instant::now();
+
+        let run = run(
+            &yes,
+            &["serv:x:4000:4000::/home/serv:/bin/sh"],
+            Duration::from_secs(30),
+        );
+
+        assert_eq!(run.outcome, Outcome::Overlong);
+        assert!(
+            run.stdout.is_empty(),
+            "a capped answer is not half an answer"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the cap must end the run long before the bound: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The `SIGCHLD`-ignoring scenario itself; the test below runs it.
+    ///
+    /// It is `#[ignore]`d because the disposition it changes is the whole
+    /// process's, and the rest of this suite spawns children in parallel.
+    #[test]
+    #[ignore = "changes the process-wide SIGCHLD disposition; run in a process of its own"]
+    fn a_reaping_host_keeps_the_answer_inner() {
+        use nix::sys::signal::{signal, SigHandler};
+
+        // SAFETY: this process was started by the test below for this scenario
+        // alone, so nothing else here depends on how children are collected.
+        #[allow(unsafe_code)]
+        unsafe { signal(Signal::SIGCHLD, SigHandler::SigIgn) }.expect("SIGCHLD can be ignored");
+
+        let printf = first_existing(&["/usr/bin/printf", "/bin/printf"]);
+        let run = run(
+            &printf,
+            &["serv:x:4000:4000::/home/serv:/bin/sh\n"],
+            Duration::from_secs(30),
+        );
+
+        assert_ne!(
+            run.outcome,
+            Outcome::Unstartable,
+            "a host that reaps its own children has not broken the resolver"
+        );
+        assert_eq!(
+            lookup_in_passwd_bytes(&run.stdout, "serv", &"getent passwd"),
+            super::super::system_account::PasswdLookup::Uid(4000),
+            "the answer was written and read; there was simply no status to collect"
+        );
+    }
+
+    #[test]
+    fn a_host_that_reaps_its_own_children_still_gets_the_answer() {
+        // `SIGCHLD` set to `SIG_IGN` has the kernel collect children by itself,
+        // so the wait returns `ECHILD` for every successful run. Treating that
+        // as a failure would throw away a complete answer on every login of
+        // every such host, and pay a fork each time for nothing.
+        let binary = std::env::current_exe().expect("the test binary knows its own path");
+        let inner = std::process::Command::new(binary)
+            .args([
+                "--exact",
+                "role::getent::tests::a_reaping_host_keeps_the_answer_inner",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .output()
+            .expect("the test binary can run itself");
+
+        assert!(
+            inner.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&inner.stdout),
+            String::from_utf8_lossy(&inner.stderr)
+        );
+    }
+
+    #[test]
+    fn an_end_without_a_status_is_still_an_answer() {
+        // What the scenario above amounts to, stated directly: the child wrote
+        // its answer and closed the pipe, and that the status could not be
+        // collected says something about the host, not about the answer.
+        let reaped = Run {
+            stdout: b"dyn-service:x:61184:61184::/:/usr/sbin/nologin\n".to_vec(),
+            outcome: Outcome::EndedWithoutStatus,
+        };
+
+        let resolution = interpret(&reaped, &["dyn-service"]);
+
+        assert!(!resolution.exhausted_its_bound());
+        assert_eq!(
+            resolution.answer_for("dyn-service"),
+            super::super::system_account::PasswdLookup::Uid(61184)
+        );
+    }
+
+    #[test]
+    fn only_names_that_could_be_roles_are_asked_about() {
+        // A name is a file stem, and nothing has checked it against the
+        // role-id grammar by the time it gets here. One outside the grammar
+        // can never be a role, so leaving it out costs nothing — and what is
+        // not on the command line cannot be read as an option.
+        let asked = askable(&[
+            "serv",
+            "--service=evil",
+            "-s",
+            "--help",
+            "ROOT",
+            "with space",
+            "toolongtobearoleid",
+        ])
+        .expect("one askable name remains");
+
+        assert_eq!(asked, vec!["serv"]);
+        assert!(
+            askable(&["--service=evil"]).is_none(),
+            "a run with nothing askable left is not worth a process"
+        );
+    }
+
+    #[test]
+    fn every_name_is_passed_after_the_end_of_options_marker() {
+        // `getent` parses options wherever they appear, so the marker is what
+        // makes a key a key.
+        assert_eq!(
+            command_line(&["serv", "oper"]),
+            vec!["passwd", "--", "serv", "oper"]
+        );
+    }
+
+    #[test]
+    fn a_hostile_name_reaches_the_resolver_as_nothing_at_all() {
+        // End to end: the run happens for the name that could be a role, and
+        // the one that could not is a name the source says nothing about.
+        let echo = first_existing(&["/bin/echo", "/usr/bin/echo"]);
+
+        let resolution = resolve_with(&echo, &["--service=evil", "serv"], Duration::from_secs(30));
+
+        assert!(!resolution.exhausted_its_bound());
+        assert_eq!(
+            resolution.answer_for("--service=evil"),
+            super::super::system_account::PasswdLookup::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_base_past_the_cap_is_not_asked_about_at_all() {
+        // Every name is a word on a command line, and an argument list past
+        // the kernel's limit fails inside the child, where the only thing it
+        // can turn into is silence indistinguishable from a broken resolver.
+        let names: Vec<String> = (0..=MAX_NAMES_PER_RUN)
+            .map(|index| format!("role{index:04}"))
+            .collect();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        assert!(askable(&borrowed).is_none());
+        assert!(
+            askable(
+                borrowed
+                    .get(..MAX_NAMES_PER_RUN)
+                    .expect("the list is longer than the cap")
+            )
+            .is_some(),
+            "a base at the cap is still asked about"
         );
     }
 

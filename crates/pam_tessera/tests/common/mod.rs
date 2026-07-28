@@ -69,7 +69,9 @@ impl RoleFixture {
             default_session_ttl: Duration::from_secs(
                 tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
             ),
-            accounts: test_accounts(),
+            // The store was loaded through [`test_accounts`], and the check
+            // takes both the view and its verdicts from that load.
+            accounts: tessera_core::role::AccountCheck::from_store(&self.store),
         }
     }
 }

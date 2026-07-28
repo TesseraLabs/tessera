@@ -439,11 +439,17 @@ pub struct RoleStage<'a> {
     pub store: &'a tessera_core::role::RoleStore,
     /// Global default session TTL from `[roles].default_session_ttl`.
     pub default_session_ttl: std::time::Duration,
-    /// The device's account view, used to refuse a login into an account the
-    /// system already owns. It travels with the stage because the role and the
-    /// login account are the same name, so "which accounts exist here" is an
-    /// input to role selection like the store itself.
-    pub accounts: tessera_core::role::SystemAccounts,
+    /// How this stage decides whether a name is an account the system already
+    /// owns: the device's account view, plus whatever verdicts that same view
+    /// has already reached.
+    ///
+    /// It travels with the stage because the role and the login account are the
+    /// same name, so "which accounts exist here" is an input to role selection
+    /// like the store itself. The pairing of view and verdicts lives inside
+    /// [`tessera_core::role::AccountCheck`], which is what keeps a load run
+    /// against a view that knows no accounts from clearing a name the device
+    /// itself refuses.
+    pub accounts: tessera_core::role::AccountCheck<'a>,
 }
 
 /// Outcome of a successful authentication.
@@ -1738,10 +1744,14 @@ fn requested_role(pam_user: &str) -> Result<tessera_core::role::RoleId, FlowErro
 /// database could not be consulted to establish otherwise (fail-closed).
 fn ensure_role_account(
     pam_user: &str,
-    accounts: tessera_core::role::SystemAccounts,
+    accounts: tessera_core::role::AccountCheck<'_>,
 ) -> Result<(), FlowError> {
     use tessera_core::role::{RoleDenyReason, SystemAccountError};
 
+    // Whether the verdict comes from the store's load or from a fresh lookup is
+    // decided inside the check, which holds the view and that view's own
+    // verdicts as one thing: a name the load already asked about is not paid
+    // for twice, and a name it never saw is asked about in full.
     accounts.check(pam_user).map_err(|error| {
         let reason = match error {
             SystemAccountError::SystemAccount { .. } => RoleDenyReason::SystemAccount,
@@ -2132,6 +2142,13 @@ mod tests {
         _dir: tempfile::TempDir,
         store: tessera_core::role::RoleStore,
         requested: tessera_core::role::RoleId,
+        /// The account view this fixture's stage authenticates against, when it
+        /// is not the one the store was loaded through.
+        ///
+        /// `None` means the two are the same and the stage may take both from
+        /// the store; `Some` names the device view a login is judged by while
+        /// the base on disk got in under a different one.
+        authenticating_view: Option<tessera_core::role::SystemAccounts>,
     }
 
     impl RoleFixture {
@@ -2155,6 +2172,7 @@ mod tests {
                 _dir: dir,
                 store,
                 requested: tessera_core::role::RoleId::new("serv").unwrap(),
+                authenticating_view: None,
             }
         }
 
@@ -2191,6 +2209,11 @@ mod tests {
                 _dir: dir,
                 store,
                 requested: tessera_core::role::RoleId::new("root").unwrap(),
+                // The load ran against a view that knows no accounts, which is
+                // what let the `root` slice in. The login is judged by the
+                // device's own view instead, and that view has not been asked
+                // about anything yet — so the stage asks it afresh.
+                authenticating_view: Some(test_accounts()),
             }
         }
 
@@ -2203,7 +2226,10 @@ mod tests {
                 default_session_ttl: Duration::from_secs(
                     tessera_core::config::validated::DEFAULT_ROLE_SESSION_TTL_SECONDS,
                 ),
-                accounts: test_accounts(),
+                accounts: self.authenticating_view.map_or_else(
+                    || tessera_core::role::AccountCheck::from_store(&self.store),
+                    tessera_core::role::AccountCheck::from_view,
+                ),
             }
         }
     }
@@ -3893,16 +3919,22 @@ level = "info"
 
     #[test]
     fn role_account_outside_the_system_range_passes_the_account_check() {
-        ensure_role_account(RoleFixture::ACCOUNT, test_accounts())
-            .expect("a provisioned role account must pass");
+        ensure_role_account(
+            RoleFixture::ACCOUNT,
+            tessera_core::role::AccountCheck::from_view(test_accounts()),
+        )
+        .expect("a provisioned role account must pass");
     }
 
     #[test]
     fn absent_account_is_not_refused_by_the_account_check() {
         // An account with no passwd entry is refused later, on its own terms
         // (no such role, no such user); this gate must not pre-empt that.
-        ensure_role_account("ghost", test_accounts())
-            .expect("an absent account must not be refused here");
+        ensure_role_account(
+            "ghost",
+            tessera_core::role::AccountCheck::from_view(test_accounts()),
+        )
+        .expect("an absent account must not be refused here");
     }
 
     #[test]
@@ -3910,8 +3942,11 @@ level = "info"
         let accounts = tessera_core::role::SystemAccounts::with_lookup(|_| {
             tessera_core::role::PasswdLookup::Unavailable
         });
-        let err = ensure_role_account("serv", accounts)
-            .expect_err("an unusable passwd database must fail closed");
+        let err = ensure_role_account(
+            "serv",
+            tessera_core::role::AccountCheck::from_view(accounts),
+        )
+        .expect_err("an unusable passwd database must fail closed");
         // Denied like any other undecidable login, but audited as a backend
         // failure: `system_account` means somebody tried to enter an account
         // the system owns, and a name service that keeps dropping must not
@@ -3933,9 +3968,16 @@ level = "info"
             _ => tessera_core::role::PasswdLookup::Unavailable,
         });
 
-        let attack = ensure_role_account("root", accounts).expect_err("root must be refused");
-        let outage = ensure_role_account("serv", accounts)
-            .expect_err("an unusable passwd database must fail closed");
+        let attack = ensure_role_account(
+            "root",
+            tessera_core::role::AccountCheck::from_view(accounts),
+        )
+        .expect_err("root must be refused");
+        let outage = ensure_role_account(
+            "serv",
+            tessera_core::role::AccountCheck::from_view(accounts),
+        )
+        .expect_err("an unusable passwd database must fail closed");
 
         assert!(
             matches!(
@@ -3953,13 +3995,133 @@ level = "info"
         );
     }
 
+    /// How many times [`reused_names`] was asked. A counter per test: the
+    /// suite runs them in parallel, and a shared one would count the other
+    /// test's questions.
+    static REUSED_NAME_LOOKUPS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    /// The same, for the test that asks about a name outside the base.
+    static FRESH_NAME_LOOKUPS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// The additive source of the account view below, counting its questions.
+    ///
+    /// It stands for the source whose cost is the one worth not paying twice:
+    /// on a device it is a process, and on a slow directory it is the whole
+    /// configured bound.
+    fn reused_names(_account: &str, _timeout: Duration) -> tessera_core::role::PasswdLookup {
+        REUSED_NAME_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tessera_core::role::PasswdLookup::NoEntry
+    }
+
+    /// The same source for the other test.
+    fn fresh_names(_account: &str, _timeout: Duration) -> tessera_core::role::PasswdLookup {
+        FRESH_NAME_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tessera_core::role::PasswdLookup::NoEntry
+    }
+
+    /// The local source paired with it: `serv` is a role account, `root` is the
+    /// system's.
+    fn counted_local(account: &str) -> tessera_core::role::PasswdLookup {
+        match account {
+            "root" => tessera_core::role::PasswdLookup::Uid(0),
+            _ => tessera_core::role::PasswdLookup::Uid(4000),
+        }
+    }
+
+    #[test]
+    fn a_login_into_a_role_asks_the_name_service_once() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // Loading the store already asked about every slice name, waiting out
+        // the additive source's bound if it came to that. A login into one of
+        // those names must not pay that wait a second time — the bound the
+        // configuration states is the bound one login attempt may cost.
+        let accounts =
+            tessera_core::role::SystemAccounts::with_sources(counted_local, reused_names);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("serv.toml"),
+            b"role = \"serv\"\nversion = 4\nos = \"linux\"\nname = \"serv\"\nlevel = 1\n\
+              [payload]\ngroups = [\"wheel\"]\n"
+                .as_slice(),
+        )
+        .unwrap();
+
+        REUSED_NAME_LOOKUPS.store(0, Relaxed);
+        let store = tessera_core::role::RoleStore::load(
+            dir.path(),
+            tessera_core::role::RoleOs::Linux,
+            tessera_core::role::TrustMode::Standalone,
+            accounts,
+        )
+        .unwrap();
+        assert_eq!(
+            REUSED_NAME_LOOKUPS.load(Relaxed),
+            1,
+            "the load asks about the one slice name"
+        );
+
+        ensure_role_account("serv", tessera_core::role::AccountCheck::from_store(&store))
+            .expect("a provisioned role account must pass");
+
+        assert_eq!(
+            REUSED_NAME_LOOKUPS.load(Relaxed),
+            1,
+            "the verdict the load already reached is the verdict the login uses"
+        );
+    }
+
+    #[test]
+    fn a_login_into_an_account_no_slice_is_named_after_is_still_asked_about() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // The other half: the snapshot's local source would answer about such
+        // a name, but its additive source was never asked — and that is the
+        // one source that sees an account no local file holds. Reusing the
+        // snapshot here would drop it silently.
+        let accounts = tessera_core::role::SystemAccounts::with_sources(counted_local, fresh_names);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("serv.toml"),
+            b"role = \"serv\"\nversion = 4\nos = \"linux\"\nname = \"serv\"\nlevel = 1\n\
+              [payload]\ngroups = [\"wheel\"]\n"
+                .as_slice(),
+        )
+        .unwrap();
+        let store = tessera_core::role::RoleStore::load(
+            dir.path(),
+            tessera_core::role::RoleOs::Linux,
+            tessera_core::role::TrustMode::Standalone,
+            accounts,
+        )
+        .unwrap();
+        assert!(!store
+            .account_snapshot()
+            .expect("a store loaded from a directory carries its snapshot")
+            .covers("oper"));
+
+        FRESH_NAME_LOOKUPS.store(0, Relaxed);
+        ensure_role_account("oper", tessera_core::role::AccountCheck::from_store(&store))
+            .expect("an account outside the base is not a system account here");
+
+        assert_eq!(
+            FRESH_NAME_LOOKUPS.load(Relaxed),
+            1,
+            "a name the snapshot was not taken for has to be asked about"
+        );
+    }
+
     #[test]
     fn system_account_denial_says_nothing_about_the_store() {
         // The message must not become the store oracle that an early
         // role-existence check would have been.
-        let err = ensure_role_account("root", test_accounts())
-            .expect_err("root must be refused")
-            .to_string();
+        let err = ensure_role_account(
+            "root",
+            tessera_core::role::AccountCheck::from_view(test_accounts()),
+        )
+        .expect_err("root must be refused")
+        .to_string();
         assert!(!err.contains("slice"), "{err}");
         assert!(!err.contains("store"), "{err}");
     }
