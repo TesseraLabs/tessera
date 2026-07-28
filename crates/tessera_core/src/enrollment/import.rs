@@ -55,6 +55,7 @@ use sha2::{Digest, Sha256};
 use crate::role::manifest::MANIFEST_FILENAME;
 use crate::role::{
     self, atomic_update, ManifestError, RoleOs, RoleStoreError, SystemAccounts, UpdateTrust,
+    DEFAULT_ACCOUNT_LOOKUP_TIMEOUT,
 };
 
 use super::audit;
@@ -430,7 +431,10 @@ impl EnrollmentPackage {
                 &staged,
                 device_os,
                 &UpdateTrust::Standalone,
-                SystemAccounts::passwd(),
+                // The default bound, not a configured one: an import is an
+                // operator command, not a login, and the device configuration
+                // it would read is part of what enrollment puts in place.
+                SystemAccounts::device(DEFAULT_ACCOUNT_LOOKUP_TIMEOUT),
             ) {
                 committed.rollback();
                 return Err(ImportError::from(e));
@@ -1102,7 +1106,8 @@ impl EnrollmentPackage {
                     trusted_pubkey,
                     persist_dir: &paths.persist_dir,
                 },
-                SystemAccounts::passwd(),
+                // See the standalone path: an import runs the default bound.
+                SystemAccounts::device(DEFAULT_ACCOUNT_LOOKUP_TIMEOUT),
             ) {
                 committed.rollback();
                 restore_prior_floor(&paths.persist_dir, already);

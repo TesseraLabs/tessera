@@ -221,7 +221,9 @@ deploy_store_with_serv() {
     rm -f "$ROLES_DIR"/*.toml
     install -m 0644 -o root -g root "$STORE_SRC/serv.toml" "$ROLES_DIR/serv.toml"
     # Sanity: the CLI must agree the slice loads (lenient list).
-    if ! tessera role list --dir "$ROLES_DIR" --os linux | grep -q '^serv	'; then
+    # --on-device: this runs on the device the base belongs to, so the slice
+    # names are checked against the accounts that will actually serve the login.
+    if ! tessera role list --dir "$ROLES_DIR" --os linux --on-device | grep -q '^serv	'; then
         log "WARN: 'tessera role list' did not report serv — store deploy may be wrong"
     fi
 }

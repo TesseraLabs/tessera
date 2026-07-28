@@ -218,6 +218,10 @@ pub struct RolesSection {
     /// Global default session TTL, used when neither the certificate nor the
     /// role sets one. Default 12h; never unbounded (design Decision 8).
     pub default_session_ttl: Duration,
+    /// How long name resolution may take while deciding whether the login
+    /// account is a system account. Default 10s. Exhausting it is silence, not
+    /// a refusal, but the wait itself lands on every login attempt.
+    pub account_lookup_timeout: Duration,
 }
 
 impl Default for RolesSection {
@@ -225,6 +229,7 @@ impl Default for RolesSection {
         Self {
             dir: PathBuf::from(crate::role::DEFAULT_ROLES_DIR),
             default_session_ttl: Duration::from_secs(DEFAULT_ROLE_SESSION_TTL_SECONDS),
+            account_lookup_timeout: crate::role::DEFAULT_ACCOUNT_LOOKUP_TIMEOUT,
         }
     }
 }
@@ -685,10 +690,44 @@ fn validate_roles(raw: &RawRoles) -> Result<RolesSection, Error> {
         Some(secs) => Duration::from_secs(secs),
         None => Duration::from_secs(DEFAULT_ROLE_SESSION_TTL_SECONDS),
     };
+    let account_lookup_timeout =
+        validate_account_lookup_timeout(raw.account_lookup_timeout_seconds)?;
     Ok(RolesSection {
         dir,
         default_session_ttl,
+        account_lookup_timeout,
     })
+}
+
+/// Turn `[roles].account_lookup_timeout_seconds` into the bound the account
+/// check applies.
+///
+/// Zero is refused rather than read as "do not wait": name resolution is the
+/// only source that sees the `DynamicUser=` accounts the local passwd file has
+/// no entry for, so a bound of zero would silently reopen the gap in the upper
+/// uid boundary that the source exists to close. The upper limit is refused for
+/// the opposite reason — the wait sits ahead of the credential on every login
+/// attempt, and past a minute it reads as a dead device rather than a slow one.
+fn validate_account_lookup_timeout(seconds: Option<u64>) -> Result<Duration, Error> {
+    let max = crate::role::MAX_ACCOUNT_LOOKUP_TIMEOUT;
+    match seconds {
+        None => Ok(crate::role::DEFAULT_ACCOUNT_LOOKUP_TIMEOUT),
+        Some(0) => Err(Error::ConfigInvalid {
+            reason: "[roles].account_lookup_timeout_seconds must be > 0: a zero limit would \
+                     disable the name-resolution check that refuses logins into systemd \
+                     DynamicUser accounts, which have no entry in /etc/passwd"
+                .into(),
+        }),
+        Some(secs) if Duration::from_secs(secs) > max => Err(Error::ConfigInvalid {
+            reason: format!(
+                "[roles].account_lookup_timeout_seconds must be at most {} (got {secs}): the \
+                 check runs before any credential is presented, so a longer wait only delays \
+                 every login attempt, including the emergency console one",
+                max.as_secs()
+            ),
+        }),
+        Some(secs) => Ok(Duration::from_secs(secs)),
+    }
 }
 
 fn fly_dm_absolute_path(
@@ -2159,6 +2198,79 @@ mod tests {
     }
 
     #[test]
+    fn roles_account_lookup_timeout_defaults_to_ten_seconds() {
+        let s = validate_roles(&RawRoles::default()).expect("defaults are valid");
+        assert_eq!(
+            s.account_lookup_timeout,
+            crate::role::DEFAULT_ACCOUNT_LOOKUP_TIMEOUT
+        );
+        assert_eq!(s.account_lookup_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn roles_custom_account_lookup_timeout_is_taken() {
+        let s = validate_roles(&RawRoles {
+            account_lookup_timeout_seconds: Some(3),
+            ..Default::default()
+        })
+        .expect("a limit inside the allowed band is accepted");
+        assert_eq!(s.account_lookup_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn roles_rejects_a_zero_account_lookup_timeout() {
+        // Zero would read as "do not consult name resolution at all", and that
+        // source is the only one that sees DynamicUser accounts.
+        let err = validate_roles(&RawRoles {
+            account_lookup_timeout_seconds: Some(0),
+            ..Default::default()
+        })
+        .unwrap_err();
+        match err {
+            Error::ConfigInvalid { reason } => {
+                assert!(
+                    reason.contains("account_lookup_timeout_seconds"),
+                    "diagnostic must name the key, got: {reason}"
+                );
+                assert!(
+                    reason.contains("DynamicUser"),
+                    "diagnostic must say what a zero limit gives up, got: {reason}"
+                );
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roles_rejects_an_account_lookup_timeout_past_the_ceiling() {
+        let ceiling = crate::role::MAX_ACCOUNT_LOOKUP_TIMEOUT.as_secs();
+        validate_roles(&RawRoles {
+            account_lookup_timeout_seconds: Some(ceiling),
+            ..Default::default()
+        })
+        .expect("the ceiling itself is allowed");
+
+        let err = validate_roles(&RawRoles {
+            account_lookup_timeout_seconds: Some(ceiling + 1),
+            ..Default::default()
+        })
+        .unwrap_err();
+        match err {
+            Error::ConfigInvalid { reason } => {
+                assert!(
+                    reason.contains("account_lookup_timeout_seconds"),
+                    "diagnostic must name the key, got: {reason}"
+                );
+                assert!(
+                    reason.contains(&ceiling.to_string()),
+                    "diagnostic must name the ceiling, got: {reason}"
+                );
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn roles_rejects_relative_dir() {
         let err = validate_roles(&RawRoles {
             dir: Some(PathBuf::from("roles")),
@@ -2310,10 +2422,12 @@ level = "info"
 [roles]
 dir = "/var/lib/tessera/roles"
 default_session_ttl_seconds = 7200
+account_lookup_timeout_seconds = 5
 "#;
         let raw: RawConfig = toml::from_str(toml_src).expect("raw parse");
         let roles = validate_roles(&raw.roles).expect("validate roles");
         assert_eq!(roles.dir, PathBuf::from("/var/lib/tessera/roles"));
         assert_eq!(roles.default_session_ttl, Duration::from_hours(2));
+        assert_eq!(roles.account_lookup_timeout, Duration::from_secs(5));
     }
 }

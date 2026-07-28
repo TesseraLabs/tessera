@@ -439,7 +439,7 @@ pub struct RoleStage<'a> {
     pub store: &'a tessera_core::role::RoleStore,
     /// Global default session TTL from `[roles].default_session_ttl`.
     pub default_session_ttl: std::time::Duration,
-    /// The device's passwd view, used to refuse a login into an account the
+    /// The device's account view, used to refuse a login into an account the
     /// system already owns. It travels with the stage because the role and the
     /// login account are the same name, so "which accounts exist here" is an
     /// input to role selection like the store itself.
@@ -1721,31 +1721,45 @@ fn requested_role(pam_user: &str) -> Result<tessera_core::role::RoleId, FlowErro
 /// exists — that fact is the oracle an early store-existence check would have
 /// created, and the reason such a check was rejected.
 ///
+/// Both refusals are equally final, but they are audited apart:
+/// `system_account` means somebody tried to log into an account the system
+/// owns, which is an attack signal worth alerting on, while
+/// `backend_unavailable` means the local account database did not answer, which is a
+/// device fault and will repeat for every login while it lasts. Merging them
+/// would bury the first under the second on any device with a flaky name
+/// service.
+///
 /// # Errors
 ///
 /// Returns [`FlowError::RoleDenied`] with
 /// [`tessera_core::role::RoleDenyReason::SystemAccount`] when the account is a
-/// system account, or when the passwd database could not be consulted to
-/// establish otherwise (fail-closed).
+/// system account, and with
+/// [`tessera_core::role::RoleDenyReason::BackendUnavailable`] when the passwd
+/// database could not be consulted to establish otherwise (fail-closed).
 fn ensure_role_account(
     pam_user: &str,
     accounts: tessera_core::role::SystemAccounts,
 ) -> Result<(), FlowError> {
-    use tessera_core::role::RoleDenyReason;
+    use tessera_core::role::{RoleDenyReason, SystemAccountError};
 
     accounts.check(pam_user).map_err(|error| {
+        let reason = match error {
+            SystemAccountError::SystemAccount { .. } => RoleDenyReason::SystemAccount,
+            // `LookupFailed`, and — since `SystemAccountError` is
+            // `non_exhaustive` — any future refusal this module has not been
+            // taught about: still a denial, under the reason that claims the
+            // least about why.
+            _ => RoleDenyReason::BackendUnavailable,
+        };
         tracing::warn!(
             target: "tessera.flow",
             error = %error,
             pam_user = %pam_user,
+            reason = %reason,
             "login account is not a role account; refused before any credential is touched"
         );
-        tessera_core::role::audit::emit_role_deny(
-            pam_user,
-            pam_user,
-            RoleDenyReason::SystemAccount.as_str(),
-        );
-        FlowError::RoleDenied(RoleDenyReason::SystemAccount)
+        tessera_core::role::audit::emit_role_deny(pam_user, pam_user, reason.as_str());
+        FlowError::RoleDenied(reason)
     })
 }
 
@@ -2147,7 +2161,7 @@ mod tests {
         /// A store that holds a `root` slice — the provisioning mistake the
         /// login gate exists for.
         ///
-        /// The slice is loaded through a passwd view that knows no accounts,
+        /// The slice is loaded through a account view that knows no accounts,
         /// because the store loader refuses such a slice on a real device.
         /// That is the point: the login must be refused even where the slice
         /// did get in.
@@ -2194,7 +2208,7 @@ mod tests {
         }
     }
 
-    /// The device's passwd view these tests authenticate against.
+    /// The device's account view these tests authenticate against.
     ///
     /// The real passwd file of the machine running the tests is never
     /// consulted: `root` must be a system account and `serv` a provisioned
@@ -3892,18 +3906,50 @@ level = "info"
     }
 
     #[test]
-    fn unusable_passwd_database_fails_closed() {
+    fn unusable_passwd_database_fails_closed_as_a_backend_failure() {
         let accounts = tessera_core::role::SystemAccounts::with_lookup(|_| {
             tessera_core::role::PasswdLookup::Unavailable
         });
         let err = ensure_role_account("serv", accounts)
             .expect_err("an unusable passwd database must fail closed");
+        // Denied like any other undecidable login, but audited as a backend
+        // failure: `system_account` means somebody tried to enter an account
+        // the system owns, and a name service that keeps dropping must not
+        // bury that signal under its own noise.
         assert!(
             matches!(
                 err,
-                FlowError::RoleDenied(tessera_core::role::RoleDenyReason::SystemAccount)
+                FlowError::RoleDenied(tessera_core::role::RoleDenyReason::BackendUnavailable)
             ),
             "got {err:?}"
+        );
+        assert_eq!(err.pam_code(), 6, "PAM_PERM_DENIED");
+    }
+
+    #[test]
+    fn a_system_account_and_a_broken_name_service_audit_apart() {
+        let accounts = tessera_core::role::SystemAccounts::with_lookup(|account| match account {
+            "root" => tessera_core::role::PasswdLookup::Uid(0),
+            _ => tessera_core::role::PasswdLookup::Unavailable,
+        });
+
+        let attack = ensure_role_account("root", accounts).expect_err("root must be refused");
+        let outage = ensure_role_account("serv", accounts)
+            .expect_err("an unusable passwd database must fail closed");
+
+        assert!(
+            matches!(
+                attack,
+                FlowError::RoleDenied(tessera_core::role::RoleDenyReason::SystemAccount)
+            ),
+            "got {attack:?}"
+        );
+        assert!(
+            matches!(
+                outage,
+                FlowError::RoleDenied(tessera_core::role::RoleDenyReason::BackendUnavailable)
+            ),
+            "got {outage:?}"
         );
     }
 

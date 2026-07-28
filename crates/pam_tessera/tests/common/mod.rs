@@ -74,7 +74,7 @@ impl RoleFixture {
     }
 }
 
-/// The device's passwd view these tests authenticate against.
+/// The device's account view these tests authenticate against.
 ///
 /// The real passwd file of the machine running the tests is never
 /// consulted: `root` must be a system account and `serv` a provisioned

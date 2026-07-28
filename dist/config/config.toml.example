@@ -251,6 +251,15 @@ dir = "/var/lib/tessera/roles"
 # Session TTL used when neither the credential nor the role slice sets one.
 # Seconds, must be > 0; a session cap is never unbounded. Default 43200 (12h).
 # default_session_ttl_seconds = 43200
+# How long name resolution may take while the login account is checked against
+# the system accounts. That check runs before any credential is presented, so
+# an unresponsive directory (LDAP/sssd) would otherwise delay every login
+# attempt, the emergency console one included. Running the limit out counts as
+# silence — the local /etc/passwd verdict stands and the login continues — and
+# the resolver is then not asked again for the life of the process.
+# Seconds, 1..=60; 0 is rejected, because a disabled check would let a systemd
+# DynamicUser account (no entry in /etc/passwd) log in. Default 10.
+# account_lookup_timeout_seconds = 10
 
 # --- Logging -----------------------------------------------------------------
 [logging]

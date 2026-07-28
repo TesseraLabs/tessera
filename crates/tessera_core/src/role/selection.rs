@@ -37,9 +37,12 @@ pub enum RoleDenyReason {
     /// The requested role is not a member of the certificate's
     /// `allowed_roles` list.
     NotCovered,
-    /// The resolved role payload needs an enforcement backend that the
-    /// runtime does not provide (`mac_mask` without an active plugin or
-    /// `selinux` without the `SELinux` adapter).
+    /// A backend the decision depends on did not answer: the resolved role
+    /// payload needs an enforcement backend the runtime does not provide
+    /// (`mac_mask` without an active plugin, `selinux` without the `SELinux`
+    /// adapter), or the local account database could not be consulted to tell a role
+    /// account from a system one. Every such case denies — an undecidable
+    /// login is a refused login.
     BackendUnavailable,
     /// The role's MAC mask exceeds the certificate's integrity ceiling
     /// (reserved for the mac-integrity intersection in task 5.1).
@@ -47,11 +50,15 @@ pub enum RoleDenyReason {
     /// The login string was syntactically invalid, or no role was supplied
     /// where one is required.
     Syntax,
-    /// The login account is a system account of this device (uid below
-    /// [`crate::role::FIRST_REGULAR_UID`]) and can never be a role, or the
-    /// passwd database could not be consulted to establish otherwise. Both
-    /// land here because the verdict is the same: the account was not cleared
-    /// as a role account, so the login is refused before any right is granted.
+    /// The login account is a system account of this device — its uid is
+    /// outside [`crate::role::FIRST_REGULAR_UID`]`..=`[`crate::role::LAST_REGULAR_UID`]
+    /// — and can never be a role.
+    ///
+    /// This reason means somebody tried to enter an account the system owns.
+    /// A local account database that cannot answer is refused just as firmly, but
+    /// under [`RoleDenyReason::BackendUnavailable`]: it is a device fault that
+    /// repeats for every login, and mixing it in here would drown the signal
+    /// this reason exists to raise.
     SystemAccount,
 }
 

@@ -15,11 +15,11 @@
 //!   verifies.
 //!
 //! Both modes consult a [`SystemAccounts`] view: a slice whose name is an
-//! account this device already owns (uid below
-//! [`crate::role::FIRST_REGULAR_UID`]) never becomes a role. Because the role
-//! is the login account, such a slice would turn `root` or `daemon` into an
-//! ordinary role login; catching it at load puts the provisioning mistake in
-//! front of the administrator instead of leaving it to the login path.
+//! account this device already owns (a uid outside the regular range, at
+//! either end) never becomes a role. Because the role is the login account,
+//! such a slice would turn `root` or `daemon` into an ordinary role login;
+//! catching it at load puts the provisioning mistake in front of the
+//! administrator instead of leaving it to the login path.
 //!
 //! Calling [`RoleStore::load`] with [`TrustMode::Managed`] is a hard error
 //! ([`RoleStoreError::ManagedRequiresManifest`]): managed loads need a
@@ -94,6 +94,20 @@ pub enum RoleStoreError {
         /// The role id (slice file stem).
         role: String,
         /// Why the name cannot be a role.
+        #[source]
+        source: SystemAccountError,
+    },
+    /// The local account database could not be consulted, so no slice name can
+    /// be cleared against the device's accounts.
+    ///
+    /// Separate from [`Self::SystemAccount`] on purpose. A slice named after a
+    /// system account is one bad file among good ones and is skipped like any
+    /// other invalid slice; an unusable account database disqualifies *every*
+    /// slice, and reporting that as a pile of per-slice skips would hand the
+    /// operator an empty, successfully loaded base and no word about why.
+    #[error("cannot check role names against the device's accounts: {source}")]
+    AccountsUnavailable {
+        /// The lookup failure that stopped the check.
         #[source]
         source: SystemAccountError,
     },
@@ -175,6 +189,12 @@ impl RoleStore {
     /// account of this device — a signed bundle that claims such a role is
     /// internally wrong about the device, and the whole base is refused
     /// (fail-closed, as everywhere on the managed path).
+    ///
+    /// The bundle's `bundle_version` is accepted (the anti-rollback floor
+    /// advances) only after every check here has passed. Accepting at
+    /// verification time would mean a bundle this function goes on to reject
+    /// still raises the floor above the base the device is running, turning the
+    /// active base into a rollback and locking the device out of its own roles.
     pub fn load_managed(
         dir: &Path,
         device_os: RoleOs,
@@ -182,7 +202,12 @@ impl RoleStore {
         persist_dir: &Path,
         accounts: SystemAccounts,
     ) -> Result<Self, RoleStoreError> {
-        let verified = manifest::verify_manifest(dir, device_os, trusted_pubkey, persist_dir)?;
+        let verified = manifest::verify_manifest_without_accepting(
+            dir,
+            device_os,
+            trusted_pubkey,
+            persist_dir,
+        )?;
         if verified.manifest.roles.len() > MAX_ROLES {
             return Err(RoleStoreError::TooManyRoles {
                 count: verified.manifest.roles.len(),
@@ -190,17 +215,31 @@ impl RoleStore {
             });
         }
         let mut roles = HashMap::with_capacity(verified.manifest.roles.len());
+        // Both account sources are asked once for the whole bundle: this load
+        // runs on the login path too, and asking per role would multiply a file
+        // read and a name-service run by the number of roles in the bundle.
+        let names: Vec<&str> = verified
+            .manifest
+            .roles
+            .keys()
+            .map(super::schema::RoleId::as_str)
+            .collect();
+        let device_accounts = accounts.snapshot(&names);
         // The manifest's hashes already matched the on-disk slices, so the
         // schema parse below should succeed; a schema error here is still a
         // hard error (a hash-matching slice that fails schema means the
         // signed bundle is internally inconsistent → fail-closed).
         for role_id in verified.manifest.roles.keys() {
-            accounts
-                .check(role_id.as_str())
-                .map_err(|source| RoleStoreError::SystemAccount {
-                    role: role_id.to_string(),
-                    source,
-                })?;
+            match device_accounts.check(role_id.as_str()) {
+                Ok(()) => {}
+                Err(source @ SystemAccountError::SystemAccount { .. }) => {
+                    return Err(RoleStoreError::SystemAccount {
+                        role: role_id.to_string(),
+                        source,
+                    })
+                }
+                Err(source) => return Err(RoleStoreError::AccountsUnavailable { source }),
+            }
             let slice_path = dir.join(format!("{role_id}.toml"));
             let bytes = fs::read(&slice_path).map_err(|e| RoleStoreError::Io {
                 path: slice_path.display().to_string(),
@@ -217,6 +256,9 @@ impl RoleStore {
                 }
             }
         }
+        // Everything checked out: only now is this bundle_version the one the
+        // device stands on.
+        manifest::accept_bundle_version(persist_dir, &verified)?;
         Ok(Self { roles })
     }
 
@@ -241,7 +283,7 @@ impl RoleStore {
             path: load_dir.display().to_string(),
             reason: e.to_string(),
         })?;
-        let mut roles: HashMap<RoleId, RoleSlice> = HashMap::new();
+        let mut candidates: Vec<(PathBuf, String)> = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| RoleStoreError::Io {
                 path: load_dir.display().to_string(),
@@ -266,24 +308,47 @@ impl RoleStore {
                 continue;
             }
             // Role id = file stem. A non-role-id stem is a per-slice skip.
-            let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+            let Some(stem) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
                 audit::emit_role_slice_invalid(
                     &path.display().to_string(),
                     "file stem is not valid UTF-8",
                 );
                 continue;
             };
+            candidates.push((path, stem));
+        }
+
+        // Both account sources are asked once for the whole base. This load
+        // runs on every login, before any credential is presented, so a source
+        // consulted per slice would put the number of slices as a multiplier on
+        // a file read — and on a name-service run, which costs a process.
+        let names: Vec<&str> = candidates.iter().map(|(_, stem)| stem.as_str()).collect();
+        let device_accounts = accounts.snapshot(&names);
+
+        let mut roles: HashMap<RoleId, RoleSlice> = HashMap::new();
+        for (path, stem) in &candidates {
             // A slice named after an account the system already owns is
             // refused here, where the administrator sees it, instead of at the
             // first login attempt. The login path refuses it again on its own.
-            if let Err(e) = accounts.check(stem) {
-                audit::emit_role_slice_invalid(&path.display().to_string(), &e.to_string());
-                continue;
+            //
+            // An account database that cannot answer is a different failure: it
+            // disqualifies every slice, so it fails the load outright rather
+            // than emptying the base one "invalid slice" at a time.
+            match device_accounts.check(stem) {
+                Ok(()) => {}
+                Err(source @ SystemAccountError::SystemAccount { .. }) => {
+                    audit::emit_role_slice_invalid(
+                        &path.display().to_string(),
+                        &source.to_string(),
+                    );
+                    continue;
+                }
+                Err(source) => return Err(RoleStoreError::AccountsUnavailable { source }),
             }
             let bytes = if privileged {
-                crate::privileged_path::read_file(&path, crate::privileged_path::ExecTrust::Root)?
+                crate::privileged_path::read_file(path, crate::privileged_path::ExecTrust::Root)?
             } else {
-                match fs::read(&path) {
+                match fs::read(path) {
                     Ok(b) => b,
                     Err(e) => {
                         audit::emit_role_slice_invalid(&path.display().to_string(), &e.to_string());
@@ -524,7 +589,88 @@ mod tests {
         assert!(matches!(err, RoleStoreError::ManagedRequiresManifest));
     }
 
-    /// A passwd view of a device where `root` and `mail` are system accounts
+    /// Build a signed managed bundle in a fresh dir; returns the role dir, the
+    /// anti-rollback persist dir, and the public key to verify with.
+    fn build_signed_bundle(bundle_version: u64, slices: &[&str]) -> (TempDir, TempDir, Vec<u8>) {
+        use openssl::pkey::PKey;
+        use openssl::sign::Signer;
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+
+        let key = PKey::generate_ed25519().unwrap();
+        let pub_pem = key.public_key_to_pem().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let persist = tempfile::tempdir().unwrap();
+
+        let mut roles_toml = String::new();
+        for role in slices {
+            let body = slice_doc(role, 1, "linux");
+            fs::write(dir.path().join(format!("{role}.toml")), body.as_bytes()).unwrap();
+            let sha = hex::encode(Sha256::digest(body.as_bytes()));
+            let _ = write!(
+                roles_toml,
+                "[roles.{role}]\nversion = 1\nsha256 = \"{sha}\"\n"
+            );
+        }
+        let unsigned = format!("bundle_version = {bundle_version}\nos = \"linux\"\n{roles_toml}");
+        let mut signer = Signer::new_without_digest(&key).unwrap();
+        let sig = hex::encode(signer.sign_oneshot_to_vec(unsigned.as_bytes()).unwrap());
+        let full = format!(
+            "bundle_version = {bundle_version}\nos = \"linux\"\nsignature = \"{sig}\"\n{roles_toml}"
+        );
+        fs::write(dir.path().join(MANIFEST_FILENAME), full.as_bytes()).unwrap();
+
+        (dir, persist, pub_pem)
+    }
+
+    #[test]
+    fn a_rejected_managed_bundle_does_not_advance_the_rollback_floor() {
+        // The bundle is properly signed and its hashes match, so verification
+        // passes; it is the role names that disqualify it. If acceptance were
+        // recorded during verification, this rejected version would become the
+        // floor, and the base the device is actually running — an earlier
+        // version — would count as a rollback from then on.
+        let (dir, persist, pub_pem) = build_signed_bundle(9, &["serv", "root"]);
+
+        let err = RoleStore::load_managed(
+            dir.path(),
+            RoleOs::Linux,
+            &pub_pem,
+            persist.path(),
+            device_accounts(),
+        )
+        .expect_err("a bundle claiming a system account as a role must be refused");
+        assert!(matches!(err, RoleStoreError::SystemAccount { .. }));
+
+        assert_eq!(
+            super::super::manifest::last_accepted_bundle_version(persist.path()).unwrap(),
+            None,
+            "a refused bundle must leave the anti-rollback floor where it was"
+        );
+    }
+
+    #[test]
+    fn an_accepted_managed_bundle_advances_the_rollback_floor() {
+        let (dir, persist, pub_pem) = build_signed_bundle(9, &["serv"]);
+
+        let store = RoleStore::load_managed(
+            dir.path(),
+            RoleOs::Linux,
+            &pub_pem,
+            persist.path(),
+            device_accounts(),
+        )
+        .expect("a clean bundle must load");
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            super::super::manifest::last_accepted_bundle_version(persist.path()).unwrap(),
+            Some(9),
+            "an accepted bundle must advance the floor"
+        );
+    }
+
+    /// A account view of a device where `root` and `mail` are system accounts
     /// and `serv` is a provisioned role account. Tests must not consult the
     /// passwd file of the machine running them.
     fn device_accounts() -> SystemAccounts {
@@ -534,6 +680,31 @@ mod tests {
             "serv" => PasswdLookup::Uid(4000),
             _ => PasswdLookup::NoEntry,
         })
+    }
+
+    /// A account view of a device whose name service is broken.
+    fn unusable_accounts() -> SystemAccounts {
+        SystemAccounts::with_lookup(|_| PasswdLookup::Unavailable)
+    }
+
+    #[test]
+    fn an_unusable_passwd_database_fails_the_whole_load() {
+        let dir = tempfile::tempdir().unwrap();
+        write_slice(&dir, "oper", 1, "linux");
+        write_slice(&dir, "serv", 1, "linux");
+
+        // Without a passwd database no slice name can be cleared, so the load
+        // must say so once — not hand back an empty base and a pile of
+        // "invalid slice" events that blame the slices for a device fault.
+        let err = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            unusable_accounts(),
+        )
+        .expect_err("an unusable passwd database must fail the load");
+
+        assert!(matches!(err, RoleStoreError::AccountsUnavailable { .. }));
     }
 
     #[test]
@@ -585,6 +756,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.get(&RoleId::new("serv").unwrap()).unwrap().version, 2);
+    }
+
+    /// How many times the local account database was read during a load.
+    static PASSWD_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// The device's account database, in the shape the loader consumes it.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the shape is the account source's: `None` is a database that could not be read"
+    )]
+    fn counted_passwd() -> Option<Vec<u8>> {
+        PASSWD_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(
+            b"root:x:0:0:root:/root:/bin/bash\n\
+              serv:x:4000:4000::/home/serv:/bin/sh\n\
+              oper:x:4001:4001::/home/oper:/bin/sh\n"
+                .to_vec(),
+        )
+    }
+
+    #[test]
+    fn the_account_database_is_read_once_for_the_whole_base() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // A load happens on every login, before any credential is presented.
+        // Re-reading the database per slice would put the size of the base on
+        // the login path as a multiplier.
+        let dir = tempfile::tempdir().unwrap();
+        write_slice(&dir, "serv", 1, "linux");
+        write_slice(&dir, "oper", 1, "linux");
+        write_slice(&dir, "root", 1, "linux");
+        PASSWD_READS.store(0, Relaxed);
+
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::with_database(counted_passwd),
+        )
+        .unwrap();
+
+        assert_eq!(store.len(), 2, "the slice named after `root` must not load");
+        assert_eq!(
+            PASSWD_READS.load(Relaxed),
+            1,
+            "one read for the base, whatever the number of slices in it"
+        );
     }
 
     #[test]

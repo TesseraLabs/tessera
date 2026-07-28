@@ -211,6 +211,10 @@ pub struct RawRoles {
     /// certificate nor the role sets one. Default 43200 (12h).
     #[serde(default)]
     pub default_session_ttl_seconds: Option<u64>,
+    /// How long name resolution may take when the login account is checked
+    /// against the system accounts. Default 10; must be > 0 and at most 60.
+    #[serde(default)]
+    pub account_lookup_timeout_seconds: Option<u64>,
 }
 
 /// Raw `[fly_dm_greeter]` block: Astra fly-dm login-screen wallpaper

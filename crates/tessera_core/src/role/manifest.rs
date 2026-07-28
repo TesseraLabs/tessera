@@ -125,13 +125,19 @@ pub struct Manifest {
 }
 
 /// A manifest that has passed full verification (signature + anti-rollback +
-/// per-slice hash) and whose `bundle_version` has been persisted.
+/// per-slice hash).
+///
+/// Verification and acceptance are separate: whether this bundle's
+/// `bundle_version` has become the device's anti-rollback floor depends on
+/// which entry point produced the value — [`verify_manifest`] accepts it,
+/// [`verify_manifest_without_accepting`] leaves that to the caller's later
+/// [`accept_bundle_version`].
 #[derive(Debug, Clone)]
 pub struct VerifiedManifest {
     /// The verified manifest.
     pub manifest: Manifest,
-    /// `true` when this acceptance established the anti-rollback baseline
-    /// (no `bundle_version` was previously persisted — TOFU).
+    /// `true` when accepting this bundle establishes the anti-rollback
+    /// baseline (no `bundle_version` was previously persisted — TOFU).
     pub baseline_established: bool,
 }
 
@@ -420,19 +426,46 @@ pub fn persist_bundle_version(persist_dir: &Path, v: u64) -> Result<(), Manifest
     })
 }
 
-/// Verify the managed role bundle in `dir` against `trusted_pubkey`,
-/// enforcing OS match, signature, anti-rollback, and per-slice hashes; then
-/// persist the accepted `bundle_version`.
+/// Verify the managed role bundle in `dir` against `trusted_pubkey` and record
+/// the acceptance of its `bundle_version`.
 ///
-/// Order: read+parse manifest → OS match → signature → anti-rollback →
-/// per-slice hash → persist `bundle_version`. Any failure is fail-closed
-/// (whole base rejected) and emits the corresponding `bundle_rejected`
-/// audit event for the security-relevant rejections.
+/// Order: [`verify_manifest_without_accepting`] → [`accept_bundle_version`].
+/// Any failure is fail-closed (whole base rejected) and emits the
+/// corresponding `bundle_rejected` audit event for the security-relevant
+/// rejections.
+///
+/// Callers that have further validation of their own to run on the bundle must
+/// use the two steps directly and accept only once everything passed —
+/// recording acceptance of a version that is then rejected turns the
+/// anti-rollback floor against the base still in place. [`crate::role::RoleStore::load_managed`]
+/// does exactly that.
 ///
 /// # Errors
 ///
 /// Any [`ManifestError`]; the base must be treated as unusable on `Err`.
 pub fn verify_manifest(
+    dir: &Path,
+    device_os: RoleOs,
+    trusted_pubkey: &[u8],
+    persist_dir: &Path,
+) -> Result<VerifiedManifest, ManifestError> {
+    let verified = verify_manifest_without_accepting(dir, device_os, trusted_pubkey, persist_dir)?;
+    accept_bundle_version(persist_dir, &verified)?;
+    Ok(verified)
+}
+
+/// Verify the managed role bundle in `dir` without recording its acceptance.
+///
+/// Order: read+parse manifest → OS match → signature → anti-rollback →
+/// per-slice hash. The anti-rollback floor is *read* and enforced here but not
+/// advanced: until [`accept_bundle_version`] runs, the device still stands on
+/// the previously accepted version, so a caller that rejects the bundle for its
+/// own reasons leaves nothing behind.
+///
+/// # Errors
+///
+/// Any [`ManifestError`]; the base must be treated as unusable on `Err`.
+pub fn verify_manifest_without_accepting(
     dir: &Path,
     device_os: RoleOs,
     trusted_pubkey: &[u8],
@@ -468,10 +501,10 @@ pub fn verify_manifest(
     // 2) Anti-rollback against the persisted floor.
     let last = last_accepted_bundle_version(persist_dir)?;
     let baseline_established = match last {
-        None => {
-            audit::emit_bundle_baseline_established(manifest.bundle_version);
-            true
-        }
+        // The baseline audit event belongs to acceptance, not to verification:
+        // announcing a trust-on-first-use baseline for a bundle that is then
+        // rejected would record a decision that was never taken.
+        None => true,
         Some(prev) => {
             if manifest.bundle_version < prev {
                 audit::emit_bundle_rejected(audit::REASON_ROLLBACK, manifest.bundle_version);
@@ -510,14 +543,32 @@ pub fn verify_manifest(
         }
     }
 
-    // 4) Accept: persist the (baseline or advanced) bundle_version. Idempotent
-    // for an equal version.
-    persist_bundle_version(persist_dir, manifest.bundle_version)?;
-
     Ok(VerifiedManifest {
         manifest,
         baseline_established,
     })
+}
+
+/// Record the acceptance of a verified bundle: advance the anti-rollback floor
+/// to its `bundle_version`.
+///
+/// The last step of adopting a bundle, and deliberately separate from
+/// [`verify_manifest_without_accepting`]: everything the caller wants to check
+/// runs first, because once the floor carries this version, every earlier
+/// bundle — including the one the device is running — counts as a rollback.
+/// Idempotent for an equal version.
+///
+/// # Errors
+///
+/// [`ManifestError::Io`] when the floor could not be persisted.
+pub fn accept_bundle_version(
+    persist_dir: &Path,
+    verified: &VerifiedManifest,
+) -> Result<(), ManifestError> {
+    if verified.baseline_established {
+        audit::emit_bundle_baseline_established(verified.manifest.bundle_version);
+    }
+    persist_bundle_version(persist_dir, verified.manifest.bundle_version)
 }
 
 #[cfg(test)]
@@ -619,6 +670,34 @@ mod tests {
             signed_payload(file.as_bytes()),
             Err(ManifestError::NoSignatureLine)
         ));
+    }
+
+    #[test]
+    fn verification_alone_leaves_the_rollback_floor_untouched() {
+        let key = gen_key();
+        let (dir, persist) = build_bundle(&key, 7, &[("oper", 1)]);
+
+        let verified = verify_manifest_without_accepting(
+            dir.path(),
+            RoleOs::Linux,
+            &key.pub_pem,
+            persist.path(),
+        )
+        .unwrap();
+
+        assert_eq!(verified.manifest.bundle_version, 7);
+        assert_eq!(
+            last_accepted_bundle_version(persist.path()).unwrap(),
+            None,
+            "verification must not decide what the device stands on"
+        );
+
+        // Acceptance is the separate, later step.
+        accept_bundle_version(persist.path(), &verified).unwrap();
+        assert_eq!(
+            last_accepted_bundle_version(persist.path()).unwrap(),
+            Some(7)
+        );
     }
 
     #[test]
