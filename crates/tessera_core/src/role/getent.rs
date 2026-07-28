@@ -85,9 +85,9 @@ const KEY_NOT_FOUND: i32 = 2;
 
 /// Largest one `passwd` record is taken to be.
 ///
-/// Five of the seven fields are a name, two ids, a home and a shell, all short;
-/// only the gecos field is free text, and a directory that fills it generously
-/// still stays orders of magnitude below this.
+/// Six of the seven fields are a name, a password placeholder, two ids, a home
+/// and a shell, all short; only the gecos field is free text, and a directory
+/// that fills it generously still stays orders of magnitude below this.
 const MAX_RECORD_BYTES: usize = 16 * 1024;
 
 /// Largest answer that still counts as an answer.
@@ -121,6 +121,21 @@ const REAP_GRACE: Duration = Duration::from_secs(1);
 /// Short enough that the answer is not held back noticeably on a healthy
 /// device, long enough that the wait costs no measurable CPU.
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How long a single wait on the pipe may last when the remaining budget cannot
+/// be expressed as a poll timeout.
+///
+/// The conversion cannot fail for a budget the caller already validated, so this
+/// only covers the unforeseen; it is short because the loop re-checks the
+/// deadline after every wait, and a fallback that waits *longer* than asked
+/// would defeat the bound this whole module exists to keep.
+const POLL_RECHECK_MILLIS: u16 = 50;
+
+/// The byte a complete `getent passwd` answer ends on.
+///
+/// Every record it prints is a whole line, so a final newline is what tells a
+/// finished answer from one cut off mid-record — see [`is_complete`].
+const RECORD_TERMINATOR: u8 = b'\n';
 
 /// Ask the name service about `accounts`, in one child process, under `timeout`.
 ///
@@ -223,11 +238,10 @@ fn interpret(run: &Run, accounts: &[&str]) -> NameResolution {
         // as harmless to the verdict as silence: only a uid outside the
         // regular range can add a refusal.
         //
-        // An end without a status is read the same way. The child wrote its
-        // answer and closed the pipe; that it could not be collected afterwards
-        // says something about the host process, not about the answer. A
-        // half-written record cannot invent a uid either — a line short of its
-        // fields is not a record to this parser.
+        // An end without a status is read the same way. The child wrote a whole
+        // answer and closed the pipe; that the status could not be collected
+        // afterwards says something about the host process, not about the
+        // answer.
         Outcome::Exited(0 | KEY_NOT_FOUND) | Outcome::EndedWithoutStatus => {
             NameResolution::answered(
                 accounts
@@ -327,9 +341,9 @@ impl Run {
 /// on Linux, and one `passwd` record per name in a full role base is of that
 /// order: a parent that waited for the child before reading would deadlock
 /// against a child blocked writing into a pipe nobody is emptying, every time,
-/// on exactly the devices with the largest role bases. The end of the answer is
-/// therefore end-of-file on the pipe, and the child's status only refines what
-/// that already established.
+/// on exactly the devices with the largest role bases. Reading therefore ends at
+/// end-of-file on the pipe, the collected bytes themselves say whether the
+/// answer is whole, and the child's status only refines that.
 fn run(program: &Path, args: &[&str], timeout: Duration) -> Run {
     let Some(storage) = argv_storage(program, args) else {
         return Run::unstartable();
@@ -431,16 +445,19 @@ fn cloexec_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
 /// pipe buffer holds keeps making progress instead of stalling against a parent
 /// that is not reading yet. The waiting happens in `poll` against what is left
 /// of the bound rather than inside `read`, so every idle moment is one the
-/// deadline is checked in. End-of-file is what says the run is over — the child
+/// deadline is checked in. End-of-file is what stops the collecting — the child
 /// has either `execve`d and exited or died, and in both cases it is the closing
-/// of its last descriptor that lets the read return zero.
+/// of its last descriptor that lets the read return zero. What was collected by
+/// then is a whole answer only if it ends on a record boundary; a resolver that
+/// closed its output mid-record, or a read that failed mid-answer, leaves bytes
+/// that parse as cleanly as a complete answer and silently lack entries, so they
+/// are discarded instead.
 ///
 /// Exhausting the bound kills the child and reaps it. That is the whole point
 /// of running the lookup elsewhere: the request stops, rather than being left
 /// to finish in a library the caller may already have unloaded. Where the bound
-/// runs out decides what the run is worth: before end-of-file there is no answer
-/// to keep, while after it the answer is complete and only the status is
-/// missing.
+/// runs out decides what the run is worth: before the answer is whole there is
+/// nothing to keep, while after it only the status is missing.
 fn supervise(child: Pid, answer: &OwnedFd, timeout: Duration) -> Run {
     supervise_with(child, answer, timeout, set_nonblocking)
 }
@@ -500,9 +517,37 @@ fn supervise_with(
         }
     }
 
+    if !is_complete(&collected) {
+        // Collecting stopped in the middle of a record: either the read failed
+        // or the resolver closed its output before it had written everything.
+        // The bytes in hand cannot be told apart from a whole answer once they
+        // are parsed — a name missing from them reads as "no such account",
+        // which is exactly the refusal this source was added to find. So the
+        // run is treated as a source that did not answer.
+        kill_and_reap(child);
+        return Run {
+            stdout: Vec::new(),
+            outcome: Outcome::Unstartable,
+        };
+    }
+
     Run {
         outcome: collect_status(child, deadline),
         stdout: collected,
+    }
+}
+
+/// Whether the collected bytes are a whole answer rather than the front of one.
+///
+/// `getent passwd` prints whole lines and nothing else, so an answer that ends
+/// on a record terminator has no record half-written in it. Nothing collected
+/// at all is complete too: that is what "none of these names is known" looks
+/// like, and it is the ordinary answer for a role base of names the directory
+/// does not serve.
+fn is_complete(collected: &[u8]) -> bool {
+    match collected.last() {
+        None => true,
+        Some(last) => *last == RECORD_TERMINATOR,
     }
 }
 
@@ -550,9 +595,9 @@ fn fill(answer: &OwnedFd, collected: &mut Vec<u8>) -> Filling {
             Err(Errno::EINTR) => {}
             Err(Errno::EAGAIN) => return Filling::Waiting,
             // Any other error on the read end is not something a further read
-            // would recover from, and an incomplete answer is treated as the
-            // end of one: what was collected still parses, and what is missing
-            // from it can only cost a refusal, never cause one.
+            // would recover from, so collecting stops here. Whether what was
+            // collected is a whole answer or the front of one is not this
+            // function's to say: the caller decides that from the bytes.
             Err(_) => return Filling::Ended,
         }
     }
@@ -565,14 +610,18 @@ fn fill(answer: &OwnedFd, collected: &mut Vec<u8>) -> Filling {
 /// keeps, not by this call.
 fn wait_readable(answer: &OwnedFd, budget: Duration) {
     let mut watched = [PollFd::new(answer.as_fd(), PollFlags::POLLIN)];
-    let budget = PollTimeout::try_from(budget).unwrap_or(PollTimeout::MAX);
+    let budget = PollTimeout::try_from(budget).unwrap_or_else(|_| POLL_RECHECK_MILLIS.into());
     let _readable = poll(&mut watched, budget);
 }
 
 /// Establish how the child that has finished writing ended.
 ///
-/// The answer is already in hand by the time this runs, so the status only
-/// refines it and can never take it away. `ECHILD` is not a failure: a host
+/// This runs only once the collected bytes have been found to end on a record
+/// boundary, so a whole answer is already in hand and the status can only refine
+/// it, never take it away. End-of-file alone would not license that: it says
+/// every writer let go, not that the writer was done. What makes the answer
+/// complete is the shape of the bytes — see [`is_complete`] — and this function
+/// is reached only after that has been established. `ECHILD` is not a failure: a host
 /// process with `SIGCHLD` set to `SIG_IGN` has the kernel reap its children, so
 /// there is no status left to read and nothing left running either.
 ///
@@ -746,6 +795,97 @@ mod tests {
             },
             &["serv"],
         );
+        assert!(
+            !resolution.exhausted_its_bound(),
+            "a source that answered must not be quieted for its cooldown"
+        );
+        assert_eq!(
+            resolution.answer_for("serv"),
+            super::super::system_account::PasswdLookup::Uid(4000)
+        );
+    }
+
+    #[test]
+    fn an_answer_cut_off_inside_a_record_is_not_an_answer() {
+        // The dangerous truncation: the bytes that did arrive parse perfectly
+        // well, and every name missing from them would read as "no such
+        // account" — the very refusal this source is consulted for. A record
+        // boundary is what tells a finished answer from a severed one, so an
+        // answer ending anywhere else is the source saying nothing at all.
+        let (child, read_end, write_end) = unending_pipe_and_child();
+        let severed = b"dyn-service:x:61184:61184::/:/usr/sbin/nologin\nserv:x:4000:40";
+        let written = nix::unistd::write(&write_end, severed).expect("the pipe takes the bytes");
+        assert_eq!(written, severed.len());
+        drop(write_end);
+
+        let run = supervise_with(child, &read_end, Duration::from_secs(30), set_nonblocking);
+
+        assert_eq!(run.outcome, Outcome::Unstartable);
+        assert!(
+            run.stdout.is_empty(),
+            "a severed answer is not half an answer"
+        );
+
+        let resolution = interpret(&run, &["dyn-service", "serv"]);
+        assert!(
+            !resolution.exhausted_its_bound(),
+            "a source that could not be read is silent, not exhausted"
+        );
+        assert_eq!(
+            resolution.answer_for("serv"),
+            super::super::system_account::PasswdLookup::Unavailable,
+            "a name missing from severed bytes must not read as a name that is not there"
+        );
+        assert_eq!(
+            resolution.answer_for("dyn-service"),
+            super::super::system_account::PasswdLookup::Unavailable,
+            "the records that did arrive are no more trustworthy than the run"
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_is_the_ordinary_none_of_these_names() {
+        // Nothing written at all is what a directory serving none of the names
+        // looks like; it must not be mistaken for an answer cut short.
+        let (child, read_end, write_end) = unending_pipe_and_child();
+        drop(write_end);
+
+        let run = supervise_with(child, &read_end, Duration::from_millis(0), set_nonblocking);
+
+        assert_eq!(run.outcome, Outcome::EndedWithoutStatus);
+        assert!(run.stdout.is_empty());
+
+        let resolution = interpret(&run, &["serv"]);
+        assert!(!resolution.exhausted_its_bound());
+        assert_eq!(
+            resolution.answer_for("serv"),
+            super::super::system_account::PasswdLookup::NoEntry,
+            "an answer that mentions no name says the name is not there"
+        );
+        assert!(is_complete(b""), "nothing collected is nothing missing");
+    }
+
+    #[test]
+    fn an_answer_whole_at_the_deadline_is_kept_without_quieting_the_source() {
+        // The behaviour the record-boundary check must not undo: the resolver
+        // wrote everything and closed the pipe, and only its status was late.
+        // The answer stands, and the source is not quieted for its cooldown.
+        let (child, read_end, write_end) = unending_pipe_and_child();
+        let whole = b"serv:x:4000:4000::/home/serv:/bin/sh\n";
+        let written = nix::unistd::write(&write_end, whole).expect("the pipe takes the bytes");
+        assert_eq!(written, whole.len());
+        drop(write_end);
+
+        let run = supervise_with(child, &read_end, Duration::from_millis(0), set_nonblocking);
+
+        assert_eq!(
+            run.outcome,
+            Outcome::EndedWithoutStatus,
+            "a status that came too late is not a lost answer"
+        );
+        assert_eq!(run.stdout, whole);
+
+        let resolution = interpret(&run, &["serv"]);
         assert!(
             !resolution.exhausted_its_bound(),
             "a source that answered must not be quieted for its cooldown"
