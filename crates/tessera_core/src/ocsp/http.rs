@@ -11,6 +11,16 @@
 //!   handshake + write + read (`ocsp_timeout_seconds`);
 //! * the response body is capped at [`MAX_RESPONSE_BYTES`].
 //!
+//! The module runs inside a PAM stack hosted by someone else's process
+//! (`sshd`, `login`, a display manager), where signals arrive for reasons
+//! that have nothing to do with us — reaped children, timers, window-system
+//! events.  A blocking socket call cut short by such a signal reports
+//! `EINTR`; treating that as a transport failure would turn an unrelated
+//! signal into a revocation-check failure and, under a fail-closed policy,
+//! into a denied login.  Every blocking operation here therefore resumes
+//! after an interruption — but always against the *same* deadline, never a
+//! fresh one, so a stream of signals cannot stretch the exchange out.
+//!
 //! `https://` responders are reached through `openssl::ssl::SslConnector`
 //! with default peer verification (system trust store + hostname check).
 //! Note that HTTPS adds nothing to OCSP's own security — responses are
@@ -18,7 +28,7 @@
 //! configures it, it is enforced, not silently downgraded.
 
 use crate::error::TrustError;
-use openssl::ssl::{SslConnector, SslMethod, SslStream};
+use openssl::ssl::{HandshakeError, SslConnector, SslMethod, SslStream};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
@@ -187,27 +197,129 @@ impl Transport {
     }
 }
 
-impl Read for Transport {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+/// A blocking byte stream whose next operation can be bounded by a budget.
+///
+/// Exists so the interruption-aware read/write loops below can be driven
+/// against a scripted stream in tests: the interesting cases (a signal
+/// arriving mid-read, a socket timeout firing) are not reproducible on
+/// demand through a real socket.
+trait DeadlineStream {
+    /// Bounds the next blocking operation by `budget`.
+    fn arm(&self, budget: Duration) -> Result<(), TrustError>;
+
+    /// One `read(2)`; `Interrupted` is surfaced, not swallowed.
+    fn read_once(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+
+    /// One `write(2)`; `Interrupted` is surfaced, not swallowed.
+    fn write_once(&mut self, buf: &[u8]) -> std::io::Result<usize>;
+
+    /// One flush attempt.
+    fn flush_once(&mut self) -> std::io::Result<()>;
+}
+
+impl DeadlineStream for Transport {
+    fn arm(&self, budget: Duration) -> Result<(), TrustError> {
+        let tcp = self.tcp();
+        tcp.set_read_timeout(Some(budget))
+            .map_err(|e| map_io(&e, "set_read_timeout"))?;
+        tcp.set_write_timeout(Some(budget))
+            .map_err(|e| map_io(&e, "set_write_timeout"))?;
+        Ok(())
+    }
+
+    fn read_once(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Transport::Plain(s) => s.read(buf),
             Transport::Tls(s) => s.read(buf),
         }
     }
-}
 
-impl Write for Transport {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Transport::Plain(s) => s.write(buf),
             Transport::Tls(s) => s.write(buf),
         }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush_once(&mut self) -> std::io::Result<()> {
         match self {
             Transport::Plain(s) => s.flush(),
             Transport::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Re-arms `stream` with whatever is left of the budget.
+///
+/// Every retry goes through here, so the socket timeout for the resumed
+/// operation is the *remaining* time, never the original one: interruptions
+/// shorten the window instead of resetting it, and an exhausted budget is a
+/// timeout regardless of how the previous attempt ended.
+fn rearm<S: DeadlineStream + ?Sized>(stream: &S, deadline: Instant) -> Result<(), TrustError> {
+    stream.arm(remaining(deadline)?)
+}
+
+/// One read that survives signal delivery.
+///
+/// A signal that lands while the socket read is blocked yields `EINTR`; the
+/// read is simply resumed. `WouldBlock`/`TimedOut` mean the armed socket
+/// timeout fired and stay a timeout — see [`map_io`].
+fn read_interruptible<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
+    buf: &mut [u8],
+    deadline: Instant,
+    what: &str,
+) -> Result<usize, TrustError> {
+    loop {
+        rearm(stream, deadline)?;
+        match stream.read_once(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(map_io(&e, what)),
+        }
+    }
+}
+
+/// Writes `buf` in full, surviving both short writes and signal delivery.
+///
+/// Not `Write::write_all`: that resumes after `EINTR` with the socket
+/// timeout armed before the first attempt, so each interruption would hand
+/// the remainder of the write a fresh full window.
+fn write_all_interruptible<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
+    buf: &[u8],
+    deadline: Instant,
+    what: &str,
+) -> Result<(), TrustError> {
+    let mut rest = buf;
+    while !rest.is_empty() {
+        rearm(stream, deadline)?;
+        match stream.write_once(rest) {
+            Ok(0) => {
+                return Err(TrustError::OcspTransport {
+                    reason: format!("{what}: connection accepted no further bytes"),
+                })
+            }
+            Ok(n) => rest = rest.get(n..).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(map_io(&e, what)),
+        }
+    }
+    Ok(())
+}
+
+/// Flushes, resuming after signal delivery within the same deadline.
+fn flush_interruptible<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
+    deadline: Instant,
+    what: &str,
+) -> Result<(), TrustError> {
+    loop {
+        rearm(stream, deadline)?;
+        match stream.flush_once() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(map_io(&e, what)),
         }
     }
 }
@@ -381,10 +493,20 @@ fn connect(
     let addrs = resolve_within_budget(resolver, pool, &url.host, url.port, deadline)?;
     let mut last: Option<TrustError> = None;
     for addr in addrs {
-        let budget = remaining(deadline)?;
-        match TcpStream::connect_timeout(&addr, budget) {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last = Some(map_io(&e, &format!("connect {addr}"))),
+        loop {
+            // Each attempt is bounded by what is left of the budget, so a
+            // signal arriving mid-connect resumes into a shorter window.
+            let budget = remaining(deadline)?;
+            match TcpStream::connect_timeout(&addr, budget) {
+                Ok(stream) => return Ok(stream),
+                // Interrupted by a signal: retry this address, and the
+                // `remaining` above gives the retry a shorter window.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    last = Some(map_io(&e, &format!("connect {addr}")));
+                    break;
+                }
+            }
         }
     }
     Err(last.unwrap_or_else(|| TrustError::OcspTransport {
@@ -392,13 +514,22 @@ fn connect(
     }))
 }
 
-fn set_timeouts(tcp: &TcpStream, deadline: Instant) -> Result<(), TrustError> {
+/// Bounds the next socket operation on `tcp` by the remaining budget.
+fn arm_tcp(tcp: &TcpStream, deadline: Instant) -> Result<(), TrustError> {
     let budget = remaining(deadline)?;
     tcp.set_read_timeout(Some(budget))
         .map_err(|e| map_io(&e, "set_read_timeout"))?;
     tcp.set_write_timeout(Some(budget))
         .map_err(|e| map_io(&e, "set_write_timeout"))?;
     Ok(())
+}
+
+/// True when the TLS layer failed because the syscall underneath was cut
+/// short by a signal, which OpenSSL reports as a plain `EINTR` I/O error.
+fn is_interrupted(error: &openssl::ssl::Error) -> bool {
+    error
+        .io_error()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
 }
 
 fn open_transport(
@@ -408,7 +539,7 @@ fn open_transport(
     pool: &ResolverPool,
 ) -> Result<Transport, TrustError> {
     let tcp = connect(url, deadline, resolver, pool)?;
-    set_timeouts(&tcp, deadline)?;
+    arm_tcp(&tcp, deadline)?;
     match url.scheme {
         OcspScheme::Http => Ok(Transport::Plain(tcp)),
         OcspScheme::Https => {
@@ -417,13 +548,26 @@ fn open_transport(
                     reason: format!("TLS init: {e}"),
                 })?
                 .build();
-            let stream =
-                connector
-                    .connect(&url.host, tcp)
-                    .map_err(|e| TrustError::OcspTransport {
-                        reason: format!("TLS handshake: {e}"),
-                    })?;
-            Ok(Transport::Tls(stream))
+            let mut attempt = connector.connect(&url.host, tcp);
+            loop {
+                match attempt {
+                    Ok(stream) => return Ok(Transport::Tls(stream)),
+                    // A signal during the handshake leaves the session
+                    // resumable; pick it up again with a shortened budget.
+                    Err(HandshakeError::Failure(mid)) if is_interrupted(mid.error()) => {
+                        arm_tcp(mid.get_ref(), deadline)?;
+                        attempt = mid.handshake();
+                    }
+                    // The armed socket timeout surfaces as a stalled
+                    // handshake, and that is the deadline, not a failure.
+                    Err(HandshakeError::WouldBlock(_)) => return Err(TrustError::OcspTimeout),
+                    Err(e) => {
+                        return Err(TrustError::OcspTransport {
+                            reason: format!("TLS handshake: {e}"),
+                        })
+                    }
+                }
+            }
         }
     }
 }
@@ -479,8 +623,8 @@ fn parse_head(head: &str) -> Result<ResponseHead, TrustError> {
 
 /// Reads bytes until the `\r\n\r\n` head terminator; returns the head text
 /// and any body bytes that arrived in the same reads.
-fn read_head(
-    transport: &mut Transport,
+fn read_head<S: DeadlineStream + ?Sized>(
+    transport: &mut S,
     deadline: Instant,
 ) -> Result<(String, Vec<u8>), TrustError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
@@ -497,10 +641,7 @@ fn read_head(
                 reason: format!("response head exceeds {MAX_HEADER_BYTES} bytes"),
             });
         }
-        set_timeouts(transport.tcp(), deadline)?;
-        let n = transport
-            .read(&mut chunk)
-            .map_err(|e| map_io(&e, "read response head"))?;
+        let n = read_interruptible(transport, &mut chunk, deadline, "read response head")?;
         if n == 0 {
             return Err(TrustError::OcspTransport {
                 reason: "connection closed before response head completed".to_string(),
@@ -514,8 +655,8 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn read_body(
-    transport: &mut Transport,
+fn read_body<S: DeadlineStream + ?Sized>(
+    transport: &mut S,
     deadline: Instant,
     mut body: Vec<u8>,
     expected: usize,
@@ -530,10 +671,7 @@ fn read_body(
     }
     let mut chunk = [0_u8; 4096];
     while body.len() < expected {
-        set_timeouts(transport.tcp(), deadline)?;
-        let n = transport
-            .read(&mut chunk)
-            .map_err(|e| map_io(&e, "read response body"))?;
+        let n = read_interruptible(transport, &mut chunk, deadline, "read response body")?;
         if n == 0 {
             return Err(TrustError::OcspTransport {
                 reason: format!(
@@ -604,14 +742,14 @@ fn post_ocsp_request_with(
         url.host_header(),
         request_der.len()
     );
-    set_timeouts(transport.tcp(), deadline)?;
-    transport
-        .write_all(head.as_bytes())
-        .map_err(|e| map_io(&e, "write request head"))?;
-    transport
-        .write_all(request_der)
-        .map_err(|e| map_io(&e, "write request body"))?;
-    transport.flush().map_err(|e| map_io(&e, "flush request"))?;
+    write_all_interruptible(
+        &mut transport,
+        head.as_bytes(),
+        deadline,
+        "write request head",
+    )?;
+    write_all_interruptible(&mut transport, request_der, deadline, "write request body")?;
+    flush_interruptible(&mut transport, deadline, "flush request")?;
 
     let (head_text, early_body) = read_head(&mut transport, deadline)?;
     let head = parse_head(&head_text)?;
@@ -653,10 +791,12 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::{
-        post_ocsp_request, post_ocsp_request_with, HostResolver, OcspScheme, OcspUrl, ResolverPool,
-        MAX_RESPONSE_BYTES,
+        post_ocsp_request, post_ocsp_request_with, DeadlineStream, HostResolver, OcspScheme,
+        OcspUrl, ResolverPool, MAX_RESPONSE_BYTES,
     };
     use crate::error::TrustError;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -992,5 +1132,177 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Signal interruption
+    // ----------------------------------------------------------------
+
+    /// Byte stream driven by a script of I/O outcomes.
+    ///
+    /// A real socket cannot be made to return `EINTR` on demand, so the
+    /// retry loops are driven against this instead. It records the budget
+    /// armed before every attempt, which is what makes the claim testable:
+    /// a retry after an interruption must inherit the time that is left,
+    /// not a fresh window. Each step sleeps briefly so the recorded budgets
+    /// differ by more than the clock's resolution.
+    struct ScriptedStream {
+        reads: VecDeque<std::io::Result<Vec<u8>>>,
+        writes: VecDeque<std::io::Result<usize>>,
+        written: Vec<u8>,
+        armed: RefCell<Vec<Duration>>,
+    }
+
+    /// Time each scripted step blocks before answering.
+    const STEP: Duration = Duration::from_millis(2);
+
+    impl ScriptedStream {
+        fn new(reads: Vec<std::io::Result<Vec<u8>>>, writes: Vec<std::io::Result<usize>>) -> Self {
+            Self {
+                reads: reads.into(),
+                writes: writes.into(),
+                written: Vec::new(),
+                armed: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn armed(&self) -> Vec<Duration> {
+            self.armed.borrow().clone()
+        }
+    }
+
+    fn interrupted<T>() -> std::io::Result<T> {
+        Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+    }
+
+    impl DeadlineStream for ScriptedStream {
+        fn arm(&self, budget: Duration) -> Result<(), TrustError> {
+            self.armed.borrow_mut().push(budget);
+            Ok(())
+        }
+
+        fn read_once(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(STEP);
+            match self.reads.pop_front() {
+                Some(Ok(bytes)) => {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    Ok(n)
+                }
+                Some(Err(e)) => Err(e),
+                // Past the end of the script the signals never stop.
+                None => interrupted(),
+            }
+        }
+
+        fn write_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(STEP);
+            match self.writes.pop_front() {
+                Some(Ok(n)) => {
+                    let n = n.min(buf.len());
+                    self.written.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                }
+                Some(Err(e)) => Err(e),
+                None => interrupted(),
+            }
+        }
+
+        fn flush_once(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Asserts the budget armed for each attempt is strictly below the one
+    /// before it, i.e. retries eat into the same deadline.
+    fn assert_shrinking(armed: &[Duration]) {
+        assert!(
+            armed.windows(2).all(|w| w[1] < w[0]),
+            "each retry must arm a strictly smaller budget, got {armed:?}"
+        );
+    }
+
+    #[test]
+    fn interrupted_read_resumes_against_the_same_deadline() {
+        let mut stream = ScriptedStream::new(
+            vec![interrupted(), interrupted(), Ok(b"ok".to_vec())],
+            vec![],
+        );
+        let total = Duration::from_millis(500);
+        let deadline = Instant::now() + total;
+        let mut buf = [0_u8; 8];
+        let n = super::read_interruptible(&mut stream, &mut buf, deadline, "read").unwrap();
+        assert_eq!(&buf[..n], b"ok");
+        let armed = stream.armed();
+        assert_eq!(armed.len(), 3, "one arm per attempt, got {armed:?}");
+        assert!(
+            armed[0] <= total,
+            "first budget exceeds the total {armed:?}"
+        );
+        assert_shrinking(&armed);
+    }
+
+    #[test]
+    fn endless_read_interruption_still_hits_the_deadline() {
+        // Nothing but signals: the retries must consume the budget and end
+        // as a timeout rather than looping forever or reporting the signal.
+        let mut stream = ScriptedStream::new(vec![], vec![]);
+        let total = Duration::from_millis(150);
+        let started = Instant::now();
+        let mut buf = [0_u8; 8];
+        let err = super::read_interruptible(&mut stream, &mut buf, started + total, "read")
+            .expect_err("an exhausted budget must fail");
+        assert!(matches!(err, TrustError::OcspTimeout), "got {err:?}");
+        assert!(
+            started.elapsed() >= total,
+            "returned before the deadline: {:?}",
+            started.elapsed()
+        );
+        let armed = stream.armed();
+        assert!(armed.len() > 1, "expected repeated retries, got {armed:?}");
+        assert_shrinking(&armed);
+    }
+
+    #[test]
+    fn interrupted_write_finishes_the_buffer_within_the_deadline() {
+        // A short write, then a signal, then the remainder.
+        let mut stream = ScriptedStream::new(vec![], vec![Ok(2), interrupted(), Ok(3)]);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        super::write_all_interruptible(&mut stream, b"abcde", deadline, "write").unwrap();
+        assert_eq!(stream.written, b"abcde");
+        let armed = stream.armed();
+        assert_eq!(armed.len(), 3, "one arm per attempt, got {armed:?}");
+        assert_shrinking(&armed);
+    }
+
+    #[test]
+    fn endless_write_interruption_still_hits_the_deadline() {
+        let mut stream = ScriptedStream::new(vec![], vec![]);
+        let total = Duration::from_millis(150);
+        let started = Instant::now();
+        let err = super::write_all_interruptible(&mut stream, b"abc", started + total, "write")
+            .expect_err("an exhausted budget must fail");
+        assert!(matches!(err, TrustError::OcspTimeout), "got {err:?}");
+        assert!(started.elapsed() >= total);
+    }
+
+    #[test]
+    fn interrupted_reads_feed_the_head_parser() {
+        // The same retry loop seen through `read_head`: signals interleaved
+        // with the response head must not disturb the parse.
+        let mut stream = ScriptedStream::new(
+            vec![
+                interrupted(),
+                Ok(b"HTTP/1.1 200 OK\r\nContent-".to_vec()),
+                interrupted(),
+                Ok(b"Length: 3\r\n\r\nder".to_vec()),
+            ],
+            vec![],
+        );
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let (head, early) = super::read_head(&mut stream, deadline).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "got {head:?}");
+        assert_eq!(early, b"der");
+        assert_shrinking(&stream.armed());
     }
 }

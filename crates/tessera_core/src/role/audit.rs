@@ -67,7 +67,7 @@ pub fn emit_role_session_open(
 /// Emit `role_deny` — a login denied for a role reason.
 ///
 /// `reason` is one of `not_found` / `not_covered` / `backend_unavailable` /
-/// `mask_exceeds_ceiling` / `syntax`. The canonical user and the requested
+/// `mask_exceeds_ceiling` / `syntax` / `system_account`. The canonical user and the requested
 /// role are separate fields; the raw login string is only logged for
 /// `reason = syntax` (handled at the parse site, not here).
 pub fn emit_role_deny(user: &str, requested_role: &str, reason: &str) {

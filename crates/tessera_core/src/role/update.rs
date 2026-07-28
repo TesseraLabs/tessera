@@ -20,6 +20,7 @@ use std::path::Path;
 
 use super::schema::RoleOs;
 use super::store::{RoleStore, RoleStoreError};
+use super::system_account::SystemAccounts;
 
 /// Trust mode + parameters for validating a staged update.
 #[derive(Debug, Clone, Copy)]
@@ -51,16 +52,20 @@ pub fn atomic_update(
     staged_dir: &Path,
     device_os: RoleOs,
     trust: &UpdateTrust<'_>,
+    accounts: SystemAccounts,
 ) -> Result<RoleStore, RoleStoreError> {
     // 1) Validate the staged set first; never touch target_dir on failure.
     let store = match *trust {
-        UpdateTrust::Standalone => {
-            RoleStore::load(staged_dir, device_os, super::store::TrustMode::Standalone)?
-        }
+        UpdateTrust::Standalone => RoleStore::load(
+            staged_dir,
+            device_os,
+            super::store::TrustMode::Standalone,
+            accounts,
+        )?,
         UpdateTrust::Managed {
             trusted_pubkey,
             persist_dir,
-        } => RoleStore::load_managed(staged_dir, device_os, trusted_pubkey, persist_dir)?,
+        } => RoleStore::load_managed(staged_dir, device_os, trusted_pubkey, persist_dir, accounts)?,
     };
 
     // 2) Swap into place.
@@ -198,8 +203,14 @@ mod tests {
         write_slice(&staged, "oper", 2);
         write_slice(&staged, "serv", 1);
 
-        let store =
-            atomic_update(&target, &staged, RoleOs::Linux, &UpdateTrust::Standalone).unwrap();
+        let store = atomic_update(
+            &target,
+            &staged,
+            RoleOs::Linux,
+            &UpdateTrust::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
         assert_eq!(store.len(), 2);
         assert_eq!(store.get(&RoleId::new("oper").unwrap()).unwrap().version, 2);
         // On disk: target now holds the new set; staged is gone.
@@ -217,8 +228,14 @@ mod tests {
         fs::create_dir(&staged).unwrap();
         write_slice(&staged, "oper", 1);
 
-        let store =
-            atomic_update(&target, &staged, RoleOs::Linux, &UpdateTrust::Standalone).unwrap();
+        let store = atomic_update(
+            &target,
+            &staged,
+            RoleOs::Linux,
+            &UpdateTrust::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
         assert_eq!(store.len(), 1);
         assert!(target.join("oper.toml").exists());
     }
@@ -238,8 +255,14 @@ mod tests {
             write_slice(&staged, &format!("r{i}"), 1);
         }
 
-        let err =
-            atomic_update(&target, &staged, RoleOs::Linux, &UpdateTrust::Standalone).unwrap_err();
+        let err = atomic_update(
+            &target,
+            &staged,
+            RoleOs::Linux,
+            &UpdateTrust::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap_err();
         assert!(matches!(err, RoleStoreError::TooManyRoles { .. }));
 
         // Active base unchanged: target still holds the old single slice.
@@ -248,6 +271,7 @@ mod tests {
             &target,
             RoleOs::Linux,
             super::super::store::TrustMode::Standalone,
+            SystemAccounts::empty(),
         )
         .unwrap();
         assert_eq!(reloaded.len(), 1);

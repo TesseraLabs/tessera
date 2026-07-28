@@ -85,3 +85,26 @@ cases:
     teardown:
       - run: helpers/usb-loop.sh detach
       - run: helpers/setup/deploy-fixtures.sh
+
+  - id: ROLE-005
+    title: Вход в системную учётную запись не открывает сессию
+    requirement: openspec/specs/role-selection/spec.md
+    requires: [service-manager, usb]
+    steps:
+      # root есть на любом устройстве и удовлетворяет грамматике имени роли:
+      # после перехода на модель «роль = ролевая учётная запись» имя роли и
+      # есть имя записи входа, поэтому пространства имён совпали. Носитель
+      # предъявлен настоящий — отказ не должен зависеть ни от него, ни от
+      # содержимого хранилища.
+      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
+      - run: pam-drive certauth root authenticate
+        stdin: "123456"
+        expect: { exit_code: 6, stdout_matches: 'auth: PAM_PERM_DENIED \(6\)' }
+        timeout: 60
+      # Причина отказа именно «системная учётная запись», а не «роль не найдена»:
+      # проверка идёт по uid записи на устройстве и срабатывает до хранилища.
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'reason="?system_account"?'
+    teardown:
+      - run: helpers/usb-loop.sh detach

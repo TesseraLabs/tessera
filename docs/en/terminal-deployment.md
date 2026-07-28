@@ -177,7 +177,14 @@ sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sudo
 A role is a slice file in the role-database directory. A database is for a
 single OS: Linux and Astra slices are not mixed in one directory. The slices are
 checked before rollout:
-`tessera role lint --dir /var/lib/tessera/roles --os linux`.
+`tessera role lint --dir /var/lib/tessera/roles --os linux --on-device`.
+
+`--on-device` states that the command runs on the device the database belongs
+to. Only then does lint check slice names against the local accounts and catch
+a slice named after a system account (`root.toml` and the like). Without the
+flag that check is skipped with a note in the output: on a workstation it would
+answer from somebody else's accounts — rejecting the legitimate `mail` slice
+and passing a system account that exists only on the device.
 
 ### 8.1. On an OS without mandatory control (Linux)
 
@@ -330,7 +337,7 @@ server — the server adds scale and data freshness, not security.
 - [ ] `monitor_fail_mode = "strict"`.
 - [ ] `on_usb_removed` = `logout` or `shutdown`, `usb_removed_grace_seconds = 0`.
 - [ ] cert-only login mode wired into the required services (login, sudo, graphical login).
-- [ ] Role slices have passed `tessera role lint`.
+- [ ] Role slices have passed `tessera role lint --on-device` on the device itself.
 - [ ] Role TTLs match the risk (higher permissions — shorter session).
 - [ ] For Astra with МКЦ — the commercial enforcement adapter is installed.
 - [ ] ЗПС (DIGSIG) in `enforce` mode; Tessera binaries are signed.

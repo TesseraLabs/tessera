@@ -36,7 +36,12 @@ use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
-#[cfg(target_os = "linux")]
+/// `PAM_AUTH_ERR` — the generic "authentication did not succeed" code.
+///
+/// Compiled outside the Linux module body as well so the store-load verdict it
+/// belongs to can be exercised on a development host: the cdylib itself only
+/// builds on Linux, which would otherwise leave that mapping untested until CI.
+#[cfg(any(target_os = "linux", test))]
 const PAM_AUTH_ERR: i32 = 7;
 #[cfg(target_os = "linux")]
 const PAM_SYSTEM_ERR: i32 = 4;
@@ -46,7 +51,7 @@ const PAM_ACCT_EXPIRED: i32 = 13;
 /// this", which is what a `PAM_USER` that the certificate was never checked
 /// against amounts to. Matches the role-denial row of the
 /// [`crate::flow::FlowError::pam_code`] table.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const PAM_PERM_DENIED: i32 = 6;
 
 /// Owned holder for the role-selection stage: keeps the loaded
@@ -67,6 +72,11 @@ impl RoleStageOwned {
         crate::flow::RoleStage {
             store: &self.store,
             default_session_ttl: self.default_session_ttl,
+            // View and verdicts both come from the store's own load, so what it
+            // asked both account sources about every slice name is what this
+            // stage would ask again — at the cost of another resolver run, and
+            // of another wait on a directory that is not answering.
+            accounts: tessera_core::role::AccountCheck::from_store(&self.store),
         }
     }
 }
@@ -86,25 +96,40 @@ fn build_role_stage(
     roles_cfg: &tessera_core::config::validated::RolesSection,
     device_os: tessera_core::role::RoleOs,
 ) -> Result<RoleStageOwned, i32> {
-    use tessera_core::role::{RoleDenyReason, RoleStore, TrustMode};
+    use tessera_core::role::{RoleStore, SystemAccounts, TrustMode};
+
+    // The device's real passwd database: on a live device that is the only
+    // honest source for "is this account the system's own". Name resolution is
+    // consulted on top of it under the configured bound, so a directory that
+    // stops answering costs the login that bound once and nothing after it.
+    let accounts = SystemAccounts::device(roles_cfg.account_lookup_timeout);
 
     // Load the on-device role store through the privileged-path validator.
     // OS selection is runtime state now: the same open PAM binary serves
     // Linux and Astra, with the Parsec plugin identifying the Astra contour.
-    let store = match RoleStore::load_privileged(&roles_cfg.dir, device_os, TrustMode::Standalone) {
+    let store = match RoleStore::load_privileged(
+        &roles_cfg.dir,
+        device_os,
+        TrustMode::Standalone,
+        accounts,
+    ) {
         Ok(s) => s,
         Err(err) => {
-            // A store that cannot be loaded is "roles not configured" —
-            // fail-closed, because coverage cannot be proven without it.
+            // Fail-closed either way — coverage cannot be proven without a
+            // store — but the two failures are audited apart, and this is the
+            // place where that distinction is decided in a real login: the
+            // store is loaded before the flow runs, so an unusable account
+            // database surfaces here and never reaches the flow's own check.
+            let (reason, code) = store_load_denial(&err);
             tracing::error!(
                 target: "role.audit",
                 event = "role_deny",
-                reason = %RoleDenyReason::NotFound,
+                reason = %reason,
                 dir = %roles_cfg.dir.display(),
                 error = %err,
                 "role store load failed",
             );
-            return Err(PAM_AUTH_ERR);
+            return Err(code);
         }
     };
 
@@ -112,6 +137,32 @@ fn build_role_stage(
         store,
         default_session_ttl: roles_cfg.default_session_ttl,
     })
+}
+
+/// The audit reason and PAM code a failed role-store load is refused under.
+///
+/// A device whose account database cannot be consulted is not a device without
+/// roles. Reporting it as "not configured" would tell the administrator to go
+/// look for a missing base while the real fault — an unreadable `/etc/passwd`,
+/// a name service that answers with an error — repeats on every login and says
+/// nothing about itself. The distinction has to be made here rather than deeper
+/// in the flow: the store is loaded before authentication starts, so this is
+/// the first thing an unusable account database breaks.
+///
+/// `PAM_PERM_DENIED` matches the code the flow returns for a role denial, so
+/// the same fault reads the same way whichever stage catches it.
+#[cfg(any(target_os = "linux", test))]
+fn store_load_denial(
+    error: &tessera_core::role::RoleStoreError,
+) -> (tessera_core::role::RoleDenyReason, i32) {
+    use tessera_core::role::{RoleDenyReason, RoleStoreError};
+
+    match error {
+        RoleStoreError::AccountsUnavailable { .. } => {
+            (RoleDenyReason::BackendUnavailable, PAM_PERM_DENIED)
+        }
+        _ => (RoleDenyReason::NotFound, PAM_AUTH_ERR),
+    }
 }
 
 /// Load this device's trusted tag set from the configured `[tags]` source
@@ -735,6 +786,61 @@ pub unsafe extern "C" fn pam_sm_close_session(
         }
         PAM_SUCCESS
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::missing_docs_in_private_items)]
+mod store_load_denial_tests {
+    use super::{store_load_denial, PAM_AUTH_ERR, PAM_PERM_DENIED};
+
+    use tessera_core::role::store::RoleStoreError;
+    use tessera_core::role::{RoleDenyReason, RoleOs, RoleStore, SystemAccounts, TrustMode};
+
+    /// The error a real load produces when the account database cannot be
+    /// consulted, taken from the loader rather than constructed here: the
+    /// mapping is only worth anything if it names the variant this path
+    /// actually yields.
+    fn accounts_unavailable_error() -> RoleStoreError {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("serv.toml"),
+            b"role = \"serv\"\nversion = 1\nos = \"linux\"\nname = \"serv\"\nlevel = 1\n"
+                .as_slice(),
+        )
+        .expect("write slice");
+
+        RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::with_lookup(|_| tessera_core::role::PasswdLookup::Unavailable),
+        )
+        .expect_err("an unusable account database must fail the load")
+    }
+
+    #[test]
+    fn an_unusable_account_database_is_not_reported_as_a_missing_base() {
+        let (reason, code) = store_load_denial(&accounts_unavailable_error());
+
+        assert_eq!(reason.as_str(), "backend_unavailable");
+        assert_eq!(code, PAM_PERM_DENIED);
+    }
+
+    #[test]
+    fn every_other_load_failure_keeps_the_previous_verdict() {
+        let missing_dir = RoleStore::load(
+            std::path::Path::new("/nonexistent/role/base"),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .expect_err("a missing directory must fail the load");
+
+        let (reason, code) = store_load_denial(&missing_dir);
+
+        assert_eq!(reason, RoleDenyReason::NotFound);
+        assert_eq!(code, PAM_AUTH_ERR);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

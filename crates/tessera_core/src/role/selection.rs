@@ -27,7 +27,7 @@ use super::store::RoleStore;
 
 /// Reason a role login was denied. Matches the `role_deny` audit dictionary
 /// (logging-audit spec): `not_found` / `not_covered` / `backend_unavailable`
-/// / `mask_exceeds_ceiling` / `syntax`.
+/// / `mask_exceeds_ceiling` / `syntax` / `system_account`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleDenyReason {
     /// The requested role is not present in the on-device store, or the
@@ -37,9 +37,12 @@ pub enum RoleDenyReason {
     /// The requested role is not a member of the certificate's
     /// `allowed_roles` list.
     NotCovered,
-    /// The resolved role payload needs an enforcement backend that the
-    /// runtime does not provide (`mac_mask` without an active plugin or
-    /// `selinux` without the `SELinux` adapter).
+    /// A backend the decision depends on did not answer: the resolved role
+    /// payload needs an enforcement backend the runtime does not provide
+    /// (`mac_mask` without an active plugin, `selinux` without the `SELinux`
+    /// adapter), or the local account database could not be consulted to tell a role
+    /// account from a system one. Every such case denies — an undecidable
+    /// login is a refused login.
     BackendUnavailable,
     /// The role's MAC mask exceeds the certificate's integrity ceiling
     /// (reserved for the mac-integrity intersection in task 5.1).
@@ -47,6 +50,16 @@ pub enum RoleDenyReason {
     /// The login string was syntactically invalid, or no role was supplied
     /// where one is required.
     Syntax,
+    /// The login account is a system account of this device — its uid is
+    /// outside [`crate::role::FIRST_REGULAR_UID`]`..=`[`crate::role::LAST_REGULAR_UID`]
+    /// — and can never be a role.
+    ///
+    /// This reason means somebody tried to enter an account the system owns.
+    /// A local account database that cannot answer is refused just as firmly, but
+    /// under [`RoleDenyReason::BackendUnavailable`]: it is a device fault that
+    /// repeats for every login, and mixing it in here would drown the signal
+    /// this reason exists to raise.
+    SystemAccount,
 }
 
 impl RoleDenyReason {
@@ -59,6 +72,7 @@ impl RoleDenyReason {
             RoleDenyReason::BackendUnavailable => "backend_unavailable",
             RoleDenyReason::MaskExceedsCeiling => "mask_exceeds_ceiling",
             RoleDenyReason::Syntax => "syntax",
+            RoleDenyReason::SystemAccount => "system_account",
         }
     }
 }
@@ -324,7 +338,13 @@ mod tests {
     fn store_with(role: &str, body: &str) -> (TempDir, RoleStore) {
         let dir = tempfile::tempdir().unwrap();
         write(&dir, role, body);
-        let store = RoleStore::load(dir.path(), RoleOs::Linux, TrustMode::Standalone).unwrap();
+        let store = RoleStore::load(
+            dir.path(),
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            crate::role::SystemAccounts::empty(),
+        )
+        .unwrap();
         (dir, store)
     }
 
@@ -507,6 +527,7 @@ mod tests {
             "mask_exceeds_ceiling"
         );
         assert_eq!(RoleDenyReason::Syntax.as_str(), "syntax");
+        assert_eq!(RoleDenyReason::SystemAccount.as_str(), "system_account");
         assert_eq!(CoverageMethod::Cert.as_str(), "cert");
         assert_eq!(CoverageMethod::Code.as_str(), "code");
     }

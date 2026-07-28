@@ -686,27 +686,333 @@ The full description of the section is in
 
 ### 8.3 The login account
 
-The account name *is* the role, so the system account `serv` must exist
-on the device. Across a fleet, role accounts are provisioned separately;
-for a lab bench this is enough:
+The account name *is* the role, so the account `serv` must exist on the
+device. Across a fleet, role accounts are provisioned separately; for a
+lab bench this is enough:
 
 ```bash
-sudo useradd --system --create-home --shell /bin/bash serv
+sudo useradd --create-home --shell /bin/bash serv
 ```
 
-No password is set for it: entry into a role account is open only
-through Tessera certificate authentication.
+**A role account must be a regular account, not a system one.** The
+absence of `--system` is deliberate: that flag hands out a uid outside
+the regular-user range, and the product refuses to let anyone into an
+account with such a uid. That account simply will not let an engineer
+in.
+
+**The regular-user range is set by two boundaries: 1000 and 61183
+inclusive.** Everything below is accounts the distribution and its
+packages created for themselves; the lower boundary matches `UID_MIN`
+from `/etc/login.defs` on Debian, Ubuntu and Astra. Everything above is
+not a regular user either: 61184 opens the block systemd hands out to
+units with `DynamicUser=yes`, and beyond it sit `nobody` (65534) and
+`nogroup` (65535). The check keys on exactly these two boundaries
+rather than on a list of reserved names; a uid above the upper boundary
+is not arithmetic exotica but the normal state of any system running
+systemd.
+
+The upper boundary deliberately differs from `UID_MAX` (60000 on
+Debian): `UID_MAX` only bounds what `useradd` allocates by itself,
+whereas a role account provisioned above that value must still be able
+to log in. `UID_MAX` remains a sensible recommendation for
+provisioning, but it is not the refusal boundary.
+
+The reason for the refusal is that the role namespace and the Unix
+account namespace became the same namespace. `root`, `daemon`, `bin`,
+`sys`, `mail` and `nobody` all satisfy the `role_id` grammar
+(`^[a-z][a-z0-9-]{0,15}$`), and a single `root.toml` slice — a
+provisioning typo, or a copied sample — would turn `ssh root@device`
+into an ordinary role login with privileges the role model never
+granted. So the product looks not at the name but at the uid the account
+has on this very device: the danger is not the name but the fact that an
+account with somebody else's privileges already exists under it. A list
+of names would encode a guess about which names those are, drift from
+the distribution, and reject legitimate roles — on Debian `mail` is a
+system account and a sensible role name at the same time.
+
+The product carries the boundaries inside it rather than reading
+`/etc/login.defs` at login time: editing that file on the device must
+not widen the gate. That is also why the acceptance check below tests
+against the product's boundaries rather than the contents of
+`login.defs` — otherwise it would answer a different question from the
+one the module answers at login time.
+
+If the account was already created with `--system`, changing the uid of
+a live account is not worth it — files would stay behind with the old
+owner. It is simpler to delete and recreate it:
+
+```bash
+id -u serv                      # outside the range → logins will not work
+sudo userdel -r serv
+sudo useradd --create-home --shell /bin/bash serv
+```
+
+When provisioning through Census this step is already done: Census
+creates the role account with `useradd -u <uid> …`, taking the uid from
+the `uid_range` declared in the declaration — which lies entirely inside
+the regular-user range — and checks that every role falls inside it.
+
+### 8.4 Closing the remaining ways into a role account
+
+The account from §8.3 is created with a home directory and a login
+shell. The absence of a password closes exactly one way in — the
+password one; `~/.ssh/authorized_keys`, `su serv`, `sudo -u serv -i` and
+any PAM stack without `pam_tessera` stay open. The product does not
+close those paths — it manages neither `sshd_config` nor `sudoers` nor
+anybody else's PAM stacks. Provisioning and the device administrator
+close them.
+
+The price of a skipped step grew together with the model. A bypass used
+to yield the personal account of one engineer; now `serv` is a *shared*
+role account carrying the role's privileges, and a login that goes
+around `pam_tessera` leaves no trace in `role.audit` or in the issuance
+journal: there is nobody to record who actually came in.
+
+Below is the minimum to perform on every device. Everything touching
+`sshd` should be done with a second root shell open (see
+[pam-integration.md §8](pam-integration.md#8-safety-of-the-edit)).
+
+#### The password: lock it, do not merely "leave it unset"
+
+```bash
+sudo passwd -l serv
+sudo passwd -S serv     # expected: L in the second column
+```
+
+`passwd -S` on somebody else's account reads `/etc/shadow`, so it runs
+as `root`; without `sudo` the command is refused.
+
+"No password set" and "password locked" are different states. `useradd`
+leaves a `!` in the password field, and such an account really does
+refuse password logins — but that is a default state, not a declared
+intent: a single `passwd serv` typed while debugging silently opens the
+password path, and nothing in the device configuration shows it.
+`passwd -l` makes the lock explicit and `passwd -S` makes it visible:
+the `L` in the second column is one command to check, both at acceptance
+and later.
+
+Separately: `passwd -l` does not close the non-password methods. A key
+in `authorized_keys`, `su` from `root` and `sudo -u` keep working —
+which is exactly why the remaining steps follow.
+
+When provisioning through Census, `passwd -l` has already been run: it
+is part of the role-account creation sequence. Running it again is
+harmless, and on a hand-built device it is mandatory.
+
+#### `authorized_keys`: must not exist, and must not appear
+
+Take the home directory from the passwd database rather than guessing
+it — under provisioning it comes from the declaration and need not be
+`/home/serv`:
+
+```bash
+HOME_SERV=$(getent passwd serv | cut -d: -f6)
+sudo test -e "$HOME_SERV/.ssh/authorized_keys" \
+    && echo "authorized_keys exists — find out where it came from"
+```
+
+Expected: the command prints nothing. Census never creates that file; if
+it is there, it was placed by hand or shipped in an image.
+
+To keep it from appearing later, hand the `.ssh` directory to `root` and
+take write access to it away from the role account:
+
+```bash
+sudo mkdir -p "$HOME_SERV/.ssh"
+sudo chown root:root "$HOME_SERV/.ssh"
+sudo chmod 0500 "$HOME_SERV/.ssh"
+```
+
+The honest limit of this measure: it stops a key from being added as
+`serv` (including from inside an already open role session), but not as
+`root`. Moreover, `sshd` with `StrictModes yes` accepts an
+`authorized_keys` owned by the directory's owner **or** by `root` — so a
+root-owned key placed here would be accepted. The public-key path for
+this account is fully closed only by the `sshd` settings in the next
+step; directory permissions are a second line, not the first.
+
+#### `sshd`: leave a single authentication method
+
+Tessera certificate authentication reaches `sshd` through
+keyboard-interactive and PAM, so everything else must be closed while
+`UsePAM yes` and `KbdInteractiveAuthentication yes` are kept:
+
+```bash
+sudo tee /etc/ssh/sshd_config.d/50-tessera-roles.conf >/dev/null <<'EOF'
+Match User serv
+    PubkeyAuthentication no
+    PasswordAuthentication no
+    KbdInteractiveAuthentication yes
+    HostbasedAuthentication no
+    GSSAPIAuthentication no
+    PermitEmptyPasswords no
+Match all
+EOF
+sudo sshd -t
+sudo sshd -T -C user=serv,host=localhost,addr=127.0.0.1 \
+    | grep -E '^(usepam|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|hostbasedauthentication)'
+sudo sshd -T -C user=<a-regular-account>,host=localhost,addr=127.0.0.1 \
+    | grep -E '^(usepam|pubkeyauthentication)'
+```
+
+Expected from the first check: `usepam yes`,
+`kbdinteractiveauthentication yes`, and `no` for the other three.
+Expected from the second: `usepam yes` and `pubkeyauthentication yes` —
+that is, the block did not affect another user. It is `sshd -T -C` that
+shows the *effective* configuration for a given account, accounting for
+every `Match` block and the order of includes; reading the config files
+by eye does not replace it.
+
+> **The trailing `Match all` is not decoration — do not delete it.** A
+> `Match` block's scope runs until the next `Match` **or the end of the
+> whole configuration**, not the end of the file it was written in.
+> Debian and Ubuntu put `Include /etc/ssh/sshd_config.d/*.conf` on the
+> **first** line of `sshd_config` — so without a closing `Match all` the
+> `User serv` condition would cover the entire remaining
+> configuration: the other included files and the whole body of the
+> parent `sshd_config`. Global directives declared below would stop
+> applying to every other user — including `UsePAM yes`, which on Debian
+> is declared exactly there. A setting meant to close the ways into one
+> account would switch PAM off for the whole device. `Match all` returns
+> parsing to the global context, and the second `sshd -T -C` check above
+> is the one that catches this mistake.
+
+Two places where distributions diverge, and where no universal command
+exists:
+
+- **The `sshd_config.d/` directory.** The line `Include
+  /etc/ssh/sshd_config.d/*.conf` ships with Debian 11+, Ubuntu 20.04+
+  and Astra with OpenSSH 8.2+. Check it with
+  `grep -n '^Include' /etc/ssh/sshd_config`. If the line is absent,
+  creating the file is pointless — append the block **at the end** of
+  `/etc/ssh/sshd_config`. The closing `Match all` is needed there too: a
+  trailing block is safe only until the first edit made after it, and
+  appending a global directive to the end of `sshd_config` is an
+  everyday thing to do — it would silently land inside the `User serv`
+  condition.
+- **The unit name.** `sudo systemctl reload ssh` on Debian/Ubuntu,
+  `sudo systemctl reload sshd` on Astra and some builds. Check with
+  `systemctl list-units 'ssh*'`; reload only after `sshd -t` succeeds.
+
+If the installed OpenSSH understands `AuthorizedKeysFile none` (8.2+),
+add the directive to the same `Match` block as a third line of defence
+on top of `PubkeyAuthentication no`. Older builds do not support it and
+`sshd` fails to start; check with the same `sshd -t` right after the
+edit.
+
+#### `su` and `sudo -u`: close the switch into a role account
+
+There is no single command that works identically on Debian, Ubuntu and
+Astra here: `su` and `sudo` are different mechanisms with different
+configuration files, and each has to be closed on its own.
+
+For `su`, `pam_succeed_if` works. The module ships in `libpam-modules`,
+which is part of the base install on all three target distributions and
+is not split into a separate dependency. Confirm it is present before
+editing the stack — the line below is written as `requisite`, and if the
+module is missing `su` will close for everyone, `root` included:
+
+```bash
+ls /lib/*/security/pam_succeed_if.so /lib/security/pam_succeed_if.so 2>/dev/null
+```
+
+Collect role accounts into a dedicated group and forbid switching into a
+member of that group:
+
+```bash
+sudo groupadd -f tessera-roles
+sudo usermod -aG tessera-roles serv
+```
+
+In `/etc/pam.d/su`, **above** the `auth sufficient pam_rootok.so` line:
+
+```
+auth       requisite   pam_succeed_if.so quiet user notingroup tessera-roles
+```
+
+`user` here is the *target* account of `su`, so the rule reads "the
+switch is allowed only if the target is not a role account". It goes
+above `pam_rootok.so` because otherwise `root` bypasses the check.
+`root` cannot be shut out entirely anyway: it has `chsh`, direct edits
+of `shadow` and a dozen other routes. The point of the line is to stop
+`su serv` from being an everyday command for everyone else.
+
+Both sides need verifying — that the prohibition took effect, and that
+it did not catch everyone else. From an unprivileged account:
+
+```bash
+su - serv                     # expected: refused
+su - <a-regular-account>      # expected: a password prompt and a login
+```
+
+The second command is mandatory. If it is refused as well, the problem
+is not the rule but the line itself: with the module missing or
+misspelled, `requisite` closes `su` entirely. Sort that out with a
+second root shell open — recovery means editing `/etc/pam.d/su`.
+
+For `sudo`, the same is done by a negation in the runas list:
+
+```bash
+sudo visudo -cf /etc/sudoers.d/40-tessera-roles   # after creating the file
+```
+
+Contents (create it through `visudo -f`, not `tee`):
+
+```
+%engineers ALL = (ALL, !%tessera-roles) ALL
+```
+
+One caveat matters here. A negation in a runas list only affects the
+rule it is written in. If the engineer is granted `(serv) ALL` somewhere
+else, or a broader rule appears later in the file, the last match wins
+and the prohibition does not take effect. So check the result, not the
+file:
+
+```bash
+sudo -l -U <engineer-account>
+```
+
+Expected: no line in the output permits running as `serv`.
+
+#### PAM stacks without the module
+
+Every service that authenticates and opens a session is a way in. A
+stack without `pam_tessera` will let a caller into the role account on
+its own terms, past the role and past `role.audit`. Check every stack
+people actually enter the device through: `sshd`, `login`, `fly-dm` (and
+the screen locker), `su`, `sudo`. What to add and where —
+[pam-integration.md](pam-integration.md); `tessera check` catches module
+ordering errors in stacks where the module is already present, but will
+not tell you about a stack it was never added to.
 
 ### Verification (section 8)
 
 ```bash
 ls -la /var/lib/tessera/roles/
 id serv
+
+# uid inside the regular-user range (product boundaries, see §8.3)
+u=$(id -u serv)
+[ "$u" -ge 1000 ] && [ "$u" -le 61183 ] \
+    && echo "uid inside the regular-user range: ok"
+
+sudo passwd -S serv
+sudo test -e "$(getent passwd serv | cut -d: -f6)/.ssh/authorized_keys" \
+    && echo "authorized_keys exists — find out where it came from"
+sudo sshd -T -C user=serv,host=localhost,addr=127.0.0.1 \
+    | grep -E '^(usepam|pubkeyauthentication|passwordauthentication)'
+sudo sshd -T -C user=<a-regular-account>,host=localhost,addr=127.0.0.1 \
+    | grep -E '^(usepam|pubkeyauthentication)'
 sudo tessera check
 ```
 
 Expected: `serv.toml` is present with `-rw-r--r-- root root`, `id serv`
-prints uid/gid, `tessera check` finishes with no ERROR.
+prints uid/gid, the uid falls inside the regular-user range, `passwd -S`
+shows `L` in the second column, nothing is printed about
+`authorized_keys`, for `serv` — `usepam yes` with `pubkeyauthentication
+no` and `passwordauthentication no`, for the other account — `usepam
+yes` and `pubkeyauthentication yes` (the block did not leak past its
+bounds), and `tessera check` finishes with no ERROR.
 
 ## 9. Editing `/etc/pam.d/*`
 
