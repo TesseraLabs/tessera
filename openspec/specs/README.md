@@ -14,8 +14,8 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 | [gost-crypto](gost-crypto/spec.md) | Делегация в gost-engine, ленивая загрузка |
 | [cert-scope-binding](cert-scope-binding/spec.md) | host_binding + max_integrity + allowed_roles extensions, OID-контракт |
 | [host-identity](host-identity/spec.md) | first-working-wins, normalize+sha256, override, fallback |
-| [role-selection](role-selection/spec.md) | Роль = имя ролевой УЗ входа (без дефолта, PAM_USER не переписывается), покрытие удостоверением, фаза сессии от аутентифицированной УЗ, TTL сессии |
-| [role-store](role-store/spec.md) | База ролей `/var/lib/tessera/roles/`, формат среза TOML, standalone (права ФС) + managed (подписанный manifest, anti-rollback), атомарное обновление |
+| [role-selection](role-selection/spec.md) | Роль = имя ролевой УЗ входа (без дефолта, PAM_USER не переписывается), системная УЗ ролью быть не может, покрытие удостоверением, фаза сессии от аутентифицированной УЗ, TTL сессии |
+| [role-store](role-store/spec.md) | База ролей `/var/lib/tessera/roles/`, формат среза TOML, standalone (права ФС) + managed (подписанный manifest, anti-rollback), атомарное обновление, отказ грузить срез с именем системной УЗ |
 
 ### Носители
 | [usb-media-pkcs12](usb-media-pkcs12/spec.md) | USB discovery, hardened mount, anti-oracle перебор партиций, PIN |
