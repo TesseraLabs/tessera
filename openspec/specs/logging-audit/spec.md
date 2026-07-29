@@ -68,7 +68,7 @@
 | Событие | Поля | Когда |
 |---|---|---|
 | `role_session_open` | `user` (канон), `role`, `role_version`, `method` (cert/code), `ttl` | успешное открытие сессии |
-| `role_deny` | `user`, `requested_role`, `reason` (`not_found` / `not_covered` / `backend_unavailable` / `mask_exceeds_ceiling` / `syntax`) | любой отказ по роли |
+| `role_deny` | `user`, `requested_role`, `reason` (`not_found` / `not_covered` / `backend_unavailable` / `mask_exceeds_ceiling` / `syntax` / `system_account`) | любой отказ по роли |
 | `role_slice_invalid` | `path`, `error` | срез отвергнут валидацией (standalone: per-роль) |
 | `bundle_rejected` | `reason` (`signature` / `rollback` / `hash_mismatch`), `bundle_version` | managed: отказ всей базы (severity critical) |
 | `bundle_baseline_established` | `bundle_version` | первый манифест после потери персиста (TOFU) |
@@ -84,6 +84,12 @@
 #### Scenario: Отказ базы в managed
 - **WHEN** манифест отвергнут (rollback)
 - **THEN** эмитится `bundle_rejected` severity critical с `reason=rollback` и обеими версиями в полях
+
+`system_account` означает, что учётная запись входа признана системной по uid и
+ролью быть не может. Диагностика этого отказа НЕ ДОЛЖНА (MUST NOT) сообщать,
+присутствует ли в хранилище срез с таким именем: это дало бы оракул наличия
+роли до предъявления удостоверения — ровно тот, ради отсутствия которого ранняя
+проверка существования роли и была отвергнута.
 
 ### Requirement: Audit-события делегирования и тегов
 
