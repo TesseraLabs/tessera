@@ -13,6 +13,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod client;
+pub mod cp;
 pub mod framing;
 pub mod server;
 pub mod session_target;
@@ -21,8 +22,13 @@ pub mod version;
 pub mod wire;
 
 pub use client::{ClientMessage, SessionOpenPayload};
+pub use cp::client::{Client, ClientError};
+pub use cp::{
+    Admission, AuthVerdict, CpClientMessage, CpServerMessage, Denial, DenialReason, RoleSummary,
+    WireSecret,
+};
 pub use framing::{decode, encode, FramingError};
 pub use server::{error_codes, ServerErrorCode, ServerMessage};
 pub use session_target::SessionTarget;
 pub use version::PROTOCOL_VERSION;
-pub use wire::{decode_bytes, decode_line, encode_message, WireError, MAX_FRAME_BYTES};
+pub use wire::{decode_bytes, decode_line, encode_message, read_frame, WireError, MAX_FRAME_BYTES};

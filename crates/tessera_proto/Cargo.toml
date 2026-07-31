@@ -16,6 +16,9 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# The credential-provider messages carry a PIN and a password; both are wiped
+# on drop rather than left in freed memory.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
