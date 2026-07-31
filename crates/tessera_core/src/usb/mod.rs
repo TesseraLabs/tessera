@@ -6,8 +6,10 @@
 //! 2. **Monitor** for new "add" events until either a match shows up or the
 //!    caller-supplied timeout elapses.
 //!
-//! On non-Linux platforms the public API surface is preserved but every
-//! call returns [`UsbError::UnsupportedPlatform`].
+//! On Windows the same contract is served by [`RemovableVolumeEnumerator`],
+//! which walks the volumes the OS has already mounted; on every other
+//! platform the public API surface is preserved but every call returns
+//! [`UsbError::UnsupportedPlatform`].
 //!
 //! Tests that need not bind to real udev should plug a mock implementation
 //! of [`UsbEnumerator`] into [`wait_for_usb_with`].
@@ -17,6 +19,9 @@ pub mod partition;
 
 #[cfg(target_os = "linux")]
 mod linux_impl;
+
+#[cfg(windows)]
+mod windows_impl;
 
 pub use error::UsbError;
 pub use partition::{select_partitions, PartitionCandidate};
@@ -77,6 +82,92 @@ impl UsbEnumerator for UdevEnumerator {
             let _ = vid_pid_filter;
             Err(UsbError::UnsupportedPlatform)
         }
+    }
+}
+
+/// Enumerator over the removable volumes the operating system has mounted.
+///
+/// The Windows counterpart of [`UdevEnumerator`]: instead of a device tree it
+/// walks drive letters, keeping only what the OS classifies as removable
+/// media. Non-Windows builds return [`UsbError::UnsupportedPlatform`].
+///
+/// `vid_pid_filter` is accepted for trait compatibility and deliberately
+/// ignored: a drive letter carries no USB descriptor, so both fields of every
+/// returned [`UsbDevice`] are zero and filtering on them could only ever
+/// produce an empty result. The filter becomes meaningful together with
+/// removal handling, which is what reads the descriptor identity.
+#[derive(Debug, Default)]
+pub struct RemovableVolumeEnumerator;
+
+impl UsbEnumerator for RemovableVolumeEnumerator {
+    fn enumerate(&self, vid_pid_filter: &[(u16, u16)]) -> Result<Vec<UsbDevice>, UsbError> {
+        if !vid_pid_filter.is_empty() {
+            tracing::warn!(
+                target: "tessera.usb",
+                entries = vid_pid_filter.len(),
+                "vid/pid allow-list ignored: removable volumes expose no USB descriptor yet"
+            );
+        }
+        #[cfg(windows)]
+        {
+            windows_impl::enumerate_removable_volumes()
+        }
+        #[cfg(not(windows))]
+        {
+            Err(UsbError::UnsupportedPlatform)
+        }
+    }
+}
+
+/// Cooperative cancellation for a bounded wait.
+///
+/// A wait for media is the one step of the flow that lasts as long as the
+/// person in front of the device takes, so its shape decides whether a server
+/// can serve anyone else meanwhile. Every waiter here holds only its own
+/// borrow of an enumerator and its own deadline — no process-wide handle, no
+/// lock, nothing another connection could queue behind — and consults this
+/// trait between polls, so a connection that goes away releases its thread
+/// instead of pinning it until the deadline.
+pub trait WaitCancel: Sync {
+    /// `true` once the caller no longer wants the wait to continue.
+    fn is_cancelled(&self) -> bool;
+}
+
+/// A [`WaitCancel`] that never cancels: the wait ends on its own deadline.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NeverCancel;
+
+impl WaitCancel for NeverCancel {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// A cancellation flag shared between a waiting thread and whoever may want
+/// to end the wait early.
+///
+/// Cloning shares the flag; tripping it through any clone ends every wait
+/// observing it.
+#[derive(Debug, Default, Clone)]
+pub struct CancelFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelFlag {
+    /// A fresh, untripped flag.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Trip the flag: every wait observing it returns
+    /// [`UsbError::WaitCancelled`] at its next poll.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl WaitCancel for CancelFlag {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -167,9 +258,42 @@ pub fn wait_for_usb_with<E: UsbEnumerator>(
     vid_pid_filter: &[(u16, u16)],
     poll_interval: Duration,
 ) -> Result<Vec<UsbDevice>, UsbError> {
+    wait_for_devices_cancellable(
+        enumerator,
+        timeout,
+        vid_pid_filter,
+        poll_interval,
+        &NeverCancel,
+    )
+}
+
+/// Poll `enumerator` until it reports a device, `timeout` elapses, or `cancel`
+/// is tripped.
+///
+/// This is the wait used where there is no event source to block on — the
+/// Windows volume path, and any test driving a mock. It owns nothing beyond
+/// its own borrows, so several of these may run at once on different threads
+/// without contending; `poll_interval` bounds both how quickly a newly
+/// attached volume is noticed and how quickly a cancellation is observed.
+///
+/// # Errors
+///
+/// - [`UsbError::Timeout`] — nothing appeared within `timeout`.
+/// - [`UsbError::WaitCancelled`] — the caller ended the wait early.
+/// - Whatever the enumerator itself returns, verbatim.
+pub fn wait_for_devices_cancellable<E: UsbEnumerator>(
+    enumerator: &E,
+    timeout: Duration,
+    vid_pid_filter: &[(u16, u16)],
+    poll_interval: Duration,
+    cancel: &dyn WaitCancel,
+) -> Result<Vec<UsbDevice>, UsbError> {
     use std::time::Instant;
     let deadline = Instant::now() + timeout;
     loop {
+        if cancel.is_cancelled() {
+            return Err(UsbError::WaitCancelled);
+        }
         let now = Instant::now();
         let devs = enumerator.enumerate(vid_pid_filter)?;
         if !devs.is_empty() {
@@ -307,6 +431,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, UsbError::Timeout));
+    }
+
+    #[test]
+    fn cancelled_wait_is_distinguishable_from_a_timeout() {
+        let m = MockEnumerator {
+            devices: vec![],
+            error: None,
+        };
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let start = std::time::Instant::now();
+        let err = wait_for_devices_cancellable(
+            &m,
+            Duration::from_secs(30),
+            &[],
+            Duration::from_millis(10),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, UsbError::WaitCancelled));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a cancelled wait must not sit out its budget"
+        );
+    }
+
+    #[test]
+    fn a_cancel_flag_tripped_from_another_thread_ends_the_wait() {
+        let m = MockEnumerator {
+            devices: vec![],
+            error: None,
+        };
+        let cancel = CancelFlag::new();
+        let trigger = cancel.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            trigger.cancel();
+        });
+        let err = wait_for_devices_cancellable(
+            &m,
+            Duration::from_secs(30),
+            &[],
+            Duration::from_millis(10),
+            &cancel,
+        )
+        .unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(err, UsbError::WaitCancelled));
+    }
+
+    #[test]
+    fn removable_volume_enumerator_ignores_the_vid_pid_filter() {
+        // On non-Windows hosts the call refuses for want of a platform, which
+        // is still the answer that proves the filter never became a reason to
+        // return an empty list.
+        let out = RemovableVolumeEnumerator.enumerate(&[(0x1, 0x2)]);
+        #[cfg(windows)]
+        assert!(
+            out.is_ok(),
+            "enumeration must not fail on a filter: {out:?}"
+        );
+        #[cfg(not(windows))]
+        assert!(matches!(out, Err(UsbError::UnsupportedPlatform)));
     }
 
     #[test]

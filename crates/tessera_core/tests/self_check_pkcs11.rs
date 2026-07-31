@@ -9,7 +9,8 @@
 //!
 //! These run on every host — they don't require a real PKCS#11
 //! provider.  The "module load fails" case uses paths that are
-//! guaranteed to fail loading (`/nonexistent/...`, `/bin/sh`).
+//! guaranteed to fail loading: one that exists but exports no PKCS#11
+//! entry point, and one that does not exist at all.
 
 #![allow(missing_docs)]
 #![allow(
@@ -18,6 +19,12 @@
     clippy::panic,
     clippy::unwrap_used
 )]
+
+// Shared with the crate's unit tests: config validation demands absolute
+// paths, and what is absolute differs between Windows and Unix.
+#[allow(dead_code)]
+#[path = "../src/test_support.rs"]
+mod test_support;
 
 use std::path::Path;
 
@@ -46,26 +53,31 @@ fn cfg_with(mode: &str, pkcs11_module_path: &str, anchor: &Path) -> ValidatedCon
     let body = original
         .replace(
             "anchors = [\"/bin/sh\"]",
-            &format!("anchors = [{:?}]", anchor.to_string_lossy()),
+            &format!("anchors = [{}]", test_support::toml_path(anchor)),
         )
         .replace(
             "pkcs11_module = \"/bin/sh\"",
-            &format!("pkcs11_module = {pkcs11_module_path:?}"),
+            &format!(
+                "pkcs11_module = {}",
+                test_support::toml_path(pkcs11_module_path)
+            ),
         )
         .replace("mode = \"pkcs11\"", &format!("mode = {mode:?}"));
+    let body = test_support::platform_config_toml(&body);
     let raw: RawConfig = toml::from_str(&body).expect("parse fixture");
     ValidatedConfig::try_from(&raw).expect("validate")
+}
+
+/// A module path that is absolute on the host and occupied by nothing.
+fn missing_module_path() -> String {
+    test_support::absolute("/nonexistent/__tessera_no_such_module__.so")
 }
 
 #[test]
 fn pkcs11_mode_with_missing_module_path_returns_module_missing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let anchor = write_anchor(dir.path());
-    let cfg = cfg_with(
-        "pkcs11",
-        "/nonexistent/__tessera_no_such_module__.so",
-        &anchor,
-    );
+    let cfg = cfg_with("pkcs11", &missing_module_path(), &anchor);
     let err = self_check(&cfg).err().expect("must fail");
     match err {
         SelfCheckError::Pkcs11ModuleMissing(msg) => {
@@ -80,18 +92,19 @@ fn pkcs11_mode_with_missing_module_path_returns_module_missing() {
 
 #[test]
 fn pkcs11_mode_with_non_pkcs11_so_returns_module_missing() {
-    // `/bin/sh` exists and is loadable as a Mach-O / ELF object, but it
-    // does not export `C_GetFunctionList`.  cryptoki 0.7 is known to
-    // panic from inside `Pkcs11::new` in this case; T15's catch_unwind
-    // converts that into a normal `Pkcs11ModuleMissing` error.
+    // The stand-in executable exists and is loadable as a Mach-O / ELF / PE
+    // object, but it does not export `C_GetFunctionList`.  cryptoki 0.7 is
+    // known to panic from inside `Pkcs11::new` in this case; T15's
+    // catch_unwind converts that into a normal `Pkcs11ModuleMissing` error.
     let dir = tempfile::tempdir().expect("tempdir");
     let anchor = write_anchor(dir.path());
-    let cfg = cfg_with("pkcs11", "/bin/sh", &anchor);
+    let module = test_support::SHELL_PATH;
+    let cfg = cfg_with("pkcs11", module, &anchor);
     let err = self_check(&cfg).err().expect("must fail");
     match err {
         SelfCheckError::Pkcs11ModuleMissing(msg) => {
             assert!(
-                msg.contains("/bin/sh"),
+                msg.contains(module),
                 "error must mention the module path, got {msg}"
             );
         }
@@ -105,11 +118,7 @@ fn pkcs12_mode_does_not_touch_pkcs11_module_path() {
     // when `pkcs11_module` happens to point at a bogus path.
     let dir = tempfile::tempdir().expect("tempdir");
     let anchor = write_anchor(dir.path());
-    let cfg = cfg_with(
-        "pkcs12",
-        "/nonexistent/__tessera_no_such_module__.so",
-        &anchor,
-    );
+    let cfg = cfg_with("pkcs12", &missing_module_path(), &anchor);
     self_check(&cfg).expect("pkcs12 mode must skip pkcs11 self-check");
 }
 

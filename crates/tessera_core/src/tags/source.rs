@@ -296,6 +296,13 @@ mod tests {
 
     // ---- 1.2 managed source ----------------------------------------------
 
+    // Accepting a managed bundle records its version in the anti-rollback
+    // floor, a file written with a pinned POSIX mode — an attacker able to
+    // rewrite it could replay an old tag set, so the write refuses rather than
+    // inherit the directory's permissions. The three tests that get as far as
+    // an accepted bundle therefore need a platform where that file can exist;
+    // the rejection paths below stay portable.
+    #[cfg(unix)]
     #[test]
     fn managed_tags_apply_from_signed_manifest() {
         let key = gen_key();
@@ -311,6 +318,7 @@ mod tests {
         assert_eq!(tags.get("class"), Some("terminal"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_role_only_manifest_yields_empty_tags() {
         // A manifest with no [tags] section still parses (additive optional).
@@ -320,6 +328,7 @@ mod tests {
         assert!(tags.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_rollback_rejected_previous_retained() {
         let key = gen_key();

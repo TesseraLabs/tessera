@@ -7,6 +7,14 @@
 
 use crate::mac::IntegrityLabel;
 
+/// Descriptor type accepted by [`MacBackend::set_fd_label`].
+///
+/// Spelled as the C `int` the enforcement plugin's vtable actually takes
+/// rather than `std::os::unix::io::RawFd`, so the SPI keeps its shape on
+/// targets that have no Unix descriptor namespace. The two are the same type
+/// on every Unix host.
+pub type MacRawFd = std::ffi::c_int;
+
 /// Errors produced by a [`MacBackend`] implementation.
 #[derive(Debug, thiserror::Error)]
 pub enum MacError {
@@ -143,7 +151,7 @@ pub trait MacBackend: Send + Sync {
     /// unchanged rather than overwritten (including with a constant zero).
     fn set_fd_label(
         &self,
-        fd: std::os::unix::io::RawFd,
+        fd: MacRawFd,
         label: IntegrityLabel,
         irelax: bool,
     ) -> Result<(), MacError>;
@@ -200,7 +208,7 @@ impl MacBackend for StubBackend {
 
     fn set_fd_label(
         &self,
-        _fd: std::os::unix::io::RawFd,
+        _fd: MacRawFd,
         _label: IntegrityLabel,
         _irelax: bool,
     ) -> Result<(), MacError> {

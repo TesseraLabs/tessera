@@ -22,9 +22,9 @@
 //! `<openssl/ocsp.h>` of OpenSSL 1.1.1 and 3.x.
 #![allow(unsafe_code)]
 
+use std::ffi::{c_int, c_long, c_uchar};
 use std::ptr::NonNull;
 
-use libc::{c_int, c_long, c_uchar};
 use openssl_sys::{
     ASN1_INTEGER, ASN1_OBJECT, ASN1_OCTET_STRING, ASN1_STRING, OCSP_BASICRESP, OCSP_CERTID,
     OCSP_REQUEST, OCSP_RESPONSE, X509,

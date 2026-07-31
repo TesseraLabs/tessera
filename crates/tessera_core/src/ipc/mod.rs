@@ -11,9 +11,14 @@
 
 use std::sync::Arc;
 
+// The client transport is an `AF_UNIX` stream socket. Windows reaches the
+// daemon over a named pipe instead, which is a separate transport rather than
+// a variation of this one.
+#[cfg(unix)]
 pub mod client;
 pub mod failmode;
 
+#[cfg(unix)]
 pub use client::{ConnectPerCall, MonitorClientFactory, MonitordClient};
 pub use failmode::{FailModeWrapper, MonitorFailMode};
 

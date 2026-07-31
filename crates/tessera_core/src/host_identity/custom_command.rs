@@ -145,6 +145,7 @@ impl CustomCommandSource {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]

@@ -183,10 +183,19 @@ static NAME_RESOLUTION_SUPPRESSED: Suppression = Suppression::new();
 
 /// What one account source says about a login name.
 ///
-/// The same three answers describe both sources; what differs is what
-/// [`AccountSnapshot::check`] does with [`Self::Unavailable`], which is a
-/// refusal from the local database and mere silence from the name service.
+/// [`Self::Uid`], [`Self::NoEntry`] and [`Self::Unavailable`] describe both
+/// Unix sources; what differs between them is what [`AccountSnapshot::check`]
+/// does with [`Self::Unavailable`], which is a refusal from the local database
+/// and mere silence from the name service.
+///
+/// The last two answers exist for a source that establishes the class without
+/// a uid at all. Windows draws the same boundary — the system's own principals
+/// on one side, the accounts a device may open a session under on the other —
+/// but draws it with well-known SIDs rather than with a numeric range (see
+/// [`super::windows_account`]). Reporting such an answer as a fabricated uid
+/// would put a number that means nothing into the refusal an operator reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PasswdLookup {
     /// The account exists and carries this uid.
     Uid(u32),
@@ -196,6 +205,16 @@ pub enum PasswdLookup {
     /// unusable (missing, non-numeric or out-of-range uid). The account's class
     /// stays unknown to this source.
     Unavailable,
+    /// The account is one the system holds for itself, and the source says so
+    /// without giving it a uid.
+    SystemPrincipal,
+    /// The account is an ordinary account of this device, and the source says
+    /// so without giving it a uid.
+    ///
+    /// Final: a source that answers in classes is the authority over the
+    /// namespace it answers about, so there is nothing left for a second
+    /// source to add.
+    RegularAccount,
 }
 
 /// Why an account name cannot be used as a role.
@@ -226,6 +245,18 @@ pub enum SystemAccountError {
         first_regular: u32,
         /// Upper end of the applied range ([`LAST_REGULAR_UID`]).
         last_regular: u32,
+    },
+
+    /// The account is one of the system's own principals on a device whose
+    /// account namespace has no uids to bracket — a built-in or service
+    /// principal on Windows, recognised by its well-known SID.
+    #[error(
+        "account `{account}` is one of this device's own principals \
+         and cannot be a role"
+    )]
+    SystemPrincipal {
+        /// The login account name.
+        account: String,
     },
 
     /// The local account database could not be read, or holds an entry for
@@ -299,10 +330,31 @@ impl SystemAccounts {
     ///
     /// Exhausting `nss_timeout` leaves the verdict where the local database put
     /// it — the bound shortens the login, it never closes one.
+    #[cfg(not(windows))]
     #[must_use]
     pub const fn device(nss_timeout: Duration) -> Self {
         Self {
             local: LocalSource::Database(read_local_database),
+            names: NameSource::Resolver,
+            nss_timeout,
+        }
+    }
+
+    /// The device's own accounts, as Windows describes them: the well-known
+    /// SIDs the system defines for itself plus the machine's local account
+    /// database.
+    ///
+    /// There is no `/etc/passwd` to read here: the class comes from the
+    /// account's SID instead (see [`super::windows_account`]). The additive
+    /// source stays the platform's resolver, which on Windows has no name
+    /// service to consult and answers with silence — the same shape the Unix
+    /// path has when a directory says nothing, so a later Windows directory
+    /// source plugs in where this one already is.
+    #[cfg(windows)]
+    #[must_use]
+    pub const fn device(nss_timeout: Duration) -> Self {
+        Self {
+            local: LocalSource::Answers(windows_account_class),
             names: NameSource::Resolver,
             nss_timeout,
         }
@@ -523,12 +575,24 @@ impl AccountSnapshot {
                     account: account.to_owned(),
                 })
             }
+            PasswdLookup::SystemPrincipal => {
+                return Err(SystemAccountError::SystemPrincipal {
+                    account: account.to_owned(),
+                })
+            }
             PasswdLookup::Uid(uid) if !is_regular(uid) => return Err(system_account(account, uid)),
             PasswdLookup::Uid(uid) => Some(uid),
-            PasswdLookup::NoEntry => None,
+            // Cleared without a uid, so there is none to weigh against the
+            // additive source below.
+            PasswdLookup::NoEntry | PasswdLookup::RegularAccount => None,
         };
 
         match self.resolved.answer_for(account) {
+            // A class the additive source is sure of settles the question the
+            // same way the local one would have.
+            PasswdLookup::SystemPrincipal => Err(SystemAccountError::SystemPrincipal {
+                account: account.to_owned(),
+            }),
             PasswdLookup::Uid(uid) if !is_regular(uid) => {
                 if let Some(local_uid) = local_uid {
                     // Two databases describe one name differently, and which
@@ -551,7 +615,10 @@ impl AccountSnapshot {
             // A uid inside the range adds nothing the file did not already
             // allow, and silence — no entry, no answer, no reachable
             // directory — may never turn into a refusal.
-            PasswdLookup::Uid(_) | PasswdLookup::NoEntry | PasswdLookup::Unavailable => Ok(()),
+            PasswdLookup::Uid(_)
+            | PasswdLookup::NoEntry
+            | PasswdLookup::Unavailable
+            | PasswdLookup::RegularAccount => Ok(()),
         }
     }
 }
@@ -658,6 +725,7 @@ impl LocalAccounts {
 /// A failure is `None` rather than an error: the caller turns it into the
 /// refusal every name gets when the mandatory source cannot be consulted, and
 /// the reason belongs in the log next to the path, not in a per-name verdict.
+#[cfg(not(windows))]
 fn read_local_database() -> Option<Vec<u8>> {
     match read_capped(Path::new(LOCAL_PASSWD_PATH), MAX_PASSWD_BYTES) {
         Ok(contents) => Some(contents),
@@ -682,7 +750,12 @@ fn read_local_database() -> Option<Vec<u8>> {
 /// on the login path for an answer nobody would look at.
 const fn local_leaves_open(lookup: PasswdLookup) -> bool {
     match lookup {
-        PasswdLookup::Unavailable => false,
+        // A class answer is the verdict of the authority over that namespace;
+        // there is no second source to ask, and asking one would be asking a
+        // Unix name service about a Windows account.
+        PasswdLookup::Unavailable
+        | PasswdLookup::SystemPrincipal
+        | PasswdLookup::RegularAccount => false,
         PasswdLookup::Uid(uid) => is_regular(uid),
         PasswdLookup::NoEntry => true,
     }
@@ -707,6 +780,11 @@ impl NameResolution {
     }
 
     /// The source ran out of its bound and was stopped.
+    ///
+    /// Only a resolver that actually runs can exhaust a bound; platforms whose
+    /// resolver is a no-op never produce this answer outside the tests that
+    /// drive the cooldown with a stand-in resolver.
+    #[cfg(any(unix, test))]
     pub(super) const fn stopped() -> Self {
         Self {
             answers: Vec::new(),
@@ -923,6 +1001,62 @@ fn read_capped(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
         )));
     }
     Ok(contents)
+}
+
+/// The mandatory source on Windows: the account's class, as the machine's own
+/// principals and its local account database describe it.
+///
+/// The mapping onto this module's answers is where the two account models meet,
+/// so it is stated rather than implied:
+///
+/// * a principal the system holds for itself — a well-known SID, or a local
+///   account whose RID is below the boundary — is [`PasswdLookup::SystemPrincipal`];
+/// * an ordinary local account is [`PasswdLookup::RegularAccount`];
+/// * a name the machine simply does not hold is [`PasswdLookup::NoEntry`], the
+///   same answer `/etc/passwd` gives for a name it lacks. It is *not* a refusal
+///   here: this source answers "is this the system's own account", and about a
+///   name it has never heard of the honest answer is that it is not. The login
+///   path fails on its own terms when the account it needs does not exist, and
+///   treating absence as a refusal here would additionally make a role store
+///   unloadable in full over one slice named after an account this device has
+///   yet to be given;
+/// * everything else — a name qualified with a domain, a SID that is not this
+///   machine's, a lookup that could not be made — is [`PasswdLookup::Unavailable`],
+///   which refuses.
+///
+/// The reason behind a refusal is kept in the log rather than in the answer:
+/// the answers above are the vocabulary the check speaks, and an operator
+/// looking into a refused login needs the distinction between "this is the
+/// machine's own principal" and "the account database could not be asked".
+#[cfg(windows)]
+fn windows_account_class(account: &str) -> PasswdLookup {
+    use super::windows_account::{classify, WindowsAccountError};
+
+    match classify(&super::windows_account::OsAccounts, account) {
+        Ok(()) => PasswdLookup::RegularAccount,
+        Err(
+            error @ (WindowsAccountError::WellKnownPrincipal { .. }
+            | WindowsAccountError::BuiltInAccount { .. }),
+        ) => {
+            tracing::warn!(
+                target: "tessera.role",
+                account,
+                error = %error,
+                "login account is one of this device's own principals"
+            );
+            PasswdLookup::SystemPrincipal
+        }
+        Err(WindowsAccountError::NoLocalAccount { .. }) => PasswdLookup::NoEntry,
+        Err(error) => {
+            tracing::warn!(
+                target: "tessera.role",
+                account,
+                error = %error,
+                "the class of this login account could not be established; refusing"
+            );
+            PasswdLookup::Unavailable
+        }
+    }
 }
 
 /// Lookup used by [`SystemAccounts::empty`].
@@ -1142,6 +1276,78 @@ mod tests {
             err,
             SystemAccountError::SystemAccount { uid: 0, .. }
         ));
+    }
+
+    /// A source that answers in classes — the shape a Windows account view
+    /// has — refuses the system's own principals.
+    ///
+    /// The rules that decide *which* principals those are live in
+    /// `windows_account` and are exercised there; what this shows is that a
+    /// class answer travels through the check as a refusal rather than being
+    /// mistaken for an unknown name.
+    #[test]
+    fn a_class_answer_refuses_the_systems_own_principal() {
+        let accounts = SystemAccounts::with_lookup(|account| match account {
+            "engineer" => PasswdLookup::RegularAccount,
+            _ => PasswdLookup::SystemPrincipal,
+        });
+
+        let err = accounts
+            .check("system")
+            .expect_err("a principal the system holds for itself is never a role");
+        assert!(
+            matches!(err, SystemAccountError::SystemPrincipal { ref account } if account == "system"),
+            "expected SystemPrincipal, got {err:?}"
+        );
+        accounts
+            .check("engineer")
+            .expect("an ordinary account of the device passes");
+    }
+
+    /// A class answer is final: the additive source is not asked, because the
+    /// source that answered owns the namespace the name lives in.
+    #[test]
+    fn a_class_answer_settles_the_question_without_a_second_source() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        fn counted(_account: &str, _timeout: Duration) -> PasswdLookup {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            PasswdLookup::NoEntry
+        }
+
+        let accounts = SystemAccounts::with_sources(
+            |account| match account {
+                "engineer" => PasswdLookup::RegularAccount,
+                _ => PasswdLookup::SystemPrincipal,
+            },
+            counted,
+        );
+
+        CALLS.store(0, Ordering::Relaxed);
+        let _snapshot = accounts.snapshot(&["engineer", "system"]);
+        assert_eq!(
+            CALLS.load(Ordering::Relaxed),
+            0,
+            "a class answer leaves nothing for a second source to add"
+        );
+    }
+
+    /// The additive source may also answer in classes, and its refusal counts
+    /// the same way a uid outside the range does.
+    #[test]
+    fn a_class_answer_from_the_additive_source_refuses() {
+        let accounts = SystemAccounts::with_sources(
+            |_| PasswdLookup::NoEntry,
+            |_, _| PasswdLookup::SystemPrincipal,
+        );
+
+        let err = accounts
+            .check("service")
+            .expect_err("the additive source may add a refusal");
+        assert!(
+            matches!(err, SystemAccountError::SystemPrincipal { .. }),
+            "expected SystemPrincipal, got {err:?}"
+        );
     }
 
     /// How many times [`counted_nss`] was asked, so a test can show that the

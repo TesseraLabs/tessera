@@ -1,5 +1,9 @@
 //! Smoke test that confirms `nix` is available as a runtime dependency
 //! with all features required by the Stage 5 hook executor.
+//!
+//! The hook executor and its dependency both exist on Unix only.
+
+#![cfg(unix)]
 
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitPidFlag;

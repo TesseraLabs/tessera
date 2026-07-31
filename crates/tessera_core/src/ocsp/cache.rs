@@ -41,7 +41,6 @@ use crate::x509::Certificate;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -188,17 +187,12 @@ impl OcspCache {
             .dir
             .join(format!(".{}.{}.tmp", key.as_hex(), std::process::id()));
         let result = (|| {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o640)
-                .open(&tmp)?;
+            let mut file = crate::fs_mode::create_with_mode(&tmp, 0o640)?;
             file.write_all(response_der)?;
             file.sync_all()?;
             // The open(2) mode is filtered through the umask; pin the spec
             // mode explicitly before the entry becomes visible.
-            fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o640))?;
+            crate::fs_mode::pin_mode(&tmp, 0o640)?;
             fs::rename(&tmp, &path)
         })();
         if result.is_err() {
@@ -255,7 +249,11 @@ mod tests {
     use openssl::ocsp::{OcspResponse, OcspResponseStatus};
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
+    // Only the expiry test rewinds an entry's mtime, and it needs a stored
+    // entry, so it exists where the cache can be written.
+    #[cfg(unix)]
+    use std::time::SystemTime;
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -298,6 +296,13 @@ mod tests {
         assert_ne!(a, other, "different serial → different key");
     }
 
+    // Everything below that stores an entry depends on `put` succeeding, and
+    // `put` writes the entry with a pinned POSIX mode — an artefact the login
+    // path trusts, so the write refuses rather than fall back to whatever the
+    // parent directory grants. Until the DACL equivalent exists, a cache that
+    // can be written to is a Unix-only object, so these assertions have no
+    // subject elsewhere.
+    #[cfg(unix)]
     #[test]
     fn put_get_roundtrip_good() {
         let dir = tempfile::tempdir().unwrap();
@@ -308,6 +313,7 @@ mod tests {
         assert_eq!(cache.get(&key), Some(der));
     }
 
+    #[cfg(unix)]
     #[test]
     fn put_get_roundtrip_revoked() {
         // `revoked` is cached too: the status is irreversible within the
@@ -343,6 +349,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn entry_expired_by_mtime_plus_ttl_is_miss() {
         let dir = tempfile::tempdir().unwrap();
@@ -361,6 +368,10 @@ mod tests {
         assert_eq!(cache.get(&key), None, "expired by mtime + ttl");
     }
 
+    // The half that proves a disabled cache writes nothing would hold
+    // anywhere; the other half has to plant a real entry to prove a disabled
+    // `get` stays blind to it, and planting one needs the mode-pinned write.
+    #[cfg(unix)]
     #[test]
     fn ttl_zero_disables_get_and_put() {
         let dir = tempfile::tempdir().unwrap();
@@ -392,6 +403,7 @@ mod tests {
         assert!(!path.exists(), "remove evicts the entry");
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_then_get_is_miss_and_missing_key_is_quiet() {
         let dir = tempfile::tempdir().unwrap();
@@ -406,6 +418,9 @@ mod tests {
         assert_eq!(cache.get(&key), None);
     }
 
+    // The mode is what this assertion is about, so there is nothing to check
+    // where files have no mode.
+    #[cfg(unix)]
     #[test]
     fn entry_mode_is_0640_and_no_tmp_leftovers() {
         use std::os::unix::fs::PermissionsExt;

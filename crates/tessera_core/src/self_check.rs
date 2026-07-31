@@ -168,7 +168,10 @@ mod tests {
         let body = original
             .replace(
                 "anchors = [\"/bin/sh\"]",
-                &format!("anchors = [{:?}]", anchor_path.to_string_lossy()),
+                &format!(
+                    "anchors = [{}]",
+                    crate::test_support::toml_path(anchor_path)
+                ),
             )
             .replace("mode = \"pkcs11\"", "mode = \"pkcs12\"");
         let body = if extra_top.is_empty() {
@@ -176,6 +179,7 @@ mod tests {
         } else {
             format!("{extra_top}\n{body}")
         };
+        let body = crate::test_support::platform_config_toml(&body);
         let raw: RawConfig = toml::from_str(&body).expect("parse fixture");
         ValidatedConfig::try_from(&raw).expect("validate")
     }
@@ -216,13 +220,14 @@ mod tests {
         let body = original
             .replace(
                 "anchors = [\"/bin/sh\"]",
-                &format!("anchors = [{:?}]", anchor.to_string_lossy()),
+                &format!("anchors = [{}]", crate::test_support::toml_path(&anchor)),
             )
             .replace("mode = \"pkcs11\"", "mode = \"pkcs12\"");
         let body = body.replace(
             "allowed_signature_algorithms = []",
             "allowed_signature_algorithms = [\"1.2.643.7.1.1.3.2\"]",
         );
+        let body = crate::test_support::platform_config_toml(&body);
         let raw: RawConfig = toml::from_str(&body).expect("parse");
         let err = ValidatedConfig::try_from(&raw)
             .expect_err("GOST allow-list must require an explicit engine path");

@@ -1,3 +1,9 @@
+//! Integration tests for the monitord IPC client.
+//!
+//! The client under test speaks over an `AF_UNIX` socket, and so does the fake
+//! daemon these cases stand up, so the whole file is Unix-only.
+
+#![cfg(unix)]
 #![allow(
     missing_docs,
     clippy::unwrap_used,

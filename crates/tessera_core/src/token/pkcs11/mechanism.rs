@@ -35,7 +35,10 @@ use super::error::Pkcs11Error;
 
 /// Number of bytes of salt to use with RSA-PSS — fixed at 32 to match
 /// the in-process challenge-response (`crate::challenge::rsa_pss`).
-const RSA_PSS_SALT_LEN: u64 = 32;
+///
+/// Typed as the C `unsigned long` behind PKCS#11's `CK_ULONG`, whose width
+/// follows the platform data model (64-bit on LP64 Unix, 32-bit on Windows).
+const RSA_PSS_SALT_LEN: std::ffi::c_ulong = 32;
 
 /// How the host should drive the token's signing operation.
 ///

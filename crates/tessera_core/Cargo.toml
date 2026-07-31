@@ -35,19 +35,15 @@ serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-syslog = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
 openssl = { workspace = true }
 openssl-sys = "0.9"
 foreign-types = "0.3"
-libc = { workspace = true }
-nix = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }
-rustix = { workspace = true }
 subtle = { workspace = true }
 chrono = { workspace = true }
 cryptoki = { workspace = true }
@@ -57,8 +53,26 @@ uuid = { workspace = true }
 mockall = { workspace = true, optional = true }
 libloading = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true }
+rustix = { workspace = true }
+# The syslog transport is a Unix facility; Windows logging goes through the
+# Event Log instead. The crate's own non-Unix fallback does not compile.
+syslog = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 udev = { workspace = true }
+
+# Windows has no system OpenSSL to link against, so the library is built from
+# the vendored source tree. Unix targets keep using the system package: it is
+# what the GOST engine is loaded into, and vendoring would both slow the build
+# and change which engine directory is searched.
+[target.'cfg(windows)'.dependencies]
+openssl = { workspace = true, features = ["vendored"] }
+# Owner/DACL inspection for the privileged-path walk; the Unix walk uses
+# libc/nix instead, so this is never on the Unix link-line.
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -12,6 +12,12 @@
 #![allow(clippy::panic)]
 #![allow(clippy::items_after_statements)]
 
+// Shared with the crate's unit tests: config validation demands absolute
+// paths, and what is absolute differs between Windows and Unix.
+#[allow(dead_code)]
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use tessera_core::config::validated::CertIntegrityMode;
 use tessera_core::config::validated::MacRuntimeMode;
 use tessera_core::config::RawConfig;
@@ -23,6 +29,17 @@ use tessera_core::Error;
 /// config-parse tests (we never reach `try_from` for negative cases).
 fn base_config() -> &'static str {
     include_str!("fixtures/full_valid.toml")
+}
+
+/// The base fixture with a real PEM anchor spliced in and every other path
+/// made valid for the host, so the full validator runs to the `[mac]` rules
+/// these tests are about.
+fn base_with_anchor(anchor: &std::path::Path) -> String {
+    let body = base_config().replace(
+        "anchors = [\"/bin/sh\"]",
+        &format!("anchors = [{}]", test_support::toml_path(anchor)),
+    );
+    test_support::platform_config_toml(&body)
 }
 
 #[test]
@@ -67,10 +84,7 @@ fn parses_required_with_fallback_validates() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     let anchor = tmp.path().join("anchor.pem");
     std::fs::write(&anchor, FAKE_PEM_CERT).expect("write anchor");
-    let base = base_config().replace(
-        "anchors = [\"/bin/sh\"]",
-        &format!("anchors = [{:?}]", anchor.to_string_lossy()),
-    );
+    let base = base_with_anchor(&anchor);
     let toml = format!(
         "{base}\n\
          [mac]\n\
@@ -135,10 +149,7 @@ fn runtime_default_is_auto() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     let anchor = tmp.path().join("anchor.pem");
     std::fs::write(&anchor, FAKE_PEM_CERT).expect("write anchor");
-    let toml = base_config().replace(
-        "anchors = [\"/bin/sh\"]",
-        &format!("anchors = [{:?}]", anchor.to_string_lossy()),
-    );
+    let toml = base_with_anchor(&anchor);
     let raw: RawConfig = toml::from_str(&toml).expect("parse");
     let validated = ValidatedConfig::try_from(&raw).expect("validate");
     assert_eq!(validated.mac.runtime, MacRuntimeMode::Auto);
@@ -153,10 +164,7 @@ fn runtime_disabled_with_cert_integrity_required_rejected() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     let anchor = tmp.path().join("anchor.pem");
     std::fs::write(&anchor, FAKE_PEM_CERT).expect("write anchor");
-    let base = base_config().replace(
-        "anchors = [\"/bin/sh\"]",
-        &format!("anchors = [{:?}]", anchor.to_string_lossy()),
-    );
+    let base = base_with_anchor(&anchor);
     let toml = format!(
         "{base}\n\
          [mac]\n\
@@ -184,10 +192,7 @@ fn runtime_required_without_backend_rejected() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     let anchor = tmp.path().join("anchor.pem");
     std::fs::write(&anchor, FAKE_PEM_CERT).expect("write anchor");
-    let base = base_config().replace(
-        "anchors = [\"/bin/sh\"]",
-        &format!("anchors = [{:?}]", anchor.to_string_lossy()),
-    );
+    let base = base_with_anchor(&anchor);
     let toml = format!(
         "{base}\n\
          [mac]\n\
@@ -229,10 +234,7 @@ fn runtime_disabled_parses_with_optional_integrity() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     let anchor = tmp.path().join("anchor.pem");
     std::fs::write(&anchor, FAKE_PEM_CERT).expect("write anchor");
-    let base = base_config().replace(
-        "anchors = [\"/bin/sh\"]",
-        &format!("anchors = [{:?}]", anchor.to_string_lossy()),
-    );
+    let base = base_with_anchor(&anchor);
     let toml = format!(
         "{base}\n\
          [mac]\n\

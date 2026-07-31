@@ -2187,13 +2187,16 @@ mod tests {
 
     #[test]
     fn roles_custom_dir_and_ttl() {
+        // The directory only has to clear the absolute-path check, which
+        // reads differently on Windows.
+        let dir = crate::test_support::absolute("/srv/roles");
         let s = validate_roles(&RawRoles {
-            dir: Some(PathBuf::from("/srv/roles")),
+            dir: Some(PathBuf::from(&dir)),
             default_session_ttl_seconds: Some(3600),
             ..Default::default()
         })
         .expect("ok");
-        assert_eq!(s.dir, PathBuf::from("/srv/roles"));
+        assert_eq!(s.dir, PathBuf::from(&dir));
         assert_eq!(s.default_session_ttl, Duration::from_hours(1));
     }
 
@@ -2420,13 +2423,17 @@ sources = ["dmi_board_serial"]
 level = "info"
 
 [roles]
-dir = "/var/lib/tessera/roles"
+dir = @ROLES_DIR@
 default_session_ttl_seconds = 7200
 account_lookup_timeout_seconds = 5
 "#;
-        let raw: RawConfig = toml::from_str(toml_src).expect("raw parse");
+        // The directory only has to clear the absolute-path check, which
+        // reads differently on Windows.
+        let roles_dir = crate::test_support::absolute("/var/lib/tessera/roles");
+        let toml_src = toml_src.replace("@ROLES_DIR@", &crate::test_support::toml_path(&roles_dir));
+        let raw: RawConfig = toml::from_str(&toml_src).expect("raw parse");
         let roles = validate_roles(&raw.roles).expect("validate roles");
-        assert_eq!(roles.dir, PathBuf::from("/var/lib/tessera/roles"));
+        assert_eq!(roles.dir, PathBuf::from(&roles_dir));
         assert_eq!(roles.default_session_ttl, Duration::from_hours(2));
         assert_eq!(roles.account_lookup_timeout, Duration::from_secs(5));
     }

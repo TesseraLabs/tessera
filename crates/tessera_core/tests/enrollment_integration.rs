@@ -26,7 +26,12 @@
 //! cargo test -p tessera_core --features mac-tests --test enrollment_integration
 //! ```
 
-#![cfg(feature = "mac-tests")]
+// Every test here begins by installing an enrollment package, and the install
+// writes each artefact with a pinned POSIX mode — the standalone mode's whole
+// trust argument is the file permissions it lands. Off Unix that write refuses
+// (the DACL equivalent is a separate piece of work), so an installed package,
+// which is what all four tests read back from, cannot exist there at all.
+#![cfg(all(unix, feature = "mac-tests"))]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::panic)]

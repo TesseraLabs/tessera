@@ -420,7 +420,7 @@ impl MacBackend for PluginBackend {
 
     fn set_fd_label(
         &self,
-        fd: std::os::unix::io::RawFd,
+        fd: crate::mac::MacRawFd,
         label: IntegrityLabel,
         irelax: bool,
     ) -> Result<(), MacError> {

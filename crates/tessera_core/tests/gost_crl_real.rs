@@ -8,7 +8,7 @@
 //! fixture is missing or empty, the test prints a `skipped: ...` line and
 //! returns; the surrounding test suite still passes.
 
-#![cfg(feature = "gost-tests")]
+#![cfg(all(unix, feature = "gost-tests"))]
 #![allow(missing_docs)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]

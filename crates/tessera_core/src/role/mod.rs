@@ -12,6 +12,10 @@
 //! open/commercial table).
 
 pub mod audit;
+#[cfg(unix)]
+mod getent;
+#[cfg(not(unix))]
+#[path = "getent_unsupported.rs"]
 mod getent;
 pub mod manifest;
 pub mod schema;
@@ -19,6 +23,9 @@ pub mod selection;
 pub mod store;
 pub mod system_account;
 pub mod update;
+// The rules are stated over a resolved SID, so they compile — and are tested —
+// everywhere; only the source that asks Windows itself is Windows-only.
+pub mod windows_account;
 
 pub use manifest::{
     accept_bundle_version, last_accepted_bundle_version, parse_manifest, persist_bundle_version,
@@ -37,3 +44,7 @@ pub use system_account::{
     MAX_ACCOUNT_LOOKUP_TIMEOUT,
 };
 pub use update::{atomic_update, cleanup_staged, UpdateTrust};
+pub use windows_account::{
+    AccountSource as WindowsAccountSource, AccountSourceError as WindowsAccountSourceError,
+    WindowsAccountError, FIRST_REGULAR_RID,
+};

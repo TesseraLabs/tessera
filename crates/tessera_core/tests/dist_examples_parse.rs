@@ -18,7 +18,11 @@
 
 use std::path::PathBuf;
 
-use tessera_core::config::{RawConfig, ValidatedConfig};
+use tessera_core::config::RawConfig;
+// The validating test below runs only where the example's POSIX paths mean
+// something.
+#[cfg(unix)]
+use tessera_core::config::ValidatedConfig;
 
 fn dist_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -34,6 +38,7 @@ fn config_example_parses_as_raw() {
 
 /// Minimal self-signed PEM cert good enough to satisfy the trust-section PEM
 /// sniff (which only checks for the `-----BEGIN CERTIFICATE-----` marker).
+#[cfg(unix)]
 const FAKE_PEM_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
 MIIBfTCCAS6gAwIBAgIUcheCkYc5VvuuVlZ8KqfA8R6Bvs8wCgYIKoZIzj0EAwIw\n\
 -----END CERTIFICATE-----\n";
@@ -42,6 +47,12 @@ MIIBfTCCAS6gAwIBAgIUcheCkYc5VvuuVlZ8KqfA8R6Bvs8wCgYIKoZIzj0EAwIw\n\
 /// scratch directory, then run full `ValidatedConfig` validation. If the
 /// example drifts in a way that breaks validation (typo'd field, removed
 /// section, invalid range), this test catches it.
+// The file under test is the example shipped in the .deb: it describes a
+// Linux deployment, and its absolute paths (`/run/tessera`, `/var/lib/tessera`,
+// `/usr/lib/...`) are POSIX by construction. Rewriting them for another
+// platform would validate a mutant instead of the artefact. The raw-parse test
+// above, which is what guards against schema drift, keeps running everywhere.
+#[cfg(unix)]
 #[test]
 fn config_example_validates_with_real_paths() {
     let path = dist_dir().join("config.toml.example");

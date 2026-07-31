@@ -25,12 +25,11 @@
 //! libcrypto into an undefined state.
 #![allow(unsafe_code)]
 
-use std::ffi::CString;
+use std::ffi::{c_char, c_int, c_uint, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
-use libc::{c_int, c_uint};
 use openssl_sys::ENGINE;
 
 use super::errors::GostEngineError;
@@ -49,15 +48,15 @@ use super::errors::GostEngineError;
 // and `openssl/engine.h` headers shipping with 1.1.1 and 3.x.
 extern "C" {
     fn ENGINE_load_builtin_engines();
-    fn ENGINE_by_id(id: *const libc::c_char) -> *mut ENGINE;
+    fn ENGINE_by_id(id: *const c_char) -> *mut ENGINE;
     fn ENGINE_init(e: *mut ENGINE) -> c_int;
     fn ENGINE_finish(e: *mut ENGINE) -> c_int;
     fn ENGINE_free(e: *mut ENGINE) -> c_int;
     fn ENGINE_set_default(e: *mut ENGINE, flags: c_uint) -> c_int;
     fn ENGINE_ctrl_cmd_string(
         e: *mut ENGINE,
-        cmd_name: *const libc::c_char,
-        arg: *const libc::c_char,
+        cmd_name: *const c_char,
+        arg: *const c_char,
         cmd_optional: c_int,
     ) -> c_int;
 }

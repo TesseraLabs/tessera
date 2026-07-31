@@ -9,7 +9,7 @@
 //! (RSA-only chains never touch the engine `OnceLock`); this file covers the
 //! positive path that requires real GOST PKI material.
 
-#![cfg(feature = "gost-tests")]
+#![cfg(all(unix, feature = "gost-tests"))]
 #![allow(missing_docs)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
