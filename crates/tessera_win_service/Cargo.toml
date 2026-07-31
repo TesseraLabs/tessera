@@ -1,0 +1,78 @@
+[package]
+name = "tessera_win_service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Windows Engine-layer service: certificate verification behind a named pipe."
+
+[lib]
+name = "tessera_win_service"
+crate-type = ["rlib"]
+
+# The service host, its installer and `prepare` are one binary: they share the
+# data-directory layout and the account name, and splitting them would mean two
+# places to keep those in step.
+[[bin]]
+name = "tessera-engine"
+path = "src/main.rs"
+
+# The bench client. It speaks the same protocol as the credential provider will,
+# so both service commands can be exercised before any COM code exists.
+[[bin]]
+name = "tessera-engine-cli"
+path = "src/bin/cli.rs"
+
+[dependencies]
+tessera_core = { path = "../tessera_core", version = "0.5.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
+pam_tessera = { path = "../pam_tessera", version = "0.5.0" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+unused_must_use = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+missing_safety_doc = "deny"
+# Футган-ловушки (порт unsafe-hardening пака из ветки 2026-05-14).
+mem_forget = "deny"
+panic_in_result_fn = "deny"
+let_underscore_must_use = "deny"
+let_underscore_lock = "deny"
+indexing_slicing = "deny"
+# Каждый unsafe-блок обязан нести // SAFETY: и одну операцию.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+# Гигиена указателей и кастов.
+transmute_ptr_to_ptr = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+ref_as_ptr = "warn"
