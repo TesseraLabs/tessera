@@ -1392,6 +1392,7 @@ pub(crate) fn session_open_extras(cert: &Certificate, pam_user: &str) -> Session
 /// when the lookup fails — monitord stores the uid as-is and the
 /// active-session lookup will simply miss for uid 0 (root is never the
 /// PAM-target user in production).
+#[cfg(unix)]
 fn resolve_uid(pam_user: &str) -> u32 {
     match nix::unistd::User::from_name(pam_user) {
         Ok(Some(u)) => u.uid.as_raw(),
@@ -1415,14 +1416,29 @@ fn resolve_uid(pam_user: &str) -> u32 {
     }
 }
 
+/// Resolve `pam_user` to a Unix uid — there is no passwd database off Unix,
+/// so the caller gets the same value a failed lookup yields.
+#[cfg(not(unix))]
+fn resolve_uid(_pam_user: &str) -> u32 {
+    0
+}
+
 /// Resolve `pam_user`'s `$HOME` via NSS.  Returns `None` when the user
 /// is not in passwd or has no home set; the MAC orchestrator's
 /// home-label advisory tolerates `None`.
+#[cfg(unix)]
 fn resolve_home_dir(pam_user: &str) -> Option<PathBuf> {
     match nix::unistd::User::from_name(pam_user) {
         Ok(Some(u)) => Some(u.dir),
         _ => None,
     }
+}
+
+/// Resolve the login account's home directory — there is no passwd database
+/// off Unix, so the caller gets the same value a failed lookup yields.
+#[cfg(not(unix))]
+fn resolve_home_dir(_pam_user: &str) -> Option<PathBuf> {
+    None
 }
 
 /// Helper to keep `flow::authenticate` body short.  Public so tests can
@@ -1641,6 +1657,7 @@ impl FlowIo for InMemoryFlowIo {
                 UsbError::UnsupportedPlatform => UsbError::UnsupportedPlatform,
                 UsbError::MissingProperty(s) => UsbError::MissingProperty(s.clone()),
                 UsbError::NoMatchingDevice => UsbError::NoMatchingDevice,
+                UsbError::WaitCancelled => UsbError::WaitCancelled,
                 UsbError::Io(io) => UsbError::Udev(format!("io: {io}")),
                 UsbError::TooManyPartitions {
                     devnode,
@@ -1754,7 +1771,8 @@ fn ensure_role_account(
     // for twice, and a name it never saw is asked about in full.
     accounts.check(pam_user).map_err(|error| {
         let reason = match error {
-            SystemAccountError::SystemAccount { .. } => RoleDenyReason::SystemAccount,
+            SystemAccountError::SystemAccount { .. }
+            | SystemAccountError::SystemPrincipal { .. } => RoleDenyReason::SystemAccount,
             // `LookupFailed`, and — since `SystemAccountError` is
             // `non_exhaustive` — any future refusal this module has not been
             // taught about: still a denial, under the reason that claims the
@@ -2280,7 +2298,16 @@ mod tests {
     fn anchor_path_toml() -> String {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tessera_core/tests/fixtures/ca.pem");
-        format!("{:?}", path.to_string_lossy())
+        crate::test_support::toml_path(&path)
+    }
+
+    /// Fill in the placeholders every config fixture in this module shares:
+    /// the anchor path and the `[monitor]` paths, both of which must be
+    /// absolute for the platform the test runs on.
+    fn fill_fixture_placeholders(raw_toml: &str) -> String {
+        raw_toml
+            .replace("@ANCHOR@", &anchor_path_toml())
+            .replace("@MONITOR@", &crate::test_support::monitor_section_toml())
     }
 
     fn minimal_cfg() -> ValidatedConfig {
@@ -2296,6 +2323,7 @@ usb_removed_grace_seconds = 5
 suspend_grace_seconds = 30
 monitor_fail_mode = "permissive"
 
+@MONITOR@
 [trust]
 anchors = [@ANCHOR@]
 intermediates = []
@@ -2320,7 +2348,7 @@ custom_command_timeout_seconds = 5
 [logging]
 level = "info"
 "#;
-        let raw_toml = raw_toml.replace("@ANCHOR@", &anchor_path_toml());
+        let raw_toml = fill_fixture_placeholders(raw_toml);
         let raw: tessera_core::config::raw::RawConfig = toml::from_str(&raw_toml).unwrap();
         ValidatedConfig::try_from(&raw).unwrap()
     }
@@ -2757,7 +2785,7 @@ level = "info"
         let raw_toml = r#"
 crypto_backend = "pkcs11_native"
 mode = "pkcs11"
-pkcs11_module = "/nonexistent/dummy.so"
+pkcs11_module = @MISSING_MODULE@
 pkcs11_token_label = "Test Token"
 pkcs11_max_pin_attempts = 2
 pkcs11_locking_mode = "os"
@@ -2767,6 +2795,7 @@ usb_removed_grace_seconds = 5
 suspend_grace_seconds = 30
 monitor_fail_mode = "permissive"
 
+@MONITOR@
 [trust]
 anchors = [@ANCHOR@]
 intermediates = []
@@ -2791,7 +2820,12 @@ custom_command_timeout_seconds = 5
 [logging]
 level = "info"
 "#;
-        let raw_toml = raw_toml.replace("@ANCHOR@", &anchor_path_toml());
+        let raw_toml = fill_fixture_placeholders(raw_toml).replace(
+            "@MISSING_MODULE@",
+            &crate::test_support::toml_path(std::path::Path::new(
+                crate::test_support::MISSING_PKCS11_MODULE_PATH,
+            )),
+        );
         let raw: tessera_core::config::raw::RawConfig = toml::from_str(&raw_toml).unwrap();
         ValidatedConfig::try_from(&raw).unwrap()
     }

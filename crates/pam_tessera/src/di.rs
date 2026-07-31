@@ -5,6 +5,22 @@
 //! every collaborator the [`crate::flow::authenticate`] function needs
 //! (verifier, ACL signature verifier, monitor IPC client).
 //!
+//! # Monitor transport
+//!
+//! Everything this module assembles except the monitor client is transport-
+//! neutral, and the per-host `[[trust_override]]` selection in particular is
+//! the kind of rule that must exist once: a second implementation elsewhere
+//! would be a second answer to "which CAs may issue for this device".
+//! [`wire_with_monitor`] therefore takes the monitor client from the caller,
+//! and [`wire`] exists on Unix only, where the transport is settled — an
+//! `AF_UNIX` socket to monitord. A host that reaches the daemon some other way
+//! (a named pipe on Windows) builds its own client and passes it in.
+//!
+//! No client is substituted when the caller has none. A default here would be
+//! a stub that answers `Ok` to every session notification, which is monitoring
+//! silently switched off — a decision that belongs to the caller, in the open,
+//! not to the wiring.
+//!
 //! # OPEN QUESTION (stage-2 acknowledged limitation)
 //!
 //! Today we re-load anchors / intermediates / CRLs from disk on every
@@ -18,7 +34,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tessera_core::config::validated::TrustOverride;
 use tessera_core::config::ValidatedConfig;
-use tessera_core::ipc::{ConnectPerCall, FailModeWrapper, MonitorClient, MonitorClientFactory};
+use tessera_core::ipc::MonitorClient;
 use tessera_core::trust::openssl_verifier::{OpensslVerifier, OpensslVerifierConfig};
 use tessera_core::x509::pinning::SpkiPin;
 use tessera_core::x509::Certificate;
@@ -132,7 +148,8 @@ fn decode_spki_pins(hex_entries: &[String]) -> Result<Vec<SpkiPin>, WireError> {
     Ok(pins)
 }
 
-/// Build a [`Wired`] collaborator bundle from a validated config.
+/// Build a [`Wired`] collaborator bundle from a validated config, over the
+/// monitor client the caller supplies.
 ///
 /// `host_id_raw` is the resolved raw host identity (before hashing). When it
 /// matches a `[[trust_override]]` entry, that entry's anchors and intermediates
@@ -141,13 +158,22 @@ fn decode_spki_pins(hex_entries: &[String]) -> Result<Vec<SpkiPin>, WireError> {
 /// parameter — revocation, pinning, signature allow-list, depth, clock skew —
 /// stays taken from the global `[trust]` section.
 ///
+/// `monitor` is whatever transport reaches the daemon on this host. It is a
+/// parameter rather than a default because the only honest default would be a
+/// client that reports every session as recorded without recording it; see the
+/// module docs.
+///
 /// # Errors
 ///
 /// Returns [`WireError::Io`] when any configured PEM/CRL path is unreadable,
 /// [`WireError::Trust`] for verifier construction failures (e.g.
 /// `max_chain_depth == 0`), and [`WireError::AmbiguousTrustOverride`] when the
 /// host matches more than one override (fail-closed).
-pub fn wire(cfg: ValidatedConfig, host_id_raw: &str) -> Result<Wired, WireError> {
+pub fn wire_with_monitor(
+    cfg: ValidatedConfig,
+    host_id_raw: &str,
+    monitor: Box<dyn MonitorClient>,
+) -> Result<Wired, WireError> {
     // Resolve the applicable per-host trust override BEFORE constructing the
     // verifier: an override replaces the anchor/intermediate set for this host,
     // so a globally-trusted-but-excluded CA is rejected here rather than
@@ -257,16 +283,6 @@ pub fn wire(cfg: ValidatedConfig, host_id_raw: &str) -> Result<Wired, WireError>
 
     let _ = anchors; // kept for future use; no ACL verifier wires it any more
 
-    // Wire the real monitord IPC client: connect-per-call wrapped in the
-    // configured fail-mode policy. The production PAM stack always reaches
-    // monitord through this stack; tests construct their own
-    // `MonitorClient` impls (typically `StubClient`).
-    let factory = MonitorClientFactory::new(cfg.monitor.socket_path.clone(), cfg.monitor.timeout);
-    let connect_per_call = ConnectPerCall::new(factory);
-    let monitor: Box<dyn MonitorClient> = Box::new(FailModeWrapper::new(
-        connect_per_call,
-        cfg.monitor.fail_mode.into(),
-    ));
     Ok(Wired {
         trust: verifier,
         monitor,
@@ -274,11 +290,39 @@ pub fn wire(cfg: ValidatedConfig, host_id_raw: &str) -> Result<Wired, WireError>
     })
 }
 
+/// Build a [`Wired`] collaborator bundle whose monitor client is the `AF_UNIX`
+/// connection to monitord.
+///
+/// The production PAM stack's entry point: connect-per-call wrapped in the
+/// configured fail-mode policy, over the socket `[monitor].socket_path` names.
+/// Tests construct their own [`MonitorClient`] impls and go through
+/// [`wire_with_monitor`].
+///
+/// # Errors
+///
+/// The errors of [`wire_with_monitor`], which builds everything else.
+#[cfg(unix)]
+pub fn wire(cfg: ValidatedConfig, host_id_raw: &str) -> Result<Wired, WireError> {
+    use tessera_core::ipc::{ConnectPerCall, FailModeWrapper, MonitorClientFactory};
+
+    let factory = MonitorClientFactory::new(cfg.monitor.socket_path.clone(), cfg.monitor.timeout);
+    let connect_per_call = ConnectPerCall::new(factory);
+    let monitor: Box<dyn MonitorClient> = Box::new(FailModeWrapper::new(
+        connect_per_call,
+        cfg.monitor.fail_mode.into(),
+    ));
+    wire_with_monitor(cfg, host_id_raw, monitor)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        toml_path, MONITOR_SOCKET_PATH, MONITOR_STATE_FILE_PATH, PKCS11_MODULE_PATH,
+    };
     use std::io::Write;
+    use std::path::Path;
     use tessera_core::config::load_validated_config;
     // Write is used below in write_min_config.
 
@@ -297,18 +341,19 @@ mod tests {
             r#"
 crypto_backend = "openssl"
 mode = "pkcs11"
-pkcs11_module = "/bin/sh"
+pkcs11_module = {module}
 usb_wait_seconds = 10
 on_usb_removed = "lock"
 suspend_grace_seconds = 5
 
 [monitor]
-socket_path = "/run/tessera/monitord.sock"
+socket_path = {socket}
+state_file_path = {state_file}
 timeout_ms = 1500
 fail_mode = "strict"
 
 [trust]
-anchors = ["{}"]
+anchors = [{anchor}]
 intermediates = []
 max_chain_depth = 5
 clock_skew_seconds = 60
@@ -330,10 +375,75 @@ fallback = "warn"
 level = "info"
 syslog_facility = "auth"
 "#,
-            anchor.display()
+            module = toml_path(Path::new(PKCS11_MODULE_PATH)),
+            socket = toml_path(Path::new(MONITOR_SOCKET_PATH)),
+            state_file = toml_path(Path::new(MONITOR_STATE_FILE_PATH)),
+            anchor = toml_path(&anchor),
         );
         f.write_all(body.as_bytes()).unwrap();
         cfg
+    }
+
+    /// The bundle carries exactly the monitor client it was handed: nothing
+    /// in the wiring may replace it, and nothing may stand in for one that was
+    /// not supplied. `StubClient` answers `Ok` to everything, so a wiring that
+    /// quietly substituted its own client would still look healthy here —
+    /// which is why the counterpart test below drives the same call through a
+    /// client that must fail.
+    #[test]
+    fn wire_with_monitor_uses_the_supplied_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = write_min_config(tmp.path());
+        let cfg = load_validated_config(&cfg_path).unwrap();
+
+        let wired =
+            wire_with_monitor(cfg, "test-host", Box::new(tessera_core::ipc::StubClient)).unwrap();
+        wired.monitor.ping().expect("the stub answers every call");
+    }
+
+    /// The supplied client's refusal reaches the caller unchanged: the wiring
+    /// neither swallows it nor falls back to a client that would not refuse.
+    #[test]
+    fn wire_with_monitor_propagates_the_supplied_client_failure() {
+        /// A monitor that is never reachable, standing in for a transport that
+        /// is down.
+        struct UnreachableClient;
+
+        impl tessera_core::ipc::MonitorClient for UnreachableClient {
+            fn hello(&self) -> Result<(), tessera_core::error::IpcError> {
+                Err(tessera_core::error::IpcError::Unavailable)
+            }
+            fn open_session(
+                &self,
+                _info: &tessera_core::ipc::OpenSessionInfo<'_>,
+            ) -> Result<(), tessera_core::error::IpcError> {
+                Err(tessera_core::error::IpcError::Unavailable)
+            }
+            fn close_session(
+                &self,
+                _session_id: &str,
+                _reason: &str,
+            ) -> Result<(), tessera_core::error::IpcError> {
+                Err(tessera_core::error::IpcError::Unavailable)
+            }
+            fn ping(&self) -> Result<(), tessera_core::error::IpcError> {
+                Err(tessera_core::error::IpcError::Unavailable)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = write_min_config(tmp.path());
+        let cfg = load_validated_config(&cfg_path).unwrap();
+
+        let wired = wire_with_monitor(cfg, "test-host", Box::new(UnreachableClient)).unwrap();
+        let err = wired
+            .monitor
+            .ping()
+            .expect_err("the supplied client refuses, so the bundle must too");
+        assert!(
+            matches!(err, tessera_core::error::IpcError::Unavailable),
+            "expected Unavailable, got {err:?}"
+        );
     }
 
     /// Regression test for P0-1: `wire(...)` must construct a real monitord
@@ -343,6 +453,10 @@ syslog_facility = "auth"
     /// socket; in `Strict` mode that propagates `IpcError::Unavailable`,
     /// proving the call reached `ConnectPerCall::ping` rather than
     /// `StubClient::ping` (which would silently return `Ok`).
+    ///
+    /// Bound to the platform whose transport `wire` picks: the socket is an
+    /// `AF_UNIX` one.
+    #[cfg(unix)]
     #[test]
     fn wire_constructs_real_monitor_client_strict() {
         let tmp = tempfile::tempdir().unwrap();
@@ -365,6 +479,7 @@ syslog_facility = "auth"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn wire_constructs_real_monitor_client_permissive() {
         let tmp = tempfile::tempdir().unwrap();
@@ -399,19 +514,20 @@ syslog_facility = "auth"
             r#"
 crypto_backend = "openssl"
 mode = "pkcs11"
-pkcs11_module = "/bin/sh"
+pkcs11_module = {module}
 usb_wait_seconds = 10
 on_usb_removed = "lock"
 suspend_grace_seconds = 5
 
 [monitor]
-socket_path = "/run/tessera/monitord.sock"
+socket_path = {socket}
+state_file_path = {state_file}
 timeout_ms = 1500
 fail_mode = "permissive"
 
 [trust]
-anchors = ["{anchor}"]
-intermediates = ["{intermediate}"]
+anchors = [{anchor}]
+intermediates = [{intermediate}]
 max_chain_depth = 5
 clock_skew_seconds = 60
 allowed_signature_algorithms = []
@@ -426,7 +542,7 @@ allowed_root_spki_sha256 = []
 
 [[trust_override]]
 when_host_id_in = ["{site_host}"]
-anchors = ["{site_anchor}"]
+anchors = [{site_anchor}]
 intermediates = []
 
 [host_identity]
@@ -436,9 +552,12 @@ fallback = "warn"
 [logging]
 level = "info"
 "#,
-            anchor = anchor.display(),
-            intermediate = intermediate.display(),
-            site_anchor = site_anchor.display(),
+            module = toml_path(Path::new(PKCS11_MODULE_PATH)),
+            socket = toml_path(Path::new(MONITOR_SOCKET_PATH)),
+            state_file = toml_path(Path::new(MONITOR_STATE_FILE_PATH)),
+            anchor = toml_path(&anchor),
+            intermediate = toml_path(&intermediate),
+            site_anchor = toml_path(&site_anchor),
             site_host = SITE_HOST_ID,
         );
         f.write_all(body.as_bytes()).unwrap();
@@ -461,7 +580,8 @@ level = "info"
         let cfg_path = write_config_with_site_override(tmp.path());
         let cfg = load_validated_config(&cfg_path).unwrap();
 
-        let wired = wire(cfg, SITE_HOST_ID).unwrap();
+        let wired =
+            wire_with_monitor(cfg, SITE_HOST_ID, Box::new(tessera_core::ipc::StubClient)).unwrap();
 
         // Leaf under the GLOBAL root must be refused: the override replaced the
         // anchors with the site root, so no chain to a trusted anchor exists.
@@ -495,7 +615,12 @@ level = "info"
         let cfg_path = write_config_with_site_override(tmp.path());
         let cfg = load_validated_config(&cfg_path).unwrap();
 
-        let wired = wire(cfg, "some-other-host.example.org").unwrap();
+        let wired = wire_with_monitor(
+            cfg,
+            "some-other-host.example.org",
+            Box::new(tessera_core::ipc::StubClient),
+        )
+        .unwrap();
 
         let global_leaf = read_cert("leaf_rsa.pem");
         let global_intermediate = vec![read_cert("int.pem")];
