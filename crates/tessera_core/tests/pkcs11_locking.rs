@@ -169,6 +169,17 @@ fn os_mode_allows_concurrent_provider_calls() {
         return;
     };
     let backend = Arc::new(Pkcs11Backend::load(&path, LockingMode::Os).expect("load module"));
+    // The mode belongs to the shared context and is resolved towards the
+    // stricter of the requests made for that module path, so asking for
+    // `Os` does not guarantee getting it.  Without this check the test
+    // would happily run a fully serialized scenario and stay green while
+    // proving nothing about concurrency.
+    assert_eq!(
+        backend.locking_mode(),
+        LockingMode::Os,
+        "this test only means something in Os mode: something else in this process \
+         established Mutex for the same module path"
+    );
     let barrier = Arc::new(Barrier::new(THREADS));
 
     let handles: Vec<_> = (0..THREADS)

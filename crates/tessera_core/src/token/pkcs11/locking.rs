@@ -35,10 +35,14 @@
 //! [`crate::token::pkcs11::Pkcs11Backend`], because two backends may
 //! disagree about the locking mode while the provider defect is
 //! process-global.  For the same reason the mode itself is a property of
-//! the shared context rather than of a backend handle — the first load of
-//! a module path fixes it, and a later load asking for the other mode is
-//! told what it got at WARN.  Serialization that half the callers opt out
-//! of serializes nothing.
+//! the shared context rather than of a backend handle: serialization that
+//! half the callers opt out of serializes nothing.  Disagreements are
+//! resolved towards `Mutex` — a load asking for it raises the context
+//! (and every handle already given out, since the mode is read per call),
+//! while `Os` can never lower one.  Resolving the other way would let a
+//! configuration that asked for serialization silently not get it,
+//! including the configuration that asked for nothing at all, `Mutex`
+//! being the default.  Either resolution is logged at WARN.
 //!
 //! ## Test instrumentation
 //!

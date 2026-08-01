@@ -23,6 +23,20 @@
 //! `C_Initialize` for the same library at once, regardless of the
 //! per-backend [`LockingMode`], which the vendor defect does not respect.
 //!
+//! The registry is a cache, not the holder of that invariant, so
+//! `CKR_CRYPTOKI_ALREADY_INITIALIZED` counts as success: the provider can
+//! be up without the registry knowing.  Someone else in the process may
+//! have initialized it — `pam_pkcs11`, `sshd` built with
+//! `PKCS11Provider`, p11-kit — or a previous incarnation of this very
+//! module may have: libpam unloads modules on `pam_end`, and `dlclose`
+//! erases these statics without running any destructor while the
+//! provider image stays mapped and initialized, because the `Library`
+//! holding it leaks along with them.  Refusing to adopt would deny every
+//! login after the first in a process that outlives one authentication.
+//! Adopting is safe for the same reason the registry can be a mere
+//! cache: we never finalize, so there is nothing to take away from
+//! whoever owns the initialization.
+//!
 //! The registry owns the context and never gives it up: `C_Finalize` is
 //! never called and the module stays loaded until the process exits.  That
 //! is deliberate.  Finalization is a process-global operation on a `dlopen`
@@ -43,14 +57,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
+use cryptoki::error::{Error as CkError, RvError};
 use cryptoki::slot::Slot;
 use parking_lot::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::error::Pkcs11Error;
 use super::locking::with_global_lock;
@@ -96,12 +111,57 @@ static CONTEXTS: LazyLock<Mutex<HashMap<PathBuf, Arc<SharedContext>>>> =
 #[derive(Debug)]
 struct SharedContext {
     ctx: Pkcs11,
-    /// Locking mode of whoever created the context.  Every backend on
-    /// this path obeys it, because the mode governs a shared library
-    /// rather than a handle: one backend skipping the mutex would let
-    /// its calls run concurrently with the calls another backend
-    /// believes are serialized.
-    locking_mode: LockingMode,
+    /// The locking mode in force for this module path.
+    mode: SharedLockingMode,
+}
+
+/// Live view of the locking mode of one PKCS#11 context.
+///
+/// The mode governs a shared library rather than a handle — one backend
+/// skipping the mutex would let its calls run concurrently with the calls
+/// another backend believes are serialized — so it cannot be copied into
+/// a handle at creation time and left there.  A later `load` asking for
+/// [`LockingMode::Mutex`] raises it, and the raise has to reach handles
+/// that already exist or it protects nothing.  Everything that has to
+/// know the mode ([`Pkcs11Backend`], [`super::session::Pkcs11Session`],
+/// whose `Drop` has no backend to ask) holds a clone of this and reads it
+/// per call.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedLockingMode {
+    /// `true` means [`LockingMode::Mutex`].  Only ever set, never
+    /// cleared — see [`LockingMode::stricter`].
+    serialized: Arc<AtomicBool>,
+}
+
+impl SharedLockingMode {
+    fn new(mode: LockingMode) -> Self {
+        Self {
+            serialized: Arc::new(AtomicBool::new(matches!(mode, LockingMode::Mutex))),
+        }
+    }
+
+    /// The mode currently in force.
+    pub(crate) fn get(&self) -> LockingMode {
+        // `Relaxed` is enough: the flag orders no other memory, and a
+        // reader that misses a raise by a few nanoseconds starts
+        // serializing from its next call, which is all the raise
+        // promises.  Every write happens under the registry lock.
+        if self.serialized.load(Ordering::Relaxed) {
+            LockingMode::Mutex
+        } else {
+            LockingMode::Os
+        }
+    }
+
+    /// Fold `requested` in and return the mode in force afterwards.
+    /// Never relaxes.
+    fn raise_to(&self, requested: LockingMode) -> LockingMode {
+        let effective = self.get().stricter(requested);
+        if matches!(effective, LockingMode::Mutex) {
+            self.serialized.store(true, Ordering::Relaxed);
+        }
+        effective
+    }
 }
 
 /// Locking mode passed to every cryptoki call.
@@ -120,6 +180,27 @@ pub enum LockingMode {
     /// default: providers that advertise `CKF_OS_LOCKING_OK` and still
     /// mishandle concurrency exist in the field.
     Mutex,
+}
+
+impl LockingMode {
+    /// The safer of two modes requested for the same module path.
+    ///
+    /// Backends sharing a module share one mode, so a disagreement has
+    /// to be resolved somehow, and the direction is not symmetric.
+    /// Resolving towards `Os` — which "whoever loaded first wins" does
+    /// half the time — withdraws serialization from a caller that asked
+    /// for it, silently and while `Mutex` is the default: a
+    /// configuration that said nothing at all would lose its protection
+    /// to whoever happened to load first. Resolving towards `Mutex` only
+    /// ever costs an uncontended lock (≈ 20 ns) on calls that expected
+    /// to run concurrently.
+    #[must_use]
+    const fn stricter(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Os, Self::Os) => Self::Os,
+            _ => Self::Mutex,
+        }
+    }
 }
 
 /// Handle to the process-global PKCS#11 context for one module path.
@@ -143,10 +224,14 @@ impl Pkcs11Backend {
     /// dropped.  The call is serialized process-wide, so concurrent
     /// callers never enter `C_Initialize` together.
     ///
-    /// `locking_mode` applies only when this call is the one that creates
-    /// the context.  A later caller asking for a different mode on the
-    /// same path gets the established one and a WARN — see
-    /// [`Self::locking_mode`].
+    /// `locking_mode` is folded into the mode of the shared context
+    /// rather than applied to this handle: the stricter of the two wins
+    /// and the conflict is logged at WARN — see [`Self::locking_mode`].
+    ///
+    /// A `CKR_CRYPTOKI_ALREADY_INITIALIZED` from `C_Initialize` is not
+    /// an error: the provider is up, which is what the caller needs, and
+    /// it may well have been brought up by a party this registry cannot
+    /// see (see the module docs).
     ///
     /// # Errors
     ///
@@ -158,8 +243,8 @@ impl Pkcs11Backend {
     /// - [`Pkcs11Error::ModuleLoadFailed`] when `cryptoki::Pkcs11::new`
     ///   fails for any other reason (ABI mismatch, missing transitive
     ///   dep, permission denied).
-    /// - [`Pkcs11Error::InitFailed`] when `C_Initialize` itself returns a
-    ///   non-zero status.
+    /// - [`Pkcs11Error::InitFailed`] when `C_Initialize` returns any
+    ///   status other than `CKR_OK` or `CKR_CRYPTOKI_ALREADY_INITIALIZED`.
     pub fn load(module_path: &Path, locking_mode: LockingMode) -> Result<Self, Pkcs11Error> {
         if !module_path.exists() {
             return Err(Pkcs11Error::ModulePathMissing(module_path.to_path_buf()));
@@ -194,12 +279,23 @@ impl Pkcs11Backend {
         let mut registry = CONTEXTS.lock();
 
         if let Some(shared) = registry.get(&key) {
-            if shared.locking_mode != locking_mode {
+            let previous = shared.mode.get();
+            let effective = shared.mode.raise_to(locking_mode);
+            if previous != effective {
                 warn!(
                     target: "tessera.pkcs11",
                     module = %key.display(),
                     requested = ?locking_mode,
-                    effective = ?shared.locking_mode,
+                    previous = ?previous,
+                    effective = ?effective,
+                    "pkcs11_locking_mode_upgraded"
+                );
+            } else if effective != locking_mode {
+                warn!(
+                    target: "tessera.pkcs11",
+                    module = %key.display(),
+                    requested = ?locking_mode,
+                    effective = ?effective,
                     "pkcs11_locking_mode_conflict"
                 );
             }
@@ -217,11 +313,33 @@ impl Pkcs11Backend {
         // conforming provider needs to hear, and `Mutex` mode's user-space
         // serialization is additive.
         let init_args = CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK);
-        ctx.initialize(init_args)
-            .map_err(|source| Pkcs11Error::InitFailed { source })?;
-        INIT_COUNT.fetch_add(1, Ordering::SeqCst);
+        match ctx.initialize(init_args) {
+            Ok(()) => {
+                INIT_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+            // Someone got here first — a neighbour in this process, or a
+            // previous incarnation of this module whose registry went
+            // away with `dlclose` while the provider stayed up.  Adopt
+            // the initialization instead of refusing the login: we never
+            // finalize, so adopting takes nothing from its owner.  Not a
+            // warning — in a login process that outlives one
+            // authentication this is the steady state after the first
+            // attempt, and a per-login WARN for an expected condition
+            // teaches operators to skip warnings.
+            Err(CkError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {
+                info!(
+                    target: "tessera.pkcs11",
+                    module = %key.display(),
+                    "pkcs11_context_adopted"
+                );
+            }
+            Err(source) => return Err(Pkcs11Error::InitFailed { source }),
+        }
 
-        let shared = Arc::new(SharedContext { ctx, locking_mode });
+        let shared = Arc::new(SharedContext {
+            ctx,
+            mode: SharedLockingMode::new(locking_mode),
+        });
         registry.insert(key, Arc::clone(&shared));
         Ok(Self {
             ctx: shared,
@@ -241,16 +359,28 @@ impl Pkcs11Backend {
 
     /// Return the locking mode in force for this module path.
     ///
-    /// This is the mode the *context* was created with, which is not
-    /// necessarily the one this backend asked for: the mode decides
-    /// whether calls into a shared library are serialized, so it has to
-    /// be a property of the library rather than of the handle.  Letting
-    /// one backend skip the mutex while another relies on it would put
-    /// concurrent calls into a provider that was declared unable to
-    /// take them.  A mismatch is logged at WARN by [`Self::load`].
+    /// This is the mode of the *context*, which is not necessarily the
+    /// one this backend asked for: the mode decides whether calls into a
+    /// shared library are serialized, so it has to be a property of the
+    /// library rather than of the handle.  Letting one backend skip the
+    /// mutex while another relies on it would put concurrent calls into
+    /// a provider that was declared unable to take them.
+    ///
+    /// The value can change under a live handle — a later `load` asking
+    /// for [`LockingMode::Mutex`] upgrades the context, and the upgrade
+    /// has to reach handles already given out or it protects nothing.
+    /// It never moves the other way; see [`LockingMode::stricter`].
+    /// Every call site therefore reads it afresh rather than caching it.
     #[must_use]
     pub fn locking_mode(&self) -> LockingMode {
-        self.ctx.locking_mode
+        self.ctx.mode.get()
+    }
+
+    /// Hand out the live mode view so a [`super::session::Pkcs11Session`]
+    /// can keep honouring the serialization layer in `Drop`, where it has
+    /// no backend left to ask.
+    pub(crate) fn shared_locking_mode(&self) -> SharedLockingMode {
+        self.ctx.mode.clone()
     }
 
     /// Borrow the underlying `cryptoki::Pkcs11` context.  Used by sibling
@@ -364,6 +494,52 @@ mod tests {
             Pkcs11Error::ModulePathMissing(p) => assert_eq!(p, path),
             other => panic!("expected ModulePathMissing, got {other:?}"),
         }
+    }
+
+    /// A conflict over the mode of a shared context resolves towards
+    /// `Mutex` in every combination, and only leaves `Os` when nobody
+    /// asked for anything else.
+    ///
+    /// The live counterpart (`tests/pkcs11_singleton.rs`) needs a second
+    /// module path and skips wherever a provider copy will not load,
+    /// which includes the host that motivated the whole rule.  This one
+    /// runs everywhere: a table of four cases is what stops the
+    /// resolution silently flipping back to "first load wins".
+    #[test]
+    fn mode_conflicts_resolve_towards_mutex() {
+        use LockingMode::{Mutex as M, Os};
+
+        assert_eq!(Os.stricter(Os), Os);
+        assert_eq!(Os.stricter(M), M, "a request for serialization must win");
+        assert_eq!(
+            M.stricter(Os),
+            M,
+            "os must never relax an established mutex"
+        );
+        assert_eq!(M.stricter(M), M);
+    }
+
+    /// Raising is retroactive and one-way: every clone of the view sees
+    /// the upgrade, and a later `Os` request cannot undo it.
+    #[test]
+    fn raising_the_shared_mode_reaches_existing_holders() {
+        let held_earlier = SharedLockingMode::new(LockingMode::Os);
+        let same_context = held_earlier.clone();
+        assert_eq!(held_earlier.get(), LockingMode::Os);
+
+        assert_eq!(
+            same_context.raise_to(LockingMode::Mutex),
+            LockingMode::Mutex
+        );
+        assert_eq!(
+            held_earlier.get(),
+            LockingMode::Mutex,
+            "a handle taken out before the upgrade must serialize too, or the calls it \
+             makes run concurrently with calls the upgrader believes are protected"
+        );
+
+        assert_eq!(same_context.raise_to(LockingMode::Os), LockingMode::Mutex);
+        assert_eq!(held_earlier.get(), LockingMode::Mutex);
     }
 
     /// The registry keeps exactly one entry per module path, and keeps it
