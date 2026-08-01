@@ -314,8 +314,11 @@ fn live_extractable_private_key_attribute_round_trips() {
         "extractable key with CKA_ID 0xEE not found on token \
          (provision step ran but softhsm2 returned no objects)"
     );
+    let handle = *handles
+        .first()
+        .expect("handle list non-empty, asserted above");
     let attrs = raw_session
-        .get_attributes(handles[0], &[cryptoki::object::AttributeType::Extractable])
+        .get_attributes(handle, &[cryptoki::object::AttributeType::Extractable])
         .expect("get_attributes");
     let mut extractable: Option<bool> = None;
     for a in attrs {
@@ -328,8 +331,12 @@ fn live_extractable_private_key_attribute_round_trips() {
         Some(true),
         "softhsm2 must report CKA_EXTRACTABLE = TRUE for the key we provisioned with --extractable"
     );
-    // Cleanly logout the raw session so it doesn't leak login state.
-    let _ = raw_session.logout();
+    // Cleanly logout the raw session so it doesn't leak login state into the
+    // rest of the run: cryptoki's login state is per-token, not per-session,
+    // so a leftover login would change what later tests observe.  The login
+    // above succeeded, so a failing logout means the provider misbehaves and
+    // the test should say so instead of swallowing it.
+    raw_session.logout().expect("logout raw session");
 }
 
 // ---------------------------------------------------------------------------
