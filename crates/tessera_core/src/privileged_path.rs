@@ -345,6 +345,18 @@ pub enum PrivilegedPathError {
         /// The ACE type byte that could not be analysed.
         ace_type: u8,
     },
+    /// A component's DACL contains an allowing entry whose principal SID is not
+    /// a well-formed SID, or is longer than the entry that is supposed to
+    /// contain it. Such an entry cannot be attributed to any principal, so the
+    /// access it grants cannot be ruled out. Fail closed.
+    #[cfg(windows)]
+    #[error("{path:?} has an access-allowed entry (#{ace_index}) with a malformed principal SID")]
+    MalformedAceSid {
+        /// The offending component.
+        path: PathBuf,
+        /// Position of the offending entry in the component's DACL.
+        ace_index: u32,
+    },
     /// The path resolves onto a network share. Its permissions are asserted by
     /// a remote machine, so no local walk can establish trust in it.
     #[cfg(windows)]

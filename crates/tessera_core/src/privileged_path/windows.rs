@@ -34,7 +34,8 @@
 //! Everything that prevents the check from reaching a verdict — an unreadable
 //! security descriptor, an owner that does not resolve, a NULL DACL (which
 //! grants everyone full access), an ACE type whose layout this code cannot
-//! parse, a path that will not canonicalize — is a refusal. There is no path
+//! parse, an allowing ACE whose principal SID is malformed or does not fit the
+//! entry, a path that will not canonicalize — is a refusal. There is no path
 //! through this module that reads a file whose trust was not established.
 //!
 //! # Known gap
@@ -66,9 +67,9 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetAce, IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    EqualSid, GetAce, GetLengthSid, IsValidSid, IsWellKnownSid, WinBuiltinAdministratorsSid,
+    WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
+    INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     GetDriveTypeW, GetVolumePathNameW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -163,6 +164,17 @@ const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 6;
 const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
 /// `ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE`.
 const ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE: u8 = 12;
+
+/// Byte offset of the inline SID inside an `ACCESS_ALLOWED_ACE`: the entry's
+/// header and access mask, with the SID's first word occupying `SidStart`.
+const ACE_SID_OFFSET: usize = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+
+/// Length of a SID's fixed prefix: the revision byte, the sub-authority count
+/// and the six-byte identifier authority. Everything that reads a SID — down to
+/// `IsValidSid`, which only looks at the first two bytes — needs at least this
+/// much to be present, and the sub-authority count found here is what decides
+/// the SID's real length.
+const SID_PREFIX_LEN: usize = 8;
 
 /// Well-known SID string for `NT SERVICE\TrustedInstaller`. It has no
 /// `WELL_KNOWN_SID_TYPE`, so it is compared by value.
@@ -577,19 +589,59 @@ fn check_dacl(
                 });
             }
         }
+        // Everything decided so far concerns the entry's *type*. What follows
+        // reads a SID whose own length is stated inside the SID, and nothing in
+        // the Win32 contract ties that length to the one the ACE header
+        // advertises. On a descriptor that has been tampered with, an entry
+        // shorter than the SID it claims to carry would send every SID-reading
+        // call below past the end of the descriptor's allocation. That bound is
+        // established here, once, before the pointer reaches any of them: the
+        // entry must be long enough for the SID's fixed prefix, the SID must
+        // pass the structural check, and the length that prefix implies must
+        // still fit inside the entry.
+        //
+        // The bound is enforced for every allowing entry, not only for those
+        // whose mask matters, because the mask alone does not make an entry
+        // harmless: an entry whose principal cannot be determined is one whose
+        // grant cannot be attributed, and that is a refusal like any other.
+        //
+        // What is still taken on trust is the entry's advertised size itself:
+        // it bounds the SID, and nothing here bounds it against the ACL. That
+        // is the same assumption `GetAce` makes to find the entry at all, so it
+        // cannot be tightened from this side.
+        // SAFETY: same pointer, same layout guarantee as the reads above —
+        // every ACE begins with an `ACE_HEADER`.
+        let ace_size = usize::from(unsafe { (*header).AceSize });
+        if ace_size < ACE_SID_OFFSET + SID_PREFIX_LEN {
+            return Err(PrivilegedPathError::MalformedAceSid {
+                path: path.to_path_buf(),
+                ace_index: index,
+            });
+        }
         let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
         // SAFETY: the header identified this ACE as `ACCESS_ALLOWED_ACE_TYPE`,
-        // so it has the `ACCESS_ALLOWED_ACE` layout.
+        // so it has the `ACCESS_ALLOWED_ACE` layout, and the entry was just
+        // shown to be long enough for that fixed prefix. `SidStart` is the
+        // first word of the variable-length SID stored inline after the mask,
+        // which is what the SID-consuming APIs expect as a `PSID`. Only its
+        // address is taken here; the SID is not read until it is bounded.
+        let sid: PSID = unsafe { &raw const (*allowed).SidStart }
+            .cast::<c_void>()
+            .cast_mut();
+        // `sid_length` is only defined for a structurally valid SID, so the
+        // short-circuit order matters.
+        if !is_valid_sid(sid) || sid_length(sid) > ace_size - ACE_SID_OFFSET {
+            return Err(PrivilegedPathError::MalformedAceSid {
+                path: path.to_path_buf(),
+                ace_index: index,
+            });
+        }
+        // SAFETY: same layout guarantee as above; the mask lies in the fixed
+        // prefix the entry was shown to hold.
         let mask = unsafe { (*allowed).Mask };
         if mask & substitution == 0 {
             continue;
         }
-        // SAFETY: same layout guarantee; `SidStart` is the first word of the
-        // variable-length SID stored inline after the mask, which is what the
-        // SID-consuming APIs expect as a `PSID`.
-        let sid: PSID = unsafe { &raw const (*allowed).SidStart }
-            .cast::<c_void>()
-            .cast_mut();
         if is_local_system(sid) || is_builtin_administrators(sid) || equals(sid, trusted_installer)
         {
             continue;
@@ -603,10 +655,37 @@ fn check_dacl(
     Ok(())
 }
 
+/// Whether `sid` is structurally a SID: a revision this Windows understands and
+/// a sub-authority count within the defined bound.
+///
+/// This is the gate that makes every other SID read below well-defined, because
+/// the sub-authority count it validates is what those reads walk.
+fn is_valid_sid(sid: PSID) -> bool {
+    // SAFETY: `sid` points at a block of at least the SID prefix length —
+    // established by the caller from the entry's own `AceSize` — and
+    // `IsValidSid` reads only the revision and the sub-authority count within
+    // it.
+    unsafe { IsValidSid(sid) != 0 }
+}
+
+/// Length in bytes of a structurally valid SID.
+///
+/// Undefined for anything that has not passed [`is_valid_sid`], so it is never
+/// called on its own.
+fn sid_length(sid: PSID) -> usize {
+    // SAFETY: `sid` passed `IsValidSid`, so its revision and sub-authority
+    // count are readable and in range; `GetLengthSid` computes the length from
+    // that count without touching the sub-authorities themselves.
+    let len = unsafe { GetLengthSid(sid) };
+    usize::try_from(len).unwrap_or(usize::MAX)
+}
+
 /// Whether `sid` is `NT AUTHORITY\SYSTEM`.
 fn is_local_system(sid: PSID) -> bool {
     // SAFETY: `sid` points at a SID inside a live security descriptor or a
-    // live `LocalAlloc` block; `IsWellKnownSid` only reads it.
+    // live `LocalAlloc` block, and a SID read out of an ACE has additionally
+    // been shown to be structurally valid and to fit within its entry;
+    // `IsWellKnownSid` only reads it.
     unsafe { IsWellKnownSid(sid, WinLocalSystemSid) != 0 }
 }
 
@@ -618,7 +697,8 @@ fn is_builtin_administrators(sid: PSID) -> bool {
 
 /// Whether two live SIDs are equal.
 fn equals(left: PSID, right: PSID) -> bool {
-    // SAFETY: both pointers refer to live SIDs; `EqualSid` only reads them.
+    // SAFETY: both pointers refer to live SIDs whose length is bounded by the
+    // structure holding them; `EqualSid` only reads them.
     unsafe { EqualSid(left, right) != 0 }
 }
 
@@ -627,8 +707,9 @@ fn equals(left: PSID, right: PSID) -> bool {
 /// else, so it is not propagated.
 fn sid_to_string(sid: PSID) -> String {
     let mut text: *mut u16 = ptr::null_mut();
-    // SAFETY: `sid` is a live SID and `text` is a valid out-parameter for a
-    // single string pointer.
+    // SAFETY: `sid` is a live SID whose length is bounded by the structure
+    // holding it, and `text` is a valid out-parameter for a single string
+    // pointer.
     let ok = unsafe { ConvertSidToStringSidW(sid, &raw mut text) };
     if ok == 0 || text.is_null() {
         return "<unprintable SID>".to_owned();
@@ -696,7 +777,9 @@ fn encode_path(path: &Path) -> Result<Vec<u16>, PrivilegedPathError> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL_REVISION,
+    };
 
     /// A security descriptor parsed from SDDL, kept alive for the assertions.
     struct Descriptor {
@@ -744,6 +827,61 @@ mod tests {
                 dacl: dacl.cast_const(),
             }
         }
+    }
+
+    /// An ACL assembled byte by byte, holding a single access-allowed entry.
+    ///
+    /// SDDL cannot express the shapes these exercise: the converter only ever
+    /// emits entries long enough for the SIDs it puts in them, which is exactly
+    /// the property the walk must not take on faith.
+    struct RawAcl {
+        /// The ACL, its entry and the entry's SID, laid out as 32-bit words so
+        /// that the `ACL` header and the entry's access mask land on the
+        /// alignment their types require.
+        words: Vec<u32>,
+    }
+
+    impl RawAcl {
+        /// Build an ACL whose single entry advertises `ace_size` bytes and
+        /// whose inline SID claims `sub_authorities` sub-authorities. The two
+        /// are set independently on purpose: a tampered descriptor is free to
+        /// disagree with itself, and the walk has to survive that.
+        fn with_single_allowed_ace(ace_size: u16, sub_authorities: u8) -> Self {
+            // The ACL header is eight bytes, and the single entry follows it.
+            let total = 8 + ace_size;
+            let mut words = vec![
+                // AclRevision, Sbz1 = 0, AclSize.
+                ACL_REVISION | (u32::from(total) << 16),
+                // AceCount = 1, Sbz2 = 0.
+                1,
+                // AceType = ACCESS_ALLOWED_ACE_TYPE, AceFlags = 0, AceSize.
+                u32::from(ace_size) << 16,
+                // Access mask: full control, so the entry is never dismissed
+                // for granting nothing that matters.
+                GENERIC_ALL,
+                // SID: revision 1 and the claimed sub-authority count. The
+                // six identifier-authority bytes and the sub-authorities that
+                // do fit follow as zeroes, spelling the NULL SID `S-1-0-…`.
+                1 | (u32::from(sub_authorities) << 8),
+            ];
+            words.resize(usize::from(total).div_ceil(4), 0);
+            Self { words }
+        }
+
+        fn as_ptr(&self) -> *const ACL {
+            self.words.as_ptr().cast::<ACL>()
+        }
+    }
+
+    /// Run the DACL verdict against a hand-built ACL.
+    fn probe_raw_dacl(acl: &RawAcl) -> Result<(), PrivilegedPathError> {
+        let trusted = trusted_installer_sid();
+        check_dacl(
+            Path::new(r"C:\ProgramData"),
+            ObjectKind::Directory,
+            acl.as_ptr(),
+            trusted.trusted_installer,
+        )
     }
 
     fn trusted_installer_sid() -> TrustedSids {
@@ -1030,6 +1168,73 @@ mod tests {
             matches!(err, PrivilegedPathError::NullDacl { .. }),
             "{err:?}"
         );
+    }
+
+    /// An entry whose advertised length cannot even hold a SID's fixed prefix
+    /// is a refusal: reading the principal out of it would run past the entry.
+    #[test]
+    fn ace_too_short_for_a_sid_is_rejected() {
+        // Twelve bytes: the entry's own header and mask plus four bytes where
+        // the eight-byte SID prefix should be.
+        let acl = RawAcl::with_single_allowed_ace(12, 1);
+        let err =
+            probe_raw_dacl(&acl).expect_err("an entry too short to hold a SID must be rejected");
+        assert!(
+            matches!(err, PrivilegedPathError::MalformedAceSid { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The prefix fits, but the sub-authority count it states puts the SID's
+    /// tail outside the entry. Trusting the count alone is what would read out
+    /// of bounds, so the two lengths are compared rather than assumed to agree.
+    #[test]
+    fn ace_shorter_than_the_sid_it_claims_is_rejected() {
+        // Sixteen bytes hold the entry prefix and the SID prefix exactly; a SID
+        // with fifteen sub-authorities is sixty-eight bytes long.
+        let acl = RawAcl::with_single_allowed_ace(16, 15);
+        let err =
+            probe_raw_dacl(&acl).expect_err("an entry shorter than its own SID must be rejected");
+        assert!(
+            matches!(err, PrivilegedPathError::MalformedAceSid { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The counterpart of the two above: an entry whose lengths agree passes
+    /// the bound and is judged on its grant, which for the NULL SID holding
+    /// full control is a refusal for the ordinary reason.
+    #[test]
+    fn ace_with_a_sid_that_fits_is_judged_on_its_grant() {
+        // Twenty bytes: entry prefix, SID prefix and one sub-authority.
+        let acl = RawAcl::with_single_allowed_ace(20, 1);
+        let err = probe_raw_dacl(&acl)
+            .expect_err("full control for an untrusted principal must be rejected");
+        assert!(
+            matches!(err, PrivilegedPathError::UntrustedSubstitution { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A malformed entry must read differently from an unreadable descriptor
+    /// and from a missing file: they point an operator at different faults.
+    #[test]
+    fn malformed_ace_reads_differently_from_the_other_refusals() {
+        let malformed = PrivilegedPathError::MalformedAceSid {
+            path: PathBuf::from(r"C:\ProgramData\Tessera\config.toml"),
+            ace_index: 3,
+        };
+        let unreadable = PrivilegedPathError::SecurityDescriptorUnavailable {
+            path: PathBuf::from(r"C:\ProgramData\Tessera\config.toml"),
+            code: 5,
+        };
+        let missing = PrivilegedPathError::Unresolvable {
+            path: PathBuf::from(r"C:\ProgramData\Tessera\config.toml"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert_ne!(malformed.to_string(), unreadable.to_string());
+        assert_ne!(malformed.to_string(), missing.to_string());
+        assert!(malformed.to_string().contains("malformed principal SID"));
     }
 
     /// A security descriptor that cannot be read must be distinguishable from

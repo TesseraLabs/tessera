@@ -1,0 +1,86 @@
+name: windows
+
+# Windows-нога адаптера входа по сертификату: ядро, протокол, служба и
+# credential provider.
+#
+# Зачем отдельный workflow, а не ветка matrix в существующих. Крейты
+# перечислены поимённо, и это не педантизм: `--workspace` под Windows не
+# собирается, потому что `tessera_cli` тянет `sd-notify` (systemd). Держать
+# такое исключение внутри общей matrix значит прятать его в условиях.
+#
+# Половина `tessera_cp` (весь COM-слой) компилируется только под Windows, а
+# `privileged_path::windows` и `usb::windows_impl` там же и тестируются. До
+# появления этой ноги весь код Windows-адаптера в CI не собирался вовсе:
+# джоба `build-test (windows-latest)` в issuer.yml относится к issuer-крейтам
+# и этих не касается.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Единый перечень для сборки, тестов и линта: расхождение между ними
+  # означало бы, что что-то собирается непроверенным.
+  WINDOWS_CRATES: >-
+    -p tessera_core
+    -p tessera_proto
+    -p tessera_cp
+    -p tessera_win_service
+    -p pam_tessera
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    name: build-test (windows-msvc)
+    steps:
+      - uses: actions/checkout@v6
+
+      # rustup на hosted-раннерах предустановлен; `rustup show` ставит
+      # toolchain, названный в rust-toolchain.toml.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        shell: bash
+        run: rustup show
+
+      - name: Print toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: windows-msvc
+
+      # `openssl` идёт с feature `vendored`, то есть собирается из исходников:
+      # предсказуемее vcpkg ценой Perl и NASM на сборочной машине. Оба есть в
+      # образе windows-latest — шаг печатает их версии, чтобы отсутствие было
+      # видно сразу и не выглядело как ошибка компиляции openssl.
+      - name: Check the vendored-openssl prerequisites
+        shell: bash
+        run: |
+          perl --version | head -2
+          nasm -v
+
+      - name: Build
+        shell: bash
+        run: cargo build ${WINDOWS_CRATES}
+
+      - name: Test
+        shell: bash
+        run: cargo test ${WINDOWS_CRATES}
+
+      - name: cargo clippy (windows crates, all targets, -D warnings)
+        shell: bash
+        run: cargo clippy ${WINDOWS_CRATES} --all-targets -- -D warnings
