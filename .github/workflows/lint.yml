@@ -43,8 +43,12 @@ jobs:
       - name: Rust build cache
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
 
-      - name: cargo clippy (workspace, all targets, -D warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--all-features` обязателен: без него код за `pkcs11-tests`, `gost-tests`
+      # и `mac-tests` не линтится вообще, и нарушения собственной lint-таблицы
+      # крейта копятся незамеченными. Фичи в workspace тестовые и внешних
+      # системных зависимостей не тянут, поэтому job остаётся самодостаточным.
+      - name: cargo clippy (workspace, all targets, all features, -D warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   supply-chain:
     # cargo-deny + cargo-audit работают по lockfile, компиляция crate-графа

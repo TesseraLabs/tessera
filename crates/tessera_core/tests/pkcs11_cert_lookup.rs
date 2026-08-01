@@ -43,7 +43,7 @@ fn live_token_serial_or_skips() {
         eprintln!("skipped: no token present in any slot");
         return;
     }
-    let slot = slots[0];
+    let slot = *slots.first().expect("slot list non-empty, checked above");
     let serial =
         tessera_core::token::pkcs11::read_token_serial(&backend, slot).expect("read serial");
     assert!(!serial.is_empty(), "serial must be non-empty");
