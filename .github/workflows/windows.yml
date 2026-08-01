@@ -29,6 +29,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # `Configure` от OpenSSL требует нативный Strawberry Perl. Шаги ниже идут
+  # под bash, а там `perl` разрешается в MSYS-перл, которому не хватает
+  # `Locale::Maketext::Simple` — сборка падает уже на конфигурировании.
+  # Указываем интерпретатор явно, вместо того чтобы полагаться на PATH.
+  OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+
   # Единый перечень для сборки, тестов и линта: расхождение между ними
   # означало бы, что что-то собирается непроверенным.
   WINDOWS_CRATES: >-
@@ -65,12 +71,19 @@ jobs:
 
       # `openssl` идёт с feature `vendored`, то есть собирается из исходников:
       # предсказуемее vcpkg ценой Perl и NASM на сборочной машине. Оба есть в
-      # образе windows-latest — шаг печатает их версии, чтобы отсутствие было
-      # видно сразу и не выглядело как ошибка компиляции openssl.
+      # образе windows-latest — шаг проверяет их до сборки, чтобы отсутствие
+      # было видно сразу и не выглядело как ошибка компиляции openssl.
+      #
+      # Проверяется именно тот интерпретатор, которым будет собираться
+      # OpenSSL, а не первый `perl` в PATH: под bash это MSYS-перл, который
+      # существует, отвечает на `--version` и при этом не годится. Проверка
+      # «perl вообще есть» здесь ничего не значит.
       - name: Check the vendored-openssl prerequisites
         shell: bash
         run: |
-          perl --version | head -2
+          set -euo pipefail
+          "$OPENSSL_SRC_PERL" --version | sed -n '2p'
+          "$OPENSSL_SRC_PERL" -MLocale::Maketext::Simple -e 'print "Locale::Maketext::Simple ok\n"'
           nasm -v
 
       - name: Build
