@@ -7,7 +7,7 @@
 //! 3. Enumerating slots that have a present token — T03.
 //! 4. Polling for a token to arrive (used by the cdylib's wait UX) — T04.
 //!
-//! ## One `C_Initialize` per module path per process
+//! ## One `C_Initialize` per module path per process, and no `C_Finalize`
 //!
 //! `cryptoki` 0.12 does **not** finalize on `Drop` — `Pkcs11::finalize` is an
 //! explicit consuming call — and `C_Initialize` is process-global state in
@@ -17,17 +17,34 @@
 //! cdylib means killing `sshd` / `login` / `fly-dm`.
 //!
 //! So the context lives in a process-global registry keyed by the canonical
-//! module path.  [`Pkcs11Backend::load`] hands out a shared handle,
-//! initializing the library only when no live handle exists, and the last
-//! backend to go away calls `C_Finalize`.  Both transitions happen while
-//! holding the registry lock, so no two threads can be inside
-//! `C_Initialize`/`C_Finalize` for the same library at once — regardless of
-//! the per-backend [`LockingMode`], which the vendor defect does not respect.
+//! module path.  [`Pkcs11Backend::load`] hands out a shared handle and
+//! initializes the library only the first time a path is asked for, while
+//! holding the registry lock — so no two threads can be inside
+//! `C_Initialize` for the same library at once, regardless of the
+//! per-backend [`LockingMode`], which the vendor defect does not respect.
+//!
+//! The registry owns the context and never gives it up: `C_Finalize` is
+//! never called and the module stays loaded until the process exits.  That
+//! is deliberate.  Finalization is a process-global operation on a `dlopen`
+//! we share with anyone else in the same process — `pam_pkcs11`, `sshd`
+//! built with `PKCS11Provider`, p11-kit — and none of them can detect that
+//! their provider was pulled out from under them.  On our own side the
+//! bookkeeping was worse than the leak it saved: `cryptoki`'s `Session`
+//! holds its own clone of `Pkcs11`, invisible to any refcount we could
+//! check, so "last owner" never implied "no live session".  The cost of
+//! keeping the module resident is nil where the process serves one
+//! authentication (`sshd`, `login`) and is the whole point where it does
+//! not (the `fly-dm` display slave lives for the machine's uptime).
+//!
+//! Sharing one `C_Initialize` also shares the PKCS#11 login state, which is
+//! scoped to the *application* rather than to a session.  Logging out is
+//! therefore [`super::session::Pkcs11Session`]'s job on every exit path,
+//! not a side effect of tearing the context down.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
@@ -56,51 +73,35 @@ pub fn context_init_count() -> u64 {
     INIT_COUNT.load(Ordering::SeqCst)
 }
 
-/// Registry of live PKCS#11 contexts, keyed by canonical module path.
+/// Registry of PKCS#11 contexts, keyed by canonical module path.
 ///
-/// Only `Weak` handles are stored: the registry keeps a context findable,
-/// it does not keep it alive.  Every state transition — upgrade, insert,
-/// `C_Initialize`, `C_Finalize`, removal — happens while this mutex is
-/// held, which is what makes the "one live initialization per path"
-/// invariant race-free.
+/// Strong handles: the registry owns every context it has ever created
+/// and outlives all backends, because the library is never finalized.
+/// Both the lookup and the `C_Initialize` that may follow it happen while
+/// this mutex is held, which is what makes the "one initialization per
+/// path" invariant race-free.  The map grows by one entry per distinct
+/// module path in the process — a bound set by the config, not by call
+/// volume.
 ///
 /// A process-global singleton is the point rather than an accident: the
 /// state it guards (`C_Initialize`) is itself process-global inside the
 /// provider, so passing it around explicitly could not enforce anything.
-static CONTEXTS: LazyLock<Mutex<HashMap<PathBuf, Weak<SharedContext>>>> =
+static CONTEXTS: LazyLock<Mutex<HashMap<PathBuf, Arc<SharedContext>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// An initialized PKCS#11 library shared by every backend loaded from the
 /// same module path.
 ///
-/// Deliberately has no `Drop`: finalization must be serialized against
-/// [`Pkcs11Backend::load`], and `Drop` would run after the last strong
-/// count already hit zero — a window in which a concurrent `load` could
-/// have created a replacement context that our `C_Finalize` would then
-/// tear down.  [`Pkcs11Backend::drop`] does it under the registry lock
-/// instead.
+/// Deliberately has no `Drop`: there is nothing to undo.
 #[derive(Debug)]
 struct SharedContext {
     ctx: Pkcs11,
-    module_path: PathBuf,
-}
-
-impl SharedContext {
-    /// Call `C_Finalize` on the shared library, reporting failures without
-    /// propagating them — the caller is a `Drop` and has nowhere to put an
-    /// error.
-    fn finalize(&self) {
-        // `Pkcs11::finalize` consumes the handle; cloning is a refcount
-        // bump on cryptoki's inner `Arc`, not a second `dlopen`.
-        if let Err(source) = self.ctx.clone().finalize() {
-            warn!(
-                target: "tessera.pkcs11",
-                module = %self.module_path.display(),
-                error = %source,
-                "pkcs11_finalize_failed"
-            );
-        }
-    }
+    /// Locking mode of whoever created the context.  Every backend on
+    /// this path obeys it, because the mode governs a shared library
+    /// rather than a handle: one backend skipping the mutex would let
+    /// its calls run concurrently with the calls another backend
+    /// believes are serialized.
+    locking_mode: LockingMode,
 }
 
 /// Locking mode passed to every cryptoki call.
@@ -121,26 +122,31 @@ pub enum LockingMode {
     Mutex,
 }
 
-/// Handle to the process-global PKCS#11 context for one module path, plus
-/// the locking mode this handle was created with.
+/// Handle to the process-global PKCS#11 context for one module path.
 ///
 /// Several backends may exist for the same module — they share one
-/// `C_Initialize`.  Backends for *different* modules are independent.  The
-/// library is finalized when the last backend for its path is dropped.
+/// `C_Initialize` and one locking mode.  Backends for *different* modules
+/// are independent.  Dropping a backend releases nothing beyond the
+/// handle: the library stays initialized for the life of the process.
 #[derive(Debug)]
 pub struct Pkcs11Backend {
     ctx: Arc<SharedContext>,
     module_path: PathBuf,
-    locking_mode: LockingMode,
 }
 
 impl Pkcs11Backend {
     /// Obtain a handle to the PKCS#11 library at `module_path`.
     ///
-    /// The library is loaded and `C_Initialize`d only if no other backend
-    /// for the same canonical path is alive; otherwise the existing
-    /// context is shared.  The call is serialized process-wide, so
-    /// concurrent callers never enter `C_Initialize` together.
+    /// The library is loaded and `C_Initialize`d only the first time the
+    /// process asks for a given canonical path; every later call shares
+    /// the existing context, including after all previous handles were
+    /// dropped.  The call is serialized process-wide, so concurrent
+    /// callers never enter `C_Initialize` together.
+    ///
+    /// `locking_mode` applies only when this call is the one that creates
+    /// the context.  A later caller asking for a different mode on the
+    /// same path gets the established one and a WARN — see
+    /// [`Self::locking_mode`].
     ///
     /// # Errors
     ///
@@ -161,8 +167,22 @@ impl Pkcs11Backend {
         // Two configs may name the same library through different paths
         // (symlink, `..`, relative dir).  Sharing must follow the file,
         // not the spelling; if the path cannot be canonicalized we fall
-        // back to it verbatim rather than failing the load.
-        let key = std::fs::canonicalize(module_path).unwrap_or_else(|_| module_path.to_path_buf());
+        // back to it verbatim rather than failing the load — but that
+        // fallback is exactly the failure mode this registry exists to
+        // prevent, since two spellings would then key two contexts and
+        // the second `C_Initialize` is what kills the process.
+        let key = match std::fs::canonicalize(module_path) {
+            Ok(key) => key,
+            Err(source) => {
+                warn!(
+                    target: "tessera.pkcs11",
+                    module = %module_path.display(),
+                    error = %source,
+                    "pkcs11_module_path_not_canonical"
+                );
+                module_path.to_path_buf()
+            }
+        };
 
         // The whole lookup-or-create sequence runs under this guard.
         // Holding it across `C_Initialize` (tens of ms on a real device,
@@ -172,16 +192,20 @@ impl Pkcs11Backend {
         // per-backend `locking_mode` cannot prevent that because two
         // backends may disagree about it.
         let mut registry = CONTEXTS.lock();
-        // Defensive sweep: with finalization done under this same lock a
-        // dead entry should be impossible, but a leaked one would pin a
-        // `PathBuf` forever across repeated load/drop cycles.
-        registry.retain(|_, weak| weak.strong_count() > 0);
 
-        if let Some(ctx) = registry.get(&key).and_then(Weak::upgrade) {
+        if let Some(shared) = registry.get(&key) {
+            if shared.locking_mode != locking_mode {
+                warn!(
+                    target: "tessera.pkcs11",
+                    module = %key.display(),
+                    requested = ?locking_mode,
+                    effective = ?shared.locking_mode,
+                    "pkcs11_locking_mode_conflict"
+                );
+            }
             return Ok(Self {
-                ctx,
+                ctx: Arc::clone(shared),
                 module_path: module_path.to_path_buf(),
-                locking_mode,
             });
         }
 
@@ -197,15 +221,11 @@ impl Pkcs11Backend {
             .map_err(|source| Pkcs11Error::InitFailed { source })?;
         INIT_COUNT.fetch_add(1, Ordering::SeqCst);
 
-        let shared = Arc::new(SharedContext {
-            ctx,
-            module_path: key.clone(),
-        });
-        registry.insert(key, Arc::downgrade(&shared));
+        let shared = Arc::new(SharedContext { ctx, locking_mode });
+        registry.insert(key, Arc::clone(&shared));
         Ok(Self {
             ctx: shared,
             module_path: module_path.to_path_buf(),
-            locking_mode,
         })
     }
 
@@ -219,10 +239,18 @@ impl Pkcs11Backend {
         &self.module_path
     }
 
-    /// Return the locking mode this backend was initialized with.
+    /// Return the locking mode in force for this module path.
+    ///
+    /// This is the mode the *context* was created with, which is not
+    /// necessarily the one this backend asked for: the mode decides
+    /// whether calls into a shared library are serialized, so it has to
+    /// be a property of the library rather than of the handle.  Letting
+    /// one backend skip the mutex while another relies on it would put
+    /// concurrent calls into a provider that was declared unable to
+    /// take them.  A mismatch is logged at WARN by [`Self::load`].
     #[must_use]
     pub fn locking_mode(&self) -> LockingMode {
-        self.locking_mode
+        self.ctx.locking_mode
     }
 
     /// Borrow the underlying `cryptoki::Pkcs11` context.  Used by sibling
@@ -238,7 +266,7 @@ impl Pkcs11Backend {
     /// Forwards any `cryptoki` error from `C_GetSlotList` as
     /// [`Pkcs11Error::Cryptoki`].
     pub fn list_slots_with_token(&self) -> Result<Vec<Slot>, Pkcs11Error> {
-        let mode = self.locking_mode;
+        let mode = self.locking_mode();
         Ok(with_global_lock(mode, || {
             self.ctx().get_slots_with_token()
         })?)
@@ -270,7 +298,7 @@ impl Pkcs11Backend {
                 .next()
                 .ok_or(Pkcs11Error::NoTokenAvailable);
         };
-        let mode = self.locking_mode;
+        let mode = self.locking_mode();
         for slot in slots {
             let info = with_global_lock(mode, || self.ctx().get_token_info(slot))?;
             if info.label().trim_end() == want {
@@ -298,33 +326,6 @@ impl Pkcs11Backend {
         token_label: Option<&str>,
     ) -> Result<Slot, Pkcs11Error> {
         wait_for_token_with_clock(self, token_label, timeout, &RealClock)
-    }
-}
-
-impl Drop for Pkcs11Backend {
-    /// Finalize the library once the last backend for this module path
-    /// goes away.
-    ///
-    /// The strong-count check is taken while holding the registry lock, and
-    /// every other path that can create a strong reference
-    /// ([`Pkcs11Backend::load`]) needs the same lock.  So "count is 1 here"
-    /// means "no other owner exists and none can appear", and removing the
-    /// entry before `C_Finalize` guarantees a `load` that arrives next will
-    /// build a fresh context instead of resurrecting a finalized one.
-    ///
-    /// `C_Finalize` runs without the per-call lock from
-    /// [`super::locking`], and must: a thread inside a cryptoki call holds
-    /// that lock and may drop a backend, so taking it here would invert the
-    /// lock order.  There is nothing to serialize against anyway — reaching
-    /// this point means no backend, and therefore no session, is left to
-    /// issue calls through this context.
-    fn drop(&mut self) {
-        let mut registry = CONTEXTS.lock();
-        if Arc::strong_count(&self.ctx) > 1 {
-            return;
-        }
-        registry.remove(&self.ctx.module_path);
-        self.ctx.finalize();
     }
 }
 
@@ -365,23 +366,39 @@ mod tests {
         }
     }
 
-    /// The registry must not grow across load/drop cycles: a leaked entry
-    /// would pin a `PathBuf` (and a dangling `Weak`) for the lifetime of a
-    /// long-running daemon.
+    /// The registry keeps exactly one entry per module path, and keeps it
+    /// on purpose: the context is never finalized, so its entry must
+    /// survive every backend being dropped.  What must *not* happen is
+    /// growth — a second entry for the same library would mean a second
+    /// `C_Initialize`, the very thing that kills the process.
+    ///
+    /// The assertion is scoped to this path rather than to the whole map:
+    /// the registry is process-global, so a test that checked global
+    /// emptiness (or a global length) would start failing the day any
+    /// other test in this binary holds a backend.
     #[cfg(feature = "pkcs11-tests")]
     #[test]
-    fn registry_is_empty_after_every_backend_is_dropped() {
+    fn registry_keeps_exactly_one_entry_per_module_path() {
         let Some(path) = super::super::test_helpers::pkcs11_test_module_path() else {
             eprintln!("skipped: PKCS11_MODULE_PATH not set or path missing");
             return;
         };
+        let key = std::fs::canonicalize(&path).unwrap_or(path.clone());
+        let entries_before = CONTEXTS.lock().len();
         for _ in 0..3 {
             let backend = Pkcs11Backend::load(&path, LockingMode::Mutex).expect("load");
             drop(backend);
         }
+        let registry = CONTEXTS.lock();
         assert!(
-            CONTEXTS.lock().is_empty(),
-            "dead registry entries must not accumulate"
+            registry.contains_key(&key),
+            "the context must outlive its backends: no C_Finalize is ever issued"
+        );
+        assert!(
+            registry.len() <= entries_before + 1,
+            "three load/drop cycles on one path must add at most one entry: {} -> {}",
+            entries_before,
+            registry.len()
         );
     }
 }

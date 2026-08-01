@@ -140,11 +140,24 @@ What to check:
    backtrace is a provider defect reproduced through our code, not a
    flaky test — record the provider name and version.
 2. `pkcs11_singleton.rs` passes: one `C_Initialize` per module path
-   however many backends are loaded, re-initialization after the last
-   one is dropped, independent contexts for distinct paths.
+   however many backends are loaded, no re-initialization after the last
+   one is dropped (the context is never finalized), independent contexts
+   for distinct paths, and no residual login between two sequential
+   authentications.
 3. Both locking modes are exercised at least once —
    `pkcs11_locking_mode = "mutex"` (the default) and an explicit
    `"os"` — since only the former is covered by the default config.
+   The mode is fixed by the first load of a module path in a process, so
+   the two modes must be exercised by separate test binaries (they are:
+   `pkcs11_locking.rs` loads in `os`, everything else in `mutex`).
+4. A second `C_Login` in one process succeeds.  SoftHSM2 2.7 fails it
+   with `CKR_GENERAL_ERROR` regardless of `C_Logout` — reproduced
+   against bare `cryptoki`, so it is the provider, not our code — and
+   `login_state_does_not_outlive_the_session` prints a `note:` and stops
+   short when it happens.  On hardware that note must not appear: a
+   provider that cannot log in twice cannot serve a second
+   authentication from a `fly-dm` process that lives for the whole
+   uptime.
 
 A single physical token cannot serve two logins at once; tests that
 drive a PIN or a signature against one device still need to be run one

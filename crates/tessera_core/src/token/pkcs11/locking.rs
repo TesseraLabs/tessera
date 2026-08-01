@@ -30,11 +30,15 @@
 //! independent threads.  It remains available for operators who know
 //! their provider handles that, and buys real parallelism there.
 //!
-//! Neither mode governs *context creation*: `C_Initialize` and
-//! `C_Finalize` are serialized process-wide by the context registry in
+//! Neither mode governs *context creation*: `C_Initialize` is serialized
+//! process-wide by the context registry in
 //! [`crate::token::pkcs11::Pkcs11Backend`], because two backends may
 //! disagree about the locking mode while the provider defect is
-//! process-global.
+//! process-global.  For the same reason the mode itself is a property of
+//! the shared context rather than of a backend handle — the first load of
+//! a module path fixes it, and a later load asking for the other mode is
+//! told what it got at WARN.  Serialization that half the callers opt out
+//! of serializes nothing.
 //!
 //! ## Test instrumentation
 //!

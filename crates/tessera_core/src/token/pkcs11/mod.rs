@@ -2,9 +2,9 @@
 //!
 //! This module hosts the safe Rust types we layer on top of `cryptoki`:
 //!
-//! - [`Pkcs11Backend`] — owns the loaded `.so` and a single `Pkcs11`
-//!   context.  `Drop` finalises the library via `cryptoki`'s own `Drop`
-//!   chain.
+//! - [`Pkcs11Backend`] — handle to the process-global `Pkcs11` context
+//!   for one module path.  The library is initialized once per path and
+//!   never finalized; dropping a backend releases only the handle.
 //! - [`Pkcs11Session`] — RAII wrapper around `cryptoki::session::Session`
 //!   that calls `C_Logout` (when logged in) before the underlying session
 //!   `Drop` calls `C_CloseSession`.

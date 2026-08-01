@@ -114,6 +114,31 @@ fn mutex_mode_serialises_two_threads() {
     );
 }
 
+/// In `Os` mode the global mutex is not taken at all.
+///
+/// The live counterpart below can only run where a provider is
+/// installed, which on CI is nowhere: `lint.yml` and the default test
+/// job build without `--all-features`.  Without this test the "`Os`
+/// really means no serialization" half of the mode contract would go
+/// unchecked on every machine that matters, and a mistake there is
+/// silent — `Mutex` behaviour under an `os` config costs correctness
+/// nothing, so nothing else would notice.
+#[test]
+fn os_mode_does_not_take_the_mutex() {
+    let _serial = TEST_SERIALIZE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let held_inside = with_global_lock(LockingMode::Os, mutex_currently_held);
+    assert!(
+        !held_inside,
+        "Os mode must run the closure without holding the global mutex"
+    );
+    // A `Mutex`-mode call on the same thread still works afterwards —
+    // `Os` mode must not have left a guard behind.
+    assert!(with_global_lock(LockingMode::Mutex, mutex_currently_held));
+    assert!(!mutex_currently_held());
+}
+
 /// In `Os` mode several threads issue **real** cryptoki calls against
 /// one shared backend at the same time.
 ///

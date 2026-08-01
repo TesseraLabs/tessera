@@ -44,7 +44,7 @@ the example really validates through `ValidatedConfig::try_from`.
 | `pkcs11_token_label`       | string             | `None`      | `≤ 64` bytes, no NUL                                           | Filter by the token's `CKA_LABEL`.                           | Guards against accidentally selecting someone else's token on the machine.          |
 | `pkcs11_object_label`      | string             | `None`      | `≤ 64` bytes, no NUL                                           | Filter by the object's `CKA_LABEL` (cert/privkey).           | Likewise, protection against selecting the wrong object.                             |
 | `pkcs11_max_pin_attempts`  | integer            | `3`         | `1..=5`                                                        | How many times the module offers to enter the PIN.           | Too many → anti-paranoia; too few → poor UX.                                         |
-| `pkcs11_locking_mode`      | string             | `"mutex"`   | `"os"`, `"mutex"`                                              | PKCS#11 locking strategy.                                    | `"mutex"` — every module call is serialized by a process-global mutex; cost ≈ 20 ns per call. `"os"` removes the serialization and is only appropriate when the module vendor confirms thread safety: advertising `CKF_OS_LOCKING_OK` is not such a confirmation. |
+| `pkcs11_locking_mode`      | string             | `"mutex"`   | `"os"`, `"mutex"`                                              | PKCS#11 locking strategy.                                    | `"mutex"` — every module call is serialized by a process-global mutex; cost ≈ 20 ns per call. `"os"` removes the serialization and is only appropriate when the module vendor confirms thread safety: advertising `CKF_OS_LOCKING_OK` is not such a confirmation. The mode is fixed by the first load of the module in a process; a later load asking for the other value gets the established one plus a `pkcs11_locking_mode_conflict` WARN. |
 | `pkcs11_pin_prompt`        | string             | `"Введите PIN токена: "` | UTF-8, non-empty, `≤ 128` bytes                  | PIN prompt text on the PKCS#11 path. The default is the Russian string `"Введите PIN токена: "` ("Enter token PIN: "). | UX localization, not security.                                       |
 | `pkcs11_slot_wait_seconds` | integer            | `10`        | `0..=60`                                                       | How many seconds to wait for the token to be inserted.       | `0` — do not wait; UX vs. convenience.                                               |
 | `pkcs11_allow_extractable_keys` | boolean       | `false`     | `true`, `false`                                                | Whether to accept keys with `CKA_EXTRACTABLE = TRUE`.        | `false` (default) — reject (fail-closed): an extractable key breaks the invariant of mode B. `true` — only `pkcs11_extractable_key` WARN; enable deliberately. |
@@ -70,6 +70,35 @@ configured trust anchor, intermediate, CRL, PKCS#11 module, and GOST engine
 as a regular root-owned file beneath root-owned, non-group/world-writable
 directories. Unsafe paths fail authentication before native code or trust
 material is loaded.
+
+#### PKCS#11 module lifetime within a process
+
+The PKCS#11 module is loaded and initialized (`C_Initialize`) **once per
+process** per module path and is **never finalized**: `C_Finalize` is not
+called, and the library stays loaded until the process exits.
+
+This matters when the PAM stack of the same service holds a second PKCS#11
+consumer (`pam_pkcs11`, `sshd` built with `PKCS11Provider`, p11-kit):
+
+- `C_Initialize` and `C_Finalize` are process-global operations on one shared
+  loaded library. Finalizing on our side would deinitialize the provider for
+  the neighbour as well, and the neighbour has no way of detecting it — which
+  is why we do not.
+- The PKCS#11 login state is shared too: it is scoped to the "application",
+  and the application is defined by the `C_Initialize` call. While the
+  neighbour is logged into the same token, our sessions read private objects
+  without presenting a PIN, and vice versa. Our own sessions issue `C_Logout`
+  when the authentication attempt ends, successfully or not; that has no
+  effect on state the neighbour left behind.
+- The process-global mutex of `mutex` mode serializes our calls only. It
+  cannot see the neighbour's, so provider thread safety remains a requirement
+  rather than something we can guarantee.
+
+Under `sshd` and `login` the process serves a single authentication, so
+keeping the module resident costs nothing. Under `fly-dm` the display slave
+serves every login attempt for the machine's uptime — there one context per
+process is the goal: a second `C_Initialize` against a live library is at best
+rejected by the provider and at worst kills the process.
 
 #### Values of `on_usb_removed`
 
