@@ -54,7 +54,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          # github.ref, а не ref_name: на pull_request ref_name даёт «83/merge»,
+          # и checkout ищет его в refs/heads/, где такого нет. Полный ref
+          # (refs/pull/83/merge, refs/tags/v0.5.0) корректен в обоих случаях.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Build issuer (release)
         run: cargo build --release -p tessera_issuer --features "$ISSUER_FEATURES"
@@ -92,7 +95,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          # github.ref, а не ref_name: на pull_request ref_name даёт «83/merge»,
+          # и checkout ищет его в refs/heads/, где такого нет. Полный ref
+          # (refs/pull/83/merge, refs/tags/v0.5.0) корректен в обоих случаях.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show
