@@ -3,16 +3,32 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::module_name_repetitions)]
 
+// The bundle `di` builds is transport-neutral except for the monitor client,
+// which the caller supplies (`di::wire_with_monitor`); only the convenience
+// entry that opens an `AF_UNIX` socket to monitord is Unix-bound. A Windows
+// caller reaches the daemon over a named pipe and still gets the trust wiring
+// — the per-host `[[trust_override]]` selection above all — from here rather
+// than from a second implementation of its own.
 pub mod di;
-pub mod entry;
+
 pub mod flow;
-pub mod logging;
 pub mod pam_args;
 pub mod panic_guard;
 pub mod role_selection;
 pub mod session;
 pub mod session_identity;
+#[cfg(test)]
+mod test_support;
+pub mod volume_flow;
 pub mod xdg_capture;
+
+// The `pam_sm_*` C boundary exists only where PAM does.
+#[cfg(unix)]
+pub mod entry;
+
+// Syslog is a POSIX facility; a Windows host installs its own subscriber.
+#[cfg(unix)]
+pub mod logging;
 
 #[cfg(target_os = "linux")]
 pub mod data_handle;

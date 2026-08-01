@@ -34,6 +34,16 @@ pub enum UsbError {
     #[error("device missing required property: {0}")]
     MissingProperty(String),
 
+    /// The caller ended the wait before either a device appeared or the
+    /// timeout elapsed.
+    ///
+    /// Distinct from [`UsbError::Timeout`]: nothing about the device or the
+    /// budget was decided, the waiter simply stopped being wanted (a client
+    /// disconnected, a service is shutting down). Reporting it as a timeout
+    /// would tell an operator to go looking at the media.
+    #[error("wait for removable media cancelled by the caller")]
+    WaitCancelled,
+
     /// USB discovery is not available on the current platform.
     #[error("USB discovery is not supported on this platform")]
     UnsupportedPlatform,

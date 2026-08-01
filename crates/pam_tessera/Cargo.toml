@@ -30,18 +30,27 @@ tessera_core = { path = "../tessera_core", version = "0.5.0" }
 tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-syslog = { workspace = true }
 thiserror = { workspace = true }
 secrecy = { workspace = true }
 openssl = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
-nix = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `syslog` and `nix` wrap POSIX facilities and do not build for Windows
+# targets; the modules that use them are gated the same way.
+syslog = { workspace = true }
+nix = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pam-sys = { workspace = true }
+
+# Only the bench `tessera_verify` example needs Win32 directly (console echo
+# control around the PIN prompt), so it stays out of the shipped module.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 # `mac-tests` carries `VerifiedX509::from_trusted_for_test`, which unit tests

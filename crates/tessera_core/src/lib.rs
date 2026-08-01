@@ -20,6 +20,7 @@ pub mod crl;
 pub mod discovery;
 pub mod enrollment;
 pub mod error;
+mod fs_mode;
 pub mod gost;
 pub mod hooks;
 pub mod host_binding;
@@ -39,6 +40,8 @@ pub mod role;
 pub mod secret;
 pub mod self_check;
 pub mod tags;
+#[cfg(test)]
+mod test_support;
 pub mod token;
 pub mod trust;
 pub mod usb;

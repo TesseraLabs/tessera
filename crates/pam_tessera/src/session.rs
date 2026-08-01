@@ -5,14 +5,23 @@
 //! by tests under `--features mac-tests` without dragging in the cdylib
 //! PAM symbols.
 
-use tessera_core::config::validated::MacRuntimeMode;
 use tessera_core::config::ValidatedConfig;
-use tessera_core::ipc::{ConnectPerCall, FailModeWrapper, MonitorClient, MonitorClientFactory};
+// The connect-per-call monitord client rides an `AF_UNIX` socket, and the
+// runtime-plugin selection below is part of the same Unix-only production
+// path; the injectable overloads stay platform-neutral.
+#[cfg(unix)]
+use tessera_core::config::validated::MacRuntimeMode;
+use tessera_core::ipc::MonitorClient;
+#[cfg(unix)]
+use tessera_core::ipc::{ConnectPerCall, FailModeWrapper, MonitorClientFactory};
+#[cfg(unix)]
 use tessera_core::mac::audit::{
     emit_mac_runtime_required, emit_runtime_disabled, emit_runtime_fallback,
 };
 use tessera_core::mac::backend::MacBackend;
+#[cfg(unix)]
 use tessera_core::mac::backend::MacRuntime;
+#[cfg(unix)]
 use tessera_core::mac::backend::StubBackend;
 use tessera_core::mac::orchestrator::{apply_session_policy, OrchestratorError, SessionContext};
 use tessera_core::pam_data::AuthContext;
@@ -34,6 +43,7 @@ const PAM_SESSION_ERR: i32 = 14;
 /// | disabled   | Stub + `mac_runtime_disabled`       | Stub   |
 ///
 /// Returns `Err(PAM_AUTH_ERR)` only in the `required` + inactive combination.
+#[cfg(unix)]
 fn build_backend(
     mac_runtime: MacRuntimeMode,
     plugin_name: Option<&str>,
@@ -70,6 +80,7 @@ fn build_backend(
 /// # Errors
 ///
 /// On failure returns the PAM return code the cdylib should propagate.
+#[cfg(unix)]
 pub fn run_open_session_pipeline(
     cfg: &ValidatedConfig,
     ctx: &AuthContext,

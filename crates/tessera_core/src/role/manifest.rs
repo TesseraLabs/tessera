@@ -29,7 +29,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use openssl::pkey::PKey;
@@ -397,16 +396,11 @@ pub fn persist_bundle_version(persist_dir: &Path, v: u64) -> Result<(), Manifest
         std::process::id()
     ));
     let result = (|| -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(&tmp)?;
+        let mut file = crate::fs_mode::create_with_mode(&tmp, 0o644)?;
         file.write_all(format!("{v}\n").as_bytes())?;
         file.sync_all()?;
         // open(2) mode is masked by umask; pin the spec mode before publish.
-        fs::set_permissions(&tmp, PermissionsExt::from_mode(0o644))?;
+        crate::fs_mode::pin_mode(&tmp, 0o644)?;
         fs::rename(&tmp, &path)
     })();
     if result.is_err() {
@@ -585,6 +579,8 @@ mod tests {
 
     use super::*;
     use openssl::sign::Signer;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use tempfile::TempDir;
 
     /// An Ed25519 keypair with the public key exported as PEM.
@@ -672,6 +668,12 @@ mod tests {
         ));
     }
 
+    // The anti-rollback floor lives in a file written with a pinned POSIX
+    // mode: an attacker who can rewrite it can replay an old bundle, so the
+    // write refuses rather than inherit whatever the directory grants. Every
+    // test below that advances or reads back an accepted floor therefore
+    // needs a platform where that file can exist at all.
+    #[cfg(unix)]
     #[test]
     fn verification_alone_leaves_the_rollback_floor_untouched() {
         let key = gen_key();
@@ -700,6 +702,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn valid_manifest_verifies_and_persists() {
         let key = gen_key();
@@ -716,6 +719,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn tofu_baseline_when_persist_absent() {
         let key = gen_key();
@@ -727,6 +731,7 @@ mod tests {
         assert!(verified.baseline_established);
     }
 
+    #[cfg(unix)]
     #[test]
     fn rollback_rejected() {
         let key = gen_key();
@@ -803,6 +808,8 @@ mod tests {
         assert!(matches!(err, ManifestError::SliceMissing { .. }));
     }
 
+    // Persisting the floor pins a file mode, which only exists on Unix.
+    #[cfg(unix)]
     #[test]
     fn persist_roundtrip() {
         let persist = tempfile::tempdir().unwrap();

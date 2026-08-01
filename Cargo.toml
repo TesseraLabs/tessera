@@ -7,6 +7,8 @@ members = [
     "crates/tessera_proto",
     "crates/pam_tessera",
     "crates/tessera_cli",
+    "crates/tessera_cp",
+    "crates/tessera_win_service",
     "crates/tessera_test_plugin",
     "crates/xtask",
 ]
@@ -20,6 +22,8 @@ default-members = [
     "crates/tessera_proto",
     "crates/pam_tessera",
     "crates/tessera_cli",
+    "crates/tessera_cp",
+    "crates/tessera_win_service",
     "crates/tessera_test_plugin",
 ]
 
@@ -115,6 +119,33 @@ base64 = "0.22"
 # `wasm32-unknown-unknown`. Native targets never use this.
 getrandom = "0.2"
 libloading = "0.9"
+# Win32 bindings for the Windows privileged-path walk (owner/DACL inspection),
+# removable-volume enumeration and console echo control. Declared per-crate
+# under `cfg(windows)` so Unix builds never pull it in.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    # The local account database: `NetUserGetInfo` answers from this machine's
+    # own SAM, which is what keeps the account-class question off the network.
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_Storage_FileSystem",
+    # `DRIVE_REMOVABLE` and its siblings live here rather than next to
+    # `GetDriveTypeW`.
+    "Win32_System_WindowsProgramming",
+    # Console mode control: the bench verify tool turns echo off around the
+    # PIN prompt.
+    "Win32_System_Console",
+    # The Engine service: its transport, its registration, and the storage of
+    # the technical account's password.
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Services",
+    # Overlapped waits: the event a bounded read or connect waits on, and the
+    # handle duplication that gives a connection separate read and write ends.
+    "Win32_System_Threading",
+    "Win32_Security_Cryptography",
+] }
 
 [profile.dev]
 panic = "unwind"

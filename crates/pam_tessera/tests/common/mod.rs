@@ -14,6 +14,11 @@
     clippy::all
 )]
 
+// Shared with the crate's unit tests: config validation demands absolute
+// paths, and what is absolute differs between Windows and Unix.
+#[path = "../../src/test_support.rs"]
+mod test_support;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -163,6 +168,7 @@ usb_removed_grace_seconds = 5
 suspend_grace_seconds = 30
 monitor_fail_mode = "permissive"
 
+@MONITOR@
 [trust]
 anchors = [@ANCHOR@]
 intermediates = []
@@ -189,7 +195,9 @@ level = "info"
 syslog_facility = "auth"
 journald_priority = false
 "#;
-    let raw_toml = raw_toml.replace("@ANCHOR@", &format!("{:?}", anchor.to_string_lossy()));
+    let raw_toml = raw_toml
+        .replace("@ANCHOR@", &test_support::toml_path(&anchor))
+        .replace("@MONITOR@", &test_support::monitor_section_toml());
     let raw: tessera_core::config::raw::RawConfig = toml::from_str(&raw_toml).unwrap();
     ValidatedConfig::try_from(&raw).unwrap()
 }

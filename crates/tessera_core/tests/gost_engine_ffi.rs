@@ -8,6 +8,12 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+// Shared with the crate's unit tests: config validation demands absolute
+// paths, and what is absolute differs between Windows and Unix.
+#[allow(dead_code)]
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use std::path::Path;
 
 use tessera_core::config::raw::RawConfig;
@@ -28,13 +34,18 @@ fn validated(path: Option<&Path>) -> ValidatedConfig {
     .expect("write anchor");
     let body = original.replace(
         "anchors = [\"/bin/sh\"]",
-        &format!("anchors = [{:?}]", anchor.to_string_lossy()),
+        &format!("anchors = [{}]", test_support::toml_path(&anchor)),
     );
     let body = if let Some(p) = path {
-        format!("gost_engine_path = {:?}\n{}", p.to_string_lossy(), body)
+        format!(
+            "gost_engine_path = {}\n{}",
+            test_support::toml_path(p),
+            body
+        )
     } else {
         body
     };
+    let body = test_support::platform_config_toml(&body);
     let raw: RawConfig = toml::from_str(&body).expect("parse fixture");
     let cfg = ValidatedConfig::try_from(&raw).expect("validate");
     drop(dir);

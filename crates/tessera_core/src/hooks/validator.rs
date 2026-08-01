@@ -138,7 +138,10 @@ mod tests {
     fn raw_hook_with_run_as(run_as: Option<&str>) -> RawHook {
         RawHook {
             stage: HookStage::PostAuthSuccess,
-            command: vec!["/usr/local/sbin/hook".to_string()],
+            // What is under test is the `run_as` mapping, not the command;
+            // the command still has to clear the absolute-path check, which
+            // reads differently on Windows.
+            command: vec![crate::test_support::absolute("/usr/local/sbin/hook")],
             timeout_seconds: 5,
             on_failure: None,
             run_as: run_as.map(str::to_string),

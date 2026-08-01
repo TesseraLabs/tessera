@@ -23,6 +23,12 @@
     clippy::unwrap_used
 )]
 
+// Shared with the crate's unit tests: config validation demands absolute
+// paths, and what is absolute differs between Windows and Unix.
+#[allow(dead_code)]
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use std::path::Path;
 
 use tessera_core::config::{RawConfig, ValidatedConfig};
@@ -51,25 +57,32 @@ fn fixture_with_overrides(anchor: &Path, mode: &str, pkcs11_module: &str, extras
     let body = original
         .replace(
             "anchors = [\"/bin/sh\"]",
-            &format!("anchors = [{:?}]", anchor.to_string_lossy()),
+            &format!("anchors = [{}]", test_support::toml_path(anchor)),
         )
         .replace(
             "pkcs11_module = \"/bin/sh\"",
-            &format!("pkcs11_module = {pkcs11_module:?}"),
+            &format!("pkcs11_module = {}", test_support::toml_path(pkcs11_module)),
         )
         .replace("mode = \"pkcs11\"", &format!("mode = {mode:?}"));
-    if extras.is_empty() {
+    let body = if extras.is_empty() {
         body
     } else {
         format!("{extras}\n{body}")
-    }
+    };
+    test_support::platform_config_toml(&body)
+}
+
+/// A module path that is absolute on the host but loads nothing — enough for
+/// the validator, which only checks the shape.
+fn dummy_module_path() -> String {
+    test_support::absolute("/usr/lib/x.so")
 }
 
 #[test]
 fn defaults_apply_when_minimal_pkcs11() {
     let dir = tempfile::tempdir().expect("tempdir");
     let anchor = write_anchor(dir.path());
-    let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", "");
+    let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), "");
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     let cfg = ValidatedConfig::try_from(&raw).expect("validate");
     assert_eq!(cfg.pkcs11_max_pin_attempts, 3);
@@ -87,7 +100,7 @@ fn allow_extractable_keys_opt_in_passes_through() {
     let dir = tempfile::tempdir().expect("tempdir");
     let anchor = write_anchor(dir.path());
     let extras = "pkcs11_allow_extractable_keys = true";
-    let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", extras);
+    let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), extras);
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     assert!(raw.pkcs11_allow_extractable_keys);
     let cfg = ValidatedConfig::try_from(&raw).expect("validate");
@@ -100,7 +113,7 @@ fn rejects_max_pin_attempts_zero_or_too_high() {
     let anchor = write_anchor(dir.path());
     for n in [0_u32, 6, 100] {
         let extras = format!("pkcs11_max_pin_attempts = {n}");
-        let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", &extras);
+        let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), &extras);
         let raw: RawConfig = toml::from_str(&body).expect("parse");
         let err = ValidatedConfig::try_from(&raw).expect_err(&format!("must reject n={n}"));
         match err {
@@ -118,7 +131,7 @@ fn unknown_field_rejected_at_parse() {
     let dir = tempfile::tempdir().expect("tempdir");
     let anchor = write_anchor(dir.path());
     let extras = "pkcs11_secret_field = \"boom\"";
-    let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", extras);
+    let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), extras);
     let res: Result<RawConfig, _> = toml::from_str(&body);
     assert!(res.is_err(), "deny_unknown_fields must reject the typo");
 }
@@ -128,7 +141,7 @@ fn parses_locking_mode_mutex() {
     let dir = tempfile::tempdir().expect("tempdir");
     let anchor = write_anchor(dir.path());
     let extras = "pkcs11_locking_mode = \"mutex\"";
-    let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", extras);
+    let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), extras);
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     let cfg = ValidatedConfig::try_from(&raw).expect("validate");
     assert_eq!(cfg.pkcs11_locking_mode, LockingMode::Mutex);
@@ -141,7 +154,7 @@ fn rejects_token_label_with_nul() {
     // The shipping fixture has no `pkcs11_token_label` — append a
     // literal NUL via the unicode escape inside a basic string.
     let extras = "pkcs11_token_label = \"bad\\u0000label\"";
-    let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", extras);
+    let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), extras);
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject");
     match err {
@@ -159,7 +172,7 @@ fn rejects_object_label_too_long() {
     let anchor = write_anchor(dir.path());
     let too_long = "x".repeat(65);
     let extras = format!("pkcs11_object_label = \"{too_long}\"");
-    let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", &extras);
+    let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), &extras);
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject");
     match err {
@@ -176,7 +189,7 @@ fn slot_wait_out_of_range_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     let anchor = write_anchor(dir.path());
     let extras = "pkcs11_slot_wait_seconds = 600";
-    let body = fixture_with_overrides(&anchor, "pkcs11", "/usr/lib/x.so", extras);
+    let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), extras);
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject");
     match err {
@@ -200,10 +213,11 @@ fn pkcs12_mode_does_not_require_pkcs11_module() {
     let body = original
         .replace(
             "anchors = [\"/bin/sh\"]",
-            &format!("anchors = [{:?}]", anchor.to_string_lossy()),
+            &format!("anchors = [{}]", test_support::toml_path(&anchor)),
         )
         .replace("mode = \"pkcs11\"", "mode = \"pkcs12\"")
         .replace("pkcs11_module = \"/bin/sh\"\n", "");
+    let body = test_support::platform_config_toml(&body);
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     assert!(raw.pkcs11_module.is_none(), "raw module field absent");
     let cfg = ValidatedConfig::try_from(&raw).expect("validate ok");
@@ -218,9 +232,10 @@ fn pkcs11_mode_without_module_is_rejected() {
     let body = original
         .replace(
             "anchors = [\"/bin/sh\"]",
-            &format!("anchors = [{:?}]", anchor.to_string_lossy()),
+            &format!("anchors = [{}]", test_support::toml_path(&anchor)),
         )
         .replace("pkcs11_module = \"/bin/sh\"\n", "");
+    let body = test_support::platform_config_toml(&body);
     // mode is already "pkcs11" in the fixture.
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject");

@@ -206,13 +206,18 @@ mod tests {
         .expect("write anchor");
         let body = original.replace(
             "anchors = [\"/bin/sh\"]",
-            &format!("anchors = [{:?}]", anchor.to_string_lossy()),
+            &format!("anchors = [{}]", crate::test_support::toml_path(&anchor)),
         );
         let body = if let Some(p) = path {
-            format!("gost_engine_path = {:?}\n{}", p.to_string_lossy(), body)
+            format!(
+                "gost_engine_path = {}\n{}",
+                crate::test_support::toml_path(p),
+                body
+            )
         } else {
             body
         };
+        let body = crate::test_support::platform_config_toml(&body);
         let raw: RawConfig = toml::from_str(&body).expect("parse fixture");
         let v = ValidatedConfig::try_from(&raw).expect("validate");
         // Hold the tempdir alive only as long as the validated config in
@@ -258,12 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn ensure_loaded_returns_not_available_on_macos_dev_host() {
-        // On a developer host without gost-engine installed, `ENGINE_by_id("gost")`
-        // returns NULL → NotAvailable.  This is the expected steady state
-        // for CI on macOS.  On Linux hosts that DO ship gost-engine, this
-        // call may instead succeed; we accept either outcome and only
-        // assert that the result is one of the documented variants.
+    fn ensure_loaded_reports_a_documented_variant_without_the_engine() {
+        // Where gost-engine is not installed — every developer host and CI
+        // runner outside Astra — `ENGINE_by_id("gost")` returns NULL and the
+        // loader must say so through one of the documented variants rather
+        // than through a panic or a silent success. On a host that does ship
+        // the engine the call succeeds instead; both outcomes are accepted,
+        // and either way `is_available()` must agree with the answer.
         let cfg = validated_with_optional_path(None);
         match ensure_loaded(&cfg) {
             Ok(()) => assert!(is_available()),

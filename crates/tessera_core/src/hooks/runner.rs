@@ -160,6 +160,7 @@ usb_removed_grace_seconds = 5
 suspend_grace_seconds = 30
 monitor_fail_mode = "permissive"
 
+@MONITOR@
 [trust]
 anchors = [@ANCHOR@]
 intermediates = []
@@ -186,7 +187,9 @@ level = "info"
 syslog_facility = "auth"
 journald_priority = false
 "#;
-        let raw_toml = raw_toml.replace("@ANCHOR@", &format!("{:?}", anchor.to_string_lossy()));
+        let raw_toml = raw_toml
+            .replace("@ANCHOR@", &crate::test_support::toml_path(&anchor))
+            .replace("@MONITOR@", &crate::test_support::monitor_section_toml());
         let raw: crate::config::raw::RawConfig = toml::from_str(&raw_toml).unwrap();
         let mut cfg = ValidatedConfig::try_from(&raw).unwrap();
         cfg.hooks = hooks;

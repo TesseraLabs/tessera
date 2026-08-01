@@ -251,7 +251,7 @@ impl RoleStore {
         for role_id in verified.manifest.roles.keys() {
             match device_accounts.check(role_id.as_str()) {
                 Ok(()) => {}
-                Err(source @ SystemAccountError::SystemAccount { .. }) => {
+                Err(source) if names_a_system_account(&source) => {
                     return Err(RoleStoreError::SystemAccount {
                         role: role_id.to_string(),
                         source,
@@ -374,7 +374,7 @@ impl RoleStore {
             // than emptying the base one "invalid slice" at a time.
             match device_accounts.check(stem) {
                 Ok(()) => {}
-                Err(source @ SystemAccountError::SystemAccount { .. }) => {
+                Err(source) if names_a_system_account(&source) => {
                     audit::emit_role_slice_invalid(
                         &path.display().to_string(),
                         &source.to_string(),
@@ -472,6 +472,19 @@ impl RoleStore {
     pub fn is_empty(&self) -> bool {
         self.roles.is_empty()
     }
+}
+
+/// Whether a refusal says the name is one the system holds for itself, rather
+/// than that the question could not be answered at all.
+///
+/// The two are handled differently — the first disqualifies one slice, the
+/// second disqualifies every slice — and which refusals belong to which group
+/// is a decision that must read the same in both load paths.
+fn names_a_system_account(error: &SystemAccountError) -> bool {
+    matches!(
+        error,
+        SystemAccountError::SystemAccount { .. } | SystemAccountError::SystemPrincipal { .. }
+    )
 }
 
 #[cfg(test)]
@@ -753,6 +766,10 @@ mod tests {
         );
     }
 
+    // Accepting a bundle writes the anti-rollback floor with a pinned POSIX
+    // mode, which the platform has to support for the floor to advance at
+    // all. The refusal paths above need no such write and stay portable.
+    #[cfg(unix)]
     #[test]
     fn an_accepted_managed_bundle_advances_the_rollback_floor() {
         let (dir, persist, pub_pem) = build_signed_bundle(9, &["serv"]);

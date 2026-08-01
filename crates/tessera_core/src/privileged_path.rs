@@ -25,18 +25,36 @@
 //! *exactly* the inode that was validated — reopening it for a read, or (on
 //! Linux) `fexecve`-ing it — instead of re-resolving the path and racing a swap
 //! in between.
+//!
+//! The whole policy above is expressed in POSIX ownership and mode bits, and
+//! the check/use race is closed with a descriptor. Windows expresses the same
+//! questions through owner SIDs and DACLs — a different model that needs its
+//! own walk rather than a translation of this one, so it lives in the
+//! [`windows`] submodule and is selected by the same entry points. Targets that
+//! are neither Unix nor Windows have no walk at all and refuse outright with
+//! [`PrivilegedPathError::UnsupportedPlatform`], so a privileged read or exec
+//! is never performed against an unverified path.
+
+#[cfg(windows)]
+mod windows;
 
 use std::io::Read as _;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 /// `S_IWOTH` — write permission for "other". Never acceptable on a privileged
 /// path: it lets any local user rewrite the component.
+#[cfg(unix)]
 const OTHER_WRITE: u32 = 0o002;
 
 /// `S_IWGRP` — write permission for the owning group. Acceptable only when the
 /// owning group is trusted (root, or the target account's own group).
+#[cfg(unix)]
 const GROUP_WRITE: u32 = 0o020;
 
 /// The privilege level a path will be used at, which sets the ownership policy
@@ -70,9 +88,12 @@ pub enum ExecTrust {
 #[derive(Debug)]
 pub struct ValidatedPath {
     canonical: PathBuf,
+    #[cfg(unix)]
     descriptor: OwnedFd,
     trust: ExecTrust,
+    #[cfg(unix)]
     device: u64,
+    #[cfg(unix)]
     inode: u64,
     is_file: bool,
     is_dir: bool,
@@ -86,6 +107,7 @@ impl ValidatedPath {
     }
 
     /// Borrow the descriptor opened to the validated leaf inode.
+    #[cfg(unix)]
     #[must_use]
     pub fn descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
         use std::os::fd::AsFd as _;
@@ -93,6 +115,7 @@ impl ValidatedPath {
     }
 
     /// Consume the guard and return the owned descriptor to the validated leaf.
+    #[cfg(unix)]
     #[must_use]
     pub fn into_descriptor(self) -> OwnedFd {
         self.descriptor
@@ -111,6 +134,7 @@ impl ValidatedPath {
     /// Returns [`PrivilegedPathError::NotRegularFile`] when this guard was
     /// created for a non-file path, or a path-validation error when the file
     /// cannot be opened safely or changed after validation.
+    #[cfg(unix)]
     pub fn open_readonly(&self) -> Result<std::fs::File, PrivilegedPathError> {
         if !self.is_file {
             return Err(PrivilegedPathError::NotRegularFile {
@@ -139,6 +163,42 @@ impl ValidatedPath {
             });
         }
         Ok(file)
+    }
+
+    /// Open the validated regular file for reading.
+    ///
+    /// Every component of the canonical path passed the owner/DACL walk, and a
+    /// leaf that turned into a reparse point after the walk is refused here.
+    /// The remaining check/use window is not closed on this platform — see the
+    /// [`windows`] module docs for why that threshold is above the model this
+    /// check defends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrivilegedPathError::NotRegularFile`] when this guard was
+    /// created for a non-file path, or a path-validation error when the file
+    /// cannot be opened safely.
+    #[cfg(windows)]
+    pub fn open_readonly(&self) -> Result<std::fs::File, PrivilegedPathError> {
+        let _ = self.trust;
+        if !self.is_file {
+            return Err(PrivilegedPathError::NotRegularFile {
+                path: self.canonical.clone(),
+            });
+        }
+        windows::open_readonly(&self.canonical)
+    }
+
+    /// See the Unix implementation above; unreachable here because no
+    /// [`ValidatedPath`] can be constructed on this platform.
+    ///
+    /// # Errors
+    ///
+    /// Always [`PrivilegedPathError::UnsupportedPlatform`].
+    #[cfg(not(any(unix, windows)))]
+    pub fn open_readonly(&self) -> Result<std::fs::File, PrivilegedPathError> {
+        let _ = (self.is_file, self.is_dir, self.trust);
+        Err(PrivilegedPathError::UnsupportedPlatform)
     }
 }
 
@@ -226,6 +286,100 @@ pub enum PrivilegedPathError {
         /// The offending leaf.
         path: PathBuf,
     },
+    /// A component's security descriptor could not be read, so nothing can be
+    /// said about who may write it. Distinct from a missing file: the path
+    /// exists, its trust is simply unknowable. Fail closed.
+    #[cfg(windows)]
+    #[error("cannot read the security descriptor of {path:?} (win32 error {code})")]
+    SecurityDescriptorUnavailable {
+        /// The component whose descriptor could not be read.
+        path: PathBuf,
+        /// The Win32 error code reported by the failing call.
+        code: u32,
+    },
+    /// A component's security descriptor carried no owner, so the implicit
+    /// `WRITE_DAC` right that ownership confers cannot be attributed.
+    #[cfg(windows)]
+    #[error("{path:?} has no resolvable owner")]
+    OwnerUnavailable {
+        /// The component with no resolvable owner.
+        path: PathBuf,
+    },
+    /// A component has a NULL DACL, which grants every account full access.
+    #[cfg(windows)]
+    #[error("{path:?} has a NULL DACL, which grants everyone full access")]
+    NullDacl {
+        /// The offending component.
+        path: PathBuf,
+    },
+    /// A component is owned by a SID the policy does not trust. The owner can
+    /// rewrite the DACL at any time, so an untrusted owner is untrusted access.
+    #[cfg(windows)]
+    #[error("{path:?} is owned by untrusted principal {sid}")]
+    UntrustedOwnerSid {
+        /// The offending component.
+        path: PathBuf,
+        /// The owning SID, in string form.
+        sid: String,
+    },
+    /// A component's DACL lets a principal outside the trusted set substitute
+    /// it: delete or rename it, delete what is inside it, rewrite its DACL,
+    /// take its ownership, or — for a file — change its content.
+    #[cfg(windows)]
+    #[error("{path:?} may be substituted by untrusted principal {sid} (mask {mask:#010x})")]
+    UntrustedSubstitution {
+        /// The offending component.
+        path: PathBuf,
+        /// The SID that holds the offending grant.
+        sid: String,
+        /// The access mask of the offending entry.
+        mask: u32,
+    },
+    /// A component's DACL contains an allowing entry whose layout this walk
+    /// does not parse, so its grants cannot be ruled out. Fail closed.
+    #[cfg(windows)]
+    #[error("{path:?} has an access-allowed entry of unparsed type {ace_type}")]
+    UnanalyzableAce {
+        /// The offending component.
+        path: PathBuf,
+        /// The ACE type byte that could not be analysed.
+        ace_type: u8,
+    },
+    /// A component's DACL contains an allowing entry whose principal SID is not
+    /// a well-formed SID, or is longer than the entry that is supposed to
+    /// contain it. Such an entry cannot be attributed to any principal, so the
+    /// access it grants cannot be ruled out. Fail closed.
+    #[cfg(windows)]
+    #[error("{path:?} has an access-allowed entry (#{ace_index}) with a malformed principal SID")]
+    MalformedAceSid {
+        /// The offending component.
+        path: PathBuf,
+        /// Position of the offending entry in the component's DACL.
+        ace_index: u32,
+    },
+    /// The path resolves onto a network share. Its permissions are asserted by
+    /// a remote machine, so no local walk can establish trust in it.
+    #[cfg(windows)]
+    #[error("{path:?} is on a network share and cannot be trusted")]
+    NetworkPath {
+        /// The offending path.
+        path: PathBuf,
+    },
+    /// The path resolves onto a volume that is not fixed local storage
+    /// (removable, optical, RAM disk, or unidentifiable). Fail closed.
+    #[cfg(windows)]
+    #[error("{path:?} is on a non-fixed volume (drive type {drive_type})")]
+    UntrustedVolume {
+        /// The offending path.
+        path: PathBuf,
+        /// The `GetDriveTypeW` verdict for the path's volume.
+        drive_type: u32,
+    },
+    /// This platform has no implementation of the ownership walk, so no path
+    /// can be declared trusted for privileged use. Fail closed.
+    #[cfg(not(any(unix, windows)))]
+    #[error("privileged path validation is not implemented on this platform")]
+    UnsupportedPlatform,
     /// Reading a validated file failed.
     #[error("cannot read validated file {path:?}: {source}")]
     Read {
@@ -263,6 +417,7 @@ pub enum PrivilegedPathError {
 /// let _fd = validated.descriptor();
 /// # Ok::<(), tessera_core::privileged_path::PrivilegedPathError>(())
 /// ```
+#[cfg(unix)]
 pub fn validate_path(path: &Path, trust: ExecTrust) -> Result<ValidatedPath, PrivilegedPathError> {
     if !path.is_absolute() {
         return Err(PrivilegedPathError::NotAbsolute {
@@ -327,8 +482,54 @@ pub fn validate_path(path: &Path, trust: ExecTrust) -> Result<ValidatedPath, Pri
     })
 }
 
+/// Validate that `path` and every canonical ancestor are owned and writable
+/// only by principals the Windows policy trusts.
+///
+/// The caller's component chain is walked first and any reparse point in it is
+/// refused; the canonical chain is then walked from the volume root to the leaf
+/// with the owner and DACL rules described in the [`windows`] module docs. The
+/// path must be on a fixed local volume.
+///
+/// `trust` is accepted for signature parity with the Unix walk and does not
+/// relax the policy: [`ExecTrust::User`] describes a POSIX account, and there
+/// is no Windows equivalent that could be trusted with a privileged input, so
+/// the strict system policy is applied for every value.
+///
+/// # Errors
+///
+/// Returns [`PrivilegedPathError`] when the path is not absolute or normalized,
+/// contains a reparse point, cannot be canonicalized, is not on a fixed local
+/// volume, or when any component has an untrusted owner, an unreadable
+/// security descriptor, a NULL DACL, an unparsed access-allowed entry, or a
+/// grant of substitution rights to an untrusted principal.
+#[cfg(windows)]
+pub fn validate_path(path: &Path, trust: ExecTrust) -> Result<ValidatedPath, PrivilegedPathError> {
+    let validated = windows::validate(path)?;
+    Ok(ValidatedPath {
+        canonical: validated.canonical,
+        trust,
+        is_file: validated.is_file,
+        is_dir: validated.is_dir,
+    })
+}
+
+/// Refuse every path, because this platform has no ownership walk to run.
+///
+/// Callers treat a refusal as "this path may not be used at privilege", which
+/// is the only safe answer where no equivalent walk exists.
+///
+/// # Errors
+///
+/// Always [`PrivilegedPathError::UnsupportedPlatform`].
+#[cfg(not(any(unix, windows)))]
+pub fn validate_path(path: &Path, trust: ExecTrust) -> Result<ValidatedPath, PrivilegedPathError> {
+    let _ = (path, trust);
+    Err(PrivilegedPathError::UnsupportedPlatform)
+}
+
 /// Reject ambiguous resolution and validate the exact component chain supplied
 /// by the caller before canonical resolution is trusted.
+#[cfg(unix)]
 fn validate_original_components(path: &Path, trust: ExecTrust) -> Result<(), PrivilegedPathError> {
     let mut current = PathBuf::from("/");
     let mut components = Vec::new();
@@ -435,6 +636,7 @@ pub fn read_to_string(path: &Path, trust: ExecTrust) -> Result<String, Privilege
 }
 
 /// Enforce the [`ExecTrust`] policy against a single component's metadata.
+#[cfg(unix)]
 fn check_component(
     path: &Path,
     meta: &std::fs::Metadata,
@@ -496,6 +698,7 @@ fn check_component(
 /// execute-only hook still validates) and is suitable for `fexecve`/`openat`.
 /// On other Unix dev targets `O_PATH` is unavailable, so a read handle is used;
 /// dev hooks are readable, and the descriptor is only ever `fstat`ed here.
+#[cfg(unix)]
 fn open_leaf(canonical: &Path) -> Result<std::fs::File, PrivilegedPathError> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -510,7 +713,9 @@ fn open_leaf(canonical: &Path) -> Result<std::fs::File, PrivilegedPathError> {
         })
 }
 
-#[cfg(test)]
+// Every case here builds a tree with specific owners and mode bits and asserts
+// on the walk's verdict; there is no walk to exercise on other platforms.
+#[cfg(all(test, unix))]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;

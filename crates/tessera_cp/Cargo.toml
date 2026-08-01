@@ -1,0 +1,78 @@
+[package]
+name = "tessera_cp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Credential Provider for the Windows logon screen: tile, fields and serialization."
+
+[lib]
+# `cdylib` is the shipped artefact (the COM in-process server LogonUI loads);
+# `rlib` exists so the platform-neutral half can be unit-tested on any host.
+crate-type = ["cdylib", "rlib"]
+name = "tessera_cp"
+
+[dependencies]
+# The wire types of the credential-provider flow and the protocol client. This
+# is the whole of the provider's coupling to the rest of the workspace: nothing
+# of the verification core reaches the process `LogonUI` loads this DLL into.
+tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
+tracing = { workspace = true }
+# The log sink. Inside `LogonUI` there is no console to print to and no journal
+# to inherit, so the provider builds its own subscriber over a file.
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# Declared here rather than in the workspace table on purpose: the feature set
+# is specific to the credential-provider surface (Shell COM interfaces, the LSA
+# logon structures, GDI only because `ICredentialProviderCredential` mentions
+# `HBITMAP`), and no other crate in the workspace needs those bindings.
+[target.'cfg(windows)'.dependencies]
+# `windows_core` is a direct dependency because the `#[implement]` macro emits
+# absolute `::windows_core::` paths; the umbrella crate's re-export is not
+# enough for the generated code to resolve.
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security_Authentication_Identity",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+unused_must_use = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+missing_safety_doc = "deny"
+# Футган-ловушки (порт unsafe-hardening пака из ветки 2026-05-14).
+mem_forget = "deny"
+panic_in_result_fn = "deny"
+let_underscore_must_use = "deny"
+let_underscore_lock = "deny"
+indexing_slicing = "deny"
+# Каждый unsafe-блок обязан нести // SAFETY: и одну операцию.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+# Гигиена указателей и кастов.
+transmute_ptr_to_ptr = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+ref_as_ptr = "warn"
+exit = "warn"

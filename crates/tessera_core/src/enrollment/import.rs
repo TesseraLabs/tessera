@@ -47,7 +47,6 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -641,7 +640,7 @@ fn ensure_dir(dir: &Path) -> Result<(), ImportError> {
 
 /// Set a path's mode, mapping the error to [`ImportError::Io`].
 fn set_mode(path: &Path, mode: u32) -> Result<(), ImportError> {
-    fs::set_permissions(path, PermissionsExt::from_mode(mode)).map_err(|e| ImportError::Io {
+    crate::fs_mode::pin_mode(path, mode).map_err(|e| ImportError::Io {
         path: path.display().to_string(),
         reason: e.to_string(),
     })
@@ -707,15 +706,10 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), ImportError>
         .unwrap_or("artefact");
     let tmp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
     let result = (|| -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)?;
+        let mut file = crate::fs_mode::create_with_mode(&tmp, mode)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::set_permissions(&tmp, PermissionsExt::from_mode(mode))?;
+        crate::fs_mode::pin_mode(&tmp, mode)?;
         fs::rename(&tmp, path)
     })();
     if result.is_err() {
@@ -773,15 +767,10 @@ impl FileTx {
         ));
         // Write the temp file (mode pinned).
         let result = (|| -> io::Result<()> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(mode)
-                .open(&tmp_path)?;
+            let mut file = crate::fs_mode::create_with_mode(&tmp_path, mode)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            fs::set_permissions(&tmp_path, PermissionsExt::from_mode(mode))
+            crate::fs_mode::pin_mode(&tmp_path, mode)
         })();
         if let Err(e) = result {
             best_effort_remove(&tmp_path);
@@ -1156,6 +1145,8 @@ pub fn installed_managed_tags(
     )
 }
 
-#[cfg(test)]
+// Importing a package installs artefacts under pinned POSIX modes, so the
+// whole path — and everything that asserts on it — is Unix-only.
+#[cfg(all(test, unix))]
 #[path = "import_tests.rs"]
 mod tests;

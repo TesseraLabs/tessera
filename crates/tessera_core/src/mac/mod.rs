@@ -14,5 +14,5 @@ pub mod orchestrator;
 
 #[cfg(feature = "mac-tests")]
 pub use backend::MockMacBackend;
-pub use backend::{MacBackend, MacError, MacRuntime, MrdState, StubBackend};
+pub use backend::{MacBackend, MacError, MacRawFd, MacRuntime, MrdState, StubBackend};
 pub use label::IntegrityLabel;

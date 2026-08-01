@@ -4,6 +4,12 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::panic_in_result_fn)]
 
+// Shared with the crate's unit tests: config validation demands absolute
+// paths, and what is absolute differs between Windows and Unix.
+#[allow(dead_code)]
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 use std::path::{Path, PathBuf};
 use tessera_core::config::{load_privileged_validated_config, RawConfig, ValidatedConfig};
 use tessera_core::Error;
@@ -53,11 +59,18 @@ fn write_anchor(dir: &Path) -> PathBuf {
 /// host_acl_path (since `host_acl_required = false`, only ACL_PATH validity
 /// is checked at self_check, not at validation).
 fn fixture_with_anchor(anchor: &Path) -> String {
+    test_support::platform_config_toml(&fixture_with_anchor_no_monitor(anchor))
+}
+
+/// As [`fixture_with_anchor`], but without the `[monitor]` section — for the
+/// tests that append one of their own.
+fn fixture_with_anchor_no_monitor(anchor: &Path) -> String {
     let original = include_str!("fixtures/full_valid.toml");
-    original.replace(
+    let body = original.replace(
         "anchors = [\"/bin/sh\"]",
-        &format!("anchors = [{:?}]", anchor.to_string_lossy()),
-    )
+        &format!("anchors = [{}]", test_support::toml_path(anchor)),
+    );
+    test_support::platform_paths(&body)
 }
 
 /// Parse a raw config from the fixture with a custom `gost_engine_path`,
@@ -98,8 +111,13 @@ fn validated_config_omits_gost_engine_path_when_absent() -> Result<(), Box<dyn s
 fn validated_config_rejects_relative_pkcs11_module() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
+    // The fixture's module path has already been rewritten to whatever is
+    // absolute on this host, so the relative value goes in over that.
     let body = fixture_with_anchor(&anchor).replace(
-        "pkcs11_module = \"/bin/sh\"",
+        &format!(
+            "pkcs11_module = {}",
+            test_support::toml_path(test_support::SHELL_PATH)
+        ),
         "pkcs11_module = \"module.so\"",
     );
     let raw: RawConfig = toml::from_str(&body)?;
@@ -198,11 +216,14 @@ fn validated_config_rejects_empty_trust_anchors() -> Result<(), Box<dyn std::err
 fn validated_config_rejects_missing_gost_engine_path() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
-    let raw = parse_raw_with_gost_path(&anchor, "/nonexistent/path/to/gost.so");
+    // Absolute for the platform but pointing nowhere: the absoluteness check
+    // runs first, and it is the unreadability that this test is about.
+    let missing = test_support::absolute("/nonexistent/path/to/gost.so");
+    let raw = parse_raw_with_gost_path(&anchor, &missing);
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject missing path");
     assert!(
         matches!(err, Error::GostEnginePathUnreadable { ref path, .. }
-            if path == &PathBuf::from("/nonexistent/path/to/gost.so")),
+            if path == &PathBuf::from(&missing)),
         "unexpected error: {err:?}"
     );
     Ok(())
@@ -382,15 +403,21 @@ fn validated_config_accepts_absolute_custom_command_path() -> Result<(), Box<dyn
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
     let body = fixture_with_anchor(&anchor);
+    // Absoluteness is the property under test, and it reads differently on
+    // Windows.
+    let command = test_support::absolute("/usr/local/bin/host-id.sh");
     let injected = body.replace(
         "custom_command_timeout_seconds = 5",
-        "custom_command = \"/usr/local/bin/host-id.sh\"\ncustom_command_timeout_seconds = 5",
+        &format!(
+            "custom_command = {}\ncustom_command_timeout_seconds = 5",
+            test_support::toml_path(&command)
+        ),
     );
     let raw: RawConfig = toml::from_str(&injected)?;
     let validated = ValidatedConfig::try_from(&raw)?;
     assert_eq!(
         validated.host_identity.custom_command.as_deref(),
-        Some(Path::new("/usr/local/bin/host-id.sh"))
+        Some(Path::new(&command))
     );
     Ok(())
 }
@@ -399,19 +426,22 @@ fn validated_config_accepts_absolute_custom_command_path() -> Result<(), Box<dyn
 fn validated_config_parses_monitor_section_overrides() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
-    let body = fixture_with_anchor(&anchor);
+    let body = fixture_with_anchor_no_monitor(&anchor);
+    // The section under test carries the paths itself; they must be absolute
+    // for the platform, which is why they are not written out literally.
+    let socket = test_support::absolute("/run/test/m.sock");
+    let state_file = test_support::absolute("/var/lib/test/sessions.json");
     let injected = format!(
-        "{body}\n[monitor]\nsocket_path = \"/run/test/m.sock\"\nstate_file_path = \"/var/lib/test/sessions.json\"\non_usb_removed = \"shutdown\"\nusb_removed_grace_seconds = 7\nsuspend_grace_seconds = 11\n"
+        "{body}\n[monitor]\nsocket_path = {}\nstate_file_path = {}\non_usb_removed = \"shutdown\"\nusb_removed_grace_seconds = 7\nsuspend_grace_seconds = 11\n",
+        test_support::toml_path(&socket),
+        test_support::toml_path(&state_file),
     );
     let raw: RawConfig = toml::from_str(&injected)?;
     let validated = ValidatedConfig::try_from(&raw)?;
-    assert_eq!(
-        validated.monitor.socket_path,
-        PathBuf::from("/run/test/m.sock")
-    );
+    assert_eq!(validated.monitor.socket_path, PathBuf::from(&socket));
     assert_eq!(
         validated.monitor.state_file_path,
-        PathBuf::from("/var/lib/test/sessions.json")
+        PathBuf::from(&state_file)
     );
     assert!(matches!(
         validated.monitor.on_usb_removed,
@@ -433,8 +463,13 @@ fn validated_config_rejects_hook_mode_without_hook_path() -> Result<(), Box<dyn 
 {
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
-    let body = fixture_with_anchor(&anchor);
-    let injected = format!("{body}\n[monitor]\non_usb_removed = \"hook\"\n");
+    let body = fixture_with_anchor_no_monitor(&anchor);
+    // The section paths are checked before the hook rule this test is about,
+    // so they have to be absolute for the platform.
+    let injected = format!(
+        "{body}{}on_usb_removed = \"hook\"\n",
+        test_support::monitor_section_toml()
+    );
     let raw: RawConfig = toml::from_str(&injected)?;
     let err = ValidatedConfig::try_from(&raw).expect_err("must reject hook without path");
     assert!(
@@ -445,6 +480,8 @@ fn validated_config_rejects_hook_mode_without_hook_path() -> Result<(), Box<dyn 
     Ok(())
 }
 
+// Asserts the verdict of the POSIX ownership walk, which exists on Unix only.
+#[cfg(unix)]
 #[test]
 fn validated_config_rejects_non_root_controlled_monitor_hook(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -455,10 +492,11 @@ fn validated_config_rejects_non_root_controlled_monitor_hook(
     let hook = dir.path().join("hook.sh");
     std::fs::write(&hook, b"#!/bin/sh\nexit 0\n")?;
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
-    let body = fixture_with_anchor(&anchor);
+    let body = fixture_with_anchor_no_monitor(&anchor);
     let injected = format!(
-        "{body}\n[monitor]\non_usb_removed = \"hook\"\non_usb_removed_hook_path = {:?}\n",
-        hook.to_string_lossy()
+        "{body}{}on_usb_removed = \"hook\"\non_usb_removed_hook_path = {}\n",
+        test_support::monitor_section_toml(),
+        test_support::toml_path(&hook)
     );
     let raw: RawConfig = toml::from_str(&injected)?;
 
@@ -973,18 +1011,19 @@ fn tags_section_standalone_parses_and_validates() -> Result<(), Box<dyn std::err
     use tessera_core::config::validated::TagsMode;
     let dir = tempfile::tempdir()?;
     let anchor = write_anchor(dir.path());
+    // The source only has to clear the absolute-path check, which reads
+    // differently on Windows.
+    let source = test_support::absolute("/var/lib/tessera/tags.toml");
     let body = format!(
-        "{}\n[tags]\nenforce = true\nmode = \"standalone\"\nsource = \"/var/lib/tessera/tags.toml\"\n",
-        fixture_with_anchor(&anchor)
+        "{}\n[tags]\nenforce = true\nmode = \"standalone\"\nsource = {}\n",
+        fixture_with_anchor(&anchor),
+        test_support::toml_path(&source)
     );
     let raw: RawConfig = toml::from_str(&body)?;
     let v = ValidatedConfig::try_from(&raw)?;
     assert!(v.tags.enforce);
     assert_eq!(v.tags.mode, TagsMode::Standalone);
-    assert_eq!(
-        v.tags.source,
-        std::path::PathBuf::from("/var/lib/tessera/tags.toml")
-    );
+    assert_eq!(v.tags.source, std::path::PathBuf::from(&source));
     Ok(())
 }
 

@@ -3,7 +3,7 @@
 //! Gated by the `gost-tests` feature.  Skipped at runtime when fixtures or
 //! engine are unavailable (see `tests/common/mod.rs`).
 
-#![cfg(feature = "gost-tests")]
+#![cfg(all(unix, feature = "gost-tests"))]
 #![allow(missing_docs)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]

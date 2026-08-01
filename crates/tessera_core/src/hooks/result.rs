@@ -77,12 +77,15 @@ pub enum HookError {
         var: PlaceholderVar,
     },
     /// `pipe(2)` / `pipe2(2)` failed.
+    #[cfg(unix)]
     #[error("pipe creation failed: {0}")]
     Pipe(nix::errno::Errno),
     /// `fork(2)` / `vfork(2)` failed.
+    #[cfg(unix)]
     #[error("fork failed: {0}")]
     Fork(nix::errno::Errno),
     /// `waitpid(2)` / `kill(2)` failed.
+    #[cfg(unix)]
     #[error("waitpid/kill failed: {0}")]
     Wait(nix::errno::Errno),
     /// The hook hit its deadline and was killed via `SIGTERM`/`SIGKILL`
@@ -188,6 +191,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pipe_fork_wait_render_errno() {
         let e = HookError::Pipe(nix::errno::Errno::EMFILE);
         assert!(format!("{e}").contains("pipe creation failed"));
@@ -209,7 +213,8 @@ mod tests {
     fn user_resolution_includes_username() {
         let e = HookError::UserResolution {
             user: "ghost".into(),
-            source: std::io::Error::from_raw_os_error(libc::ENOENT),
+            // ENOENT on Unix, ERROR_FILE_NOT_FOUND on Windows.
+            source: std::io::Error::from_raw_os_error(2),
         };
         let s = format!("{e}");
         assert!(s.contains("ghost"), "got {s}");
