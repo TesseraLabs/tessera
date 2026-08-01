@@ -116,3 +116,37 @@ On macOS dev hosts without softhsm2, every PKCS#11 integration test
 runtime-detects the missing `PKCS11_MODULE_PATH` env var, prints
 `skipped: PKCS#11 module not available`, and returns `Ok` — see
 `crates/tessera_core/src/token/pkcs11/test_helpers.rs`.
+
+## Live hardware acceptance
+
+Green on softhsm2 does not mean green on a token.  softhsm2 survives
+races that vendor providers do not: `rtpkcs11ecp` 2.14.1 kills the
+process when `C_Initialize` is entered from two threads at once, and
+that class of defect stayed invisible for three years because every
+PKCS#11 test ran against softhsm2 only.
+
+So a run against real hardware is part of acceptance, and it is
+**multithreaded on purpose**:
+
+```bash
+export PKCS11_MODULE_PATH=/usr/lib/librtpkcs11ecp.so
+# No --test-threads=1: concurrency is the scenario under test.
+cargo test -p tessera_core --features pkcs11-tests
+```
+
+What to check:
+
+1. The process does not abort.  A `SIGABRT` with `std::terminate` in the
+   backtrace is a provider defect reproduced through our code, not a
+   flaky test — record the provider name and version.
+2. `pkcs11_singleton.rs` passes: one `C_Initialize` per module path
+   however many backends are loaded, re-initialization after the last
+   one is dropped, independent contexts for distinct paths.
+3. Both locking modes are exercised at least once —
+   `pkcs11_locking_mode = "mutex"` (the default) and an explicit
+   `"os"` — since only the former is covered by the default config.
+
+A single physical token cannot serve two logins at once; tests that
+drive a PIN or a signature against one device still need to be run one
+at a time.  That constraint is about the device, not about the library
+initialization, and must not be used to hide the concurrent run above.

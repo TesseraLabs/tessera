@@ -35,8 +35,12 @@ pkcs11_module = "/usr/lib/librtpkcs11ecp.so"
 # pkcs11_object_label = "user-cert"
 # Maximum number of consecutive PIN attempts before bailing. Range 1..=5.
 pkcs11_max_pin_attempts = 3
-# PKCS#11 locking mode: "os" (CKF_OS_LOCKING_OK, default) or "mutex".
-pkcs11_locking_mode = "os"
+# PKCS#11 locking mode. "mutex" (default) serializes every module call
+# through a process-global mutex; "os" removes that and lets calls run
+# concurrently. A module advertising CKF_OS_LOCKING_OK is not proof that it
+# tolerates concurrency — some abort the calling process — so switch to "os"
+# only on a module whose vendor confirms thread safety.
+pkcs11_locking_mode = "mutex"
 # Localized PIN prompt shown to the user. Defaults to a Russian prompt at
 # runtime; uncomment to override.
 # pkcs11_pin_prompt = "Введите PIN-код токена: "

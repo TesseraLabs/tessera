@@ -26,6 +26,16 @@
 //! - **Cert lookup miss returns `CertificateNotFound`** — runs only
 //!   when a real token is present.
 //!
+//! The live tests load in `LockingMode::Mutex` because that is what an
+//! operator who did not configure `pkcs11_locking_mode` now gets; the
+//! explicit `Os` mode is exercised against a real provider by
+//! `pkcs11_locking.rs`.
+//!
+//! `live_three_wrong_pins_yield_max_attempts` deliberately burns PIN
+//! attempts and can leave the token's user PIN locked.  Run this file with
+//! `--test-threads=1` against a single token, or its peers will see the
+//! lockout as unexplained `CKR_GENERAL_ERROR`.
+//!
 //! Intentionally **does not** drive the full `pkcs11_challenge_response`
 //! flow: that path needs an on-token X.509 cert imported alongside the
 //! key, which the setup script leaves for operators to add manually
@@ -119,7 +129,7 @@ fn live_backend_finds_slot_with_token() {
     if skip_unless_pkcs11_ready() {
         return;
     }
-    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Os).expect("load module");
+    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Mutex).expect("load module");
     let slot = backend
         .find_slot(token_label().as_deref())
         .expect("find_slot");
@@ -133,7 +143,7 @@ fn live_wait_for_token_returns_immediately_when_present() {
     if skip_unless_pkcs11_ready() {
         return;
     }
-    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Os).expect("load module");
+    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Mutex).expect("load module");
     let slot = backend
         .wait_for_token(Duration::from_secs(2), token_label().as_deref())
         .expect("wait_for_token must succeed when token is already inserted");
@@ -147,7 +157,7 @@ fn live_three_wrong_pins_yield_max_attempts() {
     if skip_unless_pkcs11_ready() {
         return;
     }
-    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Os).expect("load module");
+    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Mutex).expect("load module");
     let slot = backend
         .find_slot(token_label().as_deref())
         .expect("find_slot");
@@ -184,7 +194,7 @@ fn live_cert_lookup_with_unknown_label_returns_not_found() {
     if skip_unless_pkcs11_ready() {
         return;
     }
-    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Os).expect("load module");
+    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Mutex).expect("load module");
     let slot = backend
         .find_slot(token_label().as_deref())
         .expect("find_slot");
