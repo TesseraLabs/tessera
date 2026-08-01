@@ -12,6 +12,16 @@ name: release-issuer
 on:
   push:
     tags: ['v*']
+  # Сборка (без публикации) на PR, затрагивающих issuer: без этого workflow
+  # запускается только на теге, то есть первый его прогон за релизный цикл
+  # приходится на сам релиз. Публикация остаётся на теге — job `release-issuer`
+  # гейтится своим `if`, на PR он пропускается.
+  pull_request:
+    paths:
+      - 'crates/tessera_issuer/**'
+      - 'crates/tessera_ext/**'
+      - '.github/workflows/release-issuer.yml'
+      - 'Cargo.lock'
   workflow_dispatch:
     inputs:
       tag:
