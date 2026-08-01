@@ -30,7 +30,7 @@ on:
 
 permissions:
   contents: read
-  # Linux-нога собирается в контейнере astra-builder из GHCR: без packages:read
+  # Сборка под Linux идёт в контейнере astra-builder из GHCR: без packages:read
   # GITHUB_TOKEN не имеет права его забрать, и job падает на «Initialize
   # containers» с «Docker pull failed: denied». На PR это не всплывает —
   # workflow идёт только на тегах.
