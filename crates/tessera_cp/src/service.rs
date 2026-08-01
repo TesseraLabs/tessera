@@ -44,11 +44,22 @@ use crate::role::RoleChoice;
 
 /// How long the tile waits for a verdict.
 ///
-/// Long enough for a verification that reads a certificate off a removable
-/// medium, short enough that an engineer facing a stuck service gets an answer
-/// rather than a frozen screen. This deadline runs while somebody is waiting
-/// for a logon they asked for.
-pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
+/// The service may spend up to [`tessera_proto::MEDIA_WAIT_SECONDS_MAX`] simply
+/// waiting for the engineer to present the medium, and a deadline shorter than
+/// that would fire on every attempt where the medium is inserted after the PIN
+/// — the ordinary case, not an edge one. So the wait is derived from that
+/// bound rather than chosen, and [`VERDICT_HEADROOM`] covers the verification
+/// that follows once the medium is there.
+///
+/// This deadline runs while somebody is waiting for a logon they asked for, so
+/// it stays a deadline: a service that never answers still gives the screen
+/// back instead of freezing it.
+pub const DEFAULT_AUTH_TIMEOUT: Duration =
+    Duration::from_secs(tessera_proto::MEDIA_WAIT_SECONDS_MAX + VERDICT_HEADROOM.as_secs());
+
+/// What the verdict itself may take after the medium has appeared: reading the
+/// certificate, checking the chain and revocation, resolving the role.
+const VERDICT_HEADROOM: Duration = Duration::from_secs(30);
 
 /// How long the tile waits for the role list.
 ///
@@ -590,6 +601,27 @@ mod tests {
         );
 
         assert_eq!(engine.list_roles().unwrap_err(), EngineError::Timeout);
+    }
+
+    /// An engineer who inserts the medium after the PIN makes the service wait
+    /// for it, and that wait is bounded by configuration, not by anything this
+    /// side controls. A verdict deadline shorter than that bound would fire on
+    /// an ordinary attempt and report a stuck service.
+    #[test]
+    fn the_verdict_deadline_covers_the_longest_configurable_media_wait() {
+        assert!(
+            DEFAULT_AUTH_TIMEOUT > Duration::from_secs(tessera_proto::MEDIA_WAIT_SECONDS_MAX),
+            "the deadline ({DEFAULT_AUTH_TIMEOUT:?}) does not cover the media wait"
+        );
+    }
+
+    /// The role list is fetched while the logon screen is being built, before
+    /// anyone has asked for anything, so its deadline is deliberately not tied
+    /// to the media wait and must stay far shorter.
+    #[test]
+    fn the_role_list_deadline_stays_short() {
+        assert!(DEFAULT_LIST_TIMEOUT < DEFAULT_AUTH_TIMEOUT);
+        assert!(DEFAULT_LIST_TIMEOUT <= Duration::from_secs(5));
     }
 
     /// Each call is its own connection and its own handshake, so a service that

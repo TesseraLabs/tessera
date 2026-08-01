@@ -15,6 +15,7 @@
 pub mod client;
 pub mod cp;
 pub mod framing;
+pub mod limits;
 pub mod server;
 pub mod session_target;
 pub mod system_time_serde;
@@ -28,6 +29,7 @@ pub use cp::{
     WireSecret,
 };
 pub use framing::{decode, encode, FramingError};
+pub use limits::MEDIA_WAIT_SECONDS_MAX;
 pub use server::{error_codes, ServerErrorCode, ServerMessage};
 pub use session_target::SessionTarget;
 pub use version::PROTOCOL_VERSION;

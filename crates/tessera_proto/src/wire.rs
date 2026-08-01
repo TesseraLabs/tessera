@@ -7,6 +7,7 @@ use std::io::BufRead;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 /// Maximum allowed frame size in bytes (excluding the trailing newline).
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -33,13 +34,19 @@ pub enum WireError {
 ///
 /// The returned `Vec<u8>` ends with a single `b'\n'`.
 ///
+/// Messages carrying a secret are encoded through here, so the intermediate
+/// JSON buffer is wiped on every path out — including the two error paths,
+/// where the frame is never returned but the secret was already serialised into
+/// it. Wiping the *returned* buffer stays with the caller, which is the only
+/// side that knows when the frame has left.
+///
 /// # Errors
 ///
 /// Returns [`WireError::Encode`] when `serde_json` fails, [`WireError::EmbeddedNewline`]
 /// if the JSON itself contains a raw newline (impossible from `to_vec`),
 /// and [`WireError::FrameTooLarge`] if the JSON body exceeds [`MAX_FRAME_BYTES`].
 pub fn encode_message<T: Serialize>(msg: &T) -> Result<Vec<u8>, WireError> {
-    let bytes = serde_json::to_vec(msg).map_err(WireError::Encode)?;
+    let bytes = Zeroizing::new(serde_json::to_vec(msg).map_err(WireError::Encode)?);
     if bytes.contains(&b'\n') {
         return Err(WireError::EmbeddedNewline);
     }

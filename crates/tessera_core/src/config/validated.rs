@@ -972,10 +972,13 @@ fn validate_mac(raw: &RawMacPolicy) -> Result<MacPolicy, Error> {
 /// Range: `1..=16`; validator rejects values outside this.
 const MAX_CHAIN_DEPTH_HARD_CAP: u32 = 16;
 
-/// Upper bound on `usb_wait_seconds`.  `0` means fail-fast (no wait);
-/// anything beyond five minutes would hold the PAM stack (and thus the
-/// login screen) hostage waiting for a stick that is not coming.
-const USB_WAIT_SECONDS_MAX: u64 = 300;
+/// Upper bound on `usb_wait_seconds`.  `0` means fail-fast (no wait).
+///
+/// Taken from the protocol crate rather than written here, because the
+/// Windows credential provider sizes its own deadline from the same value
+/// and a limit raised on one side only would make waits it must tolerate
+/// look like a stuck service.
+const USB_WAIT_SECONDS_MAX: u64 = tessera_proto::MEDIA_WAIT_SECONDS_MAX;
 
 /// Validate `usb_wait_seconds` against the documented `0..=300` range.
 fn validate_usb_wait_seconds(raw: u64) -> Result<Duration, Error> {

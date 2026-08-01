@@ -117,34 +117,54 @@ pub fn pack(
     let user = encode_utf16_nul("user", &target.user)?;
     let secret = encode_utf16_nul("password", password)?;
 
-    let mut blob = Zeroizing::new(vec![0u8; STRUCT_SIZE]);
+    // The block is sized before anything is written into it. Growing a buffer
+    // that already holds part of the password would leave the old allocation —
+    // with that part still in it — in the heap of a process nobody wipes, so
+    // the one allocation that carries the secret is also the only one.
+    let total = STRUCT_SIZE + byte_len(&domain) + byte_len(&user) + byte_len(&secret);
+    let mut blob = Zeroizing::new(vec![0u8; total]);
     write_u32(&mut blob, 0, kind.code());
 
-    append_string(&mut blob, DOMAIN_OFFSET, &domain);
-    append_string(&mut blob, USER_OFFSET, &user);
-    append_string(&mut blob, PASSWORD_OFFSET, &secret);
+    let after_domain = write_string(&mut blob, DOMAIN_OFFSET, STRUCT_SIZE, &domain);
+    let after_user = write_string(&mut blob, USER_OFFSET, after_domain, &user);
+    let _end = write_string(&mut blob, PASSWORD_OFFSET, after_user, &secret);
 
     Ok(blob)
 }
 
+/// Size in bytes of the encoded units, terminator included.
+fn byte_len(units: &[u16]) -> usize {
+    size_of_val(units)
+}
+
 /// Encodes a string as NUL-terminated UTF-16, rejecting what will not fit.
 fn encode_utf16_nul(field: &'static str, value: &str) -> Result<Zeroizing<Vec<u16>>, PackError> {
-    let units: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    // Counted first, then allocated exactly: collecting straight from the
+    // iterator grows the buffer as it goes, and every growth abandons an
+    // allocation holding a prefix of what is being encoded — which for one of
+    // the three fields is the password.
+    let count = value.encode_utf16().count() + 1;
+    let mut units = Zeroizing::new(Vec::with_capacity(count));
+    units.extend(value.encode_utf16());
+    units.push(0);
+
     let bytes = units.len() * size_of::<u16>();
     if u16::try_from(bytes).is_err() {
         return Err(PackError { field, bytes });
     }
-    Ok(Zeroizing::new(units))
+    Ok(units)
 }
 
-/// Appends the characters and fills in the `UNICODE_STRING` that describes them.
+/// Writes the characters at `data_offset` and fills in the `UNICODE_STRING`
+/// that describes them. Returns the offset just past the characters.
 ///
 /// `Length` excludes the terminator and `MaximumLength` includes it — the
 /// convention LSA and every Win32 caller of `UNICODE_STRING` follow.
-fn append_string(blob: &mut Zeroizing<Vec<u8>>, field_offset: usize, units: &[u16]) {
-    let data_offset = blob.len();
+fn write_string(blob: &mut [u8], field_offset: usize, data_offset: usize, units: &[u16]) -> usize {
+    let mut at = data_offset;
     for unit in units {
-        blob.extend_from_slice(&unit.to_le_bytes());
+        write_u16(blob, at, *unit);
+        at += size_of::<u16>();
     }
 
     let with_terminator = size_of_val(units);
@@ -160,6 +180,7 @@ fn append_string(blob: &mut Zeroizing<Vec<u8>>, field_offset: usize, units: &[u1
         field_offset + align_up(2 * size_of::<u16>(), PTR),
         data_offset,
     );
+    at
 }
 
 /// Narrows a length already validated by [`encode_utf16_nul`].
@@ -336,6 +357,39 @@ mod tests {
             .expect_err("40000 characters exceed a UNICODE_STRING");
 
         assert_eq!(error.field, "password");
+    }
+
+    /// The packed block is allocated once, at its final size. A buffer that
+    /// grew while the password was being written into it would have left a
+    /// prefix of that password in an abandoned allocation, and the only visible
+    /// trace of that is spare capacity here.
+    #[test]
+    fn the_block_is_allocated_once_at_its_final_size() {
+        let blob = pack(
+            LogonKind::Interactive,
+            &LogonTarget {
+                domain: "WORKGROUP".to_owned(),
+                user: "tessera-logon".to_owned(),
+            },
+            "a rather long technical account password",
+        )
+        .unwrap();
+
+        assert_eq!(
+            blob.capacity(),
+            blob.len(),
+            "the block was grown after it was allocated"
+        );
+    }
+
+    /// The same property for the intermediate UTF-16 encoding, which holds the
+    /// password on its own before the block does.
+    #[test]
+    fn the_encoded_units_are_allocated_once() {
+        let units = encode_utf16_nul("password", "a rather long technical account password")
+            .expect("the password fits a UNICODE_STRING");
+
+        assert_eq!(units.capacity(), units.len());
     }
 
     #[test]

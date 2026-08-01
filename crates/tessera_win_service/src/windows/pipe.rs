@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
@@ -80,6 +80,14 @@ const DEFAULT_TIMEOUT_MS: u32 = 5_000;
 ///
 /// This is the service's stop latency, and nothing else depends on it.
 const ACCEPT_POLL: Duration = Duration::from_millis(250);
+
+/// How long the accept loop waits before asking for an instance again after
+/// being told there are none free.
+///
+/// The same value as [`ACCEPT_POLL`] and for the same reason: it is a bound on
+/// how long a stop takes to be noticed, and there is no point in one path being
+/// more responsive than the other.
+const INSTANCE_RETRY: Duration = ACCEPT_POLL;
 
 /// How long a reply may take to reach a peer before the connection is written
 /// off. A client that has stopped reading is not one to keep a thread for.
@@ -134,10 +142,30 @@ impl Listener {
     ///
     /// [`WinError`] when an instance cannot be created — the name is taken by
     /// another process, or the descriptor was refused. Both mean the service
-    /// cannot listen at all.
+    /// cannot listen at all. Running out of instances is not among them: that
+    /// is a transient full queue and is waited out.
     pub fn run<E: AuthEngine + 'static>(&mut self, engine: &Arc<E>) -> Result<(), WinError> {
         while !self.stop.load(Ordering::SeqCst) {
-            let instance = self.create_instance()?;
+            let instance = match self.create_instance() {
+                Ok(instance) => instance,
+                Err(error) if error.code == ERROR_PIPE_BUSY => {
+                    // Every instance is in use: clients that connected and were
+                    // then abandoned still hold theirs. That is a full queue,
+                    // not a broken service — leaving the loop here would end
+                    // the only way into the device until somebody restarts the
+                    // service by hand. Wait for one to be released instead; the
+                    // stop flag is re-read at the top of the loop, so this path
+                    // does not make the service unstoppable.
+                    tracing::warn!(
+                        target: "tessera.engine.pipe",
+                        max_instances = MAX_INSTANCES,
+                        "every pipe instance is in use; waiting for one to be released"
+                    );
+                    std::thread::sleep(INSTANCE_RETRY);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let connected = match wait_for_client(&instance, &self.stop) {
                 Ok(connected) => connected,
                 Err(error) => {

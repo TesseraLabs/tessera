@@ -332,12 +332,23 @@ impl Read for PipeConnection {
             if code != ERROR_IO_PENDING {
                 return Err(io_error("ReadFile", code));
             }
-            if !wait(&self.event, self.read_budget).map_err(std::io::Error::other)? {
-                let salvaged = self.cancel_and_reap(&block);
-                if salvaged > 0 {
-                    return Ok(salvaged as usize);
+            match wait(&self.event, self.read_budget) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let salvaged = self.cancel_and_reap(&block);
+                    if salvaged > 0 {
+                        return Ok(salvaged as usize);
+                    }
+                    return Err(timed_out("no frame arrived within the connection's budget"));
                 }
-                return Err(timed_out("no frame arrived within the connection's budget"));
+                Err(error) => {
+                    // The wait failed, but the read is still queued: the kernel
+                    // owns `block` and `buf` until it is cancelled and reaped.
+                    // Returning here without that would hand the kernel a stack
+                    // frame that no longer exists.
+                    let _salvaged = self.cancel_and_reap(&block);
+                    return Err(std::io::Error::other(error));
+                }
             }
         }
         match self.reap(&block) {
@@ -375,15 +386,25 @@ impl Write for PipeConnection {
             if code != ERROR_IO_PENDING {
                 return Err(io_error("WriteFile", code));
             }
-            if !wait(&self.event, self.write_budget).map_err(std::io::Error::other)? {
-                let salvaged = self.cancel_and_reap(&block);
-                if salvaged > 0 {
-                    // A partial write leaves the frame stream broken; the
-                    // caller's only correct move is to drop the connection,
-                    // which is what this error makes it do.
-                    return Err(timed_out("the peer stopped reading mid-frame"));
+            match wait(&self.event, self.write_budget) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let salvaged = self.cancel_and_reap(&block);
+                    if salvaged > 0 {
+                        // A partial write leaves the frame stream broken; the
+                        // caller's only correct move is to drop the connection,
+                        // which is what this error makes it do.
+                        return Err(timed_out("the peer stopped reading mid-frame"));
+                    }
+                    return Err(timed_out("the peer did not read within the write budget"));
                 }
-                return Err(timed_out("the peer did not read within the write budget"));
+                Err(error) => {
+                    // As in `read`: a failed wait does not un-queue the write,
+                    // and the kernel keeps writing from `buf` through `block`
+                    // until the operation is cancelled and reaped.
+                    let _salvaged = self.cancel_and_reap(&block);
+                    return Err(std::io::Error::other(error));
+                }
             }
         }
         match self.reap(&block) {

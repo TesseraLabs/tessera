@@ -20,8 +20,10 @@
 //! Two fields carry secrets: the PIN travelling to the service and the
 //! technical account's password travelling back. Both are [`WireSecret`], which
 //! wipes itself when dropped and never prints its contents. That covers the
-//! message value only — the encoded frame is ordinary bytes, so whoever encodes
-//! or decodes one is responsible for wiping the buffer it passed through. The
+//! message value only — the encoded frame is ordinary bytes. The split is:
+//! [`crate::encode_message`] wipes the intermediate buffers it makes itself,
+//! and whoever holds the frame it returns — or the line it decoded from — wipes
+//! that, because only that side knows when the frame has been written out. The
 //! pipe itself is not the boundary that protects these fields: its security
 //! descriptor is (see the `windows-tcb-service` delta of `ipc-protocol`).
 
