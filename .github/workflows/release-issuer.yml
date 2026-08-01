@@ -12,6 +12,16 @@ name: release-issuer
 on:
   push:
     tags: ['v*']
+  # Сборка (без публикации) на PR, затрагивающих issuer: без этого workflow
+  # запускается только на теге, то есть первый его прогон за релизный цикл
+  # приходится на сам релиз. Публикация остаётся на теге — job `release-issuer`
+  # гейтится своим `if`, на PR он пропускается.
+  pull_request:
+    paths:
+      - 'crates/tessera_issuer/**'
+      - 'crates/tessera_ext/**'
+      - '.github/workflows/release-issuer.yml'
+      - 'Cargo.lock'
   workflow_dispatch:
     inputs:
       tag:
@@ -20,6 +30,11 @@ on:
 
 permissions:
   contents: read
+  # Сборка под Linux идёт в контейнере astra-builder из GHCR: без packages:read
+  # GITHUB_TOKEN не имеет права его забрать, и job падает на «Initialize
+  # containers» с «Docker pull failed: denied». На PR это не всплывает —
+  # workflow идёт только на тегах.
+  packages: read
 
 env:
   ISSUER_FEATURES: cli,pkcs11,vault,file
@@ -39,7 +54,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          # github.ref, а не ref_name: на pull_request ref_name даёт «83/merge»,
+          # и checkout ищет его в refs/heads/, где такого нет. Полный ref
+          # (refs/pull/83/merge, refs/tags/v0.5.0) корректен в обоих случаях.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Build issuer (release)
         run: cargo build --release -p tessera_issuer --features "$ISSUER_FEATURES"
@@ -77,7 +95,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          # github.ref, а не ref_name: на pull_request ref_name даёт «83/merge»,
+          # и checkout ищет его в refs/heads/, где такого нет. Полный ref
+          # (refs/pull/83/merge, refs/tags/v0.5.0) корректен в обоих случаях.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: rustup show
