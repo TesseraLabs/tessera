@@ -307,10 +307,14 @@ const fn default_pkcs11_slot_wait_seconds() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RawPkcs11LockingMode {
-    /// Native OS thread locking (`CKF_OS_LOCKING_OK`).  Default.
-    #[default]
+    /// Concurrent cryptoki calls reach the provider unserialized.  Only
+    /// safe on providers that genuinely honour `CKF_OS_LOCKING_OK`;
+    /// selected explicitly by the operator.
     Os,
-    /// User-space mutex serialization.
+    /// User-space mutex serialization.  Default: a provider advertising
+    /// `CKF_OS_LOCKING_OK` is not evidence that it survives concurrency,
+    /// and the failure mode is the death of the calling process.
+    #[default]
     Mutex,
 }
 

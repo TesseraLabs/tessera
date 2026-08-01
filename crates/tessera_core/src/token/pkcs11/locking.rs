@@ -1,27 +1,48 @@
 //! Process-global serialization for PKCS#11 calls.
 //!
-//! Some PKCS#11 providers (notably legacy JaCarta-2 GOST builds) do
-//! **not** honour the `CKF_OS_LOCKING_OK` flag and require the host
-//! application to serialize all `C_*` calls.  When
+//! Some PKCS#11 providers do **not** survive concurrent `C_*` calls and
+//! require the host application to serialize them.  When
 //! [`crate::token::pkcs11::LockingMode::Mutex`] is selected this
 //! module's [`with_global_lock`] helper takes a process-global
 //! `parking_lot::Mutex<()>` for the duration of every cryptoki FFI call
 //! made by [`crate::token::pkcs11::Pkcs11Backend`] and
 //! [`crate::token::pkcs11::Pkcs11Session`].
 //!
-//! `Mutex` mode works correctly even though `cryptoki` 0.7 only exposes
-//! `CInitializeArgs::OsThreads` (which still asks the provider for
-//! native locking).  This is intentional duplication: legacy providers
-//! that ignore `CKF_OS_LOCKING_OK` simply silently drop the request,
-//! and our user-space mutex still serializes every call we make.  The
-//! cost is one uncontended `parking_lot::Mutex` lock per call (≈ 20 ns
-//! on x86-64) which is negligible compared to a real `C_Sign`.
+//! Advertising `CKF_OS_LOCKING_OK` support is not evidence of it, and
+//! this is not confined to legacy hardware.  On `rtpkcs11ecp` 2.14.1
+//! (Rutoken, current at the time of writing) a `C_Initialize` entered
+//! from two threads at once escapes as an uncaught C++ exception in
+//! `CApplication::InitializeCryptoki` and takes the process down through
+//! `std::terminate`, despite the flag having been passed.  Measured
+//! there: sequential re-initialization returns the correct
+//! `CKR_CRYPTOKI_ALREADY_INITIALIZED`; two unserialized threads produced
+//! zero clean runs out of three; under a user-space mutex, five out of
+//! five.  Nothing here claims that every provider is defective — one was
+//! examined — only that the defect is not restricted to old ones, which
+//! is why `Mutex` is the default.
+//!
+//! `Mutex` mode is additive: the `C_Initialize` call still asks for
+//! `CKF_OS_LOCKING_OK`, because a conforming provider needs to hear it.
+//! The cost is one uncontended `parking_lot::Mutex` lock per call
+//! (≈ 20 ns on x86-64), negligible next to a real `C_Sign`.
 //!
 //! `Os` mode skips the lock entirely, allowing concurrent calls from
-//! independent threads.  The `pam_tessera` cdylib is single-threaded
-//! per PAM frame today, but future stages or the monitor daemon may
-//! drive several backends in parallel; on modern Rutoken / ESMART
-//! providers that's the correct behaviour.
+//! independent threads.  It remains available for operators who know
+//! their provider handles that, and buys real parallelism there.
+//!
+//! Neither mode governs *context creation*: `C_Initialize` is serialized
+//! process-wide by the context registry in
+//! [`crate::token::pkcs11::Pkcs11Backend`], because two backends may
+//! disagree about the locking mode while the provider defect is
+//! process-global.  For the same reason the mode itself is a property of
+//! the shared context rather than of a backend handle: serialization that
+//! half the callers opt out of serializes nothing.  Disagreements are
+//! resolved towards `Mutex` — a load asking for it raises the context
+//! (and every handle already given out, since the mode is read per call),
+//! while `Os` can never lower one.  Resolving the other way would let a
+//! configuration that asked for serialization silently not get it,
+//! including the configuration that asked for nothing at all, `Mutex`
+//! being the default.  Either resolution is logged at WARN.
 //!
 //! ## Test instrumentation
 //!

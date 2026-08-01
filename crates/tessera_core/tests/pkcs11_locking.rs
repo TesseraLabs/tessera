@@ -114,34 +114,112 @@ fn mutex_mode_serialises_two_threads() {
     );
 }
 
-/// In `Os` mode two threads run concurrently — total wall-clock time
-/// is approximately the per-thread sleep, not the sum.
+/// In `Os` mode the global mutex is not taken at all.
+///
+/// The live counterpart below can only run where a provider is
+/// installed, which on CI is nowhere: `lint.yml` and the default test
+/// job build without `--all-features`.  Without this test the "`Os`
+/// really means no serialization" half of the mode contract would go
+/// unchecked on every machine that matters, and a mistake there is
+/// silent — `Mutex` behaviour under an `os` config costs correctness
+/// nothing, so nothing else would notice.
 #[test]
-fn os_mode_allows_concurrent_calls() {
-    const SLEEP_MS: u64 = 60;
+fn os_mode_does_not_take_the_mutex() {
+    let _serial = TEST_SERIALIZE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let held_inside = with_global_lock(LockingMode::Os, mutex_currently_held);
+    assert!(
+        !held_inside,
+        "Os mode must run the closure without holding the global mutex"
+    );
+    // A `Mutex`-mode call on the same thread still works afterwards —
+    // `Os` mode must not have left a guard behind.
+    assert!(with_global_lock(LockingMode::Mutex, mutex_currently_held));
+    assert!(!mutex_currently_held());
+}
+
+/// In `Os` mode several threads issue **real** cryptoki calls against
+/// one shared backend at the same time.
+///
+/// The previous version of this test wrapped two `thread::sleep` calls
+/// and asserted on wall-clock time.  It never touched a provider, so it
+/// stayed green while concurrent access to a real token aborted the
+/// process — a test that only proved the mutex was not taken.  This one
+/// drives `C_GetSlotList` / `C_GetTokenInfo` from every thread and
+/// requires the process to survive with all calls succeeding.
+///
+/// Needs a live provider and an explicit opt-in: gated by the
+/// `pkcs11-tests` feature at compile time, by `PKCS11_MODULE_PATH` at
+/// runtime, and by `PKCS11_ALLOW_CONCURRENCY_TEST=1` on top of both.
+///
+/// The opt-in is not caution about a failing assertion.  Whether the
+/// vendor library survives concurrent `C_*` calls is an open question —
+/// only `C_Initialize` was ever investigated — and the way it answers no
+/// is `abort`: the test binary dies with no diagnostic, no failing test
+/// name, and every other test in the run lost with it.  Nobody should
+/// meet that by setting `PKCS11_MODULE_PATH` and running the suite; it
+/// has to be asked for.
+///
+/// Deliberately a variable of its own rather than a value of
+/// `PKCS11_MODULE_PATH`: pointing that at a provider means "tests may
+/// use this token", which is a different statement from "you may drive
+/// this library concurrently and risk the process".
+#[cfg(feature = "pkcs11-tests")]
+#[test]
+fn os_mode_allows_concurrent_provider_calls() {
+    use std::sync::Barrier;
+    use tessera_core::token::pkcs11::{test_helpers, Pkcs11Backend};
+
+    const THREADS: usize = 4;
+    const CALLS_PER_THREAD: usize = 10;
+    const OPT_IN: &str = "PKCS11_ALLOW_CONCURRENCY_TEST";
+
     let _serial = TEST_SERIALIZE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let start = Instant::now();
-    let h1 = thread::spawn(|| {
-        with_global_lock(LockingMode::Os, || {
-            thread::sleep(Duration::from_millis(SLEEP_MS));
-        });
-    });
-    let h2 = thread::spawn(|| {
-        with_global_lock(LockingMode::Os, || {
-            thread::sleep(Duration::from_millis(SLEEP_MS));
-        });
-    });
-    h1.join().expect("h1 join");
-    h2.join().expect("h2 join");
-    let elapsed = start.elapsed();
-    // Concurrent execution: total ≈ 60 ms.  Allow up to 110 ms to
-    // accommodate slow CI runners; anything ≥ 120 ms (= 2× sleep)
-    // would indicate accidental serialisation.
-    assert!(
-        elapsed < Duration::from_millis(SLEEP_MS * 2),
-        "Os mode must allow concurrency: elapsed={elapsed:?}"
+    if std::env::var(OPT_IN).as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: set {OPT_IN}=1 to drive the configured provider concurrently — a \
+             provider that cannot take it aborts the process instead of failing this test"
+        );
+        return;
+    }
+    let Some(path) = test_helpers::pkcs11_test_module_path() else {
+        eprintln!("skipped: PKCS11_MODULE_PATH not set or path missing");
+        return;
+    };
+    let backend = Arc::new(Pkcs11Backend::load(&path, LockingMode::Os).expect("load module"));
+    // The mode belongs to the shared context and is resolved towards the
+    // stricter of the requests made for that module path, so asking for
+    // `Os` does not guarantee getting it.  Without this check the test
+    // would happily run a fully serialized scenario and stay green while
+    // proving nothing about concurrency.
+    assert_eq!(
+        backend.locking_mode(),
+        LockingMode::Os,
+        "this test only means something in Os mode: something else in this process \
+         established Mutex for the same module path"
     );
+    let barrier = Arc::new(Barrier::new(THREADS));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let backend = Arc::clone(&backend);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..CALLS_PER_THREAD {
+                    backend
+                        .list_slots_with_token()
+                        .expect("concurrent slot enumeration must succeed in Os mode");
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("worker join");
+    }
 }

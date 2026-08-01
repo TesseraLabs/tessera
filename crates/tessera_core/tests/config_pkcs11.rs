@@ -86,7 +86,10 @@ fn defaults_apply_when_minimal_pkcs11() {
     let raw: RawConfig = toml::from_str(&body).expect("parse");
     let cfg = ValidatedConfig::try_from(&raw).expect("validate");
     assert_eq!(cfg.pkcs11_max_pin_attempts, 3);
-    assert_eq!(cfg.pkcs11_locking_mode, LockingMode::Os);
+    // Fail-safe default: providers that advertise CKF_OS_LOCKING_OK and
+    // still cannot take concurrent calls exist in the field, so an
+    // operator who never read the locking docs gets serialization.
+    assert_eq!(cfg.pkcs11_locking_mode, LockingMode::Mutex);
     assert_eq!(cfg.pkcs11_slot_wait, std::time::Duration::from_secs(10));
     assert!(cfg.pkcs11_object_label.is_none());
     assert!(
@@ -134,6 +137,20 @@ fn unknown_field_rejected_at_parse() {
     let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), extras);
     let res: Result<RawConfig, _> = toml::from_str(&body);
     assert!(res.is_err(), "deny_unknown_fields must reject the typo");
+}
+
+#[test]
+fn parses_locking_mode_os_when_explicitly_requested() {
+    // `os` stays available: on a provider that honours
+    // CKF_OS_LOCKING_OK it buys real parallelism, and taking that away
+    // would be an unmeasured, irreversible narrowing.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let anchor = write_anchor(dir.path());
+    let extras = "pkcs11_locking_mode = \"os\"";
+    let body = fixture_with_overrides(&anchor, "pkcs11", &dummy_module_path(), extras);
+    let raw: RawConfig = toml::from_str(&body).expect("parse");
+    let cfg = ValidatedConfig::try_from(&raw).expect("validate");
+    assert_eq!(cfg.pkcs11_locking_mode, LockingMode::Os);
 }
 
 #[test]

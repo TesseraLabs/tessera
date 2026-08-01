@@ -35,8 +35,18 @@ pkcs11_module = "/usr/lib/librtpkcs11ecp.so"
 # pkcs11_object_label = "user-cert"
 # Maximum number of consecutive PIN attempts before bailing. Range 1..=5.
 pkcs11_max_pin_attempts = 3
-# PKCS#11 locking mode: "os" (CKF_OS_LOCKING_OK, default) or "mutex".
-pkcs11_locking_mode = "os"
+# The module is loaded and C_Initialize'd once per process and is never
+# finalized — C_Finalize would deinitialize PKCS#11 for every other consumer
+# sharing the same library in that process (pam_pkcs11, sshd built with
+# PKCS11Provider), which has no way of noticing.
+# PKCS#11 locking mode. "mutex" (default) serializes every module call
+# through a process-global mutex; "os" removes that and lets calls run
+# concurrently. A module advertising CKF_OS_LOCKING_OK is not proof that it
+# tolerates concurrency — some abort the calling process — so switch to "os"
+# only on a module whose vendor confirms thread safety. The mode is fixed by
+# the first load of a given module in a process: another PAM stack entry
+# asking for the other mode gets the established one and a WARN.
+pkcs11_locking_mode = "mutex"
 # Localized PIN prompt shown to the user. Defaults to a Russian prompt at
 # runtime; uncomment to override.
 # pkcs11_pin_prompt = "Введите PIN-код токена: "

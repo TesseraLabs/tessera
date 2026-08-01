@@ -84,8 +84,12 @@ pub enum Pkcs11Error {
     /// attempts are possible until the user goes through unblock.
     #[error("pkcs#11 PIN locked")]
     PinLocked,
-    /// `C_Logout` failed during normal cleanup.  Surfaced from RAII tests;
-    /// production `Drop` swallows the error and logs a WARN.
+    /// `C_Logout` failed.  Returned by
+    /// [`super::Pkcs11Session::open`] when a login left behind by
+    /// somebody else could not be cleared, which means the PIN was never
+    /// checked — the authentication must not proceed.  During normal
+    /// cleanup it is surfaced only to RAII tests; production `Drop`
+    /// swallows the error and logs it.
     #[error("pkcs#11 C_Logout failed: {source}")]
     LogoutFailed {
         /// Underlying `cryptoki` error.
