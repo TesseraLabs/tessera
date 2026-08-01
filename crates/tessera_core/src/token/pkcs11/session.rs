@@ -13,6 +13,12 @@
 //!   logout that never happened leaves the token authenticated for
 //!   whoever comes next.  See [`Pkcs11Session::logout_before_close`].
 //!
+//! The same application-wide scope means the token may already be
+//! logged in when a session opens.  That is not an authentication:
+//! [`Pkcs11Session::open`] logs the residual login out and presents the
+//! PIN for real, so `CKR_USER_ALREADY_LOGGED_IN` never becomes a way in
+//! without one.
+//!
 //! No PIN bytes are ever stored — the supplied `SecretString` is
 //! dropped (and zeroized) as soon as `C_Login` returns.
 
@@ -58,11 +64,16 @@ impl Pkcs11Session {
     /// read-only.  The challenge-response flow (T12) needs `C_Sign`, so
     /// we standardise on RW from T05 onward.
     ///
+    /// A token that is already logged in does not shortcut the PIN: see
+    /// [`Self::login_displacing_residual`].
+    ///
     /// # Errors
     ///
     /// - [`Pkcs11Error::SessionOpenFailed`] when `C_OpenSession` fails.
     /// - [`Pkcs11Error::PinIncorrect`] on `CKR_PIN_INCORRECT`.
     /// - [`Pkcs11Error::PinLocked`] on `CKR_PIN_LOCKED`.
+    /// - [`Pkcs11Error::LogoutFailed`] when a residual login could not be
+    ///   cleared, so the PIN could not be checked.
     /// - [`Pkcs11Error::Cryptoki`] for any other login failure.
     pub fn open(
         backend: &Pkcs11Backend,
@@ -70,22 +81,93 @@ impl Pkcs11Session {
         pin: &SecretString,
     ) -> Result<Self, Pkcs11Error> {
         let shared_mode = backend.shared_locking_mode();
-        let mode = shared_mode.get();
-        let session = with_global_lock(mode, || backend.ctx().open_rw_session(slot))
+        let session = with_global_lock(shared_mode.get(), || backend.ctx().open_rw_session(slot))
             .map_err(|source| Pkcs11Error::SessionOpenFailed { source })?;
-        // cryptoki 0.12: `AuthPin` is a type alias for `secrecy::SecretString`,
-        // so we can pass the caller's pin reference directly.
-        match with_global_lock(shared_mode.get(), || {
-            session.login(UserType::User, Some(pin))
-        }) {
+        match Self::login_displacing_residual(&session, &shared_mode, pin) {
             Ok(()) => Ok(Self {
                 inner: Some(session),
                 logged_in: true,
                 locking_mode: shared_mode,
             }),
-            Err(CkError::Pkcs11(RvError::PinIncorrect, _)) => Err(Pkcs11Error::PinIncorrect),
-            Err(CkError::Pkcs11(RvError::PinLocked, _)) => Err(Pkcs11Error::PinLocked),
-            Err(other) => Err(Pkcs11Error::Cryptoki(other)),
+            Err(error) => {
+                // Dropping `session` here would send `C_CloseSession`
+                // outside the serialization layer — the same call `Drop`
+                // takes trouble to keep inside it.  A failed
+                // authentication is not a reason to make an unserialized
+                // call into a provider that may not survive one.
+                with_global_lock(shared_mode.get(), || drop(session));
+                Err(error)
+            }
+        }
+    }
+
+    /// `C_Login` as `CKU_USER`, clearing a login left behind by someone
+    /// else first.
+    ///
+    /// PKCS#11 scopes the login to the *application* — the
+    /// `C_Initialize` — and this process shares one for its whole life,
+    /// so the token can already be authenticated when we arrive: a
+    /// `C_Logout` that failed at the end of the previous authentication
+    /// left it that way, or a neighbour sharing the adopted context
+    /// (`sshd` built with `PKCS11Provider` holds its login for the length
+    /// of a connection) logged in before us.  `C_Login` then answers
+    /// `CKR_USER_ALREADY_LOGGED_IN`.
+    ///
+    /// That answer is neither success nor a refusal.  Taking it for
+    /// success would authenticate the person at the console on the
+    /// strength of somebody else's PIN — no PIN of theirs was ever
+    /// presented to the provider.  Returning it as an error would deny
+    /// every login for the rest of the process's life, which in the
+    /// `fly-dm` display slave means until the machine is rebooted.  So
+    /// the residual login is dropped and the PIN presented for real; a
+    /// wrong one fails exactly as it would have on a logged-out token.
+    ///
+    /// The cost is that a neighbour loses its login.  That is the same
+    /// direction of influence already accepted for the `C_Logout` in
+    /// `Drop`, and the choice here is between "the neighbour
+    /// re-authenticates" and "the engineer cannot log in".
+    ///
+    /// Only one displacement is attempted: if the second `C_Login` also
+    /// reports a login in place, something is putting one back, and
+    /// looping would spin inside an authentication.
+    fn login_displacing_residual(
+        session: &Session,
+        mode: &SharedLockingMode,
+        pin: &SecretString,
+    ) -> Result<(), Pkcs11Error> {
+        // cryptoki 0.12: `AuthPin` is a type alias for `secrecy::SecretString`,
+        // so we can pass the caller's pin reference directly.
+        let login = || with_global_lock(mode.get(), || session.login(UserType::User, Some(pin)));
+
+        match login() {
+            Ok(()) => return Ok(()),
+            Err(CkError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
+            Err(other) => return Err(Self::login_error(other)),
+        }
+
+        warn!(
+            target: "tessera.pkcs11",
+            "the token was already logged in when this authentication started; logging it out \
+             so the PIN can be checked — a neighbouring PKCS#11 consumer in this process will \
+             have to authenticate again"
+        );
+        if let Err(source) = with_global_lock(mode.get(), || session.logout()) {
+            return Err(Pkcs11Error::LogoutFailed { source });
+        }
+        login().map_err(Self::login_error)
+    }
+
+    /// Map a `C_Login` failure onto our typed error.
+    ///
+    /// `CKR_USER_ALREADY_LOGGED_IN` deliberately has no variant: by the
+    /// time this runs it can only come from the second attempt, where it
+    /// means the logout did not stick, and the honest report of that is
+    /// the raw provider status rather than a claim about the PIN.
+    fn login_error(error: CkError) -> Pkcs11Error {
+        match error {
+            CkError::Pkcs11(RvError::PinIncorrect, _) => Pkcs11Error::PinIncorrect,
+            CkError::Pkcs11(RvError::PinLocked, _) => Pkcs11Error::PinLocked,
+            other => Pkcs11Error::Cryptoki(other),
         }
     }
 
@@ -109,9 +191,15 @@ impl Pkcs11Session {
 
     /// Log out, retrying once, before the session is closed.
     ///
-    /// A single retry rather than a loop: the failures worth retrying are
-    /// transient contention inside the provider, and anything durable
-    /// will not resolve while a `Drop` blocks the authentication path.
+    /// The retry is immediate and taken under the same global mutex, so
+    /// nothing about the provider's state can have changed in between —
+    /// it buys nothing against contention.  What it does buy is the one
+    /// case where the first call failed but moved the state anyway: the
+    /// second then answers `CKR_USER_NOT_LOGGED_IN`, which *is* the
+    /// postcondition, and the operator gets a WARN instead of an ERROR
+    /// telling them the token may still be authenticated.  A durable
+    /// refusal fails identically the second time, at the cost of one FFI
+    /// call on a path that is already logging an ERROR.
     ///
     /// The second failure is an ERROR, not a WARN, because of what it
     /// leaves behind.  PKCS#11 scopes the login to the application, and
@@ -123,11 +211,17 @@ impl Pkcs11Session {
     /// naming the call that failed, because the operator reading it has
     /// to decide whether someone got in without a PIN.
     ///
-    /// A second attempt answering `CKR_USER_NOT_LOGGED_IN` means the
-    /// first one took effect after all, and is treated as success.
+    /// `CKR_USER_NOT_LOGGED_IN` is success on either attempt: the
+    /// postcondition — this application is not logged in — already holds.
+    /// On the first attempt it means somebody else's `C_Logout` (or a
+    /// `C_CloseSession` that dropped the last session of the
+    /// application) got there first, which is not worth a retry and not
+    /// worth a WARN; on the second, that the first call took effect
+    /// despite reporting failure.
     fn logout_before_close(session: &Session, mode: LockingMode) {
-        let Err(first) = with_global_lock(mode, || session.logout()) else {
-            return;
+        let first = match with_global_lock(mode, || session.logout()) {
+            Ok(()) | Err(CkError::Pkcs11(RvError::UserNotLoggedIn, _)) => return,
+            Err(first) => first,
         };
         match with_global_lock(mode, || session.logout()) {
             Ok(()) | Err(CkError::Pkcs11(RvError::UserNotLoggedIn, _)) => {

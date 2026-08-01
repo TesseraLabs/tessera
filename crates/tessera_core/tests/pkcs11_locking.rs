@@ -149,8 +149,22 @@ fn os_mode_does_not_take_the_mutex() {
 /// drives `C_GetSlotList` / `C_GetTokenInfo` from every thread and
 /// requires the process to survive with all calls succeeding.
 ///
-/// Needs a live provider: gated by the `pkcs11-tests` feature at compile
-/// time and by `PKCS11_MODULE_PATH` at runtime.
+/// Needs a live provider and an explicit opt-in: gated by the
+/// `pkcs11-tests` feature at compile time, by `PKCS11_MODULE_PATH` at
+/// runtime, and by `PKCS11_ALLOW_CONCURRENCY_TEST=1` on top of both.
+///
+/// The opt-in is not caution about a failing assertion.  Whether the
+/// vendor library survives concurrent `C_*` calls is an open question —
+/// only `C_Initialize` was ever investigated — and the way it answers no
+/// is `abort`: the test binary dies with no diagnostic, no failing test
+/// name, and every other test in the run lost with it.  Nobody should
+/// meet that by setting `PKCS11_MODULE_PATH` and running the suite; it
+/// has to be asked for.
+///
+/// Deliberately a variable of its own rather than a value of
+/// `PKCS11_MODULE_PATH`: pointing that at a provider means "tests may
+/// use this token", which is a different statement from "you may drive
+/// this library concurrently and risk the process".
 #[cfg(feature = "pkcs11-tests")]
 #[test]
 fn os_mode_allows_concurrent_provider_calls() {
@@ -159,11 +173,19 @@ fn os_mode_allows_concurrent_provider_calls() {
 
     const THREADS: usize = 4;
     const CALLS_PER_THREAD: usize = 10;
+    const OPT_IN: &str = "PKCS11_ALLOW_CONCURRENCY_TEST";
 
     let _serial = TEST_SERIALIZE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+    if std::env::var(OPT_IN).as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: set {OPT_IN}=1 to drive the configured provider concurrently — a \
+             provider that cannot take it aborts the process instead of failing this test"
+        );
+        return;
+    }
     let Some(path) = test_helpers::pkcs11_test_module_path() else {
         eprintln!("skipped: PKCS11_MODULE_PATH not set or path missing");
         return;

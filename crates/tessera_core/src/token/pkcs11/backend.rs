@@ -88,6 +88,23 @@ pub fn context_init_count() -> u64 {
     INIT_COUNT.load(Ordering::SeqCst)
 }
 
+/// Number of times this process adopted a context somebody else had
+/// already initialized (`CKR_CRYPTOKI_ALREADY_INITIALIZED`).  Monotonic.
+static ADOPT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the process-wide count of adopted contexts.
+///
+/// Adoption leaves no trace in [`context_init_count`] — that is the whole
+/// point of it — so a test that wanted to prove adoption happened could
+/// otherwise only observe that the init counter did *not* move, which is
+/// equally true of an ordinary cache hit.  This counter is the positive
+/// statement.  Feature-gated so production builds cannot depend on it.
+#[cfg(feature = "pkcs11-tests")]
+#[must_use]
+pub fn context_adopt_count() -> u64 {
+    ADOPT_COUNT.load(Ordering::SeqCst)
+}
+
 /// Registry of PKCS#11 contexts, keyed by canonical module path.
 ///
 /// Strong handles: the registry owns every context it has ever created
@@ -142,11 +159,13 @@ impl SharedLockingMode {
 
     /// The mode currently in force.
     pub(crate) fn get(&self) -> LockingMode {
-        // `Relaxed` is enough: the flag orders no other memory, and a
-        // reader that misses a raise by a few nanoseconds starts
-        // serializing from its next call, which is all the raise
-        // promises.  Every write happens under the registry lock.
-        if self.serialized.load(Ordering::Relaxed) {
+        // `Acquire` against the `Release` in `raise_to`.  The raise is
+        // documented — and asserted by the unit test below — as
+        // retroactive: a handle taken out before it must serialize from
+        // its next call onwards.  Stating that as a guarantee means
+        // stating it in the memory model, not relying on x86 to make
+        // `Relaxed` behave.
+        if self.serialized.load(Ordering::Acquire) {
             LockingMode::Mutex
         } else {
             LockingMode::Os
@@ -158,7 +177,7 @@ impl SharedLockingMode {
     fn raise_to(&self, requested: LockingMode) -> LockingMode {
         let effective = self.get().stricter(requested);
         if matches!(effective, LockingMode::Mutex) {
-            self.serialized.store(true, Ordering::Relaxed);
+            self.serialized.store(true, Ordering::Release);
         }
         effective
     }
@@ -231,7 +250,10 @@ impl Pkcs11Backend {
     /// A `CKR_CRYPTOKI_ALREADY_INITIALIZED` from `C_Initialize` is not
     /// an error: the provider is up, which is what the caller needs, and
     /// it may well have been brought up by a party this registry cannot
-    /// see (see the module docs).
+    /// see (see the module docs).  Such an adopted context is always
+    /// [`LockingMode::Mutex`], `locking_mode` notwithstanding: the
+    /// arguments that set the library's locking discipline were the
+    /// other party's, and may have promised it single-threaded use.
     ///
     /// # Errors
     ///
@@ -313,6 +335,7 @@ impl Pkcs11Backend {
         // conforming provider needs to hear, and `Mutex` mode's user-space
         // serialization is additive.
         let init_args = CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK);
+        let mut adopted = false;
         match ctx.initialize(init_args) {
             Ok(()) => {
                 INIT_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -327,6 +350,8 @@ impl Pkcs11Backend {
             // attempt, and a per-login WARN for an expected condition
             // teaches operators to skip warnings.
             Err(CkError::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {
+                adopted = true;
+                ADOPT_COUNT.fetch_add(1, Ordering::SeqCst);
                 info!(
                     target: "tessera.pkcs11",
                     module = %key.display(),
@@ -336,9 +361,34 @@ impl Pkcs11Backend {
             Err(source) => return Err(Pkcs11Error::InitFailed { source }),
         }
 
+        // An adopted context is serialized whatever the config asked
+        // for.  Our `CInitializeArgs` were discarded — the library was
+        // already up — so its locking discipline is the one the first
+        // initializer chose, and that may be none: `NULL pInitArgs` is
+        // the caller promising the provider it will not use it from more
+        // than one thread.  We cannot tell which happened, and running
+        // concurrent calls into a library that was told it is
+        // single-threaded is the failure class `rtpkcs11ecp` answers
+        // with `abort`.  The cost of being wrong the other way is an
+        // uncontended lock per call.
+        let effective_mode = if adopted {
+            LockingMode::Mutex
+        } else {
+            locking_mode
+        };
+        if adopted && effective_mode != locking_mode {
+            warn!(
+                target: "tessera.pkcs11",
+                module = %key.display(),
+                requested = ?locking_mode,
+                effective = ?effective_mode,
+                "pkcs11_locking_mode_forced_by_adoption"
+            );
+        }
+
         let shared = Arc::new(SharedContext {
             ctx,
-            mode: SharedLockingMode::new(locking_mode),
+            mode: SharedLockingMode::new(effective_mode),
         });
         registry.insert(key, Arc::clone(&shared));
         Ok(Self {
@@ -428,8 +478,15 @@ impl Pkcs11Backend {
                 .next()
                 .ok_or(Pkcs11Error::NoTokenAvailable);
         };
-        let mode = self.locking_mode();
         for slot in slots {
+            // Read afresh per slot: another thread's `load` can raise the
+            // context to `Mutex` while this scan runs, and a scan that
+            // cached `Os` at the top would keep issuing unserialized
+            // calls into a library somebody else now believes is
+            // protected.  Enumerating slots is exactly the kind of loop
+            // that can be long enough for that to happen — one
+            // `C_GetTokenInfo` per slot, on hardware.
+            let mode = self.locking_mode();
             let info = with_global_lock(mode, || self.ctx().get_token_info(slot))?;
             if info.label().trim_end() == want {
                 return Ok(slot);

@@ -55,6 +55,28 @@ The output env vars used by the test suite are:
 | `SOFTHSM_RSA_LABEL`      | `tessera_rsa`                            |
 | `SOFTHSM_ECDSA_LABEL`    | `tessera_ec_p256`                        |
 
+Two more variables are never set by the script and have to be supplied
+by hand; both unlock coverage that is otherwise skipped:
+
+| Variable                       | Meaning                                                         |
+|--------------------------------|-----------------------------------------------------------------|
+| `PKCS11_MODULE_PATH_2`         | a **second, different** provider the tests may copy to get module paths this process has never loaded |
+| `PKCS11_ALLOW_CONCURRENCY_TEST`| `1` permits driving the configured provider from several threads at once |
+
+`PKCS11_MODULE_PATH_2` must not point at the configured module: the
+tests copy it, and two live instances of one vendor library on one
+device is the condition `rtpkcs11ecp` 2.14.1 answers with `abort`.
+Without it, every test that needs a never-before-loaded path skips —
+adoption, mode upgrade, independent contexts.  On a Rutoken host point
+it at softhsm2, which relocates cleanly.
+
+`PKCS11_ALLOW_CONCURRENCY_TEST` gates
+`os_mode_allows_concurrent_provider_calls`.  Whether calls other than
+`C_Initialize` survive concurrency is an open question, and the way a
+provider answers no is `abort` — no failing test name, no diagnostic,
+the whole binary gone.  That has to be opted into, not inherited from
+having set a module path.
+
 ## Tearing down
 
 ```bash
@@ -130,6 +152,11 @@ So a run against real hardware is part of acceptance, and it is
 
 ```bash
 export PKCS11_MODULE_PATH=/usr/lib/librtpkcs11ecp.so
+# A second provider, or the tests that need an unseen module path skip.
+export PKCS11_MODULE_PATH_2=/usr/lib/softhsm/libsofthsm2.so
+# Opt in to concurrent C_* calls against the vendor library — see above
+# for what happens if it cannot take them.
+export PKCS11_ALLOW_CONCURRENCY_TEST=1
 # No --test-threads=1: concurrency is the scenario under test.
 cargo test -p tessera_core --features pkcs11-tests
 ```
@@ -158,6 +185,13 @@ What to check:
    provider that cannot log in twice cannot serve a second
    authentication from a `fly-dm` process that lives for the whole
    uptime.
+5. The residual-login pair in `pkcs11_singleton.rs` actually runs.  Both
+   tests need the second `C_Login` of item 4 and skip without it, which
+   is why softhsm2 can never check them: they prove that a token left
+   logged in neither blocks the next authentication nor lets a wrong PIN
+   through it.  A `skipped:` line from either one on hardware means the
+   displacement path went unverified.  Between them they spend one wrong
+   PIN attempt on the token.
 
 A single physical token cannot serve two logins at once; tests that
 drive a PIN or a signature against one device still need to be run one

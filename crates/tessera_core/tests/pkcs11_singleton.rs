@@ -32,9 +32,12 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11 as RawPkcs11};
+use cryptoki::session::UserType;
+use cryptoki::slot::Slot;
 use secrecy::SecretString;
 use tessera_core::token::pkcs11::{
-    context_init_count, test_helpers, LockingMode, Pkcs11Backend, Pkcs11Error, Pkcs11Session,
+    context_adopt_count, context_init_count, test_helpers, LockingMode, Pkcs11Backend, Pkcs11Error,
+    Pkcs11Session,
 };
 
 /// The init counter is process-global, so two tests from this binary
@@ -71,20 +74,129 @@ fn user_pin() -> SecretString {
     SecretString::from(std::env::var("SOFTHSM_USER_PIN").unwrap_or_else(|_| "1234".to_owned()))
 }
 
+/// A PIN the token cannot possibly accept.
+fn wrong_pin() -> SecretString {
+    SecretString::from("__tessera_wrong_pin__".to_owned())
+}
+
+/// Load the configured provider and locate the test token, or print a
+/// skip line and return `None`.
+fn backend_and_slot() -> Option<(Pkcs11Backend, Slot)> {
+    let backend = Pkcs11Backend::load(&module_path(), LockingMode::Mutex).expect("load");
+    match backend.find_slot(token_label().as_deref()) {
+        Ok(slot) => Some((backend, slot)),
+        Err(Pkcs11Error::NoTokenAvailable | Pkcs11Error::TokenNotFound { .. }) => {
+            eprintln!("skipped: no matching token present");
+            None
+        }
+        Err(other) => {
+            // Not a failure of anything under test: enumerating tokens is
+            // what every other test in this file starts with.  `SoftHSM2`
+            // 2.7 gets here because refusing a second `C_Login` leaves its
+            // context answering `CKR_GENERAL_ERROR` to everything for the
+            // rest of the process, so whichever test met that defect first
+            // decides what the ones after it see.
+            eprintln!("skipped: the provider will not enumerate its token any more ({other:?})");
+            None
+        }
+    }
+}
+
+/// Cached answer to [`provider_accepts_a_second_login`].
+///
+/// Asking costs a second `C_Login`, and on a provider that refuses one
+/// the refusal is not confined to the call: `SoftHSM2` 2.7 wedges its
+/// whole context afterwards.  Once is once too often already; twice
+/// would be gratuitous.
+static SECOND_LOGIN_SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Backend, slot, and a provider that can actually exercise the
+/// displacement path — or `None` with a printed reason.
+fn residual_login_fixture() -> Option<(Pkcs11Backend, Slot)> {
+    if SECOND_LOGIN_SUPPORTED.get() == Some(&false) {
+        eprintln!("skipped: this provider already refused a second C_Login in this process");
+        return None;
+    }
+    let (backend, slot) = backend_and_slot()?;
+    if *SECOND_LOGIN_SUPPORTED.get_or_init(|| provider_accepts_a_second_login(&backend, slot)) {
+        Some((backend, slot))
+    } else {
+        None
+    }
+}
+
+/// Will this provider accept a second `C_Login` in one process?
+///
+/// Displacing a residual login means `C_Logout` followed by another
+/// `C_Login`, so a provider that refuses every login after the first one
+/// cannot exercise the path at all.  `SoftHSM2` 2.7 is such a provider —
+/// it answers `CKR_GENERAL_ERROR`, with or without an intervening
+/// `C_Logout`, and the defect reproduces against bare `cryptoki` with no
+/// tessera code involved.  The two residual-login tests below therefore
+/// ask first and skip rather than assert a provider bug.
+///
+/// The probe leaves the token logged out on every path it returns from,
+/// so it does not itself create the residual login the callers set up.
+fn provider_accepts_a_second_login(backend: &Pkcs11Backend, slot: Slot) -> bool {
+    let session = match test_helpers::open_logged_in_session(backend, slot, &user_pin()) {
+        Ok(session) => session,
+        Err(Pkcs11Error::PinIncorrect | Pkcs11Error::PinLocked) => {
+            eprintln!("skipped: token PIN does not match SOFTHSM_USER_PIN");
+            return false;
+        }
+        Err(other) => panic!("unexpected login error while probing: {other:?}"),
+    };
+    if let Err(e) = session.logout() {
+        eprintln!("skipped: the probe session could not log out: {e}");
+        return false;
+    }
+    match session.login(UserType::User, Some(&user_pin())) {
+        Ok(()) => {
+            if let Err(e) = session.logout() {
+                panic!("the probe's second login could not be undone: {e}");
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "skipped: this provider refuses a second C_Login in one process ({e}), so the \
+                 residual-login path cannot be exercised here (SoftHSM2 2.7 is known to do this)"
+            );
+            false
+        }
+    }
+}
+
 /// Serial number for private module copies, so no two of them ever share
 /// a file name even inside one directory.
 static COPY_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
-/// Which module the private copies are cut from: `PKCS11_MODULE_PATH_2`
-/// when set, the configured module otherwise.
+/// Which module the private copies are cut from: `PKCS11_MODULE_PATH_2`,
+/// and nothing else.
 ///
-/// The variable exists because the configured provider may refuse to load
-/// from anywhere but its install directory — `rtpkcs11ecp` resolves its
-/// dependencies relatively and does — which leaves the host unable to
-/// produce a second module path at all.  Point it at something that
-/// relocates cleanly (`SoftHSM2`) to get these tests running there.
-fn copy_source() -> PathBuf {
-    std::env::var("PKCS11_MODULE_PATH_2").map_or_else(|_| module_path(), PathBuf::from)
+/// A copy of the *configured* module would give the process two live
+/// instances of one vendor library driving one device — the condition
+/// `rtpkcs11ecp` 2.14.1 answers with `abort` rather than an error code,
+/// which takes down the test binary instead of failing a test.  So the
+/// second provider has to be named explicitly, and has to be a genuinely
+/// different file: pointing `PKCS11_MODULE_PATH_2` at the configured
+/// module is the same hazard spelled differently.
+///
+/// The variable exists in the first place because the configured provider
+/// may refuse to load from anywhere but its install directory —
+/// `rtpkcs11ecp` resolves its dependencies relatively and does.  Point it
+/// at something that relocates cleanly (`SoftHSM2`) to get these tests
+/// running on a Rutoken host.
+fn copy_source() -> Option<PathBuf> {
+    let second = PathBuf::from(std::env::var("PKCS11_MODULE_PATH_2").ok()?);
+    if !second.exists() {
+        return None;
+    }
+    let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    if canonical(&second) == canonical(&module_path()) {
+        return None;
+    }
+    Some(second)
 }
 
 /// Can this process `dlopen` `path`?
@@ -114,21 +226,17 @@ fn module_is_loadable(path: &std::path::Path) -> bool {
 /// file per call removes the coupling instead of documenting it: the
 /// registry keys on the canonical path, and no two copies share one.
 ///
-/// # A copy that loads is a second live instance of the provider
+/// # A copy that loads is a second live instance of its provider
 ///
 /// `dlopen` keys on the file, so a copy is a separate image with its own
 /// `C_Initialize` state — that is exactly what makes it usable as a fresh
-/// path.  The flip side is that the process then holds two initialized
-/// instances of the *same vendor library* driving the same device.  That
-/// is a condition production never creates and one that `rtpkcs11ecp`
-/// 2.14.1 has already been seen to answer with `abort` rather than an
-/// error code, so a host where such a copy loads can lose the whole test
-/// binary instead of failing a test.  Setting `PKCS11_MODULE_PATH_2` to a
-/// *different* provider avoids that: the copies are then cut from
-/// something that has no second instance of the vendor library to clash
-/// with.
+/// path.  It also means the process ends up holding two initialized
+/// instances of whatever library was copied, which is why the source is
+/// never the configured module: two instances of the *same vendor
+/// library* on the same device is the condition `rtpkcs11ecp` 2.14.1
+/// answers with `abort`.  See [`copy_source`].
 fn fresh_module_path(dir: &std::path::Path) -> Option<PathBuf> {
-    let src = copy_source();
+    let src = copy_source()?;
     let stem = src.file_stem()?.to_str()?;
     let serial = COPY_SERIAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let name = match src.extension().and_then(std::ffi::OsStr::to_str) {
@@ -140,12 +248,17 @@ fn fresh_module_path(dir: &std::path::Path) -> Option<PathBuf> {
     module_is_loadable(&dst).then_some(dst)
 }
 
+/// Uniform explanation for a host that cannot provide a fresh module
+/// path.  Callers decide whether that means a skip or a weaker run.
+fn no_fresh_path_reason() -> &'static str {
+    "no loadable copy could be made: set PKCS11_MODULE_PATH_2 to a second, \
+     relocatable provider (it must not be the configured module — two live \
+     instances of one vendor library on one device is what aborts the process)"
+}
+
 /// Uniform skip line for a host that cannot provide a fresh module path.
 fn skip_no_fresh_path() {
-    eprintln!(
-        "skipped: no loadable copy of the module could be made \
-         (set PKCS11_MODULE_PATH_2 to a relocatable provider)"
-    );
+    eprintln!("skipped: {}", no_fresh_path_reason());
 }
 
 /// The counter is process-global and the context is never torn down, so
@@ -363,15 +476,34 @@ fn load_adopts_a_context_initialized_outside_the_registry() {
     }
 
     let before = context_init_count();
-    let backend = Pkcs11Backend::load(&path, LockingMode::Mutex).expect(
+    let adoptions_before = context_adopt_count();
+    // Asking for `Os` on purpose: the adopted context must come out
+    // serialized anyway (see the assertion below).
+    let backend = Pkcs11Backend::load(&path, LockingMode::Os).expect(
         "a provider already initialized outside the registry must be adopted: rejecting it \
          denies authentication for the rest of the process's life",
+    );
+    // The positive fact, not the absence of one: an unchanged init
+    // counter is also what an ordinary cache hit looks like, so on its
+    // own it would leave this test green even if `load` had never
+    // reached the adoption branch at all.
+    assert_eq!(
+        context_adopt_count() - adoptions_before,
+        1,
+        "load must have taken the adoption branch: CKR_CRYPTOKI_ALREADY_INITIALIZED from a \
+         path the registry has never seen"
     );
     assert_eq!(
         context_init_count(),
         before,
         "adoption is not an initialization: CKR_CRYPTOKI_ALREADY_INITIALIZED means the \
          library was up before we asked"
+    );
+    assert_eq!(
+        backend.locking_mode(),
+        LockingMode::Mutex,
+        "an adopted context is serialized whatever the config asked for: the first \
+         initializer's locking discipline is unknown and may be none at all"
     );
     backend
         .list_slots_with_token()
@@ -385,6 +517,11 @@ fn load_adopts_a_context_initialized_outside_the_registry() {
         context_init_count(),
         before,
         "the adopted context must be cached like any other"
+    );
+    assert_eq!(
+        context_adopt_count() - adoptions_before,
+        1,
+        "the second load must hit the cache, not adopt again"
     );
     again
         .list_slots_with_token()
@@ -420,8 +557,14 @@ fn concurrent_load_initializes_once_and_survives() {
     let (path, unseen_path) = if let Some(copy) = fresh_module_path(dir.path()) {
         (copy, true)
     } else {
-        skip_no_fresh_path();
-        eprintln!("note: racing on the configured module instead, with the weaker bound");
+        // Not a skip: the test still runs, on the configured module and
+        // with the weaker bound.  Saying "skipped" here would hide a
+        // full run of the regression test behind a word that means the
+        // opposite.
+        eprintln!(
+            "note: {} — racing on the configured module instead, with the weaker bound",
+            no_fresh_path_reason()
+        );
         (module_path(), false)
     };
     let before = context_init_count();
@@ -616,4 +759,106 @@ fn login_state_does_not_outlive_the_session() {
         0,
         "the second session must log out too"
     );
+}
+
+/// A token that is already logged in must not deny the next
+/// authentication.
+///
+/// The login state of a process-global context belongs to the
+/// `C_Initialize`, not to a session, and two mechanisms this change
+/// introduced can leave it set with nobody owning it.  A `C_Logout` that
+/// failed at the end of the previous authentication leaves one behind —
+/// the ERROR that path logs says as much — and in the `fly-dm` display
+/// slave, whose process lives for the machine's uptime, that state then
+/// meets every later login attempt.  An adopted context adds a second
+/// source: a neighbour in the process (`sshd` built with
+/// `PKCS11Provider` holds its login for the length of a connection) may
+/// have logged in before us.
+///
+/// In both cases `C_Login` answers `CKR_USER_ALREADY_LOGGED_IN`, and
+/// surfacing that as an error would deny authentication until the
+/// machine is rebooted — the exact outcome the adoption rule was written
+/// to prevent.
+#[test]
+fn residual_login_does_not_block_the_next_authentication() {
+    let _serial = lock_tests();
+    if skip_unless_module() {
+        return;
+    }
+    let Some((backend, slot)) = residual_login_fixture() else {
+        return;
+    };
+
+    // A login no RAII wrapper owns: exactly what a failed `C_Logout` or
+    // a logged-in neighbour leaves on the token.
+    let residual = test_helpers::open_logged_in_session(&backend, slot, &user_pin())
+        .expect("the probe above just proved this token takes our PIN");
+
+    let session = Pkcs11Session::open(&backend, slot, &user_pin()).expect(
+        "a residual login must be displaced and the PIN re-checked, not turned into a \
+         refusal: in a process that outlives one authentication the refusal lasts until \
+         the machine is rebooted",
+    );
+    drop(session);
+    drop(residual);
+}
+
+/// A residual login must not become a way in without a PIN.
+///
+/// This is the security half of the rule and the reason
+/// `CKR_USER_ALREADY_LOGGED_IN` is not simply treated as success:
+/// accepting it would authenticate whoever is at the console on the
+/// strength of somebody else's `C_Login`, with no PIN ever presented —
+/// the same hole `login_state_does_not_outlive_the_session` forbids from
+/// the other direction.  Displacing the login instead means the PIN is
+/// checked for real, so a wrong one has to fail even though the token
+/// was authenticated a moment earlier.
+///
+/// Costs one PIN attempt on the token; providers with a failure counter
+/// clear it on the next successful login, which the test performs
+/// best-effort at the end.
+#[test]
+fn residual_login_with_wrong_pin_is_rejected() {
+    let _serial = lock_tests();
+    if skip_unless_module() {
+        return;
+    }
+    let Some((backend, slot)) = residual_login_fixture() else {
+        return;
+    };
+
+    let residual = test_helpers::open_logged_in_session(&backend, slot, &user_pin())
+        .expect("the probe above just proved this token takes our PIN");
+    let probe = |stage: &str| {
+        test_helpers::private_objects_visible_without_login(&backend, slot)
+            .unwrap_or_else(|e| panic!("private-object probe failed ({stage}): {e:?}"))
+    };
+    // Non-zero means both that the residual login is real and that the
+    // probe can see anything at all; zero means the token holds no
+    // private objects and the probe proves nothing either way.
+    let visible_under_residual_login = probe("residual login");
+
+    let err = Pkcs11Session::open(&backend, slot, &wrong_pin())
+        .err()
+        .expect("a wrong PIN must never authenticate, least of all by inheriting a login");
+    assert!(
+        matches!(err, Pkcs11Error::PinIncorrect),
+        "the re-login must reach the provider and be judged on the PIN: got {err:?}"
+    );
+
+    if visible_under_residual_login > 0 {
+        assert_eq!(
+            probe("after the rejected attempt"),
+            0,
+            "the displaced login must not come back: a failed authentication may not leave \
+             the token readable"
+        );
+    }
+
+    drop(residual);
+    // Best effort: a successful login clears the failure counter the
+    // wrong PIN just incremented on providers that keep one.
+    if let Err(e) = Pkcs11Session::open(&backend, slot, &user_pin()) {
+        eprintln!("note: could not log in again to clear the PIN failure counter: {e:?}");
+    }
 }

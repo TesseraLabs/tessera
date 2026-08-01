@@ -45,7 +45,7 @@ pub mod test_helpers;
 mod waiter;
 
 #[cfg(feature = "pkcs11-tests")]
-pub use backend::context_init_count;
+pub use backend::{context_adopt_count, context_init_count};
 pub use backend::{LockingMode, Pkcs11Backend};
 pub use cert_lookup::FoundCertificate;
 pub use error::Pkcs11Error;
