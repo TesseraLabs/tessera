@@ -52,6 +52,7 @@ extern "C" {
     fn ENGINE_init(e: *mut ENGINE) -> c_int;
     fn ENGINE_finish(e: *mut ENGINE) -> c_int;
     fn ENGINE_free(e: *mut ENGINE) -> c_int;
+    fn ENGINE_remove(e: *mut ENGINE) -> c_int;
     fn ENGINE_set_default(e: *mut ENGINE, flags: c_uint) -> c_int;
     fn ENGINE_ctrl_cmd_string(
         e: *mut ENGINE,
@@ -215,6 +216,57 @@ impl EngineHandle {
             ));
         };
 
+        // Some hosts already have *something* registered under
+        // `engine_id` by the time we get here — e.g. Astra Linux's
+        // system `/usr/lib/ssl/openssl.cnf` auto-registers a "gost"
+        // engine via `openssl_conf`/`[engine_section]` as soon as any
+        // process (including this one) initialises libcrypto with
+        // default config loading, well before this function ever runs.
+        // A prior in-process load under the same id would leave the
+        // same kind of stale registration behind.
+        //
+        // libcrypto refuses to register a second engine under an id
+        // that is already taken, so the `LOAD` ctrl command below would
+        // fail (returns 0) against that pre-existing registration.
+        //
+        // We must never simply *adopt* whatever is already sitting
+        // under that id — that could be an attacker-planted engine
+        // reachable via some ambient config or engine search path, and
+        // tessera's whole point here is to load explicitly and only
+        // from the specific, root-controlled `path` the operator
+        // configured. So instead: if the id is already taken, clear it
+        // — `ENGINE_remove` followed by `ENGINE_free` to release the
+        // reference — freeing the slot, and then fall through to the
+        // exact same explicit, path-verified `SO_PATH`/`ID`/`LOAD`
+        // sequence below as if nothing had been registered. This is
+        // best-effort: we ignore the return codes of `ENGINE_remove`/
+        // `ENGINE_free` themselves, since the only goal is clearing the
+        // slot — if it somehow doesn't clear, the `LOAD` command below
+        // fails exactly as it did before this check existed, surfacing
+        // the existing `LoadFailed` error as an acceptable fallback.
+        //
+        // SAFETY: `id_c.as_ptr()` is a NUL-terminated C string valid for
+        // the duration of the call.  `ENGINE_by_id` returns either a
+        // valid `*mut ENGINE` (with one structural reference for us) or
+        // NULL.
+        let preexisting = unsafe { ENGINE_by_id(id_c.as_ptr()) };
+        if let Some(preexisting) = NonNull::new(preexisting) {
+            // SAFETY: `preexisting` is a valid ENGINE pointer we just
+            // obtained a structural reference to via `ENGINE_by_id`
+            // above; `ENGINE_remove` takes it out of libcrypto's global
+            // engine list so the id becomes free again.
+            unsafe {
+                let _ = ENGINE_remove(preexisting.as_ptr());
+            }
+            // SAFETY: `preexisting` is a valid ENGINE pointer; this
+            // releases the structural reference obtained from
+            // `ENGINE_by_id` above (distinct from whatever reference(s)
+            // the ambient registration itself may still be holding).
+            unsafe {
+                let _ = ENGINE_free(preexisting.as_ptr());
+            }
+        }
+
         // Run the SO_PATH/ID/LOAD ctrl sequence, stopping at the first
         // non-1 return.  We close over `raw` and `_guard` by reference;
         // any failure must drop the engine before returning.  Each
@@ -376,6 +428,103 @@ mod tests {
                 Err(GostEngineError::PathMissing(_) | GostEngineError::LoadFailed(_)),
             ),
             "expected PathMissing or LoadFailed, got {res:?}",
+        );
+    }
+
+    /// Finds a real, dynamically-loadable OpenSSL engine module on this
+    /// host, paired with its own true engine id.
+    ///
+    /// Deliberately avoids `"gost"`/gost-engine paths: the `ID` ctrl
+    /// command doesn't let a caller rename an engine module to an
+    /// arbitrary id (it only selects *which* id inside the module to
+    /// bind, and a mismatch makes `LOAD` fail), so the regression test
+    /// below must use each module's own real id — and the crate's own
+    /// `gost::engine` keeps a process-wide `OnceLock` keyed on `"gost"`
+    /// that other unit tests in this same test binary rely on staying
+    /// unavailable/consistent. Registering a real `"gost"` engine as a
+    /// side effect of this test would leak into and race with those
+    /// other tests. Non-GOST stock OpenSSL engine modules (e.g.
+    /// `loader_attic`, shipped by Homebrew's `openssl@3` and by distro
+    /// OpenSSL 3.x packages) are just as valid for exercising the
+    /// generic id-collision-then-clear mechanism, which has nothing
+    /// GOST-specific about it, without that risk.
+    fn find_real_engine_module() -> Option<(std::path::PathBuf, &'static str)> {
+        const CANDIDATES: &[(&str, &str)] = &[
+            // Debian/Astra Linux OpenSSL 3.x stock engine modules.
+            (
+                "/usr/lib/x86_64-linux-gnu/engines-3/loader_attic.so",
+                "loader_attic",
+            ),
+            ("/usr/lib/engines-3/loader_attic.so", "loader_attic"),
+            ("/usr/lib/x86_64-linux-gnu/engines-3/afalg.so", "afalg"),
+            // Homebrew on macOS dev hosts (Apple Silicon / Intel prefixes).
+            (
+                "/opt/homebrew/lib/engines-3/loader_attic.dylib",
+                "loader_attic",
+            ),
+            (
+                "/usr/local/lib/engines-3/loader_attic.dylib",
+                "loader_attic",
+            ),
+        ];
+        CANDIDATES
+            .iter()
+            .map(|(p, id)| (std::path::Path::new(p), *id))
+            .find(|(p, _)| p.exists())
+            .map(|(p, id)| (p.to_path_buf(), id))
+    }
+
+    #[test]
+    fn load_dynamic_clears_a_preexisting_registration_under_the_same_id() {
+        // Regression test for the Astra Linux ambient-registration bug:
+        // the system `/usr/lib/ssl/openssl.cnf` auto-registers a "gost"
+        // engine at libcrypto init time, before tessera's own explicit
+        // `load_dynamic` call ever runs — so the second (tessera's own)
+        // attempt to register under the same id used to fail with
+        // `LoadFailed` citing `LOAD=0`, even though the exact same path
+        // loads cleanly on a host with no prior registration. (This test
+        // uses a non-GOST stock engine module to reproduce the same
+        // mechanism — see the doc comment on `find_real_engine_module`
+        // for why.)
+        //
+        // We can't drive a *real* ambient-config auto-load from a unit
+        // test, but we can reproduce the exact symptom with the code
+        // under test itself: `EngineHandle::load_dynamic` registers its
+        // engine in libcrypto's global engine list via `ENGINE_add`
+        // (inside the dynamic loader's `LOAD` command) and never calls
+        // `ENGINE_remove` on drop — `Drop for EngineHandle` only runs
+        // `ENGINE_finish`/`ENGINE_free` — so the registration outlives
+        // the handle exactly like the ambient one does. Loading the
+        // same `.so` a second time under the same id therefore hits the
+        // identical id-collision this fix addresses.
+        //
+        // No env-var-gated fixture mechanism exists for pulling in a
+        // real engine `.so` at the `src/`-unit-test level (that pattern
+        // — `tests/fixtures/gen_gost.sh` + `gost-tests` feature + skip
+        // when absent — only exists for the `tests/gost_*_real.rs`
+        // integration tests), so this test follows the same
+        // skip-with-a-message convention used by
+        // `tests/common::skip_unless_gost_ready` rather than inventing
+        // a new one.
+        let Some((path, id)) = find_real_engine_module() else {
+            eprintln!(
+                "skipped: no real OpenSSL dynamic engine module found on \
+                 this host (checked conventional distro/Homebrew \
+                 locations); run on a host that has one to exercise this \
+                 regression test.",
+            );
+            return;
+        };
+
+        let first = EngineHandle::load_dynamic(&path, id);
+        assert!(first.is_ok(), "first load must succeed: {first:?}");
+        drop(first);
+
+        let second = EngineHandle::load_dynamic(&path, id);
+        assert!(
+            second.is_ok(),
+            "second load under the same id must succeed after the fix \
+             (pre-fix this failed with LoadFailed citing LOAD=0): {second:?}",
         );
     }
 
