@@ -138,3 +138,5 @@ issuer accept \
 - [issuance-workflows.md](issuance-workflows.md) — сравнение процессов
 - [carriers.md](carriers.md) — свойства флешки и пассивного токена
 - [issuer.md](issuer.md) — бэкенды подписи, журнал выпусков
+- [Tessera Access](https://tessera-access.ru/access/) — обзор продукта:
+  делегирование, отзыв, работа без постоянной сети

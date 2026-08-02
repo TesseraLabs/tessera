@@ -128,3 +128,4 @@ issuer accept --verify-only --media /mnt/usb --chain chain.pem \
 - [issuance-workflows.md](issuance-workflows.md) — сравнение процессов
 - [cert-issuance.md](cert-issuance.md) — привязки, роли, потолок уровня целостности
 - [issuer.md](issuer.md) — бэкенды подписи, журнал выпусков, источники секретов
+- [Tessera Access](https://tessera-access.ru/access/) — обзор продукта

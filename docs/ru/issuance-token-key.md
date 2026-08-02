@@ -136,3 +136,6 @@ issuer accept \
 - [issuance-workflows.md](issuance-workflows.md) — сравнение процессов
 - [carriers.md](carriers.md#активный-токен) — свойства активных токенов
 - [issuer.md](issuer.md) — бэкенды подписи, журнал выпусков
+- [Tessera Access](https://tessera-access.ru/access/) — обзор продукта;
+  [Tessera Codes](https://tessera-access.ru/codes/) — вариант без носителя,
+  когда выдавать токены нецелесообразно
