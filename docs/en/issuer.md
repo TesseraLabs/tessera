@@ -353,7 +353,9 @@ The backend's rules:
 - The key file must not be accessible to the group or to others (`chmod 600`) —
   otherwise the backend refuses before reading the contents. File ownership and
   directory permissions are not checked — keep the key in your own directory
-  with `700` permissions.
+  with `700` permissions. On Windows file permissions are not checked at all,
+  same as for secret files (see [Secret sources](#secret-sources)): the key is
+  accepted and a warning says so on stderr.
 - The passphrase of an encrypted key is prompted through the ladder of sources
   (see [Secret sources](#secret-sources)); the passphrase never appears in
   command-line arguments or logs, and memory is zeroized.
