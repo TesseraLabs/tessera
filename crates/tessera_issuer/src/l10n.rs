@@ -237,6 +237,12 @@ pub(crate) enum Msg {
     SecretFileBeyondOwner,
     /// Secret ladder: the secret file could not be read (a detail follows).
     SecretFileUnreadable,
+    /// Secret ladder: this platform does not check file permissions, so the
+    /// owner-only gate did not run (the path follows); printed to stderr.
+    SecretFileUncheckedPlatform,
+    /// CLI: a secret-source flag belongs to a backend other than the selected
+    /// one (the flags and the backend follow).
+    CliSecretFlagForeignBackend,
     /// Secret ladder: standard input could not be read (a detail follows).
     SecretStdinUnreadable,
     /// Secret ladder: the console prompt failed (a detail follows).
@@ -293,6 +299,13 @@ impl Msg {
                  (chmod 600):"
             }
             Msg::SecretFileUnreadable => "cannot read the secret file:",
+            Msg::SecretFileUncheckedPlatform => {
+                "warning: this platform does not check file permissions, so the secret file was \
+                 accepted unchecked; keep it in a directory only its owner can enter —"
+            }
+            Msg::CliSecretFlagForeignBackend => {
+                "this flag names a secret source for another backend and would be ignored:"
+            }
             Msg::SecretStdinUnreadable => "cannot read the secret from standard input:",
             Msg::SecretConsoleFailed => "the console secret prompt failed:",
             Msg::SecretPinentryFailed => "the pinentry program returned no secret:",
@@ -336,6 +349,13 @@ impl Msg {
                  владельцем (chmod 600):"
             }
             Msg::SecretFileUnreadable => "не удалось прочитать файл секрета:",
+            Msg::SecretFileUncheckedPlatform => {
+                "предупреждение: на этой платформе права файла не проверяются, файл секрета принят \
+                 без проверки; держите его в каталоге, доступном только владельцу —"
+            }
+            Msg::CliSecretFlagForeignBackend => {
+                "этот флаг задаёт источник секрета для другого бэкенда и был бы проигнорирован:"
+            }
             Msg::SecretStdinUnreadable => "не удалось прочитать секрет со стандартного ввода:",
             Msg::SecretConsoleFailed => "не удалось запросить секрет в консоли:",
             Msg::SecretPinentryFailed => "программа pinentry не вернула секрет:",

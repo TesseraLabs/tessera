@@ -290,9 +290,22 @@ graph TD
 ```
 
 Installing GnuPG or Gpg4win is required on no platform: without pinentry the
-tool prompts for the secret itself. A secret file must be unreadable by group
-and others (`chmod 600`), or the backend refuses before reading its contents. No
-flag takes a secret **by value**: arguments are visible in the process list.
+tool prompts for the secret itself. No flag takes a secret **by value**:
+arguments are visible in the process list.
+
+**Secret files.** On Linux and macOS the file must be unreadable by group and
+others (`chmod 600`), or the backend refuses before reading its contents; the
+check runs on the already-open file, so the path cannot be swapped between the
+check and the read. Windows does not express file permissions in a comparable
+way and the check **does not run** there: the file is accepted and a warning
+says so on stderr. Protection then rests on the directory the file lives in —
+keep it somewhere only its owner can enter.
+
+**Standard input.** On Linux and macOS the secret is read into a wiped buffer,
+bypassing the standard library's own. Elsewhere that bypass is unavailable and
+the secret stays in the standard-input buffer for the life of the process. Where
+that matters, prefer `--pin-file` and `--key-passphrase-file`: the file source
+leaves no such residue.
 
 ### Vault / OpenBao Transit
 
