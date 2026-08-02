@@ -717,27 +717,27 @@ fn run_file(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Result<
     // `--algorithm` is only a cross-check, so pass it through as-is (None means
     // "no cross-check") rather than substituting a default.
     let requested_algorithm = args.algorithm.as_deref().map(parse_algorithm).transpose()?;
-    // The CA key passes the same owner-only gate as a secret file. Where the
-    // platform has no such check, say so: silence would read as a permission
-    // check that ran and found nothing wrong.
-    if !crate::secret_file::GATE_ENFORCED {
-        eprintln!(
-            "{} {}",
-            Msg::SecretFileUncheckedPlatform.text(locale),
-            path.display()
-        );
-    }
     let key_id = effective_key_id(args)?;
     let passphrase = keypass::FilePassphraseSource::new(args.key_passphrase_source(), locale);
     let signer = FileSigner::open(
         FileConfig {
-            path,
+            path: path.clone(),
             key_id,
             requested_algorithm,
         },
         &passphrase,
     )
     .map_err(|e| CliError::Backend(e.to_string()))?;
+    // The CA key passes the same owner-only gate as a secret file. Where the
+    // platform has no such check, say so: silence would read as a permission
+    // check that ran and found nothing wrong. It is said only once the key is
+    // actually open — a warning about a file the run never got to read would
+    // point the operator at the wrong thing.
+    if let Some(notice) =
+        secret::unchecked_gate_notice(crate::secret_file::GATE_ENFORCED, locale, &path)
+    {
+        secret::warn(&mut std::io::stderr(), &notice);
+    }
     // A plaintext CA key is accepted but flagged on every start.
     if !signer.key_is_encrypted() {
         eprintln!("{}", Msg::FilePlaintextKeyWarning.text(locale));
@@ -1532,7 +1532,7 @@ mod prompt {
 /// in `argv`.
 #[cfg(any(feature = "pkcs11", feature = "file"))]
 mod secret {
-    use std::io::{IsTerminal as _, Read as _};
+    use std::io::IsTerminal as _;
     use std::path::{Path, PathBuf};
 
     use secrecy::SecretString;
@@ -1736,7 +1736,7 @@ mod secret {
             },
             Rung::Stdin => {
                 let line = read_stdin_line()
-                    .map_err(|e| error(request, Msg::SecretStdinUnreadable, &e.to_string()))?;
+                    .map_err(|e| line_error(request, &e, Msg::SecretStdinUnreadable, "stdin"))?;
                 let text = as_text(&line)
                     .map_err(|e| error(request, Msg::SecretStdinUnreadable, &e.to_string()))?;
                 accept(request, text, "stdin")
@@ -1748,7 +1748,8 @@ mod secret {
                 // standard error, while the prompt reads the terminal device
                 // itself (`/dev/tty`, `CONIN$`). When the two disagree the rung
                 // simply cannot start, and the ladder continues; an entry the
-                // operator interrupted is an answer, and stops it.
+                // operator ended — interrupted, or closed with no input — is an
+                // answer, and stops it.
                 Err(e) if console_failure_is_fatal(e.kind()) => {
                     Err(error(request, Msg::SecretConsoleFailed, &e.to_string()))
                 }
@@ -1768,19 +1769,26 @@ mod secret {
     /// A warning that cannot be written is dropped: the secret is in hand and
     /// the operation is sound, so failing it over an unwritable stderr would
     /// trade a real issuance for a note about one.
-    fn warn(sink: &mut dyn std::io::Write, line: &str) {
+    pub(super) fn warn(sink: &mut dyn std::io::Write, line: &str) {
         let written = writeln!(sink, "{line}");
         drop(written);
     }
 
     /// Whether a failed console prompt ends the ladder.
     ///
-    /// Only an interrupted entry does: it means the operator was at the prompt
-    /// and refused, and reaching past that refusal for the environment variable
-    /// would answer a question they declined to answer. Every other failure says
-    /// the prompt never got to ask.
+    /// Two failures mean the operator was at the prompt and declined: an
+    /// interrupt (`Ctrl-C`) and an end of input with nothing entered (`Ctrl-D`,
+    /// `Ctrl-Z` on Windows), which `rpassword` reports as an unexpected
+    /// end-of-file. Reaching past either for the environment variable would
+    /// answer a question they refused to answer, and the variable is the last
+    /// resort for a process with no terminal — not for one whose operator said
+    /// no. Every other failure says the prompt never got to ask, and the ladder
+    /// goes on.
     fn console_failure_is_fatal(kind: std::io::ErrorKind) -> bool {
-        kind == std::io::ErrorKind::Interrupted
+        matches!(
+            kind,
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::UnexpectedEof
+        )
     }
 
     /// Read a secret file: the owner-only gate first, its first line second.
@@ -1810,13 +1818,17 @@ mod secret {
                 &format!("{} (mode {:04o})", path.display(), refusal.mode),
             ),
         })?;
-        if !crate::secret_file::GATE_ENFORCED {
-            let warning = unchecked_platform_warning(request.locale, path);
-            warn(&mut *ports.warn, &warning);
+        let origin = path.display().to_string();
+        if let Some(notice) =
+            unchecked_gate_notice(crate::secret_file::GATE_ENFORCED, request.locale, path)
+        {
+            warn(&mut *ports.warn, &notice);
         }
-        let raw = opened.read_all().map_err(|e| unreadable(&e))?;
-        let text = as_text(first_line(&raw)).map_err(|e| unreadable(&e))?;
-        accept(request, text, &path.display().to_string())
+        let line = opened
+            .read_first_line()
+            .map_err(|e| line_error(request, &e, Msg::SecretFileUnreadable, &origin))?;
+        let text = as_text(&line).map_err(|e| unreadable(&e))?;
+        accept(request, text, &origin)
     }
 
     /// Read one line of the secret from standard input.
@@ -1830,57 +1842,23 @@ mod secret {
     /// read falls back to that buffer and the residue is real; the file and
     /// dialog sources have no such caveat.
     ///
-    /// The reopened handle carries its own file offset, so it must be the only
-    /// reader of standard input in the process — which it is: nothing else in
-    /// the CLI reads standard input.
-    fn read_stdin_line() -> std::io::Result<Zeroizing<Vec<u8>>> {
+    /// What `/dev/stdin` *is* differs between Unixes, and so does the reopened
+    /// handle's file offset. On Linux it resolves through `/proc/self/fd/0`, and
+    /// reopening a regular file there yields a fresh file description starting
+    /// at offset zero; on macOS it is a devfs node that duplicates descriptor 0
+    /// and shares its offset. So a run that redirects standard input from a file
+    /// *already partly consumed* — `exec 0<secrets.txt`, a line read away, then
+    /// `issuer --pin-stdin` — takes the file's first line on Linux and the next
+    /// unread one on macOS. This source is meant for a pipe or a terminal, where
+    /// the two agree; a partly consumed file redirection is not a supported way
+    /// to name a secret, and `--pin-file` is the source that reads a file
+    /// predictably.
+    fn read_stdin_line() -> Result<Zeroizing<Vec<u8>>, crate::secret_file::ReadLineError> {
         #[cfg(unix)]
         if let Ok(mut reopened) = std::fs::File::open("/dev/stdin") {
-            return read_line_from(&mut reopened);
+            return crate::secret_file::read_line(&mut reopened);
         }
-        read_line_from(&mut std::io::stdin())
-    }
-
-    /// Read one line into a buffer that is wiped when it is dropped, dropping a
-    /// single trailing line terminator (`\n`, optionally preceded by `\r`).
-    ///
-    /// The read is byte at a time and unbuffered on purpose: a `BufReader` would
-    /// hold the rest of the stream — the secret's own tail among it — in an
-    /// allocation nobody wipes. Secrets are short, so the syscalls are few, and
-    /// nothing beyond the line is consumed.
-    ///
-    /// Only the terminator goes: a secret's own trailing spaces are its content.
-    #[expect(
-        clippy::unbuffered_bytes,
-        reason = "a buffered read would keep the secret in an allocation that is never wiped; \
-                  a secret is a line long, so the syscalls it costs are a handful"
-    )]
-    fn read_line_from(source: &mut impl std::io::Read) -> std::io::Result<Zeroizing<Vec<u8>>> {
-        let mut buffer = Zeroizing::new(Vec::with_capacity(64));
-        for byte in source.bytes() {
-            let byte = byte?;
-            if byte == b'\n' {
-                break;
-            }
-            buffer.push(byte);
-        }
-        if buffer.last() == Some(&b'\r') {
-            buffer.pop();
-        }
-        Ok(buffer)
-    }
-
-    /// The first line of a buffer read whole, without its terminator.
-    fn first_line(raw: &[u8]) -> &[u8] {
-        let end = raw
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .unwrap_or(raw.len());
-        let line = raw.get(..end).unwrap_or(raw);
-        match line.split_last() {
-            Some((b'\r', head)) => head,
-            _ => line,
-        }
+        crate::secret_file::read_line(&mut std::io::stdin())
     }
 
     /// Borrow a read buffer as text, without copying it out of its wiped
@@ -1937,14 +1915,47 @@ mod secret {
         format!("{} {env_var}", Msg::SecretEnvWarning.text(locale))
     }
 
-    /// The stderr warning printed when a secret file is accepted on a platform
-    /// where the owner-only gate does not run.
-    fn unchecked_platform_warning(locale: Locale, path: &Path) -> String {
-        format!(
-            "{} {}",
-            Msg::SecretFileUncheckedPlatform.text(locale),
-            path.display()
-        )
+    /// The warning owed to the operator when a secret-bearing file was accepted
+    /// without the owner-only gate, or `None` where the gate ran.
+    ///
+    /// The gate's reach is a parameter rather than read here so both callers —
+    /// this ladder and the file backend's key — say the same thing, and so both
+    /// answers can be seen on either platform.
+    pub(super) fn unchecked_gate_notice(
+        gate_enforced: bool,
+        locale: Locale,
+        path: &Path,
+    ) -> Option<String> {
+        (!gate_enforced).then(|| {
+            format!(
+                "{} {}",
+                Msg::SecretFileUncheckedPlatform.text(locale),
+                path.display()
+            )
+        })
+    }
+
+    /// A localized error for a line that could not be read from `origin`.
+    ///
+    /// A secret longer than the bound is called out as its own case: read as a
+    /// generic I/O failure it would send the operator looking at permissions,
+    /// when what happened is that the source held no line terminator.
+    fn line_error(
+        request: &Request<'_>,
+        failure: &crate::secret_file::ReadLineError,
+        unreadable: Msg,
+        origin: &str,
+    ) -> SecretError {
+        match failure {
+            crate::secret_file::ReadLineError::TooLong => error(
+                request,
+                Msg::SecretTooLong,
+                &format!("{origin} ({} bytes)", crate::secret_file::MAX_SECRET_LEN),
+            ),
+            crate::secret_file::ReadLineError::Io(e) => {
+                error(request, unreadable, &format!("{origin}: {e}"))
+            }
+        }
     }
 
     /// The error shown when no source produced a secret, naming every source
@@ -1974,9 +1985,9 @@ mod secret {
         #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
         use super::{
-            accept, climb, console_failure_is_fatal, env_warning, error, first_line,
-            read_line_from, read_secret_file, resolve_with, rungs, unchecked_platform_warning,
-            Facts, FlagSource, Msg, PathBuf, Ports, Request, Rung, SecretError,
+            accept, climb, console_failure_is_fatal, env_warning, error, line_error,
+            read_secret_file, resolve_with, rungs, unchecked_gate_notice, Facts, FlagSource, Msg,
+            PathBuf, Ports, Request, Rung, SecretError,
         };
         use crate::l10n::Locale;
         use secrecy::ExposeSecret as _;
@@ -2151,27 +2162,52 @@ mod secret {
             assert!(err.to_string().contains("absent"));
         }
 
-        /// One line is taken and its terminator dropped; the rest of the stream
-        /// is ignored and inner spaces survive.
+        /// A secret file is read to its first line and no further: the rest of
+        /// the file is neither consumed nor required to arrive.
         #[test]
-        fn one_line_is_read_and_its_terminator_dropped() {
-            assert_eq!(&*read_line_from(&mut &b"pw\n"[..]).unwrap(), b"pw");
-            assert_eq!(&*read_line_from(&mut &b"pw\r\n"[..]).unwrap(), b"pw");
-            assert_eq!(&*read_line_from(&mut &b"pw"[..]).unwrap(), b"pw");
-            assert_eq!(
-                &*read_line_from(&mut &b"a b \nnext\n"[..]).unwrap(),
-                b"a b "
-            );
+        fn a_secret_file_is_read_to_its_first_line_only() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pin");
+            std::fs::write(&path, "s3cret\nnot-the-secret\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+
+            let mut warnings = Vec::new();
+            let secret = read_secret_file(&path, &request(None), &mut ports(None, &mut warnings))
+                .unwrap()
+                .unwrap();
+            assert_eq!(secret.expose_secret(), "s3cret");
         }
 
-        /// The same line-taking applied to a buffer read whole.
+        /// A source with no line break within the bound is refused by name, not
+        /// as a generic read failure — and the bound is in the message.
         #[test]
-        fn the_first_line_of_a_whole_buffer_loses_its_terminator() {
-            assert_eq!(first_line(b"pw\n"), b"pw");
-            assert_eq!(first_line(b"pw\r\n"), b"pw");
-            assert_eq!(first_line(b"pw"), b"pw");
-            assert_eq!(first_line(b"a b \nnext\n"), b"a b ");
-            assert_eq!(first_line(b""), b"");
+        fn a_source_without_a_line_break_is_refused_by_name() {
+            let failure = crate::secret_file::ReadLineError::TooLong;
+            let message = line_error(
+                &request(None),
+                &failure,
+                Msg::SecretFileUnreadable,
+                "/run/secrets/pin",
+            )
+            .to_string();
+            assert!(message.contains("no line break"), "{message:?}");
+            assert!(message.contains("/run/secrets/pin"), "{message:?}");
+            assert!(
+                message.contains(&crate::secret_file::MAX_SECRET_LEN.to_string()),
+                "{message:?} must name the bound"
+            );
+
+            let ru = Request {
+                locale: Locale::Ru,
+                ..request(None)
+            };
+            let ru_message =
+                line_error(&ru, &failure, Msg::SecretFileUnreadable, "pin").to_string();
+            assert!(ru_message.contains("перевода строки"), "{ru_message:?}");
         }
 
         /// The environment rung answers from the injected environment and says
@@ -2239,10 +2275,17 @@ mod secret {
         }
 
         /// A console prompt that could not start hands the ladder on; one the
-        /// operator interrupted stops it.
+        /// operator ended stops it.
+        ///
+        /// Both ways of ending it count. `rpassword` reports `Ctrl-C` as an
+        /// interrupt and `Ctrl-D` (`Ctrl-Z` on Windows) with nothing typed as an
+        /// unexpected end of input; treating the latter as "the rung could not
+        /// start" would walk past a refusal straight into the environment
+        /// variable.
         #[test]
-        fn only_an_interrupted_console_entry_stops_the_ladder() {
+        fn an_interrupted_or_ended_console_entry_stops_the_ladder() {
             assert!(console_failure_is_fatal(std::io::ErrorKind::Interrupted));
+            assert!(console_failure_is_fatal(std::io::ErrorKind::UnexpectedEof));
             for kind in [
                 std::io::ErrorKind::NotFound,
                 std::io::ErrorKind::PermissionDenied,
@@ -2257,14 +2300,21 @@ mod secret {
         }
 
         /// A platform without the permission gate says so, in the operator's
-        /// locale, naming the file it did not check.
+        /// locale, naming the file it did not check; a platform with one says
+        /// nothing.
         #[test]
         fn an_unchecked_platform_is_announced() {
             let path = PathBuf::from("/run/secrets/pin");
-            let en = unchecked_platform_warning(Locale::En, &path);
+            let en = unchecked_gate_notice(false, Locale::En, &path).unwrap();
             assert!(en.contains("/run/secrets/pin"));
             assert!(en.contains("does not check file permissions"));
-            assert!(unchecked_platform_warning(Locale::Ru, &path).contains("права файла"));
+            assert!(unchecked_gate_notice(false, Locale::Ru, &path)
+                .unwrap()
+                .contains("права файла"));
+            assert!(
+                unchecked_gate_notice(true, Locale::En, &path).is_none(),
+                "a gate that ran has nothing to announce"
+            );
         }
 
         /// An empty value is refused rather than passed on as a secret.

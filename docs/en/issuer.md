@@ -268,7 +268,10 @@ backend — are requested through a single ladder of sources:
    pinentry-compatible dialog; `--pin-file <path>` / `--pin-stdin` for the token
    PIN; `--key-passphrase-file <path>` / `--key-passphrase-stdin` for the file
    backend's key passphrase. A named source is used without consulting any
-   other. Naming two at once is an argument-parsing error.
+   other. Naming two at once is an argument-parsing error. So is naming a flag
+   that belongs to another backend (`--key-passphrase-file` with
+   `--backend pkcs11`, say): a source you named is never silently swapped for
+   another.
 2. **A pinentry found on `PATH`** (`pinentry`, `pinentry-mac`, `pinentry-gtk-2`,
    `pinentry-qt`, `pinentry-curses`).
 3. **Console input with the echo off**, when the process is attached to a
@@ -306,6 +309,18 @@ bypassing the standard library's own. Elsewhere that bypass is unavailable and
 the secret stays in the standard-input buffer for the life of the process. Where
 that matters, prefer `--pin-file` and `--key-passphrase-file`: the file source
 leaves no such residue.
+
+This source is meant for a pipe or a terminal. Redirecting standard input from a
+file that has been **partly consumed** is not a supported way to name a secret:
+`/dev/stdin` differs between Unixes — on Linux it resolves through
+`/proc/self/fd/0` and reopening a regular file starts at offset zero, while on
+macOS the descriptor is duplicated along with its current position. So
+`exec 0<secrets.txt`, one line read away, then `issuer --pin-stdin` takes the
+file's first line on Linux and the next unread one on macOS. To read a secret
+from a file, use `--pin-file`, which does it predictably.
+
+A secret is bounded at 4096 bytes: a source that gives no line break within that
+length is refused, and the error names the source and the bound.
 
 ### Vault / OpenBao Transit
 

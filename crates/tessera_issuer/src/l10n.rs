@@ -251,6 +251,9 @@ pub(crate) enum Msg {
     SecretPinentryFailed,
     /// Secret ladder: the source produced an empty value (its name follows).
     SecretEmpty,
+    /// Secret ladder: the source produced no line break within the accepted
+    /// length (the source and the bound follow).
+    SecretTooLong,
 }
 
 #[cfg(feature = "cli")]
@@ -310,6 +313,9 @@ impl Msg {
             Msg::SecretConsoleFailed => "the console secret prompt failed:",
             Msg::SecretPinentryFailed => "the pinentry program returned no secret:",
             Msg::SecretEmpty => "the secret source returned an empty value:",
+            Msg::SecretTooLong => {
+                "the secret source gave no line break within the accepted length:"
+            }
         }
     }
 
@@ -360,6 +366,9 @@ impl Msg {
             Msg::SecretConsoleFailed => "не удалось запросить секрет в консоли:",
             Msg::SecretPinentryFailed => "программа pinentry не вернула секрет:",
             Msg::SecretEmpty => "источник секрета вернул пустое значение:",
+            Msg::SecretTooLong => {
+                "источник секрета не дал перевода строки в пределах допустимой длины:"
+            }
         }
     }
 }
