@@ -162,6 +162,64 @@ fn privileged_config_loader_rejects_user_controlled_path() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// True when the test process itself runs as root. Only then can a fixture
+/// this test writes to a tempdir come out root-owned, which is what
+/// `load_privileged_validated_config`'s `ExecTrust::Root` walk requires for
+/// every path it touches, including the config file itself. Mirrors the same
+/// check `privileged_path.rs`'s own unit tests use.
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    nix::unistd::Uid::effective().is_root()
+}
+
+/// Regression test for the bug where `mode = "pkcs12"` configs with a
+/// leftover (non-existent) `pkcs11_module` from the example file failed
+/// `pam_tessera` auth even though `tessera check` reported them clean: the
+/// privileged loader canonicalized `pkcs11_module` unconditionally instead of
+/// only when it is actually the active mode. A `pkcs12` config must load
+/// successfully via `load_privileged_validated_config` regardless of what
+/// `pkcs11_module` points at.
+#[cfg(unix)]
+#[test]
+fn privileged_loader_ignores_pkcs11_module_path_when_mode_is_pkcs12(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !running_as_root() {
+        eprintln!(
+            "skip: requires a root-owned config file and trust anchor (run as root to exercise)"
+        );
+        return Ok(());
+    }
+
+    let dir = tempfile::tempdir()?;
+    let anchor = write_anchor(dir.path());
+    let stale_module = "pkcs11_module = \"/nonexistent/rutoken/driver.so\"";
+    let body = fixture_with_anchor(&anchor)
+        .replace("mode = \"pkcs11\"", "mode = \"pkcs12\"")
+        .replace(
+            &format!(
+                "pkcs11_module = {}",
+                test_support::toml_path(test_support::SHELL_PATH)
+            ),
+            stale_module,
+        );
+    assert!(
+        body.contains(stale_module),
+        "fixture must still carry the non-existent pkcs11_module for this to be a meaningful test"
+    );
+
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, &body)?;
+
+    let validated = load_privileged_validated_config(&config_path)?;
+
+    assert_eq!(validated.mode, tessera_core::config::validated::Mode::Pkcs12);
+    assert_eq!(
+        validated.pkcs11_module.as_deref(),
+        Some(Path::new("/nonexistent/rutoken/driver.so"))
+    );
+    Ok(())
+}
+
 #[test]
 fn validated_config_accepts_logging_without_deprecated_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
