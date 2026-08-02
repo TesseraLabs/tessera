@@ -167,6 +167,10 @@ Next steps:
      account name IS a role name. See README.
   4. systemctl enable --now tessera.service
   5. Integrate the PAM stack:
+        WARNING: keep a second root shell open before this step — it is
+        your only way back in if the PAM stack breaks and locks out
+        sudo/login. Run 'sudo tessera check' first and confirm it
+        reports no ERROR before proceeding.
         sudo /usr/share/tessera/integrate-pam.sh /etc/pam.d/sudo
         sudo /usr/share/tessera/integrate-pam.sh /etc/pam.d/fly-dm
 ==============================================================

@@ -44,18 +44,51 @@ sudo apt install -y \
     libudev1 \
     libdbus-1-3 \
     libsystemd0 \
-    pcsc-lite \
     pcscd \
     opensc-pkcs11 \
-    gost-engine \
+    libgost-astra \
     pamtester
 ```
 
-The exact package names match the Astra SE 1.7 repository. On
-Ubuntu 22.04 the `gost-engine` package is not in the main repository —
-you have to build it from source or take it from a third-party PPA, and
-in that case the GOST functionality will not work (see the README,
-"Supported operating systems" section).
+The GOST engine package name depends on the system: `libgost-astra` on
+Astra SE (as above); on plain Debian/Ubuntu, if available at all in
+your configured repositories, it's `libgost-engine`. The `.deb`
+declares the dependency as the alternation `libgost-engine |
+gost-engine | libgost-astra` — `apt install ./tessera_*.deb` (§2.4)
+will pull whatever actually resolves; `apt-cache search gost` shows
+what's available in your repos. On Ubuntu 22.04 none of the three is in
+the main repository — build the engine from source (see the README,
+"Supported operating systems" section; the same build path documented
+for macOS — [gost-engine-macos.md](gost-engine-macos.md) —
+carries over to Linux with minor changes).
+
+If `apt install` can't find `pamtester` (or other packages above) on
+Ubuntu/Debian, check whether the `universe`/`multiverse` component is
+enabled (`sudo add-apt-repository universe && sudo apt update` on
+Ubuntu): `pamtester` is a real `.deb` dependency (see
+`debian/control`), it just doesn't live in `main`. **On Astra SE
+`pamtester` isn't packaged at all** — not in any component
+(`main`/`contrib`/`non-free`/`non-free-firmware`) of either
+`repository-main` or `repository-extended`; `apt-cache search
+pamtester` there is always empty, no repository will fix it. It builds
+from source in about a minute (upstream hasn't moved since 2005,
+version is always `0.1.2`, the only dependency is `libpam0g-dev`):
+
+```bash
+sudo apt install -y build-essential libpam0g-dev
+cd /tmp
+wget -L "https://sourceforge.net/projects/pamtester/files/pamtester/0.1.2/pamtester-0.1.2.tar.gz/download" -O pamtester-0.1.2.tar.gz
+# fallback mirror of the same tarball if SourceForge serves an
+# interstitial page instead of the file:
+#   wget http://deb.debian.org/debian/pool/main/p/pamtester/pamtester_0.1.2.orig.tar.gz -O pamtester-0.1.2.tar.gz
+tar xzf pamtester-0.1.2.tar.gz
+cd pamtester-0.1.2
+./configure && make
+sudo make install
+```
+
+Installs to `/usr/local/bin/pamtester` — it lands on `PATH`
+automatically, and is used exactly as in §10 from there on.
 
 ### 1.4 Checking `gost-engine`
 
@@ -66,6 +99,13 @@ openssl engine gost -t
 Expected: the output contains `[ available ]` and a list of available
 algorithms, including `id-GostR3411-2012-256` (Streebog-256) and
 `gost2012_256` (GOST 34.10-2012-256).
+
+> Sections 3–4 (issuing a test CA and certificates) don't have to run
+> on the target Astra machine — they're just `openssl` invocations, and
+> it's often more convenient to run them on the administrator's
+> workstation. Homebrew has no prebuilt `gost-engine` package for
+> macOS — build it from source, see
+> [gost-engine-macos.md](gost-engine-macos.md).
 
 ### Verification (section 1)
 
@@ -134,24 +174,35 @@ not go through — `pam_tessera.so` simply does not load. See also
 
 ### 2.1 Download
 
+Releases are published on GitHub:
+[github.com/TesseraLabs/tessera/releases](https://github.com/TesseraLabs/tessera/releases).
+The release publishes only the `.deb` in two variants (`…-astra.deb`
+and `…-ubuntu.deb`), plus `.changes` and `.buildinfo` for audit — there
+are no ready-made checksum files there; the operator computes them on a
+trusted machine (see §2.2). Download the variant you need via the `gh`
+CLI or manually from the browser:
+
 ```bash
-# The release link is a placeholder; replace it with the real URL after
-# v0.5.0 is published (usually GitHub Releases or the Astra Linux
-# internal repository). The release publishes only the `.deb` in two
-# variants (`…-astra.deb` and `…-ubuntu.deb`, plus `.changes` and
-# `.buildinfo` for audit) — there are no ready-made checksum files there;
-# the operator computes them on a trusted machine (see §2.2).
-wget https://example.test/releases/tessera_0.5.0-1_amd64.deb
+gh release download v0.5.0 --repo TesseraLabs/tessera --pattern '*-astra.deb'
+# or for an Ubuntu target:
+# gh release download v0.5.0 --repo TesseraLabs/tessera --pattern '*-ubuntu.deb'
 ```
 
 ### 2.2 Generating the checksums (trusted machine)
 
 The checksums are computed by the builder or the operator on a
 **trusted** machine (not the target) with the `generate-checksums.sh`
-script:
+script. The script lives in the repository
+(`scripts/generate-checksums.sh`) and is not bundled into the `.deb` —
+the trusted machine needs either a clone of `tessera` at the matching
+tag (`git clone --branch v0.5.0 --depth 1
+https://github.com/TesseraLabs/tessera.git`) or just the file itself:
 
 ```bash
-scripts/generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
+curl -fsSL -o generate-checksums.sh \
+    https://raw.githubusercontent.com/TesseraLabs/tessera/v0.5.0/scripts/generate-checksums.sh
+chmod +x generate-checksums.sh
+./generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
 ```
 
 The script puts a `checksums.txt` file into the `checksums/` directory —
@@ -162,9 +213,19 @@ the `.deb` itself and for every file inside the package — plus standalone
 the section is skipped, and SHA-256 is still computed.
 
 Three things are delivered to the target machine: the `.deb` itself,
-`checksums.txt`, and a copy of `verify-checksums.sh` (the script is
+`checksums.txt` (generated on the trusted machine in §2.2, transferred
+manually — scp, USB, etc.), and `verify-checksums.sh` (the script is
 self-contained — the only external thing it needs is `openssl` with
-`gost-engine` for the GOST section).
+`gost-engine` for the GOST section). Unlike `checksums.txt`, the script
+itself is a static repository file, so it's simpler to download it
+directly on the target machine rather than copy it from the trusted
+one:
+
+```bash
+curl -fsSL -o verify-checksums.sh \
+    https://raw.githubusercontent.com/TesseraLabs/tessera/v0.5.0/scripts/verify-checksums.sh
+chmod +x verify-checksums.sh
+```
 
 ### 2.3 Verifying on the target machine
 
@@ -187,7 +248,8 @@ cause is understood.
 sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
-`apt` will pull in the missing dependencies (`libgost-engine | gost-engine`,
+`apt` will pull in the missing dependencies (`libgost-engine |
+gost-engine | libgost-astra`,
 `libpkcs11-helper1`, `librtpkcs11ecp`).
 
 ### 2.4½ Preflight check (`tessera check`)
@@ -282,7 +344,15 @@ test -d /run/tessera && echo "runtime dir OK"
 test -S /run/tessera/monitord.sock && echo "socket OK"
 ```
 
-Expected: version `0.5.0`, both `OK` lines.
+Expected: version `0.5.0`. On a **fresh** machine where
+`/etc/tessera/config.toml` does not exist yet (see the `.deb`'s
+post-install hint — `cp config.toml.example config.toml`), the other
+two lines are expected to stay empty: the daemon starts, but a valid
+`config.toml` needs material from §3 (CA), §7 (cert extensions) and §8
+(role store) that doesn't exist yet at this point in the walkthrough.
+Both lines should only appear after `systemctl restart tessera` at the
+end of §8 — the full daemon/socket check happens there, in Verification
+(section 8) and the §10 smoke test.
 
 ## 3. Creating a test CA (GOST)
 
@@ -317,7 +387,7 @@ openssl req -new -x509 -engine gost -key ca.key \
 ### 3.4 Check
 
 ```bash
-openssl x509 -in ca.pem -text -noout | head -30
+openssl x509 -engine gost -in ca.pem -text -noout | head -30
 ```
 
 Expected line: `Signature Algorithm: GOST R 34.10-2012 with GOST R 34.11-2012 (256 bit)`.
@@ -325,7 +395,7 @@ Expected line: `Signature Algorithm: GOST R 34.10-2012 with GOST R 34.11-2012 (2
 ### Verification (section 3)
 
 ```bash
-openssl verify -CAfile ca.pem ca.pem
+openssl verify -engine gost -CAfile ca.pem ca.pem
 ```
 
 Expected: `ca.pem: OK`.
