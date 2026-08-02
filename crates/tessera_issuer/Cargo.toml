@@ -22,7 +22,7 @@ required-features = ["cli"]
 # host and the binary is not built.
 default = ["native"]
 native = ["dep:rand"]
-cli = ["native", "dep:clap"]
+cli = ["native", "dep:clap", "dep:rpassword"]
 # Exposes the deterministic in-crate signer so integration tests (and, later,
 # the CLI's dry-run mode) can assemble artifacts without a real key store.
 test-support = []
@@ -76,6 +76,9 @@ base64 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
+# Console secret entry with the echo off (the CLI's interactive step). Pulled by
+# the `cli` feature only, so the wasm core never sees it.
+rpassword = { workspace = true, optional = true }
 cryptoki = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }

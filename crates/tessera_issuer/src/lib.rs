@@ -80,6 +80,11 @@ pub mod l10n;
 pub mod monotonicity;
 mod profile;
 pub mod serial;
+// The owner-only gate shared by the file backend's key file and the CLI's
+// `--pin-file`/`--key-passphrase-file` sources. Compiled only where one of those
+// readers exists, so no other build carries an unused check.
+#[cfg(any(feature = "file", all(feature = "cli", feature = "pkcs11")))]
+mod secret_file;
 pub mod sign;
 pub mod summary;
 mod tbs;

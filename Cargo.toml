@@ -114,6 +114,11 @@ ureq = { version = "3", default-features = false, features = [
     "json",
 ] }
 base64 = "0.22"
+# Console secret entry with the echo turned off, for the issuer CLI. The three
+# platforms need termios / Console API calls, and the issuer crate denies
+# `unsafe_code`, so the unsafe lives behind this crate instead of being
+# reimplemented per platform. Native-only, behind the `cli` feature.
+rpassword = "7.5"
 # Browser entropy backend for the wasm issuer core: the RustCrypto stack
 # (p256/rsa) pulls `getrandom`, which needs the `js` feature on
 # `wasm32-unknown-unknown`. Native targets never use this.

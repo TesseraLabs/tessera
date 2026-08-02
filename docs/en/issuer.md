@@ -50,10 +50,9 @@ the key itself and the flag acts as a cross-check). Times
 (`--parent`, `--spki`, `--csr`, `--issuer`) are accepted as PEM or DER (the
 format is detected from the content). Output is PEM, or DER with `--der`.
 
-The token PIN is **never** a command-line argument: the PKCS#11 backend prompts
-for it through pinentry for the duration of the operation, falling back to the
-`TESSERA_ISSUER_PIN` environment variable when no pinentry is available (see
-[Signing backends](#signing-backends)).
+The token PIN is **never** a command-line argument: the tool prompts for it for
+the duration of the operation, following the ladder of sources — see
+[Secret sources](#secret-sources).
 
 ### Issue an organisation CA
 
@@ -251,13 +250,49 @@ The default backend, one code path for hardware tokens and HSMs. Flags:
 (select a token when there are several), `--key` (the CA key's `CKA_LABEL`),
 `--pinentry` (the pinentry program explicitly).
 
-The PIN is requested through pinentry for the duration of the operation
-(`Secret` + `zeroize`, never in logs or argv); absent pinentry, from
-`TESSERA_ISSUER_PIN`.
+The PIN is requested for the duration of the operation (`Secret` + `zeroize`,
+never in logs or argv) following the ladder of sources — see
+[Secret sources](#secret-sources). For a non-interactive run: `--pin-file <path>`
+or `--pin-stdin`.
 
 For trials and CI, **SoftHSM** works as a software PKCS#11 module. GOST tokens
 work through the same adapter when the token exposes the required PKCS#11
 mechanism.
+
+### Secret sources
+
+Backend secrets — the token PIN for PKCS#11 and the key passphrase for the file
+backend — are requested through a single ladder of sources:
+
+1. **A source named by a flag.** `--pinentry <path>` for an external
+   pinentry-compatible dialog; `--pin-file <path>` / `--pin-stdin` for the token
+   PIN; `--key-passphrase-file <path>` / `--key-passphrase-stdin` for the file
+   backend's key passphrase. A named source is used without consulting any
+   other. Naming two at once is an argument-parsing error.
+2. **A pinentry found on `PATH`** (`pinentry`, `pinentry-mac`, `pinentry-gtk-2`,
+   `pinentry-qt`, `pinentry-curses`).
+3. **Console input with the echo off**, when the process is attached to a
+   terminal.
+4. **An environment variable** — `TESSERA_ISSUER_PIN` or
+   `TESSERA_ISSUER_KEY_PASSPHRASE` — as the last resort, with a warning: the
+   value is visible to child processes and lands in memory dumps.
+
+```mermaid
+graph TD
+  A["A secret is needed"] --> B{"source named by a flag?"}
+  B -->|--pinentry| C["external dialog"]
+  B -->|--pin-file / --pin-stdin| D["read from a file or stream"]
+  B -->|no| E{"pinentry on PATH?"}
+  E -->|yes| C
+  E -->|no| F{"a terminal?"}
+  F -->|yes| G["console input, echo off"]
+  F -->|no| H["environment variable<br/>+ warning"]
+```
+
+Installing GnuPG or Gpg4win is required on no platform: without pinentry the
+tool prompts for the secret itself. A secret file must be unreadable by group
+and others (`chmod 600`), or the backend refuses before reading its contents. No
+flag takes a secret **by value**: arguments are visible in the process list.
 
 ### Vault / OpenBao Transit
 
@@ -306,8 +341,8 @@ The backend's rules:
   otherwise the backend refuses before reading the contents. File ownership and
   directory permissions are not checked — keep the key in your own directory
   with `700` permissions.
-- The passphrase of an encrypted key is prompted through pinentry, falling back
-  to `TESSERA_ISSUER_KEY_PASSPHRASE`; the passphrase never appears in
+- The passphrase of an encrypted key is prompted through the ladder of sources
+  (see [Secret sources](#secret-sources)); the passphrase never appears in
   command-line arguments or logs, and memory is zeroized.
 - An unencrypted key is accepted, but with a warning on every start; the
   recommendation is encrypted PKCS#8.

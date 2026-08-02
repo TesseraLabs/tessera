@@ -18,9 +18,11 @@
 //!
 //! Help text and subcommand names are English (the usual CLI convention); the
 //! *result* messages an operator reads are localized through [`crate::l10n`].
-//! The token PIN is never a command-line argument: the PKCS#11 backend prompts
-//! for it (pinentry, falling back to `TESSERA_ISSUER_PIN`) only for the duration
-//! of a signing operation.
+//! The token PIN is never a command-line argument: no flag takes a secret by
+//! value. It is obtained for the duration of a signing operation through the
+//! ladder in [`secret`] — a source named by a flag, else a pinentry program on
+//! `PATH`, else a console prompt with the echo off, else `TESSERA_ISSUER_PIN`
+//! with a warning — and the file backend's key passphrase the same way.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -125,9 +127,26 @@ struct BackendArgs {
     #[arg(long)]
     key_file: Option<PathBuf>,
     /// pinentry program for the PIN prompt (pkcs11 backend) or the key
-    /// passphrase prompt (file backend).
-    #[arg(long)]
+    /// passphrase prompt (file backend). Naming one pins the secret source: no
+    /// other source is consulted.
+    #[arg(long, conflicts_with_all = ["pin_stdin", "pin_file", "key_passphrase_stdin", "key_passphrase_file"])]
     pinentry: Option<PathBuf>,
+    /// Read the token PIN as one line from standard input (pkcs11 backend).
+    #[arg(long, conflicts_with_all = ["pin_file", "key_passphrase_stdin"])]
+    pin_stdin: bool,
+    /// Read the token PIN as one line from a file readable only by its owner
+    /// (pkcs11 backend). The flag takes the file's path, never the PIN itself.
+    #[arg(long)]
+    pin_file: Option<PathBuf>,
+    /// Read the CA key passphrase as one line from standard input (file
+    /// backend).
+    #[arg(long, conflicts_with_all = ["key_passphrase_file"])]
+    key_passphrase_stdin: bool,
+    /// Read the CA key passphrase as one line from a file readable only by its
+    /// owner (file backend). The flag takes the file's path, never the
+    /// passphrase itself.
+    #[arg(long)]
+    key_passphrase_file: Option<PathBuf>,
     /// Vault base address, e.g. `https://vault.example:8200` (vault backend).
     #[arg(long)]
     vault_addr: Option<String>,
@@ -143,6 +162,38 @@ struct BackendArgs {
     /// Send a locally computed digest with `prehashed=true` (vault backend).
     #[arg(long)]
     prehashed: bool,
+}
+
+#[cfg(any(feature = "pkcs11", feature = "file"))]
+impl BackendArgs {
+    /// The PIN source the operator named, if any.
+    ///
+    /// Only one can be present: the flags are mutually exclusive at parsing, so
+    /// the order the arms are tried here never decides anything.
+    #[cfg(feature = "pkcs11")]
+    fn pin_source(&self) -> Option<secret::FlagSource> {
+        if let Some(program) = self.pinentry.clone() {
+            return Some(secret::FlagSource::Pinentry(program));
+        }
+        if self.pin_stdin {
+            return Some(secret::FlagSource::Stdin);
+        }
+        self.pin_file.clone().map(secret::FlagSource::File)
+    }
+
+    /// The key-passphrase source the operator named, if any.
+    #[cfg(feature = "file")]
+    fn key_passphrase_source(&self) -> Option<secret::FlagSource> {
+        if let Some(program) = self.pinentry.clone() {
+            return Some(secret::FlagSource::Pinentry(program));
+        }
+        if self.key_passphrase_stdin {
+            return Some(secret::FlagSource::Stdin);
+        }
+        self.key_passphrase_file
+            .clone()
+            .map(secret::FlagSource::File)
+    }
 }
 
 /// Flags for `issuer issue-root`.
@@ -549,7 +600,7 @@ fn run_pkcs11(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Resul
         // registry key is configured by external signing frontends, not here.
         registry_key: None,
     };
-    let signer = Pkcs11Signer::open(config, pin::CliPinSource::new(args.pinentry.clone()))
+    let signer = Pkcs11Signer::open(config, pin::CliPinSource::new(args.pin_source(), locale))
         .map_err(|e| CliError::Backend(e.to_string()))?;
     job.run(&signer, locale)
 }
@@ -610,7 +661,7 @@ fn run_file(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Result<
     // "no cross-check") rather than substituting a default.
     let requested_algorithm = args.algorithm.as_deref().map(parse_algorithm).transpose()?;
     let key_id = effective_key_id(args)?;
-    let passphrase = keypass::FilePassphraseSource::new(args.pinentry.clone());
+    let passphrase = keypass::FilePassphraseSource::new(args.key_passphrase_source(), locale);
     let signer = FileSigner::open(
         FileConfig {
             path,
@@ -1133,12 +1184,12 @@ fn encode_pem(label: &str, der: &[u8]) -> String {
 
 /// Shared pinentry prompting for the interactive backend secrets: the PKCS#11
 /// token PIN and the file-backend key passphrase. The Assuan exchange is the
-/// same; only the prompt caption and the environment fallback differ, so the
-/// exchange lives here and each backend's secret source wraps it.
+/// same; only the prompt caption differs, so the exchange lives here and the
+/// [`secret`] ladder wraps it as one of its sources.
 #[cfg(any(feature = "pkcs11", feature = "file"))]
 mod prompt {
     use std::io::{BufRead, BufReader, Write};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
 
     use secrecy::SecretString;
@@ -1152,24 +1203,17 @@ mod prompt {
         "pinentry-curses",
     ];
 
-    /// Prompt for a secret via pinentry, or `None` if none is available or the
-    /// prompt is cancelled (the caller then falls back to the environment).
+    /// Prompt for a secret with `program`, or `None` if the dialog produced
+    /// none (it is missing, it failed, or the operator cancelled).
     ///
     /// `prompt` is the caption shown in the dialog (e.g. the token PIN or the
     /// key passphrase).
-    pub(super) fn prompt_secret(explicit: Option<PathBuf>, prompt: &str) -> Option<SecretString> {
-        let program = discover(explicit)?;
-        pinentry_get_secret(&program, prompt)
+    pub(super) fn ask(program: &Path, prompt: &str) -> Option<SecretString> {
+        pinentry_get_secret(program, prompt)
     }
 
-    /// Locate a pinentry program: an explicit path if present, else the first
-    /// known name on `PATH`.
-    fn discover(explicit: Option<PathBuf>) -> Option<PathBuf> {
-        if let Some(path) = explicit {
-            if path.exists() {
-                return Some(path);
-            }
-        }
+    /// The first known pinentry program on `PATH`, if any.
+    pub(super) fn discover_on_path() -> Option<PathBuf> {
         let paths = std::env::var_os("PATH")?;
         for dir in std::env::split_paths(&paths) {
             for name in PINENTRY_NAMES {
@@ -1186,7 +1230,7 @@ mod prompt {
     ///
     /// Returns `None` on any channel or protocol failure so the caller can fall
     /// back; a cancelled prompt is also `None`.
-    fn pinentry_get_secret(program: &PathBuf, prompt: &str) -> Option<SecretString> {
+    fn pinentry_get_secret(program: &Path, prompt: &str) -> Option<SecretString> {
         let mut child = Command::new(program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1401,91 +1445,596 @@ mod prompt {
     }
 }
 
-/// The PIN provider for the CLI's PKCS#11 backend: an interactive pinentry
-/// prompt, falling back to the `TESSERA_ISSUER_PIN` environment variable.
-#[cfg(feature = "pkcs11")]
-mod pin {
-    use std::path::PathBuf;
+/// The ladder of secret sources shared by the backends that need one: the
+/// PKCS#11 token PIN and the file backend's CA key passphrase.
+///
+/// The order is fixed — a source named by a flag, else a pinentry program found
+/// on `PATH`, else a console prompt with the echo off, else an environment
+/// variable — and it exists to keep the environment variable last. A pinentry
+/// program ships with `GnuPG`, which is not present on a stock macOS or Windows
+/// workstation; without the console step those two platforms would have the
+/// variable as their only source, and a token PIN in the environment is visible
+/// to every child process and lands in memory dumps.
+///
+/// A source named by a flag is used *alone*: an unattended run that named one
+/// must fail rather than block on a dialog nobody is there to answer.
+///
+/// Whatever the source, the secret is held in a [`SecretString`] (zeroized when
+/// dropped), never logged, never journaled, and never accepted as a flag value —
+/// the file and stdin sources take a path or a stream, so no secret can appear
+/// in `argv`.
+#[cfg(any(feature = "pkcs11", feature = "file"))]
+mod secret {
+    use std::io::{BufRead, IsTerminal as _};
+    use std::path::{Path, PathBuf};
 
     use secrecy::SecretString;
+    use zeroize::Zeroizing;
 
+    use crate::l10n::{Locale, Msg};
+
+    /// A secret source named on the command line.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum FlagSource {
+        /// An operator-supplied Assuan-compatible dialog (`--pinentry`).
+        Pinentry(PathBuf),
+        /// One line on standard input (`--pin-stdin` / `--key-passphrase-stdin`).
+        Stdin,
+        /// One line of an owner-only file (`--pin-file` / `--key-passphrase-file`).
+        File(PathBuf),
+    }
+
+    /// One rung of the ladder: a source to try, in the order [`rungs`] returns.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Rung {
+        /// Ask an Assuan-compatible dialog at this path.
+        Pinentry(PathBuf),
+        /// Read one line from standard input.
+        Stdin,
+        /// Read one line from this file.
+        File(PathBuf),
+        /// Prompt on the attached terminal with the echo off.
+        Console,
+        /// Take the value of the environment variable.
+        Env,
+    }
+
+    /// The process facts the ladder's non-flag rungs depend on.
+    ///
+    /// Kept as data so the precedence can be tested without a terminal, a
+    /// pinentry program, or a mutated environment.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    struct Facts {
+        /// A pinentry program found on `PATH`, if any.
+        discovered_pinentry: Option<PathBuf>,
+        /// Whether a terminal is attached for a console prompt.
+        console: bool,
+        /// Whether the environment variable holds a non-empty value.
+        env_present: bool,
+    }
+
+    impl Facts {
+        /// Probe the running process for the non-flag rungs.
+        fn probe(env_var: &str) -> Self {
+            Self {
+                discovered_pinentry: super::prompt::discover_on_path(),
+                console: console_attached(),
+                env_present: env_value(env_var).is_some(),
+            }
+        }
+    }
+
+    /// One backend secret: what to call it, and where its non-flag sources are.
+    pub(super) struct Request<'a> {
+        /// The source named on the command line, if the operator named one.
+        pub(super) explicit: Option<&'a FlagSource>,
+        /// The prompt caption shown to the operator.
+        pub(super) caption: Msg,
+        /// The environment variable of last resort.
+        pub(super) env_var: &'static str,
+        /// The flags that can name a source, for the message shown when none of
+        /// the sources produced a secret.
+        pub(super) flags: &'static str,
+        /// The operator-message locale.
+        pub(super) locale: Locale,
+    }
+
+    /// A localized failure of the secret ladder.
+    ///
+    /// Carries a message already rendered in the operator's locale and nothing
+    /// else — in particular never a secret, and never a partially read buffer.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct SecretError {
+        /// The localized text shown to the operator.
+        message: String,
+    }
+
+    impl core::fmt::Display for SecretError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for SecretError {}
+
+    /// Obtain the secret described by `request`, walking the ladder.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretError`] when a source was reached and failed (an unreadable or
+    /// over-permissive file, a broken console), or when no source produced a
+    /// secret at all — the latter message names every source that could.
+    pub(super) fn resolve(request: &Request<'_>) -> Result<SecretString, SecretError> {
+        // A named source short-circuits the probe: with one given, the ladder
+        // must not touch `PATH`, the terminal, or the environment at all.
+        let facts = if request.explicit.is_some() {
+            Facts::default()
+        } else {
+            Facts::probe(request.env_var)
+        };
+        for rung in rungs(request.explicit, &facts) {
+            if let Some(secret) = climb(&rung, request)? {
+                return Ok(secret);
+            }
+        }
+        Err(unavailable(request))
+    }
+
+    /// The sources to try, most preferred first.
+    ///
+    /// A named source is the whole ladder. Otherwise the rungs are those the
+    /// process actually has, in the fixed order the module documents.
+    fn rungs(explicit: Option<&FlagSource>, facts: &Facts) -> Vec<Rung> {
+        if let Some(source) = explicit {
+            return vec![match source {
+                FlagSource::Pinentry(program) => Rung::Pinentry(program.clone()),
+                FlagSource::Stdin => Rung::Stdin,
+                FlagSource::File(path) => Rung::File(path.clone()),
+            }];
+        }
+        let mut ladder = Vec::new();
+        if let Some(program) = &facts.discovered_pinentry {
+            ladder.push(Rung::Pinentry(program.clone()));
+        }
+        if facts.console {
+            ladder.push(Rung::Console);
+        }
+        if facts.env_present {
+            ladder.push(Rung::Env);
+        }
+        ladder
+    }
+
+    /// Try one rung: `Ok(Some)` on a secret, `Ok(None)` when the rung produced
+    /// none and the next may be tried, `Err` when the rung failed outright.
+    ///
+    /// Only a pinentry dialog yields `Ok(None)`: a dialog that is missing,
+    /// broken or cancelled is exactly what the rest of the ladder is for. A
+    /// named file or stream that cannot be read is an error instead — silently
+    /// continuing there would send a run that meant to read a file off to an
+    /// interactive prompt or to the environment variable.
+    fn climb(rung: &Rung, request: &Request<'_>) -> Result<Option<SecretString>, SecretError> {
+        let caption = request.caption.text(request.locale);
+        match rung {
+            Rung::Pinentry(program) => match super::prompt::ask(program, caption) {
+                Some(secret) => Ok(Some(secret)),
+                // A named dialog that answers nothing has no successor: the
+                // operator pinned this source, so falling onward would defeat
+                // the pinning.
+                None if request.explicit.is_some() => Err(error(
+                    request,
+                    Msg::SecretPinentryFailed,
+                    &program.display().to_string(),
+                )),
+                None => Ok(None),
+            },
+            Rung::Stdin => {
+                let line = read_line(&mut std::io::stdin().lock())
+                    .map_err(|e| error(request, Msg::SecretStdinUnreadable, &e.to_string()))?;
+                accept(request, &line, "stdin")
+            }
+            Rung::File(path) => read_secret_file(path, request),
+            Rung::Console => {
+                let entered = rpassword::prompt_password(format!("{caption}: "))
+                    .map_err(|e| error(request, Msg::SecretConsoleFailed, &e.to_string()))?;
+                accept(request, &Zeroizing::new(entered), "console")
+            }
+            Rung::Env => {
+                let value =
+                    Zeroizing::new(env_value(request.env_var).ok_or_else(|| unavailable(request))?);
+                eprintln!("{}", env_warning(request.locale, request.env_var));
+                accept(request, &value, request.env_var)
+            }
+        }
+    }
+
+    /// Read a secret file: the owner-only gate first, its first line second.
+    ///
+    /// The gate runs on the file's metadata, so a file anyone can read is
+    /// refused before its bytes are opened, let alone held in memory. It is the
+    /// same gate the file backend applies to the CA key.
+    fn read_secret_file(
+        path: &Path,
+        request: &Request<'_>,
+    ) -> Result<Option<SecretString>, SecretError> {
+        let unreadable = |e: &dyn core::fmt::Display| {
+            error(
+                request,
+                Msg::SecretFileUnreadable,
+                &format!("{}: {e}", path.display()),
+            )
+        };
+        let metadata = std::fs::metadata(path).map_err(|e| unreadable(&e))?;
+        crate::secret_file::reject_beyond_owner(&metadata).map_err(|e| {
+            error(
+                request,
+                Msg::SecretFileBeyondOwner,
+                &format!("{} (mode {:04o})", path.display(), e.mode),
+            )
+        })?;
+        let file = std::fs::File::open(path).map_err(|e| unreadable(&e))?;
+        let line = read_line(&mut std::io::BufReader::new(file)).map_err(|e| unreadable(&e))?;
+        accept(request, &line, &path.display().to_string())
+    }
+
+    /// Read one line into a zeroizing buffer, dropping a single trailing line
+    /// terminator (`\n`, optionally preceded by `\r`).
+    ///
+    /// Only the terminator goes: a secret's own trailing spaces are its content.
+    /// The buffer is wiped when it is dropped, so the plaintext outlives neither
+    /// this call nor the [`SecretString`] built from it.
+    fn read_line(source: &mut impl BufRead) -> std::io::Result<Zeroizing<String>> {
+        let mut buffer = Zeroizing::new(String::new());
+        source.read_line(&mut buffer)?;
+        if buffer.ends_with('\n') {
+            buffer.pop();
+            if buffer.ends_with('\r') {
+                buffer.pop();
+            }
+        }
+        Ok(buffer)
+    }
+
+    /// Wrap a read value as the secret, refusing an empty one.
+    ///
+    /// An empty secret is never what the operator meant — an empty file, an
+    /// empty line, a variable set to nothing — and passing it on would surface
+    /// as a failed login or, on a token, as a consumed PIN attempt.
+    fn accept(
+        request: &Request<'_>,
+        value: &str,
+        origin: &str,
+    ) -> Result<Option<SecretString>, SecretError> {
+        if value.is_empty() {
+            return Err(error(request, Msg::SecretEmpty, origin));
+        }
+        Ok(Some(SecretString::from(value.to_owned())))
+    }
+
+    /// Whether a terminal is attached for an interactive console prompt.
+    ///
+    /// Either end counts. A run whose standard input is a pipe but whose
+    /// standard error is the terminal still has an operator in front of it (the
+    /// shape `ssh` and `sudo` prompt in), and the console prompt reads from the
+    /// terminal device rather than from standard input.
+    fn console_attached() -> bool {
+        std::io::stdin().is_terminal() || std::io::stderr().is_terminal()
+    }
+
+    /// The environment variable's value, treating an empty one as unset.
+    fn env_value(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|value| !value.is_empty())
+    }
+
+    /// The stderr warning printed whenever the environment variable is used.
+    pub(super) fn env_warning(locale: Locale, env_var: &str) -> String {
+        format!("{} {env_var}", Msg::SecretEnvWarning.text(locale))
+    }
+
+    /// The error shown when no source produced a secret, naming every source
+    /// that could have.
+    fn unavailable(request: &Request<'_>) -> SecretError {
+        SecretError {
+            message: format!(
+                "{} {}; {} {}",
+                Msg::SecretUnavailableFlags.text(request.locale),
+                request.flags,
+                Msg::SecretUnavailableFallbacks.text(request.locale),
+                request.env_var,
+            ),
+        }
+    }
+
+    /// A localized ladder error: a caption from the table, then the technical
+    /// detail (a path, a variable name, an OS error) that is not translated.
+    fn error(request: &Request<'_>, caption: Msg, detail: &str) -> SecretError {
+        SecretError {
+            message: format!("{} {detail}", caption.text(request.locale)),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+        use super::{
+            accept, env_warning, error, read_line, read_secret_file, rungs, Facts, FlagSource, Msg,
+            PathBuf, Request, Rung, SecretError,
+        };
+        use crate::l10n::Locale;
+        use secrecy::ExposeSecret as _;
+
+        /// The flag list the PIN request advertises, mirrored from `pin`.
+        const FLAGS: &str = "--pinentry <path>, --pin-file <path>, --pin-stdin";
+
+        /// A PIN-shaped request over `explicit`.
+        fn request(explicit: Option<&FlagSource>) -> Request<'_> {
+            Request {
+                explicit,
+                caption: Msg::SecretPromptTokenPin,
+                env_var: "TESSERA_ISSUER_PIN",
+                flags: FLAGS,
+                locale: Locale::En,
+            }
+        }
+
+        /// A process that has every non-flag source available.
+        fn everything() -> Facts {
+            Facts {
+                discovered_pinentry: Some(PathBuf::from("/usr/bin/pinentry")),
+                console: true,
+                env_present: true,
+            }
+        }
+
+        /// A named dialog is the whole ladder: with `--pinentry` given, no other
+        /// source is consulted even though every one of them is available.
+        #[test]
+        fn a_named_pinentry_is_the_only_rung() {
+            let explicit = FlagSource::Pinentry(PathBuf::from("/opt/corp/pinentry"));
+            assert_eq!(
+                rungs(Some(&explicit), &everything()),
+                vec![Rung::Pinentry(PathBuf::from("/opt/corp/pinentry"))]
+            );
+        }
+
+        /// A named file wins over a pinentry on `PATH`: an unattended run must
+        /// not be diverted into a dialog nobody can answer.
+        #[test]
+        fn a_named_file_outranks_a_discovered_pinentry() {
+            let explicit = FlagSource::File(PathBuf::from("/run/secrets/pin"));
+            assert_eq!(
+                rungs(Some(&explicit), &everything()),
+                vec![Rung::File(PathBuf::from("/run/secrets/pin"))]
+            );
+            let explicit = FlagSource::Stdin;
+            assert_eq!(rungs(Some(&explicit), &everything()), vec![Rung::Stdin]);
+        }
+
+        /// With no flag, a pinentry on `PATH` leads and the rest follow it.
+        #[test]
+        fn a_discovered_pinentry_leads_the_unnamed_ladder() {
+            assert_eq!(
+                rungs(None, &everything()),
+                vec![
+                    Rung::Pinentry(PathBuf::from("/usr/bin/pinentry")),
+                    Rung::Console,
+                    Rung::Env,
+                ]
+            );
+        }
+
+        /// No pinentry but a terminal: the console prompt is used, and the
+        /// environment variable is not needed to reach a secret.
+        #[test]
+        fn without_a_pinentry_a_terminal_makes_the_console_the_source() {
+            let facts = Facts {
+                discovered_pinentry: None,
+                console: true,
+                env_present: true,
+            };
+            let ladder = rungs(None, &facts);
+            assert_eq!(ladder.first(), Some(&Rung::Console));
+
+            // And with no variable set at all the console still answers.
+            let facts = Facts {
+                console: true,
+                ..Facts::default()
+            };
+            assert_eq!(rungs(None, &facts), vec![Rung::Console]);
+        }
+
+        /// No pinentry and no terminal: the environment variable is the last
+        /// resort, and it is announced.
+        #[test]
+        fn without_a_terminal_the_environment_is_the_last_resort() {
+            let facts = Facts {
+                discovered_pinentry: None,
+                console: false,
+                env_present: true,
+            };
+            assert_eq!(rungs(None, &facts), vec![Rung::Env]);
+
+            let warning = env_warning(Locale::En, "TESSERA_ISSUER_PIN");
+            assert!(warning.contains("TESSERA_ISSUER_PIN"));
+            assert!(warning.contains("child processes"));
+            assert!(env_warning(Locale::Ru, "TESSERA_ISSUER_PIN").contains("дочерним процессам"));
+        }
+
+        /// With nothing available the ladder is empty and the error names every
+        /// source the operator could have offered.
+        #[test]
+        fn an_empty_ladder_reports_every_source() {
+            assert!(rungs(None, &Facts::default()).is_empty());
+            let message = super::unavailable(&request(None)).to_string();
+            for source in [
+                "--pinentry",
+                "--pin-file",
+                "--pin-stdin",
+                "pinentry program on PATH",
+                "interactive terminal",
+                "TESSERA_ISSUER_PIN",
+            ] {
+                assert!(message.contains(source), "{message:?} must name {source}");
+            }
+        }
+
+        /// A file reachable by group or others is refused on its metadata — the
+        /// error names the mode and the content is never read.
+        #[cfg(unix)]
+        #[test]
+        fn a_group_readable_file_is_refused_before_its_content_is_read() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pin");
+            std::fs::write(&path, "s3cret\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+            let err = read_secret_file(&path, &request(None)).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("0640"), "{message:?} must name the mode");
+            assert!(
+                !message.contains("s3cret"),
+                "the error must not carry content"
+            );
+
+            // Tightened to owner-only, the same file is read.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let secret = read_secret_file(&path, &request(None)).unwrap().unwrap();
+            assert_eq!(secret.expose_secret(), "s3cret");
+        }
+
+        /// A missing file is an error, not a fall-through to another source.
+        #[test]
+        fn a_missing_secret_file_is_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let err = read_secret_file(&dir.path().join("absent"), &request(None)).unwrap_err();
+            assert!(err.to_string().contains("absent"));
+        }
+
+        /// One line is taken and its terminator dropped; the rest of the stream
+        /// is ignored and inner spaces survive.
+        #[test]
+        fn one_line_is_read_and_its_terminator_dropped() {
+            assert_eq!(&*read_line(&mut &b"pw\n"[..]).unwrap(), "pw");
+            assert_eq!(&*read_line(&mut &b"pw\r\n"[..]).unwrap(), "pw");
+            assert_eq!(&*read_line(&mut &b"pw"[..]).unwrap(), "pw");
+            assert_eq!(&*read_line(&mut &b"a b \nnext\n"[..]).unwrap(), "a b ");
+        }
+
+        /// An empty value is refused rather than passed on as a secret.
+        #[test]
+        fn an_empty_value_is_refused() {
+            let err = accept(&request(None), "", "stdin").unwrap_err();
+            assert!(err.to_string().contains("stdin"));
+        }
+
+        /// Errors are localized and carry only the technical detail beside the
+        /// caption.
+        #[test]
+        fn errors_are_localized() {
+            let explicit = FlagSource::Stdin;
+            let ru = Request {
+                locale: Locale::Ru,
+                ..request(Some(&explicit))
+            };
+            let err: SecretError = error(&ru, Msg::SecretFileUnreadable, "/run/secrets/pin");
+            assert!(err.to_string().starts_with("не удалось"));
+            assert!(err.to_string().ends_with("/run/secrets/pin"));
+        }
+    }
+}
+
+/// The PIN provider for the CLI's PKCS#11 backend: the shared secret ladder,
+/// captioned as the token PIN.
+#[cfg(feature = "pkcs11")]
+mod pin {
+    use secrecy::SecretString;
+
+    use crate::l10n::{Locale, Msg};
     use crate::pkcs11::{PinSource, Pkcs11SignError};
 
-    /// A [`PinSource`] that prompts via pinentry, then falls back to the
-    /// `TESSERA_ISSUER_PIN` environment variable for non-interactive use.
+    use super::secret::{self, FlagSource, Request};
+
+    /// The flags that name a PIN source, for the message shown when none did.
+    const PIN_FLAGS: &str = "--pinentry <path>, --pin-file <path>, --pin-stdin";
+    /// The environment variable of last resort.
+    const PIN_ENV: &str = "TESSERA_ISSUER_PIN";
+
+    /// A [`PinSource`] backed by the ladder in [`super::secret`].
     pub(super) struct CliPinSource {
-        explicit_pinentry: Option<PathBuf>,
+        /// The source the operator named, if any.
+        explicit: Option<FlagSource>,
+        /// The operator-message locale.
+        locale: Locale,
     }
 
     impl CliPinSource {
-        /// A PIN source preferring `explicit_pinentry`, then a discovered one.
-        pub(super) fn new(explicit_pinentry: Option<PathBuf>) -> Self {
-            Self { explicit_pinentry }
+        /// A PIN source over the source `explicit` names, else the full ladder.
+        pub(super) fn new(explicit: Option<FlagSource>, locale: Locale) -> Self {
+            Self { explicit, locale }
         }
     }
 
     impl PinSource for CliPinSource {
         fn pin(&self) -> Result<SecretString, Pkcs11SignError> {
-            if let Some(secret) =
-                super::prompt::prompt_secret(self.explicit_pinentry.clone(), "Tessera token PIN")
-            {
-                return Ok(secret);
-            }
-            std::env::var("TESSERA_ISSUER_PIN")
-                .ok()
-                .filter(|p| !p.is_empty())
-                .map(SecretString::from)
-                .ok_or_else(|| {
-                    Pkcs11SignError::PinUnavailable(
-                        "no pinentry available; set TESSERA_ISSUER_PIN".to_owned(),
-                    )
-                })
+            secret::resolve(&Request {
+                explicit: self.explicit.as_ref(),
+                caption: Msg::SecretPromptTokenPin,
+                env_var: PIN_ENV,
+                flags: PIN_FLAGS,
+                locale: self.locale,
+            })
+            .map_err(|e| Pkcs11SignError::PinUnavailable(e.to_string()))
         }
     }
 }
 
-/// The passphrase provider for the CLI's file backend: an interactive pinentry
-/// prompt, falling back to the `TESSERA_ISSUER_KEY_PASSPHRASE` environment
-/// variable.
+/// The passphrase provider for the CLI's file backend: the shared secret ladder,
+/// captioned as the CA key passphrase.
 #[cfg(feature = "file")]
 mod keypass {
-    use std::path::PathBuf;
-
     use secrecy::SecretString;
 
     use crate::file::{FileSignError, PassphraseSource};
+    use crate::l10n::{Locale, Msg};
 
-    /// A [`PassphraseSource`] that prompts via pinentry, then falls back to the
-    /// `TESSERA_ISSUER_KEY_PASSPHRASE` environment variable.
+    use super::secret::{self, FlagSource, Request};
+
+    /// The flags that name a passphrase source, for the message shown when none
+    /// did.
+    const KEY_FLAGS: &str =
+        "--pinentry <path>, --key-passphrase-file <path>, --key-passphrase-stdin";
+    /// The environment variable of last resort.
+    const KEY_ENV: &str = "TESSERA_ISSUER_KEY_PASSPHRASE";
+
+    /// A [`PassphraseSource`] backed by the ladder in [`super::secret`].
     pub(super) struct FilePassphraseSource {
-        explicit_pinentry: Option<PathBuf>,
+        /// The source the operator named, if any.
+        explicit: Option<FlagSource>,
+        /// The operator-message locale.
+        locale: Locale,
     }
 
     impl FilePassphraseSource {
-        /// A passphrase source preferring `explicit_pinentry`, then a discovered
-        /// pinentry program.
-        pub(super) fn new(explicit_pinentry: Option<PathBuf>) -> Self {
-            Self { explicit_pinentry }
+        /// A passphrase source over the source `explicit` names, else the full
+        /// ladder.
+        pub(super) fn new(explicit: Option<FlagSource>, locale: Locale) -> Self {
+            Self { explicit, locale }
         }
     }
 
     impl PassphraseSource for FilePassphraseSource {
         fn passphrase(&self) -> Result<SecretString, FileSignError> {
-            if let Some(secret) = super::prompt::prompt_secret(
-                self.explicit_pinentry.clone(),
-                "Tessera CA key passphrase",
-            ) {
-                return Ok(secret);
-            }
-            std::env::var("TESSERA_ISSUER_KEY_PASSPHRASE")
-                .ok()
-                .filter(|p| !p.is_empty())
-                .map(SecretString::from)
-                .ok_or_else(|| {
-                    FileSignError::PassphraseUnavailable(
-                        "no pinentry available; set TESSERA_ISSUER_KEY_PASSPHRASE".to_owned(),
-                    )
-                })
+            secret::resolve(&Request {
+                explicit: self.explicit.as_ref(),
+                caption: Msg::SecretPromptKeyPassphrase,
+                env_var: KEY_ENV,
+                flags: KEY_FLAGS,
+                locale: self.locale,
+            })
+            .map_err(|e| FileSignError::PassphraseUnavailable(e.to_string()))
         }
     }
 }
@@ -1919,6 +2468,178 @@ mod tests {
         assert_ne!(
             root.max_ttl, ca.max_ttl,
             "the two ceilings bound different links and cannot share a value"
+        );
+    }
+
+    /// An `issue-root` argv that parses, ready to be extended with the secret
+    /// flags under test.
+    fn root_argv_with_role() -> Vec<&'static str> {
+        let mut argv = root_argv();
+        argv.extend(["--allow-role", "oper"]);
+        argv
+    }
+
+    /// Two named secret sources are a contradiction, not a precedence question:
+    /// a run that names both has no single answer to "where does the PIN come
+    /// from", so it is refused before anything is opened.
+    #[test]
+    fn two_named_secret_sources_are_refused_at_parsing() {
+        for extra in [
+            vec!["--pinentry", "/usr/bin/pinentry", "--pin-file", "pin.txt"],
+            vec!["--pinentry", "/usr/bin/pinentry", "--pin-stdin"],
+            vec![
+                "--pinentry",
+                "/usr/bin/pinentry",
+                "--key-passphrase-file",
+                "pass.txt",
+            ],
+            vec!["--pin-file", "pin.txt", "--pin-stdin"],
+            vec![
+                "--key-passphrase-file",
+                "pass.txt",
+                "--key-passphrase-stdin",
+            ],
+            // Both streams would consume the same standard input.
+            vec!["--pin-stdin", "--key-passphrase-stdin"],
+        ] {
+            let mut argv = root_argv_with_role();
+            argv.extend(extra.iter().copied());
+            let err = Cli::try_parse_from(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{extra:?} must not parse"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{extra:?} must be refused as a conflict"
+            );
+        }
+    }
+
+    /// Each secret flag on its own parses, so the conflict above is about the
+    /// combination and not about a flag being rejected outright.
+    #[test]
+    fn a_single_named_secret_source_parses() {
+        for extra in [
+            vec!["--pinentry", "/usr/bin/pinentry"],
+            vec!["--pin-file", "pin.txt"],
+            vec!["--pin-stdin"],
+            vec!["--key-passphrase-file", "pass.txt"],
+            vec!["--key-passphrase-stdin"],
+        ] {
+            let mut argv = root_argv_with_role();
+            argv.extend(extra.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "{extra:?} must parse on its own"
+            );
+        }
+    }
+
+    /// No flag accepts a secret by value. The sources that take an argument take
+    /// a *path*, the stream sources take none, and there is no `--pin` at all —
+    /// so a PIN or passphrase can never appear in the process's `argv`, which
+    /// every other user of the host can read.
+    #[test]
+    fn no_flag_accepts_a_secret_by_value() {
+        use clap::CommandFactory as _;
+
+        /// The secret-related flags that take an argument; every one of them
+        /// takes a filesystem path.
+        const PATH_VALUED: &[&str] = &["pinentry", "pin_file", "key_passphrase_file"];
+        /// The secret-related flags that take no argument at all.
+        const VALUELESS: &[&str] = &["pin_stdin", "key_passphrase_stdin"];
+
+        let command = Cli::command();
+        let subcommand = command
+            .get_subcommands()
+            .find(|s| s.get_name() == "issue-root")
+            .expect("issue-root");
+        let mut seen: Vec<String> = Vec::new();
+        for arg in subcommand.get_arguments() {
+            let id = arg.get_id().as_str();
+            if !(id.contains("pin") || id.contains("passphrase")) {
+                continue;
+            }
+            seen.push(id.to_owned());
+            let takes_value = matches!(
+                arg.get_action(),
+                clap::ArgAction::Set | clap::ArgAction::Append
+            );
+            assert_eq!(
+                takes_value,
+                PATH_VALUED.contains(&id),
+                "{id} takes a value it should not, or lost the one it needs"
+            );
+        }
+        seen.sort();
+        let mut expected: Vec<String> = PATH_VALUED
+            .iter()
+            .chain(VALUELESS)
+            .map(|s| (*s).to_owned())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "a secret-related flag appeared that this test has not vetted"
+        );
+
+        // And the flag that would take a secret directly does not exist.
+        for named in [
+            vec!["--pin", "1234"],
+            vec!["--key-passphrase", "hunter2"],
+            vec!["--passphrase", "hunter2"],
+        ] {
+            let mut argv = root_argv_with_role();
+            argv.extend(named.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{named:?} must not be a flag"
+            );
+        }
+    }
+
+    /// The parsed flags map onto the ladder's named source, one flag each.
+    #[cfg(all(feature = "pkcs11", feature = "file"))]
+    #[test]
+    fn named_flags_map_onto_the_ladder_source() {
+        let backend_of = |extra: Vec<&str>| {
+            let mut argv = root_argv_with_role();
+            argv.extend(extra);
+            let Command::IssueRoot(root) = Cli::parse_from(argv).command else {
+                panic!("expected issue-root");
+            };
+            root.backend
+        };
+
+        assert_eq!(backend_of(vec![]).pin_source(), None);
+        assert_eq!(
+            backend_of(vec!["--pin-file", "pin.txt"]).pin_source(),
+            Some(secret::FlagSource::File(PathBuf::from("pin.txt")))
+        );
+        assert_eq!(
+            backend_of(vec!["--pin-stdin"]).pin_source(),
+            Some(secret::FlagSource::Stdin)
+        );
+        assert_eq!(
+            backend_of(vec!["--pinentry", "/opt/corp/pinentry"]).pin_source(),
+            Some(secret::FlagSource::Pinentry(PathBuf::from(
+                "/opt/corp/pinentry"
+            )))
+        );
+        // The same dialog flag serves the file backend's passphrase.
+        assert_eq!(
+            backend_of(vec!["--pinentry", "/opt/corp/pinentry"]).key_passphrase_source(),
+            Some(secret::FlagSource::Pinentry(PathBuf::from(
+                "/opt/corp/pinentry"
+            )))
+        );
+        assert_eq!(
+            backend_of(vec!["--key-passphrase-file", "pass.txt"]).key_passphrase_source(),
+            Some(secret::FlagSource::File(PathBuf::from("pass.txt")))
+        );
+        assert_eq!(
+            backend_of(vec!["--key-passphrase-stdin"]).key_passphrase_source(),
+            Some(secret::FlagSource::Stdin)
         );
     }
 

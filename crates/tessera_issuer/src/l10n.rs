@@ -220,6 +220,31 @@ pub(crate) enum Msg {
     /// File backend: the CA key file is unencrypted (full-line warning printed
     /// once at startup, to stderr).
     FilePlaintextKeyWarning,
+    /// Secret prompt caption for the PKCS#11 token PIN.
+    SecretPromptTokenPin,
+    /// Secret prompt caption for the file backend's CA key passphrase.
+    SecretPromptKeyPassphrase,
+    /// Secret ladder: the value came from an environment variable (the variable
+    /// name follows); printed to stderr.
+    SecretEnvWarning,
+    /// Secret ladder: no source produced a secret (the flags that would name one
+    /// follow).
+    SecretUnavailableFlags,
+    /// Secret ladder: the sources needing no flag (a variable name follows).
+    SecretUnavailableFallbacks,
+    /// Secret ladder: the secret file is reachable beyond its owner (the path and
+    /// mode follow).
+    SecretFileBeyondOwner,
+    /// Secret ladder: the secret file could not be read (a detail follows).
+    SecretFileUnreadable,
+    /// Secret ladder: standard input could not be read (a detail follows).
+    SecretStdinUnreadable,
+    /// Secret ladder: the console prompt failed (a detail follows).
+    SecretConsoleFailed,
+    /// Secret ladder: the pinentry program returned nothing (its path follows).
+    SecretPinentryFailed,
+    /// Secret ladder: the source produced an empty value (its name follows).
+    SecretEmpty,
 }
 
 #[cfg(feature = "cli")]
@@ -252,6 +277,26 @@ impl Msg {
                 "warning: the CA key file is unencrypted; encrypt it \
                  (openssl pkcs8 -topk8) or use a PKCS#11/Vault backend in production"
             }
+            Msg::SecretPromptTokenPin => "Tessera token PIN",
+            Msg::SecretPromptKeyPassphrase => "Tessera CA key passphrase",
+            Msg::SecretEnvWarning => {
+                "warning: the secret was read from an environment variable; its value is \
+                 visible to child processes and lands in memory dumps —"
+            }
+            Msg::SecretUnavailableFlags => "no secret source available; pass one of",
+            Msg::SecretUnavailableFallbacks => {
+                "or provide a pinentry program on PATH, an interactive terminal, \
+                 or the environment variable"
+            }
+            Msg::SecretFileBeyondOwner => {
+                "the secret file is readable by group or others; restrict it to its owner \
+                 (chmod 600):"
+            }
+            Msg::SecretFileUnreadable => "cannot read the secret file:",
+            Msg::SecretStdinUnreadable => "cannot read the secret from standard input:",
+            Msg::SecretConsoleFailed => "the console secret prompt failed:",
+            Msg::SecretPinentryFailed => "the pinentry program returned no secret:",
+            Msg::SecretEmpty => "the secret source returned an empty value:",
         }
     }
 
@@ -275,6 +320,26 @@ impl Msg {
                 "предупреждение: файл ключа УЦ не зашифрован; зашифруйте его \
                  (openssl pkcs8 -topk8) или используйте бэкенд PKCS#11/Vault в проде"
             }
+            Msg::SecretPromptTokenPin => "PIN токена Tessera",
+            Msg::SecretPromptKeyPassphrase => "пароль ключа УЦ Tessera",
+            Msg::SecretEnvWarning => {
+                "предупреждение: секрет прочитан из переменной окружения; её значение \
+                 видно дочерним процессам и попадает в дампы памяти —"
+            }
+            Msg::SecretUnavailableFlags => "нет доступного источника секрета; задайте один из",
+            Msg::SecretUnavailableFallbacks => {
+                "либо обеспечьте программу pinentry на PATH, интерактивный терминал \
+                 или переменную окружения"
+            }
+            Msg::SecretFileBeyondOwner => {
+                "файл секрета доступен на чтение группе или остальным; ограничьте доступ \
+                 владельцем (chmod 600):"
+            }
+            Msg::SecretFileUnreadable => "не удалось прочитать файл секрета:",
+            Msg::SecretStdinUnreadable => "не удалось прочитать секрет со стандартного ввода:",
+            Msg::SecretConsoleFailed => "не удалось запросить секрет в консоли:",
+            Msg::SecretPinentryFailed => "программа pinentry не вернула секрет:",
+            Msg::SecretEmpty => "источник секрета вернул пустое значение:",
         }
     }
 }
