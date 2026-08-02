@@ -14,6 +14,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use super::key_lookup::ExtractableProbe;
+
 /// Errors raised by the `tessera_core::token::pkcs11` module.
 ///
 /// Each variant has a documented mapping to a PAM return code; the
@@ -151,6 +153,31 @@ pub enum Pkcs11Error {
         key_type: String,
         /// Short hex prefix of the key's `CKA_ID` (never the full bytes).
         cka_id_hex: String,
+    },
+    /// The token returned no value for `CKA_EXTRACTABLE`, so the mode-B
+    /// invariant (key never leaves the token) could not be established.
+    /// A provider may decline to report the attribute — as sensitive, as
+    /// not applicable, or as unavailable — and silence is not evidence of
+    /// a non-extractable key, so the default is to refuse it (fail-closed)
+    /// just like an outright `TRUE`.  Kept distinct from
+    /// [`Pkcs11Error::ExtractableKeyRejected`] so the audit trail never
+    /// conflates "not reported" with "reported extractable".  The opt-in is
+    /// likewise its own: `pkcs11_allow_unreported_extractable`, not the key
+    /// that governs an admitted `TRUE`.  Carries only log-safe metadata: the
+    /// key type, a short `CKA_ID` hex prefix and the reason the provider
+    /// gave — never key material.
+    #[error(
+        "pkcs#11 token did not report CKA_EXTRACTABLE, non-extractability \
+         unproven: key_type={key_type}, cka_id prefix {cka_id_hex}, \
+         probe={probe}; set pkcs11_allow_unreported_extractable = true to override"
+    )]
+    ExtractableAttributeUnavailable {
+        /// Stringified `CKA_KEY_TYPE` of the key in question.
+        key_type: String,
+        /// Short hex prefix of the key's `CKA_ID` (never the full bytes).
+        cka_id_hex: String,
+        /// Why the token withheld the attribute, per a follow-up query.
+        probe: ExtractableProbe,
     },
     /// `read_token_serial` (T10) found `CK_TOKEN_INFO.serialNumber`
     /// empty after trimming.  Some providers blank this on cleared

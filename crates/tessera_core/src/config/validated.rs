@@ -44,6 +44,10 @@ pub struct ValidatedConfig {
     /// Accept private keys with `CKA_EXTRACTABLE = TRUE` (default
     /// `false` — fail closed; `true` downgrades the refusal to a WARN).
     pub pkcs11_allow_extractable_keys: bool,
+    /// Accept private keys whose token reports no `CKA_EXTRACTABLE` value
+    /// (default `false` — fail closed; `true` downgrades the refusal to a
+    /// WARN).  Independent of `pkcs11_allow_extractable_keys`.
+    pub pkcs11_allow_unreported_extractable: bool,
     /// PKCS#12 path pattern.
     pub pkcs12_path_pattern: Option<String>,
     /// PIN prompt.
@@ -553,6 +557,7 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             pkcs11_pin_prompt: raw.pkcs11_pin_prompt.clone(),
             pkcs11_slot_wait: Duration::from_secs(u64::from(raw.pkcs11_slot_wait_seconds)),
             pkcs11_allow_extractable_keys: raw.pkcs11_allow_extractable_keys,
+            pkcs11_allow_unreported_extractable: raw.pkcs11_allow_unreported_extractable,
             pkcs12_path_pattern: validate_pkcs12_path_pattern(raw.pkcs12_path_pattern.as_deref())?,
             pkcs12_pin_prompt: raw.pkcs12_pin_prompt.clone(),
             gost_engine_path,

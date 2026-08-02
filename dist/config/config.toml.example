@@ -53,11 +53,22 @@ pkcs11_locking_mode = "mutex"
 # Maximum time wait_for_token will block waiting for the user to insert the
 # token, in seconds. Range 0..=60. 0 disables the wait entirely.
 pkcs11_slot_wait_seconds = 10
-# Accept private keys with CKA_EXTRACTABLE = TRUE. Default false: an
-# extractable key breaks the mode-B invariant (key never leaves the token),
-# so authentication fails closed. Set to true only as a deliberate operator
-# decision; the violation is then logged as WARN pkcs11_extractable_key.
+# Accept private keys the token reports as CKA_EXTRACTABLE = TRUE. Default
+# false: an extractable key breaks the mode-B invariant (key never leaves the
+# token), so authentication fails closed. Set to true only as a deliberate
+# operator decision; the violation is then logged as WARN
+# pkcs11_extractable_key. This key does NOT cover a token that never reports
+# the attribute — that case has its own key below.
 # pkcs11_allow_extractable_keys = false
+# Accept a private key for which the token did not report CKA_EXTRACTABLE at
+# all. Default false: silence is not proof of non-extractability, so
+# authentication fails closed. Set to true when the token vendor confirms the
+# keys are non-extractable and the module simply withholds the attribute; the
+# admission is then logged as WARN pkcs11_extractable_attribute_unavailable
+# with the reason the provider gave (sensitive, type_invalid, unavailable,
+# available_but_not_returned, probe_failed). This key does NOT accept keys
+# that openly report themselves as extractable.
+# pkcs11_allow_unreported_extractable = false
 
 # --- PKCS#12 -----------------------------------------------------------------
 # Used only when mode = "pkcs12".

@@ -50,7 +50,7 @@ pub use backend::{LockingMode, Pkcs11Backend};
 pub use cert_lookup::FoundCertificate;
 pub use error::Pkcs11Error;
 pub use info::read_token_serial;
-pub use key_lookup::FoundPrivateKey;
+pub use key_lookup::{ExtractableKeyPolicy, ExtractableProbe, ExtractableState, FoundPrivateKey};
 pub use mechanism::{select_mechanism, TokenSignMechanism};
 pub use pin_loop::{acquire_pkcs11_session, AcquireError, PinSessionOpener};
 pub use session::Pkcs11Session;

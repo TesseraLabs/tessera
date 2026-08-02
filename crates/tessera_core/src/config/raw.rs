@@ -34,12 +34,23 @@ pub struct RawConfig {
     /// to insert the token, in seconds.  Defaults to 10.
     #[serde(default = "default_pkcs11_slot_wait_seconds")]
     pub pkcs11_slot_wait_seconds: u32,
-    /// Accept private keys with `CKA_EXTRACTABLE = TRUE` (WARN instead of
-    /// refusing).  Defaults to `false`: an extractable key breaks the
-    /// mode-B invariant, so authentication fails closed unless the
-    /// operator explicitly opts in.
+    /// Accept private keys that report `CKA_EXTRACTABLE = TRUE` (WARN
+    /// instead of refusing).  Defaults to `false`: an extractable key
+    /// breaks the mode-B invariant, so authentication fails closed unless
+    /// the operator explicitly opts in.  Governs only keys that admit to
+    /// being exportable — a token that withholds the attribute is a
+    /// separate case with its own key below.
     #[serde(default)]
     pub pkcs11_allow_extractable_keys: bool,
+    /// Accept private keys whose token returns no `CKA_EXTRACTABLE` value
+    /// (WARN instead of refusing).  A provider may decline to report the
+    /// attribute, and silence is not evidence that the key cannot be
+    /// exported, so the default `false` fails closed here too.  Deliberately
+    /// separate from `pkcs11_allow_extractable_keys`: an operator whose
+    /// token merely stays silent should not have to also accept keys that
+    /// report themselves as exportable.
+    #[serde(default)]
+    pub pkcs11_allow_unreported_extractable: bool,
     /// PKCS#12 path pattern.
     pub pkcs12_path_pattern: Option<String>,
     /// PIN prompt.
