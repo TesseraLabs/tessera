@@ -27,13 +27,23 @@
 
 ### CA-админ (выпуск сертификатов)
 
-1. [cert-issuance.md](cert-issuance.md) — расширения
+1. [issuance-workflows.md](issuance-workflows.md) — пять процессов
+   выпуска и как выбрать между ними (читать первым).
+2. [issuance-central-key.md](issuance-central-key.md) — процесс с
+   ключом на стороне выпускающего (П1, П3).
+3. [issuance-engineer-key.md](issuance-engineer-key.md) — процесс с
+   программным ключом инженера (П2, П4).
+4. [issuance-token-key.md](issuance-token-key.md) — процесс с ключом
+   на активном токене (П5).
+5. [carriers.md](carriers.md) — виды носителей, их свойства и
+   ограничения, пути к модулям PKCS#11.
+6. [cert-issuance.md](cert-issuance.md) — расширения
    `pam_cert_host_binding`, `pam_cert_allowed_roles`,
    `pam_cert_max_integrity`, сценарии выпуска.
-2. [issuer.md](issuer.md) — инструменты выпуска (`tessera_issuer`):
+7. [issuer.md](issuer.md) — инструменты выпуска (`tessera_issuer`):
    CLI `issuer`, агент `serve`, CSR-поток, бэкенды PKCS#11 и
    Vault Transit, журнал выпусков, веб-кабинет.
-3. [clone-image.md §6](clone-image.md) — CA-сторона clone-image
+8. [clone-image.md §6](clone-image.md) — CA-сторона clone-image
    workflow (выпуск per-host).
 
 ### Безопасник
@@ -43,6 +53,8 @@
    правила, host identity chain.
 3. [mac-integrity.md](mac-integrity.md) — граница МКЦ/МРД, состав
    открытой части и коммерческой поставки.
+4. [compliance-mapping.md](compliance-mapping.md) — какие меры
+   стандартов поддерживают процессы выпуска и что показать оценщику.
 
 ### Разработчик
 
