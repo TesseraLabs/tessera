@@ -78,7 +78,7 @@ issuer issue-leaf \
     --backend pkcs11 --module /usr/lib/librtpkcs11ecp.so --key org-ca \
     --parent org-ca.pem \
     --csr ivanov.csr.pem \
-    --host-binding sha256:3f2a... \
+    --host sha256:3f2a... \
     --role operator \
     --not-before 1767225600 --not-after 1767239999 \
     --out ivanov.crt.pem

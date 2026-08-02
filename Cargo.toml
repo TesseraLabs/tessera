@@ -91,6 +91,22 @@ p384 = "0.13"
 # AES-CBC) used to decrypt operator keys and to generate encrypted fixtures in
 # tests. Native-only, behind the `file` feature.
 pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
+# PKCS#12 container assembly for the issuer: ASN.1 types (`PFX`, `SafeBag`,
+# `CertBag`, `MacData`) plus the RFC 7292 Appendix B key derivation the MAC
+# needs. Only the format lives here; the key is encrypted with PBES2 through
+# `pkcs8`/`pkcs5` and the MAC is `hmac`, so no primitive is written by hand.
+# Matches the workspace's `der` 0.7 / `x509-cert` 0.2 generation.
+pkcs12 = { version = "0.1", features = ["kdf"] }
+# `ContentInfo`, the envelope PKCS#12 wraps each safe in. Pulled directly
+# because the container assembly builds those envelopes itself; `pkcs12`
+# depends on the same version.
+cms = "0.2"
+hmac = "0.12"
+# The PKCS#12 MAC and the RFC 7292 key derivation are on the `digest` 0.10
+# generation, while the rest of the workspace is on `sha2` 0.11 (`digest`
+# 0.11). Both are already in the graph — `pkcs5` pulls 0.10 — so this alias
+# only makes the older one nameable where the container code needs it.
+sha2_pkcs12 = { package = "sha2", version = "0.10" }
 # Hardened pure-Rust RSA fork (MIT OR Apache-2.0), kept under the local crate
 # name `rsa` so issuer code retains the upstream-compatible API. `sad-rsa`
 # incorporates RustCrypto's `crypto-bigint` migration and padding hardening to

@@ -193,6 +193,21 @@ impl Caption {
 pub(crate) enum Msg {
     /// CLI: a certificate was written (a path follows).
     CliCertWritten,
+    /// CLI: a PKCS#12 container was written (a path follows).
+    CliContainerWritten,
+    /// CLI: the heading above a generated container password, warning that it
+    /// is shown once and is not recoverable.
+    CliContainerPassphraseHeading,
+    /// CLI: the artifacts were laid out on a carrier (paths follow).
+    CliCarrierWritten,
+    /// CLI: the carrier already holds a container; asks whether to replace it
+    /// (a path follows).
+    CliCarrierOverwriteAsk,
+    /// CLI: the operator declined replacing an existing container (full line).
+    CliCarrierOverwriteDeclined,
+    /// CLI: a container would be replaced but nothing can ask the operator
+    /// (a path follows).
+    CliCarrierOverwriteNeedsConfirmation,
     /// CLI: a CRL was written (a path follows).
     CliCrlWritten,
     /// CLI: a CSR was written (a path follows).
@@ -224,6 +239,8 @@ pub(crate) enum Msg {
     SecretPromptTokenPin,
     /// Secret prompt caption for the file backend's CA key passphrase.
     SecretPromptKeyPassphrase,
+    /// Secret prompt caption for the PKCS#12 container password.
+    SecretPromptContainerPassphrase,
     /// Secret ladder: the value came from an environment variable (the variable
     /// name follows); printed to stderr.
     SecretEnvWarning,
@@ -270,6 +287,23 @@ impl Msg {
     fn en(self) -> &'static str {
         match self {
             Msg::CliCertWritten => "certificate written to",
+            Msg::CliContainerWritten => "PKCS#12 container written to",
+            Msg::CliContainerPassphraseHeading => {
+                "container password — shown once, it cannot be recovered later; \
+                 deliver it by a channel other than the container's:"
+            }
+            Msg::CliCarrierWritten => "carrier prepared:",
+            Msg::CliCarrierOverwriteAsk => {
+                "a container is already in place and may belong to another engineer; \
+                 replace it? [y/N]:"
+            }
+            Msg::CliCarrierOverwriteDeclined => {
+                "declined: the existing container was left in place"
+            }
+            Msg::CliCarrierOverwriteNeedsConfirmation => {
+                "a container is already in place and nothing can ask for confirmation here; \
+                 re-run with --force once you have checked what it is:"
+            }
             Msg::CliCrlWritten => "CRL written to",
             Msg::CliCsrWritten => "CSR written to",
             Msg::CliCsrSubject => "CSR subject:",
@@ -288,6 +322,7 @@ impl Msg {
             }
             Msg::SecretPromptTokenPin => "Tessera token PIN",
             Msg::SecretPromptKeyPassphrase => "Tessera CA key passphrase",
+            Msg::SecretPromptContainerPassphrase => "Tessera credential container password",
             Msg::SecretEnvWarning => {
                 "warning: the secret was read from an environment variable; its value is \
                  visible to child processes and lands in memory dumps —"
@@ -323,6 +358,23 @@ impl Msg {
     fn ru(self) -> &'static str {
         match self {
             Msg::CliCertWritten => "сертификат записан в",
+            Msg::CliContainerWritten => "контейнер PKCS#12 записан в",
+            Msg::CliContainerPassphraseHeading => {
+                "пароль контейнера — показан один раз, восстановить его позже нельзя; \
+                 передайте его каналом, отличным от канала контейнера:"
+            }
+            Msg::CliCarrierWritten => "носитель подготовлен:",
+            Msg::CliCarrierOverwriteAsk => {
+                "по этому пути уже лежит контейнер, возможно другого инженера; \
+                 заменить его? [y/N]:"
+            }
+            Msg::CliCarrierOverwriteDeclined => {
+                "отменено: существующий контейнер оставлен на месте"
+            }
+            Msg::CliCarrierOverwriteNeedsConfirmation => {
+                "по этому пути уже лежит контейнер, а спросить подтверждение здесь не у кого; \
+                 разберитесь, что это, и повторите с --force:"
+            }
             Msg::CliCrlWritten => "CRL записан в",
             Msg::CliCsrWritten => "CSR записан в",
             Msg::CliCsrSubject => "субъект CSR:",
@@ -341,6 +393,7 @@ impl Msg {
             }
             Msg::SecretPromptTokenPin => "PIN токена Tessera",
             Msg::SecretPromptKeyPassphrase => "пароль ключа УЦ Tessera",
+            Msg::SecretPromptContainerPassphrase => "пароль контейнера удостоверения Tessera",
             Msg::SecretEnvWarning => {
                 "предупреждение: секрет прочитан из переменной окружения; её значение \
                  видно дочерним процессам и попадает в дампы памяти —"

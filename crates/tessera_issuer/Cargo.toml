@@ -22,12 +22,14 @@ required-features = ["cli"]
 # host and the binary is not built.
 default = ["native"]
 native = ["dep:rand"]
-cli = ["native", "dep:clap", "dep:rpassword"]
+# The container password travels the same ladder as the backend secrets, so
+# the CLI needs the secret wrapper even when no signing backend is built in.
+cli = ["native", "dep:clap", "dep:rpassword", "dep:secrecy"]
 # Exposes the deterministic in-crate signer so integration tests (and, later,
 # the CLI's dry-run mode) can assemble artifacts without a real key store.
 test-support = []
 # PKCS#11 signing adapter (token/HSM). Native-only: not built for the wasm core.
-pkcs11 = ["native", "dep:cryptoki", "dep:secrecy", "dep:zeroize"]
+pkcs11 = ["native", "dep:cryptoki", "dep:secrecy"]
 # Vault/OpenBao Transit signing adapter. Native-only. serde/serde_json/base64/
 # sha2 are core dependencies (the journal and CSR paths need them), so this
 # feature only adds the HTTP transport and secret handling.
@@ -35,18 +37,14 @@ vault = [
     "native",
     "dep:ureq",
     "dep:secrecy",
-    "dep:zeroize",
 ]
-# On-disk PKCS#8 CA key signing adapter. Native-only. p256/rsa/sha2 are core
-# dependencies (CSR verification); this feature adds p384 (P-384 signing) and
-# direct pkcs8 access (PrivateKeyInfo parsing + EncryptedPrivateKeyInfo/PBES2
-# decryption), plus the secret-handling crates.
+# On-disk PKCS#8 CA key signing adapter. Native-only. p256/p384/pkcs8 and the
+# container-assembly crates are core dependencies (leaf-key generation and
+# PKCS#12 packaging need them), so this feature only adds the secret handling
+# the CA key file's passphrase goes through.
 file = [
     "native",
-    "dep:p384",
-    "dep:pkcs8",
     "dep:secrecy",
-    "dep:zeroize",
 ]
 # Integration-test gates, mirroring tessera_core's `pkcs11-tests`: the heavy
 # tests compile only with these on and still skip gracefully (print `skipped:`
@@ -62,18 +60,28 @@ spki = { workspace = true }
 const-oid = { workspace = true }
 x509-cert = { workspace = true }
 thiserror = { workspace = true }
-# Core (wasm-compatible) dependencies. p256/rsa verify a CSR's self-signature;
-# sha2 chains the issuance journal and hashes CSR contents; serde/serde_json
-# render and parse the NDJSON journal; base64 encodes head signatures.
+# Core (wasm-compatible) dependencies. p256/p384/rsa verify a CSR's
+# self-signature and generate a leaf key pair; sha2 chains the issuance journal
+# and hashes CSR contents; serde/serde_json render and parse the NDJSON journal;
+# base64 encodes head signatures.
 p256 = { workspace = true }
-p384 = { workspace = true, optional = true }
-pkcs8 = { workspace = true, optional = true }
+p384 = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+# PKCS#12 container assembly (wasm-compatible): `pkcs8` shrouds the private key
+# with PBES2 and reads it back, `pkcs12`/`cms` carry the container's ASN.1, and
+# `hmac` + the `digest` 0.10 SHA-256 back the container MAC and its RFC 7292 key
+# derivation. `zeroize` keeps the generated private key out of freed memory.
+pkcs8 = { workspace = true }
+pkcs12 = { workspace = true }
+cms = { workspace = true }
+hmac = { workspace = true }
+sha2_pkcs12 = { workspace = true }
+zeroize = { workspace = true }
 rand = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 # Console secret entry with the echo off (the CLI's interactive step). Pulled by
@@ -81,7 +89,6 @@ clap = { workspace = true, optional = true }
 rpassword = { workspace = true, optional = true }
 cryptoki = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
-zeroize = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
 
 # The wasm core (browser cabinet) needs an entropy backend for the RustCrypto

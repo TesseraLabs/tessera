@@ -80,6 +80,8 @@ enum Command {
     IssueLeaf(IssueLeafArgs),
     /// Issue a CRL for a CA.
     IssueCrl(IssueCrlArgs),
+    /// Lay an issued credential out on a carrier.
+    PrepareCarrier(PrepareCarrierArgs),
     /// Verify an issuance journal's hash chain.
     VerifyJournal(VerifyJournalArgs),
     /// Build a certificate request signed by the engineer's token key.
@@ -327,6 +329,11 @@ struct IssueCaArgs {
 
 /// Flags for `issuer issue-leaf`.
 #[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the struct is the command line: each flag is one boolean and \
+              folding them into enums would change the operator-facing syntax"
+)]
 struct IssueLeafArgs {
     #[command(flatten)]
     backend: BackendArgs,
@@ -339,7 +346,36 @@ struct IssueLeafArgs {
     /// Leaf key source: a PKCS#10 CSR (PEM or DER). Its subject and key are used.
     #[arg(long)]
     csr: Option<PathBuf>,
-    /// Subject distinguished name (RFC 4514); required with `--spki`.
+    /// Generate the leaf key pair here instead of taking one in. The private key
+    /// exists only in memory and in the container written to `--out-p12`.
+    #[arg(long, conflicts_with_all = ["spki", "csr"])]
+    generate_key: bool,
+    /// Type of key to generate: `ecdsa-p256` (the default), `ecdsa-p384`,
+    /// `rsa-2048`, `rsa-3072` or `rsa-4096`. Only with `--generate-key`.
+    #[arg(long)]
+    key_type: Option<String>,
+    /// Output path for the PKCS#12 container. Required with, and only valid
+    /// with, `--generate-key`.
+    #[arg(long)]
+    out_p12: Option<PathBuf>,
+    /// Chain certificates to package beside the leaf (PEM, may hold several);
+    /// defaults to the parent certificate alone. Only with `--generate-key`.
+    #[arg(long)]
+    chain: Option<PathBuf>,
+    /// Read the container password as one line from standard input. Without any
+    /// `--p12-passphrase-*` flag the tool generates one and shows it once.
+    #[arg(long, conflicts_with_all = ["p12_passphrase_file", "p12_passphrase_prompt"])]
+    p12_passphrase_stdin: bool,
+    /// Read the container password as one line from a file readable only by its
+    /// owner. The flag takes the file's path, never the password itself.
+    #[arg(long, conflicts_with = "p12_passphrase_prompt")]
+    p12_passphrase_file: Option<PathBuf>,
+    /// Ask for the container password interactively (a pinentry dialog, else a
+    /// console prompt with the echo off).
+    #[arg(long)]
+    p12_passphrase_prompt: bool,
+    /// Subject distinguished name (RFC 4514); required with `--spki` and with
+    /// `--generate-key`.
     #[arg(long)]
     subject: Option<String>,
     /// A host descriptor the leaf binds (repeat for several).
@@ -369,12 +405,43 @@ struct IssueLeafArgs {
     /// NDJSON issuance journal file.
     #[arg(long)]
     journal: PathBuf,
-    /// Output path for the issued certificate.
+    /// Output path for the issued certificate. Optional with `--generate-key`,
+    /// where the certificate also travels inside the container.
     #[arg(long)]
-    out: PathBuf,
+    out: Option<PathBuf>,
     /// Write DER instead of PEM.
     #[arg(long)]
     der: bool,
+}
+
+/// Flags for `issuer prepare-carrier`.
+///
+/// The command has no signing backend: it moves already-issued artifacts onto a
+/// carrier and signs nothing.
+#[derive(Debug, Args)]
+struct PrepareCarrierArgs {
+    /// The PKCS#12 container to place.
+    #[arg(long)]
+    p12: PathBuf,
+    /// The trust chain to place beside it (PEM).
+    #[arg(long)]
+    chain: Option<PathBuf>,
+    /// The mounted carrier to lay the artifacts out on.
+    #[arg(long)]
+    media: Option<PathBuf>,
+    /// Container path relative to the carrier, for a fleet whose devices
+    /// configure `pkcs12_path_pattern` away from the default.
+    #[arg(long)]
+    container_path: Option<String>,
+    /// PKCS#11 module of a passive token to write the container to.
+    #[arg(long)]
+    module: Option<PathBuf>,
+    /// Label of the token data object holding the container.
+    #[arg(long)]
+    object_label: Option<String>,
+    /// Replace an existing container without asking.
+    #[arg(long)]
+    force: bool,
 }
 
 /// Flags for `issuer issue-crl`.
@@ -473,6 +540,7 @@ fn run(command: Command, locale: Locale) -> Result<(), CliError> {
             dispatch_with_backend(&args.backend, locale, IssueCrlJob { args: &args })
         }
         Command::Csr(args) => dispatch_with_backend(&args.backend, locale, CsrJob { args: &args }),
+        Command::PrepareCarrier(args) => prepare_carrier(&args, locale),
         Command::VerifyJournal(args) => verify_journal(&args, locale),
     }
 }
@@ -839,10 +907,20 @@ struct IssueLeafJob<'a> {
 impl BackendJob for IssueLeafJob<'_> {
     fn run<B: SignatureBackend>(self, backend: &B, locale: Locale) -> Result<(), CliError> {
         let a = self.args;
+        // Before anything is read from disk: a flag that will be ignored is a
+        // usage error, and saying so costs nothing here.
+        if !a.generate_key {
+            reject_generation_flags(a)?;
+        }
         let key = effective_key_id(&a.backend)?;
         let parent = decode_pem_or_der(&read_file(&a.parent)?)?;
-        let source = build_key_source(a.spki.as_deref(), a.csr.as_deref())?;
         let scope = leaf_scope(a);
+
+        if a.generate_key {
+            return self.run_generating(backend, &key, &parent, &scope, locale);
+        }
+
+        let source = build_key_source(a.spki.as_deref(), a.csr.as_deref())?;
 
         // With a CSR, surface the request's subject and self-signature status
         // before issuing (the core re-checks proof of possession authoritatively).
@@ -870,8 +948,85 @@ impl BackendJob for IssueLeafJob<'_> {
             &mut journal,
             now_unix()?,
         )?;
-        write_artifact(&a.out, &issued.der, "CERTIFICATE", a.der)?;
-        println!("{} {}", Msg::CliCertWritten.text(locale), a.out.display());
+        let out = a.out.as_deref().ok_or_else(|| {
+            CliError::Usage("--out is required without --generate-key".to_owned())
+        })?;
+        write_artifact(out, &issued.der, "CERTIFICATE", a.der)?;
+        println!("{} {}", Msg::CliCertWritten.text(locale), out.display());
+        Ok(())
+    }
+}
+
+impl IssueLeafJob<'_> {
+    /// The `--generate-key` path: mint the key, issue, package, write.
+    ///
+    /// Everything the operator gets out of this is written here, in one place,
+    /// because the private key exists only for the length of the call — there is
+    /// no later step that could pick it up.
+    fn run_generating<B: SignatureBackend>(
+        self,
+        backend: &B,
+        key: &KeyId,
+        parent: &[u8],
+        scope: &LeafScope,
+        locale: Locale,
+    ) -> Result<(), CliError> {
+        let a = self.args;
+        let subject = a.subject.as_deref().ok_or_else(|| {
+            CliError::Usage("--subject is required with --generate-key".to_owned())
+        })?;
+        let out_p12 = a.out_p12.as_deref().ok_or_else(|| {
+            CliError::Usage("--out-p12 is required with --generate-key".to_owned())
+        })?;
+        let key_type = crate::keygen::LeafKeyType::parse(
+            a.key_type.as_deref().unwrap_or(DEFAULT_LEAF_KEY_TYPE),
+        )?;
+
+        // Without a chain file the parent CA is the chain: it is the one
+        // certificate the leaf provably needs, and it is already in hand.
+        let chain = match a.chain.as_deref() {
+            Some(path) => decode_pem_chain(&read_file(path)?)?,
+            None => vec![parent.to_vec()],
+        };
+
+        let passphrase = p12pass::resolve(a, locale)?;
+        let mut entropy = crate::keygen::OsEntropy;
+        let mut journal = open_journal(&a.journal)?;
+        let serial = Serial::generate();
+        let generated = crate::issue_leaf_generating_key(
+            backend,
+            key,
+            parent,
+            &crate::GeneratedLeafRequest {
+                subject: subject.to_owned(),
+                key_type,
+                scope: scope.clone(),
+                chain_der: &chain,
+            },
+            passphrase.expose(),
+            &serial,
+            &mut journal,
+            &mut entropy,
+            now_unix()?,
+        )?;
+
+        write_container(out_p12, &generated.container)?;
+        println!(
+            "{} {}",
+            Msg::CliContainerWritten.text(locale),
+            out_p12.display()
+        );
+        if let Some(out) = a.out.as_deref() {
+            write_artifact(out, &generated.cert.der, "CERTIFICATE", a.der)?;
+            println!("{} {}", Msg::CliCertWritten.text(locale), out.display());
+        }
+        // The generated password is shown last so it is the final thing on the
+        // operator's screen, and only when the tool made it up: one the operator
+        // supplied is already theirs to keep.
+        if let Some(shown) = passphrase.shown_once() {
+            println!("{}", Msg::CliContainerPassphraseHeading.text(locale));
+            println!("{shown}");
+        }
         Ok(())
     }
 }
@@ -1100,6 +1255,39 @@ fn build_key_source(spki: Option<&Path>, csr: Option<&Path>) -> Result<KeySource
     }
 }
 
+/// The key type generated when the operator names none.
+///
+/// P-256 rather than RSA: every supported device verifies it, and it is the one
+/// choice whose generation does not make the operator wait.
+const DEFAULT_LEAF_KEY_TYPE: &str = "ecdsa-p256";
+
+/// Refuse a `--generate-key` flag on a run that is not generating a key.
+///
+/// `clap` cannot express this: a flag with a default value counts as present, so
+/// `requires` never fires. Left unchecked, an operator who forgot
+/// `--generate-key` would get a normal issuance and no container, with their
+/// `--out-p12` silently ignored — the shape of mistake that is only noticed when
+/// the engineer has nothing to log in with.
+fn reject_generation_flags(args: &IssueLeafArgs) -> Result<(), CliError> {
+    let stray = [
+        ("--key-type", args.key_type.is_some()),
+        ("--out-p12", args.out_p12.is_some()),
+        ("--chain", args.chain.is_some()),
+        ("--p12-passphrase-stdin", args.p12_passphrase_stdin),
+        ("--p12-passphrase-file", args.p12_passphrase_file.is_some()),
+        ("--p12-passphrase-prompt", args.p12_passphrase_prompt),
+    ]
+    .into_iter()
+    .find_map(|(flag, given)| given.then_some(flag));
+
+    match stray {
+        None => Ok(()),
+        Some(flag) => Err(CliError::Usage(format!(
+            "{flag} applies only to --generate-key"
+        ))),
+    }
+}
+
 /// Assemble the operator-set leaf scope from the parsed flags.
 fn leaf_scope(args: &IssueLeafArgs) -> LeafScope {
     LeafScope {
@@ -1196,6 +1384,179 @@ fn write_artifact(path: &Path, der: &[u8], pem_label: &str, as_der: bool) -> Res
     std::fs::write(path, bytes).map_err(|e| CliError::Io(format!("{}: {e}", path.display())))
 }
 
+/// Write a PKCS#12 container, readable by its owner alone.
+///
+/// The certificates the tool writes are public; this file is not — it carries a
+/// private key, and the password protecting that key is delivered separately
+/// and may not have reached the engineer yet. On a shared workstation the
+/// default mode would publish it to every local account for as long as it sits
+/// there. The mode is set at creation, not after the write, so the bytes are
+/// never on disk under a wider mode.
+///
+/// Windows has no equivalent one-call restriction here; the file inherits the
+/// directory's ACL, which is the platform's own answer to the same question.
+fn write_container(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| CliError::Io(format!("{}: {e}", path.display())))?;
+    file.write_all(bytes)
+        .map_err(|e| CliError::Io(format!("{}: {e}", path.display())))
+}
+
+/// Decode every PEM block of a chain file into DER, in file order.
+///
+/// A chain file holds one certificate or several; the single-block decoder
+/// would silently take only the first, which is exactly the kind of quiet loss
+/// that surfaces later as an unverifiable chain on a device.
+fn decode_pem_chain(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CliError> {
+    let looks_pem = bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|&b| b == b'-');
+    if !looks_pem {
+        return Ok(vec![bytes.to_vec()]);
+    }
+    let text =
+        core::str::from_utf8(bytes).map_err(|_| CliError::Io("PEM is not UTF-8".to_owned()))?;
+    let mut out = Vec::new();
+    let mut body = String::new();
+    let mut in_body = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("-----BEGIN") {
+            in_body = true;
+            body.clear();
+        } else if trimmed.starts_with("-----END") {
+            in_body = false;
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(body.as_bytes())
+                .map_err(|e| CliError::Io(format!("PEM base64: {e}")))?;
+            out.push(der);
+        } else if in_body {
+            body.push_str(trimmed);
+        }
+    }
+    if out.is_empty() {
+        return Err(CliError::Io("no PEM certificate found".to_owned()));
+    }
+    Ok(out)
+}
+
+/// `prepare-carrier`: lay an already-issued credential out where the device's
+/// check looks for it.
+///
+/// Nothing is signed and no secret is read: the command moves files. The one
+/// judgement it makes is about replacing a container that is already there,
+/// which it never does without a yes.
+fn prepare_carrier(args: &PrepareCarrierArgs, locale: Locale) -> Result<(), CliError> {
+    if args.module.is_some() || args.object_label.is_some() {
+        // The passive-token carrier is a separate piece of work. Saying so is
+        // the whole behaviour here: a stub that reported success would send an
+        // engineer to a device with an empty token.
+        return Err(CliError::Usage(
+            crate::carrier::lay_out_token()
+                .err()
+                .map_or_else(String::new, |e| e.to_string()),
+        ));
+    }
+    let media = args
+        .media
+        .as_deref()
+        .ok_or_else(|| CliError::Usage("--media is required".to_owned()))?;
+
+    let container = read_file(&args.p12)?;
+    let chain = match args.chain.as_deref() {
+        Some(path) => Some(read_file(path)?),
+        None => None,
+    };
+
+    let overwrite = resolve_overwrite(media, args, locale)?;
+    let written = crate::carrier::lay_out_media(
+        media,
+        &crate::carrier::CarrierPayload {
+            container: &container,
+            chain_pem: chain.as_deref(),
+        },
+        args.container_path.as_deref(),
+        overwrite,
+    )
+    .map_err(|e| CliError::Io(e.to_string()))?;
+
+    println!("{}", Msg::CliCarrierWritten.text(locale));
+    println!("  {}", written.container.display());
+    if let Some(path) = written.chain {
+        println!("  {}", path.display());
+    }
+    Ok(())
+}
+
+/// Decide whether an existing container may be replaced.
+///
+/// `--force` is the operator's yes given up front. Otherwise they are asked, and
+/// a run with nobody to ask stops rather than guessing: the container in place
+/// may be another engineer's working credential.
+fn resolve_overwrite(
+    media: &Path,
+    args: &PrepareCarrierArgs,
+    locale: Locale,
+) -> Result<crate::carrier::Overwrite, CliError> {
+    use crate::carrier::Overwrite;
+
+    if args.force {
+        return Ok(Overwrite::Allow);
+    }
+    if !crate::carrier::container_present(media, args.container_path.as_deref()) {
+        return Ok(Overwrite::Refuse);
+    }
+    let target = media.join(
+        args.container_path
+            .as_deref()
+            .unwrap_or(crate::carrier::CONTAINER_RELATIVE_PATH),
+    );
+    match ask_yes_no(&format!(
+        "{} {}",
+        Msg::CliCarrierOverwriteAsk.text(locale),
+        target.display()
+    )) {
+        Some(true) => Ok(Overwrite::Allow),
+        Some(false) => Err(CliError::Usage(
+            Msg::CliCarrierOverwriteDeclined.text(locale).to_owned(),
+        )),
+        None => Err(CliError::Usage(format!(
+            "{} {}",
+            Msg::CliCarrierOverwriteNeedsConfirmation.text(locale),
+            target.display()
+        ))),
+    }
+}
+
+/// Ask a yes/no question on the terminal.
+///
+/// `None` means there was no terminal to ask on — distinct from a "no", because
+/// the caller treats an unanswerable question and a refusal differently.
+fn ask_yes_no(question: &str) -> Option<bool> {
+    use std::io::{BufRead as _, IsTerminal as _, Write as _};
+
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    print!("{question} ");
+    std::io::stdout().flush().ok()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer).ok()?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Some(answer == "y" || answer == "yes")
+}
+
 /// Decode PEM (any label) if the input begins with `-`, else pass the DER
 /// through unchanged. Keying on the first non-whitespace byte avoids misreading
 /// DER that merely contains a dash as PEM.
@@ -1249,11 +1610,11 @@ fn encode_pem(label: &str, der: &[u8]) -> String {
 
 // --- Secret prompting (pinentry) --------------------------------------------
 
-/// Shared pinentry prompting for the interactive backend secrets: the PKCS#11
-/// token PIN and the file-backend key passphrase. The Assuan exchange is the
-/// same; only the prompt caption differs, so the exchange lives here and the
-/// [`secret`] ladder wraps it as one of its sources.
-#[cfg(any(feature = "pkcs11", feature = "file"))]
+/// Shared pinentry prompting for the interactive secrets: the PKCS#11 token
+/// PIN, the file-backend key passphrase, and an operator-chosen container
+/// password. The Assuan exchange is the same; only the prompt caption differs,
+/// so the exchange lives here and the [`secret`] ladder wraps it as one of its
+/// sources.
 mod prompt {
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
@@ -1530,7 +1891,6 @@ mod prompt {
 /// dropped), never logged, never journaled, and never accepted as a flag value —
 /// the file and stdin sources take a path or a stream, so no secret can appear
 /// in `argv`.
-#[cfg(any(feature = "pkcs11", feature = "file"))]
 mod secret {
     use std::io::IsTerminal as _;
     use std::path::{Path, PathBuf};
@@ -2385,6 +2745,102 @@ mod pin {
     }
 }
 
+/// The container password: generated by default, taken from the shared secret
+/// ladder when the operator names a source.
+///
+/// The default is *generation*, not a prompt, and that asymmetry with the
+/// backend secrets is deliberate. A backend secret already exists and the tool
+/// can only ask for it; a container password is being created here, and one a
+/// person invents under the pressure of routine is the weakest part of an
+/// artifact that carries an extractable private key. So the tool makes it up
+/// unless told otherwise — and when told, it still refuses one that is too
+/// short.
+///
+/// No flag takes the password by value: `argv` is readable by every process on
+/// the machine.
+mod p12pass {
+    use zeroize::Zeroizing;
+
+    use crate::l10n::{Locale, Msg};
+    use crate::pkcs12;
+
+    use super::secret::{self, FlagSource, Request};
+    use super::{CliError, IssueLeafArgs};
+
+    /// The flags that name a password source, for the message shown when none
+    /// did.
+    const P12_FLAGS: &str =
+        "--p12-passphrase-file <path>, --p12-passphrase-stdin, --p12-passphrase-prompt";
+    /// The environment variable of last resort, reachable only through
+    /// `--p12-passphrase-prompt` (the ladder's non-flag rungs).
+    const P12_ENV: &str = "TESSERA_ISSUER_P12_PASSPHRASE";
+
+    /// A container password, and whether the tool made it up.
+    pub(super) struct ContainerPassphrase {
+        /// The password itself, wiped when dropped.
+        value: Zeroizing<String>,
+        /// Whether the tool generated it, and so owes the operator a one-time
+        /// display.
+        generated: bool,
+    }
+
+    impl ContainerPassphrase {
+        /// The password, for the length of the packaging call.
+        pub(super) fn expose(&self) -> &str {
+            &self.value
+        }
+
+        /// The password to show once, or `None` when the operator supplied it
+        /// and already has it.
+        pub(super) fn shown_once(&self) -> Option<&str> {
+            self.generated.then(|| self.value.as_str())
+        }
+    }
+
+    /// Resolves the container password for one `issue-leaf --generate-key` run.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::Usage`] when a named source fails or yields nothing, and
+    /// [`CliError::Issue`] when an operator-supplied password is below the
+    /// length floor.
+    pub(super) fn resolve(
+        args: &IssueLeafArgs,
+        locale: Locale,
+    ) -> Result<ContainerPassphrase, CliError> {
+        let explicit = if args.p12_passphrase_stdin {
+            Some(FlagSource::Stdin)
+        } else {
+            args.p12_passphrase_file.clone().map(FlagSource::File)
+        };
+
+        if explicit.is_none() && !args.p12_passphrase_prompt {
+            return Ok(ContainerPassphrase {
+                value: pkcs12::generate_passphrase(&mut crate::keygen::OsEntropy),
+                generated: true,
+            });
+        }
+
+        let secret = secret::resolve(&Request {
+            explicit: explicit.as_ref(),
+            caption: Msg::SecretPromptContainerPassphrase,
+            env_var: P12_ENV,
+            flags: P12_FLAGS,
+            locale,
+        })
+        .map_err(|e| CliError::Usage(e.to_string()))?;
+        let value = {
+            use secrecy::ExposeSecret as _;
+            Zeroizing::new(secret.expose_secret().to_owned())
+        };
+        pkcs12::check_passphrase(&value)?;
+        Ok(ContainerPassphrase {
+            value,
+            generated: false,
+        })
+    }
+}
+
 /// The passphrase provider for the CLI's file backend: the shared secret ladder,
 /// captioned as the CA key passphrase.
 #[cfg(feature = "file")]
@@ -3122,5 +3578,370 @@ mod tests {
         let pem = encode_pem("CERTIFICATE", &der);
         assert_eq!(decode_pem_or_der(&der).unwrap(), der);
         assert_eq!(decode_pem_or_der(pem.as_bytes()).unwrap(), der);
+    }
+}
+
+/// The `--generate-key` surface: the flags, the container it produces, and what
+/// it must never leave behind.
+#[cfg(test)]
+mod generate_key_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use crate::sign::MockSigner;
+    use crate::test_support::{self_signed_ca, spki_fixture, MemoryStorage};
+    use crate::{CaRequest, Journal};
+    use tessera_ext::delegation::DelegationConstraints;
+
+    const TS: u64 = 1_600_000_000;
+
+    fn key() -> KeyId {
+        KeyId::new("ca-key")
+    }
+
+    /// An org CA the generated leaf can be issued under.
+    fn parent(signer: &MockSigner) -> Vec<u8> {
+        let req = CaRequest {
+            subject: "CN=Org CA".to_owned(),
+            subject_spki_der: spki_fixture(),
+            validity: Validity {
+                not_before: TS,
+                not_after: TS + 9_000_000,
+            },
+            constraints: DelegationConstraints {
+                require_tags: vec![],
+                allow_roles: vec!["oper".to_owned()],
+                max_level: 5,
+                max_ttl: 86_400,
+            },
+            profile_version: 0,
+        };
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        self_signed_ca(signer, &key(), &req, &Serial::generate(), &mut journal, TS)
+            .unwrap()
+            .der
+    }
+
+    /// The argv of a `--generate-key` issuance into `dir`.
+    fn argv(dir: &Path, extra: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = [
+            "issuer",
+            "issue-leaf",
+            "--backend",
+            "mock",
+            "--key",
+            "ca-key",
+            "--parent",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        out.push(dir.join("parent.der").display().to_string());
+        for arg in [
+            "--generate-key",
+            "--subject",
+            "CN=ivanov",
+            "--host",
+            "*",
+            "--role",
+            "oper",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1600003600",
+        ] {
+            out.push(arg.to_owned());
+        }
+        out.push("--journal".to_owned());
+        out.push(dir.join("journal.ndjson").display().to_string());
+        out.push("--out-p12".to_owned());
+        out.push(dir.join("ivanov.p12").display().to_string());
+        out.extend(extra.iter().map(|s| (*s).to_owned()));
+        out
+    }
+
+    /// Lay down the parent certificate and run the parsed command.
+    fn run_in(dir: &Path, extra: &[&str]) -> Result<(), CliError> {
+        let signer = MockSigner::ecdsa_sha256(key());
+        std::fs::write(dir.join("parent.der"), parent(&signer)).unwrap();
+        run(Cli::parse_from(argv(dir, extra)).command, Locale::En)
+    }
+
+    #[test]
+    fn writes_a_container_and_leaves_no_key_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        run_in(dir.path(), &[]).expect("the issuance succeeds");
+
+        let container = std::fs::read(dir.path().join("ivanov.p12")).unwrap();
+        let certs = crate::pkcs12::certificates_without_passphrase(&container)
+            .expect("the container's certificates are readable without the password");
+        assert!(!certs.is_empty());
+
+        // Nothing but the artifacts the operator asked for: in particular no
+        // key file, no temporary, and no password beside the container.
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "ivanov.p12".to_owned(),
+                "journal.ndjson".to_owned(),
+                "parent.der".to_owned(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_container_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        run_in(dir.path(), &[]).expect("the issuance succeeds");
+        let mode = std::fs::metadata(dir.path().join("ivanov.p12"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file carrying a private key must not be readable beyond its owner"
+        );
+    }
+
+    #[test]
+    fn refuses_a_key_type_the_device_cannot_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_in(dir.path(), &["--key-type", "gost-2012-256"])
+            .expect_err("an unverifiable key type must be refused");
+        let CliError::Issue(IssueError::UnsupportedKeyType { supported, .. }) = err else {
+            panic!("expected UnsupportedKeyType, got {err:?}");
+        };
+        assert!(supported.contains("ecdsa-p384"), "got {supported}");
+        assert!(
+            !dir.path().join("ivanov.p12").exists(),
+            "a refused request must not leave an artifact"
+        );
+        assert!(
+            !dir.path().join("journal.ndjson").exists(),
+            "a request refused before generation must not reach the journal"
+        );
+    }
+
+    #[test]
+    fn refuses_a_short_operator_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "short\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let err = run_in(
+            dir.path(),
+            &["--p12-passphrase-file", &secret.display().to_string()],
+        )
+        .expect_err("a short password must be refused");
+        assert!(
+            matches!(err, CliError::Issue(IssueError::PassphraseTooShort { .. })),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn no_flag_takes_the_password_by_value() {
+        // `argv` is world-readable, so a flag that accepted the password
+        // directly would publish it to every process on the machine.
+        for flag in [
+            "--p12-passphrase",
+            "--p12-password",
+            "--passphrase",
+            "--password",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut with_value = argv(dir.path(), &[]);
+            with_value.push(flag.to_owned());
+            with_value.push("hunter2hunter2".to_owned());
+            assert!(
+                Cli::try_parse_from(&with_value).is_err(),
+                "{flag} must not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_is_mutually_exclusive_with_the_other_key_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        for conflicting in [["--spki", "spki.pem"], ["--csr", "req.pem"]] {
+            let mut argv = argv(dir.path(), &[]);
+            argv.extend(conflicting.iter().map(|s| (*s).to_owned()));
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "--generate-key must conflict with {}",
+                conflicting[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_generation_flags_are_refused_without_the_generation_flag() {
+        // Silently ignoring them would issue a plain certificate and no
+        // container, which is only discovered when the engineer has nothing to
+        // log in with.
+        let base = [
+            "issuer",
+            "issue-leaf",
+            "--backend",
+            "mock",
+            "--key",
+            "ca-key",
+            "--parent",
+            "ca.pem",
+            "--spki",
+            "spki.pem",
+            "--subject",
+            "CN=ivanov",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1600003600",
+            "--journal",
+            "journal.ndjson",
+            "--out",
+            "leaf.pem",
+        ];
+        for stray in [
+            vec!["--p12-passphrase-stdin"],
+            vec!["--p12-passphrase-prompt"],
+            vec!["--out-p12", "ivanov.p12"],
+            vec!["--key-type", "ecdsa-p384"],
+            vec!["--chain", "chain.pem"],
+        ] {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend(&stray);
+            let err = run(Cli::parse_from(&argv).command, Locale::En)
+                .expect_err("a stray generation flag must be refused");
+            let CliError::Usage(message) = err else {
+                panic!("expected a usage refusal for {stray:?}, got {err:?}");
+            };
+            let flag = stray.first().copied().unwrap_or_default();
+            assert!(message.contains(flag), "got {message}");
+        }
+    }
+}
+
+/// `prepare-carrier`: where the artifacts land and what it refuses to do.
+#[cfg(test)]
+mod prepare_carrier_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Parse and run a `prepare-carrier` argv.
+    fn run_argv(flags: &[String]) -> Result<(), CliError> {
+        let mut argv = vec!["issuer".to_owned(), "prepare-carrier".to_owned()];
+        argv.extend_from_slice(flags);
+        run(Cli::parse_from(argv).command, Locale::En)
+    }
+
+    fn arg(flag: &str, value: &Path) -> Vec<String> {
+        vec![flag.to_owned(), value.display().to_string()]
+    }
+
+    #[test]
+    fn lays_artifacts_where_the_device_looks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let chain = dir.path().join("chain.pem");
+        let media = dir.path().join("media");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(&chain, b"chain").unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend(arg("--chain", &chain));
+        argv.extend(arg("--media", &media));
+        run_argv(&argv).expect("the layout succeeds");
+
+        assert_eq!(
+            std::fs::read(media.join("certs/user.p12")).unwrap(),
+            b"container"
+        );
+        assert_eq!(
+            std::fs::read(media.join("certs/chain.pem")).unwrap(),
+            b"chain"
+        );
+    }
+
+    #[test]
+    fn refuses_to_replace_a_container_without_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let media = dir.path().join("media");
+        std::fs::write(&p12, b"mine").unwrap();
+        std::fs::create_dir_all(media.join("certs")).unwrap();
+        std::fs::write(media.join("certs/user.p12"), b"someone-else").unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend(arg("--media", &media));
+        // The test process has no terminal, so the question cannot be asked and
+        // the operation must stop rather than guess.
+        let err = run_argv(&argv).expect_err("an unconfirmed overwrite must be refused");
+        assert!(matches!(err, CliError::Usage(_)), "got {err:?}");
+        assert_eq!(
+            std::fs::read(media.join("certs/user.p12")).unwrap(),
+            b"someone-else"
+        );
+
+        argv.push("--force".to_owned());
+        run_argv(&argv).expect("--force is the confirmation");
+        assert_eq!(
+            std::fs::read(media.join("certs/user.p12")).unwrap(),
+            b"mine"
+        );
+    }
+
+    #[test]
+    fn refuses_a_token_carrier_rather_than_pretending_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        std::fs::write(&p12, b"container").unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend([
+            "--module".to_owned(),
+            "/usr/lib/librtpkcs11ecp.so".to_owned(),
+        ]);
+        argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
+
+        let err = run_argv(&argv).expect_err("the token carrier is not implemented");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("not implemented"),
+            "the refusal must say so plainly: {message}"
+        );
+    }
+
+    #[test]
+    fn takes_no_password_at_all() {
+        // Container and password travel by separate channels; a flag here would
+        // invite writing the password onto the carrier beside the container.
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        std::fs::write(&p12, b"container").unwrap();
+        for flag in ["--p12-passphrase-file", "--passphrase-file", "--password"] {
+            let mut argv = arg("--p12", &p12);
+            argv.extend(arg("--media", dir.path()));
+            argv.extend([flag.to_owned(), "whatever".to_owned()]);
+            let mut full = vec!["issuer".to_owned(), "prepare-carrier".to_owned()];
+            full.extend(argv);
+            assert!(Cli::try_parse_from(&full).is_err(), "{flag} must not exist");
+        }
     }
 }
