@@ -235,6 +235,8 @@ impl FlowError {
     /// | `MaxIntegrityMalformed`                                | `PAM_PERM_DENIED` (6)      |
     /// | `Pkcs12` / `Crypto` / `Trust`                          | `PAM_PERM_DENIED` (6)      |
     /// | `MonitorRegistration`                                  | `PAM_PERM_DENIED` (6)      |
+    /// | `Pkcs11(ExtractableKeyRejected)`                       | `PAM_AUTH_ERR` (7)         |
+    /// | `Pkcs11(ExtractableAttributeUnavailable)`              | `PAM_AUTH_ERR` (7)         |
     /// | other `Pkcs11(...)` / `Pkcs11Acquire(Pkcs11)`          | `PAM_AUTH_ERR` (7)         |
     /// | `Internal`                                             | `PAM_SYSTEM_ERR` (4)       |
     #[must_use]
@@ -1119,7 +1121,8 @@ where
     P: FnMut(&str) -> Result<SecretString, PamConvError>,
 {
     use tessera_core::token::pkcs11::{
-        pkcs11_challenge_response, select_mechanism, FoundCertificate, FoundPrivateKey,
+        pkcs11_challenge_response, select_mechanism, ExtractableKeyPolicy, FoundCertificate,
+        FoundPrivateKey,
     };
 
     ensure_pkcs11_presence_mode(deps.cfg)?;
@@ -1181,11 +1184,18 @@ where
         "pkcs11 certificate found"
     );
 
-    // Step 6 — find the matching private key (paired by CKA_ID).  An
-    // extractable key is rejected here unless the operator opted in via
-    // `pkcs11_allow_extractable_keys` (mode-B invariant, fail-closed).
-    let key: FoundPrivateKey =
-        session.find_private_key_for_cert(&cert, deps.cfg.pkcs11_allow_extractable_keys)?;
+    // Step 6 — find the matching private key (paired by CKA_ID).  A key
+    // that reports itself extractable, and a key whose token will not
+    // report the attribute at all, are each rejected here unless the
+    // operator opted into that specific case (mode-B invariant,
+    // fail-closed).
+    let key: FoundPrivateKey = session.find_private_key_for_cert(
+        &cert,
+        ExtractableKeyPolicy {
+            allow_extractable: deps.cfg.pkcs11_allow_extractable_keys,
+            allow_unreported: deps.cfg.pkcs11_allow_unreported_extractable,
+        },
+    )?;
 
     // Step 7 — pick a signing mechanism, then challenge-response.
     let pubkey = cert.certificate.public_key().map_err(FlowError::Trust)?;

@@ -56,7 +56,7 @@ Bootstrap-спеки текущей реализации **v0.4.0** (2026-06-09)
 
 Security-класс (закрыто в коде):
 - **Подпись CRL верифицируется** против issuer-сертификата, fail-closed (`TrustError::CrlSignatureInvalid`); issuer-DN сверка байт-в-байт — с f542df5.
-- **Extractable PKCS#11-ключ отклоняется** (fail-closed); ослабление только явным opt-in `pkcs11_allow_extractable_keys`.
+- **Extractable PKCS#11-ключ отклоняется** (fail-closed); ослабление только явным opt-in `pkcs11_allow_extractable_keys`. Токен, не сообщивший `CKA_EXTRACTABLE`, отклоняется отдельно (`ExtractableAttributeUnavailable`) — молчание провайдера не читается как `FALSE`; свой opt-in `pkcs11_allow_unreported_extractable`.
 - **Malformed allowed_roles** — fail-closed (список считается пустым, роль не покрыта; отказ вместо игнорирования расширения).
 - **Пустой sig-alg whitelist** подменяется безопасным дефолтом `DEFAULT_SIGNATURE_ALGORITHMS` (f542df5) вместо accept-all.
 
