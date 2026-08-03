@@ -493,6 +493,33 @@ sudo /sbin/pdpl-user --ilevel 63 service
 sudo systemctl restart fly-dm
 ```
 
+**Cause 4: separate `pamtester` (or any other PAM client) calls for
+auth and for session instead of a single transaction.** The order of
+lines in `/etc/pam.d/*` is entirely correct in this case —
+`pam_parsec_mac.so` stores data via `pam_set_data()` in the auth
+instance and reads it via `pam_get_data()` in the account/session
+instance, but that API is tied to a specific `pamh`: two separate
+`pamtester` invocations are two separate processes and two independent
+`pam_start()`/`pam_end()` calls, so the second physically cannot see
+what the first one stored. The symptom reads identically to Cause 1
+(the same `Can't obtain required data`), but the fix is a command, not
+a file edit:
+
+```bash
+# wrong — three separate PAM transactions:
+pamtester login serv authenticate
+pamtester login serv acct_mgmt
+
+# right — one transaction for the whole cycle:
+pamtester login serv authenticate acct_mgmt open_session close_session
+```
+
+If the `grep` from Cause 1 showed the correct line order and the error
+is still there, check whether the run was split across several
+separate `pamtester` invocations before suspecting the МКЦ kernel
+(Causes 2–3). Details — [pam-integration.md
+§9](pam-integration.md#9-pamtester-does-not-replace-a-real-login).
+
 ### `parsec.mac=0` + `pam_parsec_mac` in the stack
 
 **Symptom:** the МКЦ kernel is disabled via GRUB (`parsec.mac=0`), but
