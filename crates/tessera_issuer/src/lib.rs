@@ -345,6 +345,15 @@ pub(crate) fn issue_leaf_recording_origin<B: SignatureBackend, S: JournalStorage
     })
 }
 
+/// Annotation `kind` recording that a leaf was issued but its container never
+/// reached the operator.
+///
+/// The journal exists for inventory, and an issuance line on its own says a
+/// credential is in circulation. When packaging fails the certificate was
+/// signed but nothing was handed over, and only this line separates the two
+/// cases afterwards.
+pub const CONTAINER_WITHHELD_ANNOTATION: &str = "tessera.issuer.container_withheld";
+
 /// A leaf issuance in which the tool generates the key pair.
 ///
 /// The scope is the operator's, exactly as for every other key source; what the
@@ -485,11 +494,34 @@ fn issue_leaf_generating_key_with<B: SignatureBackend, S: JournalStorage, E: key
         leaf_der: &cert.der,
         chain_der: req.chain_der,
     };
-    let container = match pbkdf2_iterations {
+    let built = match pbkdf2_iterations {
         Some(iterations) => {
-            pkcs12::build_with_iterations(&contents, passphrase, entropy, iterations)?
+            pkcs12::build_with_iterations(&contents, passphrase, entropy, iterations)
         }
-        None => pkcs12::build_container(&contents, passphrase, entropy)?,
+        None => pkcs12::build_container(&contents, passphrase, entropy),
+    };
+    let container = match built {
+        Ok(container) => container,
+        Err(error) => {
+            // The issuance is already in the chain and stays there — the
+            // certificate was genuinely signed. But nothing reached the
+            // engineer, and a journal that showed only the issuance would count
+            // this as a credential in circulation. The annotation is what tells
+            // the two apart later; failing to write it does not change the
+            // outcome, which is the packaging failure the caller is about to
+            // see.
+            let noted = journal.append_annotation(
+                CONTAINER_WITHHELD_ANNOTATION,
+                serde_json::json!({
+                    "serial": hex::encode(serial.as_bytes()),
+                    "subject": req.subject,
+                    "reason": error.to_string(),
+                }),
+                now_unix,
+            );
+            drop(noted);
+            return Err(error);
+        }
     };
     Ok(GeneratedLeaf { cert, container })
 }

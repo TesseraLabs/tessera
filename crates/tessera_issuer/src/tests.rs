@@ -1674,6 +1674,52 @@ mod generated_key {
     }
 
     #[test]
+    fn a_withheld_container_is_marked_in_the_journal() {
+        // The certificate is signed before the container is built, so a
+        // packaging failure leaves an issuance line for a credential nobody
+        // received. Without the annotation an inventory counts it as issued.
+        let signer = MockSigner::ecdsa_sha256(key());
+        let ca = org_ca(&signer, &root_ca(&signer));
+        let mut journal = fresh_journal();
+
+        let mut req = request(&[], LeafKeyType::EcdsaP256);
+        // A chain element that is not a certificate fails the container, and
+        // fails it after the issuance has been journaled.
+        let junk = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        req.chain_der = &junk;
+
+        let err = crate::issue_leaf_generating_key_with(
+            &signer,
+            &key(),
+            &ca,
+            &req,
+            PASSPHRASE,
+            &Serial::generate(),
+            &mut journal,
+            &mut OsEntropy,
+            TS,
+            Some(crate::pkcs12::TEST_ITERATIONS),
+        )
+        .expect_err("packaging must fail");
+        assert!(matches!(err, IssueError::Container(_)), "got {err:?}");
+
+        let lines = journal.storage().lines();
+        assert!(
+            lines.iter().any(|line| line.contains("issue_leaf")),
+            "the signed certificate stays recorded"
+        );
+        let note = lines
+            .iter()
+            .find(|line| line.contains(crate::CONTAINER_WITHHELD_ANNOTATION))
+            .expect("the withheld container is recorded");
+        assert!(note.contains("CN=ivanov"), "got {note}");
+        assert!(
+            !note.contains(PASSPHRASE),
+            "the annotation must carry no secret: {note}"
+        );
+    }
+
+    #[test]
     fn the_envelope_still_bounds_the_generated_leaf() {
         // The generated-key path must not become a way around the parent's
         // integrity ceiling, so the same refusal is asserted here as for the

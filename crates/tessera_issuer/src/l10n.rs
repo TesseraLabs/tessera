@@ -198,14 +198,16 @@ pub(crate) enum Msg {
     /// CLI: the heading above a generated container password, warning that it
     /// is shown once and is not recoverable.
     CliContainerPassphraseHeading,
+    /// CLI: a password was generated but there is no terminal to show it on.
+    CliContainerPassphraseNoTerminal,
     /// CLI: the artifacts were laid out on a carrier (paths follow).
     CliCarrierWritten,
-    /// CLI: the carrier already holds a container; asks whether to replace it
-    /// (a path follows).
+    /// CLI: the carrier already holds one of the artifacts; asks whether to
+    /// replace it (a path follows).
     CliCarrierOverwriteAsk,
-    /// CLI: the operator declined replacing an existing container (full line).
+    /// CLI: the operator declined replacing an existing artifact (full line).
     CliCarrierOverwriteDeclined,
-    /// CLI: a container would be replaced but nothing can ask the operator
+    /// CLI: an artifact would be replaced but nothing can ask the operator
     /// (a path follows).
     CliCarrierOverwriteNeedsConfirmation,
     /// CLI: a CRL was written (a path follows).
@@ -292,16 +294,20 @@ impl Msg {
                 "container password — shown once, it cannot be recovered later; \
                  deliver it by a channel other than the container's:"
             }
+            Msg::CliContainerPassphraseNoTerminal => {
+                "a container password was generated but standard error is not a terminal; \
+                 printing it would leave it in the captured output. Re-run naming a password \
+                 source: --p12-passphrase-file <path>, --p12-passphrase-stdin, \
+                 --p12-passphrase-prompt"
+            }
             Msg::CliCarrierWritten => "carrier prepared:",
             Msg::CliCarrierOverwriteAsk => {
-                "a container is already in place and may belong to another engineer; \
+                "this file is already on the carrier and may belong to another engineer; \
                  replace it? [y/N]:"
             }
-            Msg::CliCarrierOverwriteDeclined => {
-                "declined: the existing container was left in place"
-            }
+            Msg::CliCarrierOverwriteDeclined => "declined: the carrier was left as it was",
             Msg::CliCarrierOverwriteNeedsConfirmation => {
-                "a container is already in place and nothing can ask for confirmation here; \
+                "this file is already on the carrier and nothing can ask for confirmation here; \
                  re-run with --force once you have checked what it is:"
             }
             Msg::CliCrlWritten => "CRL written to",
@@ -363,16 +369,20 @@ impl Msg {
                 "пароль контейнера — показан один раз, восстановить его позже нельзя; \
                  передайте его каналом, отличным от канала контейнера:"
             }
+            Msg::CliContainerPassphraseNoTerminal => {
+                "пароль контейнера порождён, но стандартный поток ошибок — не терминал; \
+                 печать оставила бы пароль в перехваченном выводе. Повторите, назвав источник \
+                 пароля: --p12-passphrase-file <путь>, --p12-passphrase-stdin, \
+                 --p12-passphrase-prompt"
+            }
             Msg::CliCarrierWritten => "носитель подготовлен:",
             Msg::CliCarrierOverwriteAsk => {
-                "по этому пути уже лежит контейнер, возможно другого инженера; \
+                "этот файл уже лежит на носителе, возможно от другого инженера; \
                  заменить его? [y/N]:"
             }
-            Msg::CliCarrierOverwriteDeclined => {
-                "отменено: существующий контейнер оставлен на месте"
-            }
+            Msg::CliCarrierOverwriteDeclined => "отменено: носитель оставлен как был",
             Msg::CliCarrierOverwriteNeedsConfirmation => {
-                "по этому пути уже лежит контейнер, а спросить подтверждение здесь не у кого; \
+                "этот файл уже лежит на носителе, а спросить подтверждение здесь не у кого; \
                  разберитесь, что это, и повторите с --force:"
             }
             Msg::CliCrlWritten => "CRL записан в",

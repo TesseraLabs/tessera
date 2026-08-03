@@ -1024,8 +1024,7 @@ impl IssueLeafJob<'_> {
         // operator's screen, and only when the tool made it up: one the operator
         // supplied is already theirs to keep.
         if let Some(shown) = passphrase.shown_once() {
-            println!("{}", Msg::CliContainerPassphraseHeading.text(locale));
-            println!("{shown}");
+            show_generated_passphrase(shown, locale)?;
         }
         Ok(())
     }
@@ -1387,29 +1386,46 @@ fn write_artifact(path: &Path, der: &[u8], pem_label: &str, as_der: bool) -> Res
 /// Write a PKCS#12 container, readable by its owner alone.
 ///
 /// The certificates the tool writes are public; this file is not — it carries a
-/// private key, and the password protecting that key is delivered separately
-/// and may not have reached the engineer yet. On a shared workstation the
-/// default mode would publish it to every local account for as long as it sits
-/// there. The mode is set at creation, not after the write, so the bytes are
-/// never on disk under a wider mode.
+/// private key, and the password protecting that key travels separately and may
+/// not have reached the engineer yet.
+///
+/// The bytes go into a fresh file beside the target and are renamed over it.
+/// `create_new` is what makes the mode hold: setting a mode on `open` affects
+/// only a file being created, so writing straight to the target would inherit
+/// whatever mode it already had — and would follow a symlink sitting there,
+/// putting the key wherever it points. The rename also means a reader never
+/// sees a half-written container.
 ///
 /// Windows has no equivalent one-call restriction here; the file inherits the
 /// directory's ACL, which is the platform's own answer to the same question.
 fn write_container(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     use std::io::Write as _;
 
+    let io = |p: &Path, e: std::io::Error| CliError::Io(format!("{}: {e}", p.display()));
+
+    let mut staged_name = std::ffi::OsString::from(".tessera-staging-");
+    staged_name.push(path.file_name().unwrap_or_else(|| "container".as_ref()));
+    let staged = path.with_file_name(staged_name);
+    drop(std::fs::remove_file(&staged));
+
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|e| CliError::Io(format!("{}: {e}", path.display())))?;
-    file.write_all(bytes)
-        .map_err(|e| CliError::Io(format!("{}: {e}", path.display())))
+    let mut file = options.open(&staged).map_err(|e| io(&staged, e))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| io(&staged, e));
+    drop(file);
+    if let Err(e) = written {
+        drop(std::fs::remove_file(&staged));
+        return Err(e);
+    }
+    std::fs::rename(&staged, path).map_err(|e| io(path, e))
 }
 
 /// Decode every PEM block of a chain file into DER, in file order.
@@ -1418,6 +1434,22 @@ fn write_container(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
 /// would silently take only the first, which is exactly the kind of quiet loss
 /// that surfaces later as an unverifiable chain on a device.
 fn decode_pem_chain(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CliError> {
+    let chain = decode_pem_blocks(bytes)?;
+    // Decoding base64 says nothing about what was inside it. The container's
+    // certificate safe is unencrypted by design, so a file that is not a
+    // certificate — the CA key file sits under an adjacent flag — would be
+    // published in the clear. Each block is reported as the chain element it
+    // is: an operator told "the leaf certificate" would go and check the wrong
+    // file.
+    for (index, der) in chain.iter().enumerate() {
+        crate::pkcs12::check_certificate(der, &format!("chain element {index}"))
+            .map_err(|e| CliError::Usage(format!("--chain: {e}")))?;
+    }
+    Ok(chain)
+}
+
+/// Split a PEM file into the DER of each block, in file order.
+fn decode_pem_blocks(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CliError> {
     let looks_pem = bytes
         .iter()
         .find(|b| !b.is_ascii_whitespace())
@@ -1451,6 +1483,65 @@ fn decode_pem_chain(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CliError> {
     Ok(out)
 }
 
+/// Refuse to generate a password there is nobody to show.
+///
+/// A generated password is shown once and nowhere else, so a run that cannot
+/// show it produces a container no one can ever open. Writing it into a
+/// captured stream instead — a CI log, a `tee` file — would mean treating it as
+/// compromised from the moment it is issued.
+///
+/// This runs before the key is generated and before anything is journaled, so
+/// the refusal costs nothing and leaves nothing behind.
+fn require_terminal_for_generated_passphrase(locale: Locale) -> Result<(), CliError> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stderr().is_terminal() {
+        return Ok(());
+    }
+    Err(CliError::Usage(
+        Msg::CliContainerPassphraseNoTerminal
+            .text(locale)
+            .to_owned(),
+    ))
+}
+
+/// Show a generated container password, once, to a person.
+///
+/// Standard error, not standard output: the password is not part of the
+/// artifact stream an operator pipes into a file or a log, and the same crate
+/// already sends its environment-variable warning there. That the stream is a
+/// terminal was settled before the issuance ran.
+fn show_generated_passphrase(passphrase: &str, locale: Locale) -> Result<(), CliError> {
+    use std::io::Write as _;
+
+    let mut stderr = std::io::stderr();
+    writeln!(
+        stderr,
+        "{}",
+        Msg::CliContainerPassphraseHeading.text(locale)
+    )
+    .and_then(|()| writeln!(stderr, "{passphrase}"))
+    .map_err(|e| CliError::Io(format!("stderr: {e}")))
+}
+
+/// Check that a chain about to be laid out belongs to the container beside it.
+///
+/// The container's certificate safe is unencrypted, so the leaf is readable
+/// here without the password — and when it is, the chain can be checked against
+/// it rather than taken on trust. A container this tool did not build may hide
+/// its leaf; then there is nothing to check against and the chain's own
+/// well-formedness, already established, is all that can be said.
+fn check_chain_against_container(container: &[u8], chain: &[Vec<u8>]) -> Result<(), CliError> {
+    let Ok(certs) = crate::pkcs12::certificates_without_passphrase(container) else {
+        return Ok(());
+    };
+    let Some(leaf) = certs.first() else {
+        return Ok(());
+    };
+    crate::pkcs12::check_chain(leaf, chain)
+        .map_err(|e| CliError::Usage(format!("--chain does not match --p12: {e}")))
+}
+
 /// `prepare-carrier`: lay an already-issued credential out where the device's
 /// check looks for it.
 ///
@@ -1473,9 +1564,21 @@ fn prepare_carrier(args: &PrepareCarrierArgs, locale: Locale) -> Result<(), CliE
         .as_deref()
         .ok_or_else(|| CliError::Usage("--media is required".to_owned()))?;
 
+    if let Some(relative) = args.container_path.as_deref() {
+        crate::carrier::check_container_path(relative)
+            .map_err(|e| CliError::Usage(e.to_string()))?;
+    }
+
     let container = read_file(&args.p12)?;
+    // The chain is validated before it is copied: `certs/chain.pem` is read by
+    // the device, and a file that is not a chain fails there, not here.
     let chain = match args.chain.as_deref() {
-        Some(path) => Some(read_file(path)?),
+        Some(path) => {
+            let bytes = read_file(path)?;
+            let certs = decode_pem_chain(&bytes)?;
+            check_chain_against_container(&container, &certs)?;
+            Some(bytes)
+        }
         None => None,
     };
 
@@ -1514,14 +1617,15 @@ fn resolve_overwrite(
     if args.force {
         return Ok(Overwrite::Allow);
     }
-    if !crate::carrier::container_present(media, args.container_path.as_deref()) {
+    let at_risk = crate::carrier::artifact_at_risk(
+        media,
+        args.container_path.as_deref(),
+        args.chain.is_some(),
+    )
+    .map_err(|e| CliError::Usage(e.to_string()))?;
+    let Some(target) = at_risk else {
         return Ok(Overwrite::Refuse);
-    }
-    let target = media.join(
-        args.container_path
-            .as_deref()
-            .unwrap_or(crate::carrier::CONTAINER_RELATIVE_PATH),
-    );
+    };
     match ask_yes_no(&format!(
         "{} {}",
         Msg::CliCarrierOverwriteAsk.text(locale),
@@ -1549,8 +1653,13 @@ fn ask_yes_no(question: &str) -> Option<bool> {
     if !std::io::stdin().is_terminal() {
         return None;
     }
-    print!("{question} ");
-    std::io::stdout().flush().ok()?;
+    // Asked on standard error, where the answer is read from: printing to
+    // standard output would leave an operator whose output is redirected
+    // staring at a blank screen while the tool waits for an answer to a
+    // question they never saw.
+    let mut stderr = std::io::stderr();
+    write!(stderr, "{question} ").ok()?;
+    stderr.flush().ok()?;
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer).ok()?;
     let answer = answer.trim().to_ascii_lowercase();
@@ -2815,6 +2924,11 @@ mod p12pass {
         };
 
         if explicit.is_none() && !args.p12_passphrase_prompt {
+            // Asked before anything is issued: a password that cannot be shown
+            // is a container nobody can open, and finding that out after the
+            // certificate is signed and journaled leaves an artifact whose only
+            // possible fate is to be thrown away.
+            super::require_terminal_for_generated_passphrase(locale)?;
             return Ok(ContainerPassphrase {
                 value: pkcs12::generate_passphrase(&mut crate::keygen::OsEntropy),
                 generated: true,
@@ -3601,8 +3715,14 @@ mod generate_key_tests {
 
     /// An org CA the generated leaf can be issued under.
     fn parent(signer: &MockSigner) -> Vec<u8> {
+        parent_named(signer, "Org CA")
+    }
+
+    /// As [`parent`], with a common name of the caller's choosing — a second CA
+    /// needs its own subject, since that is what the chain check compares.
+    pub(super) fn parent_named(signer: &MockSigner, common_name: &str) -> Vec<u8> {
         let req = CaRequest {
-            subject: "CN=Org CA".to_owned(),
+            subject: format!("CN={common_name}"),
             subject_spki_der: spki_fixture(),
             validity: Validity {
                 not_before: TS,
@@ -3661,10 +3781,34 @@ mod generate_key_tests {
     }
 
     /// Lay down the parent certificate and run the parsed command.
+    ///
+    /// A password source is supplied by default: a test process has no terminal
+    /// to show a generated password on, and the tool refuses to print one into
+    /// output that is being captured.
     fn run_in(dir: &Path, extra: &[&str]) -> Result<(), CliError> {
+        let secret = dir.join("p12-password.txt");
+        write_owner_only(&secret, "delivered-out-of-band\n");
+        let mut with_source: Vec<&str> = extra.to_vec();
+        let path = secret.display().to_string();
+        with_source.extend(["--p12-passphrase-file", &path]);
+        run_in_raw(dir, &with_source)
+    }
+
+    /// As [`run_in`], naming no password source — the tool then generates one.
+    fn run_in_raw(dir: &Path, extra: &[&str]) -> Result<(), CliError> {
         let signer = MockSigner::ecdsa_sha256(key());
         std::fs::write(dir.join("parent.der"), parent(&signer)).unwrap();
         run(Cli::parse_from(argv(dir, extra)).command, Locale::En)
+    }
+
+    /// Write a secret file the owner-only gate accepts.
+    fn write_owner_only(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     #[test]
@@ -3689,6 +3833,9 @@ mod generate_key_tests {
             vec![
                 "ivanov.p12".to_owned(),
                 "journal.ndjson".to_owned(),
+                // The password source the test supplied, not something the run
+                // produced.
+                "p12-password.txt".to_owned(),
                 "parent.der".to_owned(),
             ]
         );
@@ -3710,6 +3857,138 @@ mod generate_key_tests {
             mode, 0o600,
             "a file carrying a private key must not be readable beyond its owner"
         );
+    }
+
+    #[test]
+    fn refuses_a_generated_password_it_cannot_show_to_a_person() {
+        // A test process has no terminal on standard error. Printing the
+        // password anyway would put it in whatever captured the run, after
+        // which it would have to be treated as compromised.
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_in_raw(dir.path(), &[]).expect_err("there is nobody to show the password to");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("--p12-passphrase-file"),
+            "the refusal must name the sources that would work: {message}"
+        );
+        // And it happens before any work: a container written but unopenable,
+        // or a journal line for a credential nobody received, would both be
+        // worse than the refusal.
+        assert!(!dir.path().join("ivanov.p12").exists());
+        assert!(!dir.path().join("journal.ndjson").exists());
+    }
+
+    #[test]
+    fn refuses_a_chain_file_that_is_not_a_certificate() {
+        // The slip: `--chain ca.pk8.pem` where `--key-file ca.pk8.pem` was
+        // meant. The certificate safe is unencrypted, so the CA key would ride
+        // out in the clear.
+        let dir = tempfile::tempdir().unwrap();
+        let key_pem = crate::keygen::generate_key_pair(
+            crate::keygen::LeafKeyType::EcdsaP256,
+            &mut crate::keygen::OsEntropy,
+        )
+        .unwrap();
+        let chain = dir.path().join("ca.pk8.pem");
+        std::fs::write(
+            &chain,
+            encode_pem("PRIVATE KEY", &key_pem.private_key_pkcs8_der),
+        )
+        .unwrap();
+
+        let err = run_in(dir.path(), &["--chain", &chain.display().to_string()])
+            .expect_err("a private key must never be packaged as a chain");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("chain element 0 is not an X.509 certificate"),
+            "the message must name the element that was checked: {message}"
+        );
+        assert!(
+            !message.contains("leaf"),
+            "a chain element must not be reported as the leaf: {message}"
+        );
+        assert!(
+            !message.contains("pkcs12 container"),
+            "the container module must not leak into a chain diagnostic: {message}"
+        );
+        assert!(
+            message.contains("expected tag"),
+            "the underlying cause is worth keeping: {message}"
+        );
+        assert!(
+            !dir.path().join("ivanov.p12").exists(),
+            "nothing may be written when the chain is refused"
+        );
+    }
+
+    #[test]
+    fn refuses_a_chain_from_a_different_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        // A well-formed CA that did not issue this leaf.
+        let signer = MockSigner::ecdsa_sha256(key());
+        let foreign = dir.path().join("foreign-chain.pem");
+        std::fs::write(
+            &foreign,
+            encode_pem("CERTIFICATE", &parent_named(&signer, "Some Other CA")),
+        )
+        .unwrap();
+
+        // The mismatch is caught by the core when the container is assembled,
+        // so it surfaces as the issuance refusal, not as a usage error.
+        let err = run_in(dir.path(), &["--chain", &foreign.display().to_string()])
+            .expect_err("a chain that did not issue the leaf must be refused");
+        let CliError::Issue(IssueError::Container(message)) = err else {
+            panic!("expected a container refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("does not lead to the leaf"),
+            "got {message}"
+        );
+        assert!(
+            !dir.path().join("ivanov.p12").exists(),
+            "nothing may be written when the chain is refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_wider_container_file_does_not_inherit_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ivanov.p12");
+        std::fs::write(&target, b"stale").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        run_in(dir.path(), &[]).expect("the issuance succeeds");
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file carrying a private key must not keep a mode it had before"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_container_path_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere.txt");
+        std::fs::write(&elsewhere, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("ivanov.p12")).unwrap();
+
+        run_in(dir.path(), &[]).expect("the issuance succeeds");
+
+        assert_eq!(
+            std::fs::read(&elsewhere).unwrap(),
+            b"untouched",
+            "the private key must not travel down a planted symlink"
+        );
+        assert!(!dir.path().join("ivanov.p12").is_symlink());
     }
 
     #[test]
@@ -3735,14 +4014,9 @@ mod generate_key_tests {
     fn refuses_a_short_operator_password() {
         let dir = tempfile::tempdir().unwrap();
         let secret = dir.path().join("secret.txt");
-        std::fs::write(&secret, "short\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        write_owner_only(&secret, "short\n");
 
-        let err = run_in(
+        let err = run_in_raw(
             dir.path(),
             &["--p12-passphrase-file", &secret.display().to_string()],
         )
@@ -3853,14 +4127,27 @@ mod prepare_carrier_tests {
         vec![flag.to_owned(), value.display().to_string()]
     }
 
+    /// A CA certificate in PEM, for the chain files these tests hand around.
+    fn ca_pem() -> String {
+        use crate::sign::MockSigner;
+        let signer = MockSigner::ecdsa_sha256(KeyId::new("ca-key"));
+        encode_pem(
+            "CERTIFICATE",
+            &super::generate_key_tests::parent_named(&signer, "Carrier Test CA"),
+        )
+    }
+
     #[test]
     fn lays_artifacts_where_the_device_looks() {
         let dir = tempfile::tempdir().unwrap();
         let p12 = dir.path().join("ivanov.p12");
         let chain = dir.path().join("chain.pem");
         let media = dir.path().join("media");
+        // Minted once: every call produces a fresh serial, so the file and the
+        // expectation have to come from the same certificate.
+        let pem = ca_pem();
         std::fs::write(&p12, b"container").unwrap();
-        std::fs::write(&chain, b"chain").unwrap();
+        std::fs::write(&chain, &pem).unwrap();
 
         let mut argv = arg("--p12", &p12);
         argv.extend(arg("--chain", &chain));
@@ -3872,8 +4159,8 @@ mod prepare_carrier_tests {
             b"container"
         );
         assert_eq!(
-            std::fs::read(media.join("certs/chain.pem")).unwrap(),
-            b"chain"
+            std::fs::read_to_string(media.join("certs/chain.pem")).unwrap(),
+            pem
         );
     }
 
@@ -3925,6 +4212,69 @@ mod prepare_carrier_tests {
         assert!(
             message.contains("not implemented"),
             "the refusal must say so plainly: {message}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_container_path_that_leaves_the_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let media = dir.path().join("media");
+        let victim = dir.path().join("keep.txt");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(&victim, b"not yours").unwrap();
+
+        for escape in [
+            "../escaped.p12".to_owned(),
+            victim.display().to_string(),
+            "certs/../../escaped.p12".to_owned(),
+        ] {
+            let mut argv = arg("--p12", &p12);
+            argv.extend(arg("--media", &media));
+            argv.extend(["--container-path".to_owned(), escape.clone()]);
+            argv.push("--force".to_owned());
+
+            let err = run_argv(&argv).expect_err("'{escape}' must be refused");
+            assert!(matches!(err, CliError::Usage(_)), "{escape}: got {err:?}");
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"not yours",
+            "a refused path must not have written anything"
+        );
+    }
+
+    #[test]
+    fn refuses_a_chain_file_that_is_not_a_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let chain = dir.path().join("not-a-chain.pem");
+        let media = dir.path().join("media");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(
+            &chain,
+            "-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend(arg("--chain", &chain));
+        argv.extend(arg("--media", &media));
+        let err = run_argv(&argv).expect_err("a chain file must hold certificates");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        // Preparing a carrier assembles no container, so nothing here may speak
+        // of one; and the element checked is a chain element, not a leaf.
+        assert!(
+            message.contains("chain element 0 is not an X.509 certificate"),
+            "got {message}"
+        );
+        assert!(!message.contains("leaf"), "got {message}");
+        assert!(!message.contains("pkcs12 container"), "got {message}");
+        assert!(
+            !media.join("certs/chain.pem").exists(),
+            "nothing may reach the carrier when the chain is refused"
         );
     }
 
