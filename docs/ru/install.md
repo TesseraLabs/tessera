@@ -21,7 +21,7 @@ cat /etc/astra_version 2>/dev/null || cat /etc/os-release
 
 Ожидаемый вывод: версия `1.7.5` или новее. На других редакциях
 Astra Linux (Орёл, Воронеж, Смоленск 1.7+) сценарий идентичен. На
-Ubuntu/Debian — best-effort, без ГОСТ.
+Ubuntu/Debian — best-effort.
 
 ### 1.2 Проверка ядра
 
@@ -44,21 +44,8 @@ sudo apt install -y \
     libsystemd0 \
     pcscd \
     opensc-pkcs11 \
-    libgost-astra \
     pamtester
 ```
-
-Имя пакета ГОСТ-движка зависит от системы: на Astra SE — `libgost-astra`
-(как выше); на «чистом» Debian/Ubuntu, если он вообще есть в
-подключённых репозиториях, — `libgost-engine`. `.deb` объявляет
-зависимость как альтернативу `libgost-engine | gost-engine |
-libgost-astra` — `apt install ./tessera_*.deb` (§2.4) подтянет то, что
-реально резолвится; `apt-cache search gost` покажет, что доступно в
-ваших репозиториях. На Ubuntu 22.04 в основном репозитории нет ни
-одного из трёх — движок надо собирать из исходников (см. README,
-раздел «Поддерживаемые ОС»; тот же build-путь, что для macOS —
-[gost-engine-macos.md](gost-engine-macos.md) — переносится на Linux
-почти без изменений).
 
 Если `apt install` не находит `pamtester` (или другие пакеты) на
 Ubuntu/Debian — проверьте, включён ли компонент `universe`/`multiverse`
@@ -87,34 +74,13 @@ sudo make install
 Ставится в `/usr/local/bin/pamtester` — в `PATH` попадает автоматически,
 дальше используется как в §10.
 
-### 1.4 Проверка `gost-engine`
+> Разделы 3–4 (выпуск тестового CA и удостоверений) — обычные вызовы
+> `openssl` без какого-либо движка (ECDSA P-256 поддерживается
+> встроенным `default`-provider'ом OpenSSL везде, включая macOS), не
+> обязаны выполняться на целевой Astra-машине и вынесены в отдельный
+> документ — [cert-issuance-lab.md](cert-issuance-lab.md).
 
-```bash
-openssl engine gost -t
-```
-
-Ожидание: вывод содержит `[ available ]` и список доступных
-алгоритмов, в том числе `id-GostR3411-2012-256` (Streebog-256) и
-`gost2012_256` (ГОСТ 34.10-2012-256).
-
-> Разделы 3–4 (выпуск тестового CA и удостоверений) не обязаны
-> выполняться на целевой Astra-машине — это просто вызовы `openssl`,
-> и удобнее их гонять на рабочей станции администратора. На macOS
-> готового пакета `gost-engine` в Homebrew нет — движок собирается из
-> исходников, см. [gost-engine-macos.md](gost-engine-macos.md).
-
-### Verification (раздел 1)
-
-```bash
-openssl dgst -engine gost -md_gost12_256 /etc/hostname
-```
-
-Ожидание: 64-символьный шестнадцатеричный хеш в выводе. Если получили
-`engine "gost" set.` без хеша — `gost-engine` подключился, но что-то
-пошло не так с алгоритмом; вероятно, версия `gost-engine` рассинхронна
-с системным OpenSSL. См. §11 «Troubleshooting».
-
-### 1.5 Preflight: USBGuard и Astra ЗПС (DIGSIG)
+### 1.4 Preflight: USBGuard и Astra ЗПС (DIGSIG)
 
 Перед установкой полезно убедиться, что окружение не заблокирует ни
 сам токен на USB-шине, ни запуск `pam_tessera.so` /
@@ -198,18 +164,17 @@ chmod +x generate-checksums.sh
 ./generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
 ```
 
-Скрипт кладёт в каталог `checksums/` файл `checksums.txt` —
-комбинированный отчёт по SHA-256 и Streebog-256 (ГОСТ Р 34.11-2012-256)
-для самого `.deb` и каждого файла внутри пакета — плюс standalone-файлы
-`*.sha256` и `*.streebog256`. Секция Streebog-256 требует `gost-engine`
-(на Astra SE 1.7+ он доступен по умолчанию); без него секция
-пропускается, а SHA-256 всё равно считается.
+Скрипт кладёт в каталог `checksums/` файл `checksums.txt` — отчёт по
+SHA-256 для самого `.deb` и каждого файла внутри пакета — плюс
+standalone-файлы `*.sha256`. (Скрипт умеет также писать секцию
+Streebog-256 при наличии `gost-engine`, но в этом сценарии ECDSA-only
+она не используется.)
 
 На целевую машину доставляются три вещи: сам `.deb`, `checksums.txt`
 (генерируется на доверенной машине в §2.2, переносится вручную — scp,
 USB и т.п.) и `verify-checksums.sh` (скрипт самодостаточен — из
-внешнего ему нужен только `openssl` с `gost-engine` для ГОСТ-секции).
-Сам скрипт, в отличие от `checksums.txt`, — статичный файл репозитория,
+внешнего ему нужен только `openssl`). Сам скрипт, в отличие от
+`checksums.txt`, — статичный файл репозитория,
 его проще скачать напрямую на целевой машине, а не копировать с
 доверенной:
 
@@ -227,11 +192,9 @@ chmod +x verify-checksums.sh
 
 Ожидание: `OK: N checksum(s) verified`. Скрипт (описан в
 [scripts/verify-checksums.sh](../../scripts/verify-checksums.sh)) сверяет
-обе суммы: SHA-256 — всегда, Streebog-256 — если в `checksums.txt` есть
-ГОСТ-секция и на машине доступен `gost-engine`. Ненулевой код выхода —
-несовпадение суммы (код 1) либо проблема запуска: неверные аргументы
-(2) или отсутствие `gost-engine` при наличии ГОСТ-секции (3). В любом
-из этих случаев пакет не устанавливать, пока причина не разобрана.
+SHA-256. Ненулевой код выхода — несовпадение суммы (код 1) либо
+проблема запуска: неверные аргументы (2). В любом из этих случаев
+пакет не устанавливать, пока причина не разобрана.
 
 ### 2.4 Установка
 
@@ -239,9 +202,8 @@ chmod +x verify-checksums.sh
 sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
-`apt` подтянет недостающие зависимости (`libgost-engine | gost-engine |
-libgost-astra`,
-`libpkcs11-helper1`, `librtpkcs11ecp`).
+`apt` подтянет недостающие зависимости (`libpkcs11-helper1`,
+`librtpkcs11ecp`).
 
 ### 2.4½ Предполётная проверка (`tessera check`)
 
@@ -342,52 +304,16 @@ test -S /run/tessera/monitord.sock && echo "socket OK"
 после `systemctl restart tessera` в конце §8 — полная проверка
 демона/сокета там же, в Verification (раздел 8) и smoke-тесте §10.
 
-## 3. Создание тестового CA (ГОСТ)
+## 3. Создание тестового CA
 
-> Тестовый CA пригоден только для лабораторного развёртывания. Для
-> production используется внешний УЦ — см.
-> [docs/operations.md](operations.md).
+Вынесено в отдельный документ — [cert-issuance-lab.md
+§«Создание тестового CA»](cert-issuance-lab.md#создание-тестового-ca):
+каталог, ключ CA, самоподписанный сертификат, verification. Всё —
+обычные вызовы `openssl` без движка (ECDSA P-256), можно выполнять на
+рабочей станции администратора, не на целевой Astra-машине.
 
-### 3.1 Каталог
-
-```bash
-mkdir -p /tmp/ca && cd /tmp/ca
-```
-
-### 3.2 Ключ CA
-
-```bash
-openssl genpkey -engine gost -algorithm gost2012_256 \
-    -pkeyopt paramset:A -out ca.key
-chmod 0600 ca.key
-```
-
-### 3.3 Сертификат CA
-
-```bash
-openssl req -new -x509 -engine gost -key ca.key \
-    -out ca.pem -days 3650 \
-    -subj "/CN=tessera Test CA/O=Test/OU=Internal" \
-    -addext "extendedKeyUsage=clientAuth" \
-    -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
-    -addext "keyUsage=critical,keyCertSign,cRLSign"
-```
-
-### 3.4 Проверка
-
-```bash
-openssl x509 -engine gost -in ca.pem -text -noout | head -30
-```
-
-Ожидаемая строка: `Signature Algorithm: GOST R 34.10-2012 with GOST R 34.11-2012 (256 bit)`.
-
-### Verification (раздел 3)
-
-```bash
-openssl verify -engine gost -CAfile ca.pem ca.pem
-```
-
-Ожидание: `ca.pem: OK`.
+Результат раздела — `ca.pem` и `ca.key` в `/tmp/ca/`, нужны дальше в
+§4 и §5.
 
 ## 4. Создание тестовой ролевой учётной записи
 
@@ -400,107 +326,16 @@ openssl verify -engine gost -CAfile ca.pem ca.pem
 в §8. Учётная запись входа тоже называется `serv`; заводим её в §8,
 вместе с ролевым хранилищем.
 
-### 4.1 Ключ
+Ключ, CSR, оба обязательных расширения (`pam_cert_host_binding`,
+`pam_cert_allowed_roles`) и упаковка в P12 — в отдельном документе:
+[cert-issuance-lab.md §«Создание удостоверения ролевой
+учётной записи»](cert-issuance-lab.md#создание-удостоверения-ролевой-учётной-записи).
+Там же — таблица OID, fail-closed-поведение при отсутствии расширений
+(см. §7 и §10 этого документа) и получение `host_id_hash` через `sudo
+tessera dump-host-id` с целевой машины.
 
-```bash
-openssl genpkey -engine gost -algorithm gost2012_256 \
-    -pkeyopt paramset:A -out serv.key
-chmod 0600 serv.key
-```
-
-### 4.2 CSR
-
-```bash
-openssl req -new -engine gost -key serv.key -out serv.csr \
-    -subj "/CN=service-engineer/UID=serv"
-```
-
-Личность инженера живёт в удостоверении и в журнале выдачи, а не в
-имени учётной записи входа. На допуск `CN` не влияет: решение
-принимается по расширениям из §4.3.
-
-### 4.3 Подпись CSR
-
-Лист обязан нести **два** расширения:
-
-| Расширение | OID | Отвечает на вопрос |
-|------------|-----|--------------------|
-| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | на каких устройствах предъявитель вправе входить |
-| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | какие роли предъявитель вправе активировать |
-
-Каждое — `SEQUENCE OF UTF8String`; `pam_cert_allowed_roles` выпускается
-некритичным. OID и ASN.1-синтаксис — из
-[cert-issuance.md](cert-issuance.md).
-
-Отдельного списка разрешённых учётных записей нет и не нужно. Имя
-учётной записи входа и есть роль, поэтому `pam_cert_allowed_roles`
-отвечает сразу на оба вопроса — «какие роли предъявитель вправе
-активировать» и «в какие учётные записи он пущен»: это одна и та же
-строка. Два списка над одной строкой описывали бы нереализуемое
-состояние «пущен в `serv`, но не вправе быть `serv`».
-
-Без любого из двух модуль отклоняет аутентификацию **fail-closed**:
-отсутствие host-расширения даёт `HostExtensionMissing`, отсутствие
-`pam_cert_allowed_roles` означает, что удостоверение не даёт ни одной
-роли, — а роль требуется на каждом входе. В обоих случаях §7 не найдёт
-OID в удостоверении, а `pamtester` в §10 не пройдёт.
-
-Сначала узнаём `host_id_hash` этой машины — тот источник, что демон
-использует сейчас (строка с `active_under_current_config=yes`,
-столбец `hash_hex`):
-
-```bash
-HOST_HASH=$(sudo tessera dump-host-id | awk -F'\t' '$7 == "yes" { print $3 }')
-echo "host_id_hash = ${HOST_HASH}"   # 64 hex-символа
-```
-
-Собираем `extfile` с обоими расширениями (хост — только эта машина,
-роль, она же учётная запись входа, — только `serv`):
-
-```bash
-cat > serv.ext <<EOF
-extendedKeyUsage = clientAuth
-keyUsage = critical,digitalSignature
-
-# Хост: только эта машина (host_id_hash получен выше)
-2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb
-# Роли, они же учётные записи входа: только serv
-2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:ar
-
-[ hb ]
-e0 = UTF8String:sha256:${HOST_HASH}
-
-[ ar ]
-e0 = UTF8String:serv
-EOF
-```
-
-Подписываем CSR с этим `extfile`:
-
-```bash
-openssl x509 -req -engine gost -in serv.csr \
-    -CA ca.pem -CAkey ca.key -CAcreateserial \
-    -out serv.pem -days 365 \
-    -extfile serv.ext
-```
-
-### 4.4 Упаковка в P12
-
-```bash
-openssl pkcs12 -export -engine gost -inkey serv.key -in serv.pem \
-    -out serv.p12 -name serv -passout pass:test
-chmod 0600 serv.p12
-```
-
-### Verification (раздел 4)
-
-```bash
-openssl pkcs12 -in serv.p12 -nokeys -passin pass:test \
-    | openssl x509 -noout -subject
-```
-
-Ожидание: `subject=CN=service-engineer, UID=serv` (точный порядок RDN
-зависит от версии OpenSSL).
+Результат раздела — `serv.p12` в `/tmp/ca/`, готов к переносу на
+USB-носитель (§5).
 
 ## 5. Подготовка USB-носителя (режим `pkcs12` / Mode A)
 
@@ -598,7 +433,8 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 ### 6.4 Импорт ключа и сертификата
 
 `pkcs11-tool` ждёт ключ и сертификат отдельными объектами в DER/PEM, а не
-PKCS#12-контейнером. Сначала извлекаем их из `serv.p12` (пароль — из §4.4):
+PKCS#12-контейнером. Сначала извлекаем их из `serv.p12` (пароль — из
+[cert-issuance-lab.md §«Упаковка в P12»](cert-issuance-lab.md#6-упаковка-в-p12)):
 
 ```bash
 openssl pkcs12 -in serv.p12 -nocerts -nodes -passin pass:test \
@@ -626,9 +462,6 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 ```bash
 shred -u serv.token.key serv.token.key.der 2>/dev/null || shred -u serv.token.key
 ```
-
-> Поведение `--write-object` для ГОСТ-ключей зависит от модели токена и
-> версии `librtpkcs11ecp` — проверьте на вашей модели токена.
 
 ### Verification (раздел 6)
 
@@ -1091,24 +924,33 @@ sudo tessera check
 Имя, передаваемое `pamtester`, — это имя ролевой учётной записи, оно же
 запрошенная роль.
 
-### 10.1 Авторизация
+### 10.1 Полный цикл: auth + account + session
+
+`AuthContext`, который `pam_sm_authenticate` кладёт через
+`pam_set_data`, живёт только в рамках одного `pam_start()`/`pam_end()`
+— то есть одного процесса, читающего/пишущего один и тот же PAM-хендл.
+Три отдельных вызова `pamtester` — это три независимых хендла, и
+`account`/`session`-фазы такого прогона ничего не скажут о реальной
+работе `pam_tessera` в проверяемой службе: модуль просто не найдёт
+контекст, оставленный предыдущим вызовом. Поэтому все операции,
+которые должны пройти в одном логине, передаются `pamtester` одним
+списком — тогда используется один `pam_start()` на всё:
 
 ```bash
-pamtester sudo serv authenticate
+pamtester sudo serv authenticate acct_mgmt open_session close_session
 ```
 
-Положительный результат: `pamtester: successfully authenticated`.
+Положительный результат: `pamtester` печатает `successfully` на
+каждую операцию по очереди (четыре строки).
 
-### 10.2 Сессия
+> `pamtester` — не полноценный логин-стек (нет привилегированного
+> разделения процессов, как у `sshd` или `login`), поэтому такой
+> smoke-тест подтверждает корректность самого PAM-стека и
+> `pam_tessera`, но не заменяет проверку через реальный сервис.
+> Разница и порядок дальнейшей проверки — в
+> [pam-integration.md §9](pam-integration.md#9-pamtester-не-заменяет-реальный-вход).
 
-```bash
-pamtester sudo serv open_session
-pamtester sudo serv close_session
-```
-
-Положительный результат: оба вызова возвращают `pamtester: successfully ...`.
-
-### 10.3 Negative-тест: извлечь USB
+### 10.2 Negative-тест: извлечь USB
 
 В одном терминале запустить:
 
@@ -1134,7 +976,7 @@ sudo journalctl -u tessera -n 20 -g 'medium absent'
 - fly-dm и greeter (wallpaper не виден) — см. также [fly-dm-greeter.md](fly-dm-greeter.md)
 - Clone-image / golden image (`dump-host-id` пуст, повторный flip) — см. также [clone-image.md](clone-image.md)
 - Инциденты безопасности (компрометация cert, потеря токена, CA worst-case, DIGSIG)
-- Установка / `gost-engine`
+
 ## 12. Хосты без systemd: SysV init
 
 Пакет ставит **оба** init-варианта: `tessera.service` (systemd)
