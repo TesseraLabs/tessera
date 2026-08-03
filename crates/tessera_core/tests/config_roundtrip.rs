@@ -190,7 +190,13 @@ fn privileged_loader_ignores_pkcs11_module_path_when_mode_is_pkcs12(
         return Ok(());
     }
 
-    let dir = tempfile::tempdir()?;
+    // `ExecTrust::Root` rejects any world-writable ancestor, and `/tmp` (the
+    // default base for `tempfile::tempdir()`) always is one (mode 0o41777,
+    // sticky bit). Since this test only runs its body once already confirmed
+    // root (see `running_as_root` above), `/root` is guaranteed to exist and
+    // be a root-owned, non-world-writable directory, so build the fixture
+    // there instead.
+    let dir = tempfile::Builder::new().tempdir_in("/root")?;
     let anchor = write_anchor(dir.path());
     let stale_module = "pkcs11_module = \"/nonexistent/rutoken/driver.so\"";
     let body = fixture_with_anchor(&anchor)
