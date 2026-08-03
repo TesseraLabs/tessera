@@ -25,6 +25,7 @@ use std::time::SystemTime;
 
 use secrecy::SecretString;
 use tessera_core::challenge::{challenge_response, CryptoError};
+use tessera_core::config::validated::Pkcs12Source;
 use tessera_core::config::ValidatedConfig;
 use tessera_core::discovery::{discover_credentials, DiscoveredCreds, DiscoveryError};
 use tessera_core::hooks::{run_hooks_for_stage, HookError, HookExecutor, HookStage, HookVars};
@@ -70,14 +71,15 @@ pub enum FlowError {
     #[error("pam conversation: {0}")]
     Conv(#[from] PamConvError),
 
-    /// No USB partition produced a syntactically valid PKCS#12 envelope.
+    /// The carrier produced no syntactically valid PKCS#12 envelope.
     ///
     /// Distinct from [`Self::Discovery`] (no file at the expected path)
     /// and from [`Self::Pkcs12`] (file is a valid envelope but PIN /
-    /// chain rejected): this is the "found a file with the right name,
-    /// but it is not actually a PKCS#12 bundle" case, and we already
-    /// burned every USB partition trying to find one.
-    #[error("invalid PKCS#12 envelope on USB: {0}")]
+    /// chain rejected): this is the "found something with the right name,
+    /// but it is not actually a PKCS#12 bundle" case. On the USB carrier we
+    /// already burned every partition trying to find one; on a token carrier
+    /// it is the single named data object that turned out not to be one.
+    #[error("invalid PKCS#12 envelope: {0}")]
     P12Envelope(#[from] P12EnvelopeError),
 
     /// The authenticating USB device exposes no stable descriptor serial,
@@ -91,6 +93,23 @@ pub enum FlowError {
     /// monitoring is the documented escape hatch (see [`authenticate_pkcs12`]).
     #[error("usb device exposes no stable serial; cannot enforce continuous presence")]
     UsbSerialMissing,
+
+    /// More than one connected token satisfies the configured selection, so
+    /// which one carries the credential is not determined.
+    ///
+    /// Taking the first would let a second token an engineer happens to have
+    /// plugged in — a personal one, a CA token — stand in for the carrier, and
+    /// the session would then be bound to that device's presence. Naming a
+    /// token in `pkcs11_token_label` resolves it; so does unplugging the
+    /// other one.
+    #[error(
+        "{count} connected tokens match the configured selection; set pkcs11_token_label to \
+         name the carrier"
+    )]
+    TokenCarrierAmbiguous {
+        /// How many tokens matched.
+        count: usize,
+    },
 
     /// PIN-retry loop exhausted its attempts.
     #[error("max PIN tries")]
@@ -145,15 +164,6 @@ pub enum FlowError {
     /// Validation should catch this; included for safety.
     #[error("pkcs11 module path missing in config")]
     Pkcs11ModulePathMissingInConfig,
-
-    /// Strict continuous-presence monitoring cannot currently observe native
-    /// PKCS#11 token removal. Token serials are not USB block-device serials,
-    /// and treating them as such would reject every real token as
-    /// `DEVICE_GONE`. Refuse the strict combination explicitly until a native
-    /// PKCS#11 event monitor is available; permissive mode remains the
-    /// documented best-effort escape hatch.
-    #[error("strict continuous-presence monitoring is not supported for pkcs11 tokens")]
-    Pkcs11StrictPresenceUnsupported,
 
     /// A `pre_auth` hook returned a fatal error (executor failure or
     /// `on_failure = abort` policy hit a non-zero exit / timeout).
@@ -224,11 +234,11 @@ impl FlowError {
     /// | Variant                                                | Code                       |
     /// | ------------------------------------------------------ | -------------------------- |
     /// | `Usb` / `Mount` / `Discovery`                          | `PAM_AUTHINFO_UNAVAIL` (9) |
-    /// | `UsbSerialMissing`                                     | `PAM_AUTHINFO_UNAVAIL` (9) |
+    /// | `UsbSerialMissing` / `TokenCarrierAmbiguous`           | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11` (module load / wait / serial / config)        | `PAM_AUTHINFO_UNAVAIL` (9) |
+    /// | `Pkcs11(DataObject*)` — carrier holds no usable envelope | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11OpensslEngineNotImplemented`                    | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `Pkcs11ModulePathMissingInConfig`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
-    /// | `Pkcs11StrictPresenceUnsupported`                      | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `MaxTries` / `Pkcs11Acquire(PinLocked|MaxAttempts)`    | `PAM_MAXTRIES` (11)        |
     /// | `Conv` / `Pkcs11Acquire(Conv)` / `Pkcs11(PinIncorrect)`| `PAM_AUTH_ERR` (7)         |
     /// | `CertScope`                                            | `PAM_AUTH_ERR` (7)         |
@@ -249,9 +259,9 @@ impl FlowError {
             | Self::Discovery(_)
             | Self::P12Envelope(_)
             | Self::UsbSerialMissing
+            | Self::TokenCarrierAmbiguous { .. }
             | Self::Pkcs11OpensslEngineNotImplemented
             | Self::Pkcs11ModulePathMissingInConfig
-            | Self::Pkcs11StrictPresenceUnsupported
             | Self::Pkcs11(
                 Pkcs11Error::ModuleLoadFailed { .. }
                 | Pkcs11Error::InitFailed { .. }
@@ -259,7 +269,18 @@ impl FlowError {
                 | Pkcs11Error::TokenWaitTimeout { .. }
                 | Pkcs11Error::NoTokenAvailable
                 | Pkcs11Error::TokenNotFound { .. }
-                | Pkcs11Error::TokenSerialMissing,
+                | Pkcs11Error::TokenSerialMissing
+                // The carrier did not yield a usable credential. The USB
+                // carrier answers the same situations with 9 — no `.p12` at
+                // the expected path is `Discovery`, a file that is not a
+                // container is `P12Envelope` — and a stack configured with
+                // `authinfo_unavail=ignore` would otherwise fall back to a
+                // password on one carrier and refuse the login outright on
+                // the other, for the same mistake at issuance.
+                | Pkcs11Error::DataObjectNotFound { .. }
+                | Pkcs11Error::DataObjectUnreadable { .. }
+                | Pkcs11Error::DataObjectNotPrivate { .. }
+                | Pkcs11Error::DataObjectAmbiguous { .. },
             ) => 9,
             // PAM_MAXTRIES — exhausted PIN-retry budget on either path.
             // 11 per `<security/_pam_types.h>`; 8 is PAM_CRED_INSUFFICIENT,
@@ -376,6 +397,27 @@ pub trait FlowIo {
     /// Default impl is a no-op so test fakes don't need updating unless
     /// they want to capture the messages.
     fn show_info(&self, _msg: &str) {}
+
+    /// Read the PKCS#12 envelope out of a data object on a PKCS#11 token.
+    ///
+    /// Only reached when `pkcs12_source = "token_object"`. The default impl
+    /// loads the configured provider and talks to a real token; tests
+    /// override it to serve a canned envelope.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`read_token_carrier_with`] returns, plus
+    /// [`FlowError::Pkcs11ModulePathMissingInConfig`] when no provider is
+    /// configured (configuration validation normally catches that first).
+    fn read_token_carrier(
+        &self,
+        cfg: &ValidatedConfig,
+        object_label: &str,
+        prompt_pin: &mut PinPrompterFn<'_>,
+    ) -> Result<TokenCarrier, FlowError> {
+        let io = real_pkcs11_io(cfg)?;
+        read_token_carrier_with(&io, cfg, object_label, prompt_pin)
+    }
 }
 
 /// A process-wide empty [`DeviceTags`] (no applied tags).
@@ -538,39 +580,20 @@ where
         Mode::Pkcs12 => {
             authenticate_pkcs12(deps, io, pam_user, pam_service, session_id, prompt_pin)
         }
-        Mode::Pkcs11 => {
-            ensure_pkcs11_presence_mode(deps.cfg)?;
-            match deps.cfg.crypto_backend {
-                CryptoBackend::Pkcs11Native => {
-                    let pkcs11_io = real_pkcs11_io(deps.cfg)?;
-                    authenticate_pkcs11(
-                        deps,
-                        &pkcs11_io,
-                        pam_user,
-                        pam_service,
-                        session_id,
-                        prompt_pin,
-                    )
-                }
-                CryptoBackend::Openssl => Err(FlowError::Pkcs11OpensslEngineNotImplemented),
+        Mode::Pkcs11 => match deps.cfg.crypto_backend {
+            CryptoBackend::Pkcs11Native => {
+                let pkcs11_io = real_pkcs11_io(deps.cfg)?;
+                authenticate_pkcs11(
+                    deps,
+                    &pkcs11_io,
+                    pam_user,
+                    pam_service,
+                    session_id,
+                    prompt_pin,
+                )
             }
-        }
-    }
-}
-
-/// Refuse an authentication policy that promises PKCS#11 removal enforcement
-/// before a native token-event source exists.
-fn ensure_pkcs11_presence_mode(
-    cfg: &tessera_core::config::validated::ValidatedConfig,
-) -> Result<(), FlowError> {
-    if cfg.monitor.fail_mode == tessera_core::config::validated::MonitorFailMode::Strict {
-        tracing::error!(
-            target: "tessera.flow",
-            "strict monitoring requested for pkcs11, but native token-removal observation is unavailable; denying authentication"
-        );
-        Err(FlowError::Pkcs11StrictPresenceUnsupported)
-    } else {
-        Ok(())
+            CryptoBackend::Openssl => Err(FlowError::Pkcs11OpensslEngineNotImplemented),
+        },
     }
 }
 
@@ -617,7 +640,277 @@ where
     )
     .map_err(FlowError::PreAuthHook)?;
 
-    // Step 2 — wait for one or more USB block devices.  On flashes with
+    // Step 2 — get the envelope from the configured carrier. Everything
+    // below this point is deliberately the same code for both carriers: the
+    // choice is where the container comes from, not what is done with it.
+    let carried = match &deps.cfg.pkcs12_source {
+        Pkcs12Source::UsbPartition => usb_envelope(deps.cfg, io, pam_user)?,
+        Pkcs12Source::TokenObject { object_label } => {
+            token_envelope(deps.cfg, io, object_label, &mut |prompt| prompt_pin(prompt))?
+        }
+    };
+    let CarriedEnvelope {
+        p12_bytes,
+        chain_pem,
+        carrier_serial,
+        usb_vid_pid,
+        usb_devnode,
+        mount,
+        candidates_tried,
+    } = carried;
+
+    // Step 5 — PIN-retry loop.  When the operator configured
+    // `pkcs12_pin_prompt` it replaces the default "Smart-card PIN: "
+    // prompt, mirroring `pkcs11_pin_prompt` on the PKCS#11 path.
+    let loaded: LoadedKeyMaterial = match acquire_p12_material_with_prompter(
+        &p12_bytes,
+        3,
+        deps.cfg.pkcs12_pin_prompt.as_deref(),
+        &mut prompt_pin,
+    ) {
+        Ok(m) => m,
+        Err(AcquireError::MaxTries) => {
+            // Try to read the cert plaintext from the .p12 (newer issuance
+            // tooling embeds the leaf cert outside the encrypted SafeContents
+            // so it can be inspected without the PIN). When that works, we
+            // can surface the host/user binding the cert is bound to so the
+            // engineer can match it against the deployment registry. If the
+            // .p12 predates that change and the cert is still encrypted,
+            // parsing fails gracefully and we fall back to a generic message.
+            io.show_info(&p12_wrong_pin_diagnostic(&p12_bytes));
+            return Err(FlowError::MaxTries);
+        }
+        Err(e) => return Err(FlowError::from(e)),
+    };
+
+    // Step 6 — challenge-response (proves we hold the private key).
+    let priv_key = loaded.private_key()?;
+    challenge_response(
+        &loaded.end_entity,
+        &priv_key,
+        deps.cfg.gost_engine_path.as_deref(),
+    )?;
+
+    // Step 7 — assemble the chain.  `chain.pem` is appended AFTER the p12's
+    // own presented chain so that whichever the bundle had wins ties.
+    let mut presented = loaded.presented_chain.clone();
+    if let Some(chain_pem) = chain_pem.as_deref() {
+        presented.extend(parse_chain_pem(chain_pem)?);
+    }
+
+    // Step 8 — trust verification (path build, signatures, CRLs, pinning).
+    let verified = deps.trust.verify(&loaded.end_entity, &presented)?;
+    tracing::info!(
+        target: "tessera.flow",
+        devnode = ?usb_devnode,
+        cert_subject = ?loaded.end_entity.subject_cn().ok(),
+        cert_serial = %loaded.end_entity.serial_hex().to_lowercase(),
+        "cert chain validated"
+    );
+
+    // Step 9 — cert scope (cert authorises this host).
+    //
+    // `pam_cert_host_binding` is mandatory: the cert MUST authorise the
+    // running host. The other axis — which account may be entered — is the
+    // role coverage check in Step 10b, since the account name IS the role.
+    if let Err(e) = verify_host_binding(loaded.end_entity.x509(), deps.host_id_hash) {
+        // Surface an admin-actionable diagnostic on the lock screen /
+        // terminal: the host_id_hash of this machine + the source kind
+        // is what the cert MUST encode. Logged at warn so syslog has a
+        // record even when the conv layer drops the message.
+        tracing::warn!(
+            target: "tessera.flow",
+            error = %e,
+            host_id_hash = %deps.host_id_hash,
+            host_id_source = ?deps.host_id_source,
+            pam_user = %pam_user,
+            "host_binding rejected; surfacing diagnostic to user"
+        );
+        // Show the short prefix on-screen (8 hex chars are eyeballable
+        // on a small terminal); the full hash already lives in syslog
+        // via the warn! above.
+        let prefix_len = deps.host_id_hash.len().min(8);
+        let prefix = &deps.host_id_hash[..prefix_len];
+        io.show_info(&format!(
+            "Сертификат выпущен для другого устройства.\n\
+             host_id этой машины: {prefix} (source={source:?})\n\
+             Передайте администратору для перевыпуска.",
+            prefix = prefix,
+            source = deps.host_id_source,
+        ));
+        return Err(FlowError::CertScope(e));
+    }
+
+    // Step 11 — assemble AuthContext.
+    let cert_cn = loaded.end_entity.subject_cn().ok();
+    let cert_serial = Some(loaded.end_entity.serial_hex().to_lowercase());
+    let cert_not_after = Some(loaded.end_entity.not_after());
+
+    // MAC integrity inputs captured for `pam_sm_open_session`.
+    let verified_leaf = verified.verified_leaf();
+    let cert_ident_value = tessera_core::x509::CertIdent::from(&verified_leaf);
+    let cert_max_integrity =
+        extract_cert_max_integrity(&verified_leaf, pam_user, &cert_ident_value)?;
+    let cert_ident = Some(cert_ident_value);
+    let home_dir = resolve_home_dir(pam_user);
+
+    // Step 10b — atomic role resolve + coverage (role-format). Runs right
+    // after cert verification and before the session payload is fixed, with
+    // no swap window (CVE-2021-3560). A denial always aborts here — the
+    // stage has no advisory mode.
+    let role = resolve_role_stage(
+        &verified_leaf,
+        &deps.role_stage,
+        pam_user,
+        cert_remaining_ttl(cert_not_after),
+    )?;
+
+    // Step 10c — LIVE delegation-envelope enforcement (tags-delegation §4).
+    // For every CA in the verified chain carrying delegation_constraints,
+    // device.tags ⊇ requireTags AND role/level/TTL ceilings must hold. A
+    // chain with no constraints is a no-op. Fail-closed: a generic message to
+    // the engineer, the full reason vector only to the `delegation_denied`
+    // audit event.
+    if let Err(e) = enforce_delegation_stage(
+        &verified,
+        deps.device_tags,
+        &role,
+        cert_max_integrity,
+        &verified_leaf,
+    ) {
+        io.show_info(tessera_core::trust::delegation_audit::GENERIC_DELEGATION_DENIED_MESSAGE);
+        return Err(e);
+    }
+
+    let auth_ctx = AuthContext {
+        session_id,
+        cert_cn,
+        cert_serial,
+        usb_serial: carrier_serial,
+        usb_vid_pid,
+        pam_service: pam_service.to_string(),
+        host_id: deps.host_id_hash.to_string(),
+        host_id_source: deps.host_id_source,
+        authenticated_at: SystemTime::now(),
+        cert_not_after,
+        clock_skew_seconds: deps.cfg.trust.clock_skew_seconds,
+        cert_max_integrity,
+        cert_ident,
+        home_dir,
+        role: Some(role),
+    };
+
+    // Step 11b — post_auth_success hooks (Stage 5). Run after every
+    // verification step has succeeded but before set_pam_data, so a hook
+    // failure can still abort the session by returning PAM_AUTH_ERR.
+    let post_vars = HookVars::for_post_auth_success(pam_user, &auth_ctx);
+    run_hooks_for_stage(
+        deps.cfg,
+        HookStage::PostAuthSuccess,
+        deps.hook_executor,
+        &post_vars,
+    )
+    .map_err(FlowError::PostAuthHook)?;
+
+    // Step 11c — notify monitord with the FULL post-auth payload (carrier
+    // serial from the device that actually held the envelope, cert CN/serial
+    // from the validated leaf, target from PAM_TTY). Under strict fail mode a
+    // registration failure denies the login: a cert-authenticated session
+    // monitord never recorded can never have its token/USB removal enforced.
+    // Under permissive mode the FailModeWrapper has already converted the
+    // transport error to Ok, so this branch fires only in strict mode.
+    let cert_cn_str = auth_ctx.cert_cn.as_deref().unwrap_or("");
+    let cert_serial_str = auth_ctx.cert_serial.as_deref().unwrap_or("");
+    let extras = session_open_extras(&loaded.end_entity, pam_user);
+    let info = OpenSessionInfo {
+        session_id: &auth_ctx.session_id,
+        pam_user,
+        pam_service,
+        host_id_hash: deps.host_id_hash,
+        target: deps.pam_target.clone(),
+        usb_serial: auth_ctx.usb_serial.as_deref(),
+        // Device-topology binding: the daemon uses VID/PID + devnode to
+        // decide whether a later udev `add` is really the same physical
+        // device before cancelling a pending removal action. The USB
+        // descriptor serial alone is attacker-controlled and cloneable.
+        // A token carrier has neither — it is not a USB block device — so
+        // both stay `None` there and the serial is the only identifier.
+        usb_vid_pid: auth_ctx.usb_vid_pid.as_deref(),
+        usb_devnode: usb_devnode.as_deref().and_then(Path::to_str),
+        // Which namespace the serial above lives in. The daemon cannot infer
+        // it from its own configuration: a host switched from one carrier to
+        // the other would judge sessions opened under the previous one in the
+        // wrong namespace, where their serial matches nothing.
+        carrier: match deps.cfg.pkcs12_source {
+            Pkcs12Source::UsbPartition => tessera_proto::CarrierKind::UsbPartition,
+            Pkcs12Source::TokenObject { .. } => tessera_proto::CarrierKind::Token,
+        },
+        cert_cn: cert_cn_str,
+        cert_serial: cert_serial_str,
+        engineer_ski: &extras.engineer_ski,
+        engineer_cert_sha256: &extras.engineer_cert_sha256,
+        uid: extras.uid,
+        role: auth_ctx.role.as_ref().map(|r| r.role.as_str()),
+        role_version: auth_ctx.role.as_ref().map(|r| r.role_version),
+        // Only role sessions carry a time-bound ceiling. The absolute expiry is
+        // clamped to the certificate's notAfter so the enforced deadline can
+        // never outlive the certificate.
+        session_expiry: session_expiry(
+            auth_ctx.role.as_ref(),
+            auth_ctx.authenticated_at,
+            auth_ctx.cert_not_after,
+        ),
+    };
+    register_session_or_deny(deps.monitor, &info)?;
+
+    tracing::info!(
+        target: "tessera.flow",
+        pam_user = %pam_user,
+        candidates_tried,
+        cert_serial = %loaded.end_entity.serial_hex().to_lowercase(),
+        "auth result: success (pkcs12)"
+    );
+
+    Ok(FlowOutcome { auth_ctx, mount })
+}
+
+/// The PKCS#12 envelope together with whatever identifies the medium that
+/// carried it.
+///
+/// The carrier identity is not decoration: `carrier_serial` is the field the
+/// daemon keys removal enforcement on, so a carrier that produced no
+/// identifier leaves a session nothing can match a removal event against.
+struct CarriedEnvelope<O: MountOps + 'static> {
+    /// The envelope bytes, exactly as the carrier held them.
+    p12_bytes: Vec<u8>,
+    /// Intermediates found beside the envelope, when the carrier had a place
+    /// to put them. A token object holds the envelope and nothing else.
+    chain_pem: Option<Vec<u8>>,
+    /// Identifier of the medium: the USB descriptor serial, or the token
+    /// serial when the envelope came off a token.
+    carrier_serial: Option<String>,
+    /// USB VID/PID, absent for a token — it is not a USB block device.
+    usb_vid_pid: Option<String>,
+    /// USB devnode, absent for a token for the same reason.
+    usb_devnode: Option<PathBuf>,
+    /// Live mount guard, absent for a token: nothing was mounted.
+    mount: Option<MountGuard<O>>,
+    /// How many USB partitions were inspected (0 for a token).
+    candidates_tried: usize,
+}
+
+/// Read the envelope off a partition of a USB medium.
+///
+/// Steps 2 through 4b of [`authenticate_pkcs12`], moved here unchanged apart
+/// from taking the config directly, so the carrier choice has one place to
+/// branch and the checks after the envelope have one place to live.
+#[allow(clippy::too_many_lines)]
+fn usb_envelope<I: FlowIo>(
+    cfg: &ValidatedConfig,
+    io: &I,
+    pam_user: &str,
+) -> Result<CarriedEnvelope<I::Ops>, FlowError> {
+    // Wait for one or more USB block devices.  On flashes with
     // a partition table this can return multiple `UsbDevice`s (one per
     // viable partition).  We try them in order until one of them yields
     // a readable `.p12`.  The first hit "binds" — if its `.p12` decrypts
@@ -632,8 +925,7 @@ where
     );
 
     // Step 3+4 — mount each candidate and look for `.p12` until one matches.
-    let pkcs12_pattern = deps
-        .cfg
+    let pkcs12_pattern = cfg
         .pkcs12_path_pattern
         .as_deref()
         .unwrap_or(tessera_core::discovery::DEFAULT_PKCS12_PATH_PATTERN);
@@ -746,7 +1038,7 @@ where
     // checks may not hold, so a serial-less device is allowed. Strict mode
     // (continuous presence is a hard requirement) denies it fail-closed.
     if dev.serial.is_none()
-        && deps.cfg.monitor.fail_mode == tessera_core::config::validated::MonitorFailMode::Strict
+        && cfg.monitor.fail_mode == tessera_core::config::validated::MonitorFailMode::Strict
     {
         tracing::warn!(
             target: "tessera.flow",
@@ -758,212 +1050,183 @@ where
         return Err(FlowError::UsbSerialMissing);
     }
 
-    // Step 5 — PIN-retry loop.  When the operator configured
-    // `pkcs12_pin_prompt` it replaces the default "Smart-card PIN: "
-    // prompt, mirroring `pkcs11_pin_prompt` on the PKCS#11 path.
-    let loaded: LoadedKeyMaterial = match acquire_p12_material_with_prompter(
-        &creds.p12_bytes,
-        3,
-        deps.cfg.pkcs12_pin_prompt.as_deref(),
-        &mut prompt_pin,
-    ) {
-        Ok(m) => m,
-        Err(AcquireError::MaxTries) => {
-            // Try to read the cert plaintext from the .p12 (newer issuance
-            // tooling embeds the leaf cert outside the encrypted SafeContents
-            // so it can be inspected without the PIN). When that works, we
-            // can surface the host/user binding the cert is bound to so the
-            // engineer can match it against the deployment registry. If the
-            // .p12 predates that change and the cert is still encrypted,
-            // parsing fails gracefully and we fall back to a generic message.
-            io.show_info(&p12_wrong_pin_diagnostic(&creds.p12_bytes));
-            return Err(FlowError::MaxTries);
-        }
-        Err(e) => return Err(FlowError::from(e)),
-    };
-
-    // Step 6 — challenge-response (proves we hold the private key).
-    let priv_key = loaded.private_key()?;
-    challenge_response(
-        &loaded.end_entity,
-        &priv_key,
-        deps.cfg.gost_engine_path.as_deref(),
-    )?;
-
-    // Step 7 — assemble the chain.  `chain.pem` is appended AFTER the p12's
-    // own presented chain so that whichever the bundle had wins ties.
-    let mut presented = loaded.presented_chain.clone();
-    if let Some(chain_pem) = creds.chain_pem.as_deref() {
-        presented.extend(parse_chain_pem(chain_pem)?);
-    }
-
-    // Step 8 — trust verification (path build, signatures, CRLs, pinning).
-    let verified = deps.trust.verify(&loaded.end_entity, &presented)?;
-    tracing::info!(
-        target: "tessera.flow",
-        devnode = ?dev.devnode,
-        cert_subject = ?loaded.end_entity.subject_cn().ok(),
-        cert_serial = %loaded.end_entity.serial_hex().to_lowercase(),
-        "cert chain validated"
-    );
-
-    // Step 9 — cert scope (cert authorises this host).
-    //
-    // `pam_cert_host_binding` is mandatory: the cert MUST authorise the
-    // running host. The other axis — which account may be entered — is the
-    // role coverage check in Step 10b, since the account name IS the role.
-    if let Err(e) = verify_host_binding(loaded.end_entity.x509(), deps.host_id_hash) {
-        // Surface an admin-actionable diagnostic on the lock screen /
-        // terminal: the host_id_hash of this machine + the source kind
-        // is what the cert MUST encode. Logged at warn so syslog has a
-        // record even when the conv layer drops the message.
-        tracing::warn!(
-            target: "tessera.flow",
-            error = %e,
-            host_id_hash = %deps.host_id_hash,
-            host_id_source = ?deps.host_id_source,
-            pam_user = %pam_user,
-            "host_binding rejected; surfacing diagnostic to user"
-        );
-        // Show the short prefix on-screen (8 hex chars are eyeballable
-        // on a small terminal); the full hash already lives in syslog
-        // via the warn! above.
-        let prefix_len = deps.host_id_hash.len().min(8);
-        let prefix = &deps.host_id_hash[..prefix_len];
-        io.show_info(&format!(
-            "Сертификат выпущен для другого устройства.\n\
-             host_id этой машины: {prefix} (source={source:?})\n\
-             Передайте администратору для перевыпуска.",
-            prefix = prefix,
-            source = deps.host_id_source,
-        ));
-        return Err(FlowError::CertScope(e));
-    }
-
-    // Step 11 — assemble AuthContext.
-    let cert_cn = loaded.end_entity.subject_cn().ok();
-    let cert_serial = Some(loaded.end_entity.serial_hex().to_lowercase());
-    let cert_not_after = Some(loaded.end_entity.not_after());
-    let usb_vid_pid = Some(format!("{:04x}:{:04x}", dev.vid, dev.pid));
-
-    // MAC integrity inputs captured for `pam_sm_open_session`.
-    let verified_leaf = verified.verified_leaf();
-    let cert_ident_value = tessera_core::x509::CertIdent::from(&verified_leaf);
-    let cert_max_integrity =
-        extract_cert_max_integrity(&verified_leaf, pam_user, &cert_ident_value)?;
-    let cert_ident = Some(cert_ident_value);
-    let home_dir = resolve_home_dir(pam_user);
-
-    // Step 10b — atomic role resolve + coverage (role-format). Runs right
-    // after cert verification and before the session payload is fixed, with
-    // no swap window (CVE-2021-3560). A denial always aborts here — the
-    // stage has no advisory mode.
-    let role = resolve_role_stage(
-        &verified_leaf,
-        &deps.role_stage,
-        pam_user,
-        cert_remaining_ttl(cert_not_after),
-    )?;
-
-    // Step 10c — LIVE delegation-envelope enforcement (tags-delegation §4).
-    // For every CA in the verified chain carrying delegation_constraints,
-    // device.tags ⊇ requireTags AND role/level/TTL ceilings must hold. A
-    // chain with no constraints is a no-op. Fail-closed: a generic message to
-    // the engineer, the full reason vector only to the `delegation_denied`
-    // audit event.
-    if let Err(e) = enforce_delegation_stage(
-        &verified,
-        deps.device_tags,
-        &role,
-        cert_max_integrity,
-        &verified_leaf,
-    ) {
-        io.show_info(tessera_core::trust::delegation_audit::GENERIC_DELEGATION_DENIED_MESSAGE);
-        return Err(e);
-    }
-
-    let auth_ctx = AuthContext {
-        session_id,
-        cert_cn,
-        cert_serial,
-        usb_serial: dev.serial.clone(),
-        usb_vid_pid,
-        pam_service: pam_service.to_string(),
-        host_id: deps.host_id_hash.to_string(),
-        host_id_source: deps.host_id_source,
-        authenticated_at: SystemTime::now(),
-        cert_not_after,
-        clock_skew_seconds: deps.cfg.trust.clock_skew_seconds,
-        cert_max_integrity,
-        cert_ident,
-        home_dir,
-        role: Some(role),
-    };
-
-    // Step 11b — post_auth_success hooks (Stage 5). Run after every
-    // verification step has succeeded but before set_pam_data, so a hook
-    // failure can still abort the session by returning PAM_AUTH_ERR.
-    let post_vars = HookVars::for_post_auth_success(pam_user, &auth_ctx);
-    run_hooks_for_stage(
-        deps.cfg,
-        HookStage::PostAuthSuccess,
-        deps.hook_executor,
-        &post_vars,
-    )
-    .map_err(FlowError::PostAuthHook)?;
-
-    // Step 11c — notify monitord with the FULL post-auth payload (USB
-    // serial from the discovered device, cert CN/serial from the
-    // validated leaf, target from PAM_TTY). Under strict fail mode a
-    // registration failure denies the login: a cert-authenticated session
-    // monitord never recorded can never have its token/USB removal enforced.
-    // Under permissive mode the FailModeWrapper has already converted the
-    // transport error to Ok, so this branch fires only in strict mode.
-    let cert_cn_str = auth_ctx.cert_cn.as_deref().unwrap_or("");
-    let cert_serial_str = auth_ctx.cert_serial.as_deref().unwrap_or("");
-    let extras = session_open_extras(&loaded.end_entity, pam_user);
-    let info = OpenSessionInfo {
-        session_id: &auth_ctx.session_id,
-        pam_user,
-        pam_service,
-        host_id_hash: deps.host_id_hash,
-        target: deps.pam_target.clone(),
-        usb_serial: dev.serial.as_deref(),
-        // Device-topology binding: the daemon uses VID/PID + devnode to
-        // decide whether a later udev `add` is really the same physical
-        // device before cancelling a pending removal action. The USB
-        // descriptor serial alone is attacker-controlled and cloneable.
-        usb_vid_pid: auth_ctx.usb_vid_pid.as_deref(),
-        usb_devnode: dev.devnode.to_str(),
-        cert_cn: cert_cn_str,
-        cert_serial: cert_serial_str,
-        engineer_ski: &extras.engineer_ski,
-        engineer_cert_sha256: &extras.engineer_cert_sha256,
-        uid: extras.uid,
-        role: auth_ctx.role.as_ref().map(|r| r.role.as_str()),
-        role_version: auth_ctx.role.as_ref().map(|r| r.role_version),
-        // Only role sessions carry a time-bound ceiling. The absolute expiry is
-        // clamped to the certificate's notAfter so the enforced deadline can
-        // never outlive the certificate.
-        session_expiry: session_expiry(
-            auth_ctx.role.as_ref(),
-            auth_ctx.authenticated_at,
-            auth_ctx.cert_not_after,
-        ),
-    };
-    register_session_or_deny(deps.monitor, &info)?;
-
-    tracing::info!(
-        target: "tessera.flow",
-        pam_user = %pam_user,
-        candidates_tried,
-        cert_serial = %loaded.end_entity.serial_hex().to_lowercase(),
-        "auth result: success (pkcs12)"
-    );
-
-    Ok(FlowOutcome {
-        auth_ctx,
+    Ok(CarriedEnvelope {
+        p12_bytes: creds.p12_bytes,
+        chain_pem: creds.chain_pem,
+        carrier_serial: dev.serial.clone(),
+        usb_vid_pid: Some(format!("{:04x}:{:04x}", dev.vid, dev.pid)),
+        usb_devnode: Some(dev.devnode.clone()),
         mount: Some(mount),
+        candidates_tried,
+    })
+}
+
+/// Read the envelope out of a data object on a PKCS#11 token.
+///
+/// No mass storage is involved: a CCID token has no filesystem, so nothing is
+/// waited for on the USB bus and nothing is mounted.
+///
+/// The object is read through `read_private_data_object`, which refuses an
+/// object stored without `CKA_PRIVATE`. The envelope holds a private key that
+/// comes out with the container password, and a public data object is readable
+/// off the token by anyone who holds it for a moment — that is a different
+/// thing from a carrier, not a weaker one.
+fn token_envelope<I: FlowIo>(
+    cfg: &ValidatedConfig,
+    io: &I,
+    object_label: &str,
+    prompt_pin: &mut PinPrompterFn<'_>,
+) -> Result<CarriedEnvelope<I::Ops>, FlowError> {
+    let carrier = io.read_token_carrier(cfg, object_label, prompt_pin)?;
+
+    // The same pre-PIN ASN.1 check the USB carrier applies to a candidate
+    // file. Nothing about the container password is touched by it, and
+    // without it an object that is not a PKCS#12 bundle at all would spend
+    // the engineer's three PIN attempts before saying so.
+    validate_p12_envelope(&carrier.p12_bytes)?;
+
+    tracing::info!(
+        target: "tessera.flow",
+        object_label,
+        p12_bytes = carrier.p12_bytes.len(),
+        "p12 envelope read from token data object (pre-PIN ASN.1 check ok)"
+    );
+
+    Ok(CarriedEnvelope {
+        p12_bytes: carrier.p12_bytes,
+        // A token object carries the envelope and nothing else; intermediates
+        // for this carrier come from `[trust]`.
+        chain_pem: None,
+        // The serial the daemon keys removal enforcement on. `read_token_serial`
+        // has already refused an empty one, so a session is never opened without
+        // an identifier for the medium that carried the credential.
+        carrier_serial: Some(carrier.token_serial),
+        // Not a USB block device: there is no VID/PID and no devnode to bind
+        // removal cancellation to.
+        usb_vid_pid: None,
+        usb_devnode: None,
+        // Nothing was mounted.
+        mount: None,
+        candidates_tried: 0,
+    })
+}
+
+/// The envelope as it came off a PKCS#11 token, with the identity of the
+/// token that carried it.
+pub struct TokenCarrier {
+    /// `CKA_VALUE` of the data object, uninterpreted.
+    pub p12_bytes: Vec<u8>,
+    /// Trimmed `CK_TOKEN_INFO.serialNumber` of the token it came from.
+    pub token_serial: String,
+}
+
+// Manual `Debug`: the bytes are a PKCS#12 container whose private key comes
+// out with the container password, and this type is handled on the
+// authentication path, where a `?carrier` in a log line would put it into the
+// journal of `sshd` or the display manager.
+impl std::fmt::Debug for TokenCarrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenCarrier")
+            .field("bytes", &self.p12_bytes.len())
+            .field("token_serial", &self.token_serial)
+            .finish()
+    }
+}
+
+/// Read the carrier object off a token through the given PKCS#11 I/O.
+///
+/// The serial is read **before** the PIN prompt on purpose: a token that
+/// reports none can never be matched by a removal event, and refusing it after
+/// the engineer has typed a PIN would spend an attempt on a token that was
+/// never going to be usable.
+///
+/// The session is dropped on every exit path, including the error ones —
+/// `Pkcs11Session::Drop` runs `C_Logout` before `C_CloseSession`. That matters
+/// here more than elsewhere: `fly-dm` serves every login of the machine's
+/// uptime from one process, so a login left behind would hand the next person
+/// at the console a token that is already authenticated.
+///
+/// # Errors
+///
+/// - [`FlowError::Pkcs11`] — module load, no token, or an empty token serial
+///   ([`tessera_core::token::pkcs11::Pkcs11Error::TokenSerialMissing`]).
+/// - [`FlowError::Pkcs11Acquire`] — the token PIN loop failed or ran out.
+/// - [`FlowError::Pkcs11`] — the object is absent, ambiguous, unreadable, or
+///   stored without `CKA_PRIVATE`.
+pub fn read_token_carrier_with<T: Pkcs11Io>(
+    io: &T,
+    cfg: &ValidatedConfig,
+    object_label: &str,
+    prompt_pin: &mut PinPrompterFn<'_>,
+) -> Result<TokenCarrier, FlowError> {
+    // Waiting and choosing are separate questions. This call answers only the
+    // first — whether a token the configuration could accept has turned up
+    // yet — and its return value is deliberately discarded: the slot it hands
+    // back is whichever the provider enumerated first, which is not an answer
+    // to "which token carries the credential".
+    io.wait_for_token()?;
+
+    // That question is answered here, and the token that gets used is the one
+    // this check passed. An engineer with a second token plugged in — their
+    // own, a CA token, one left in the reader — must not have it stand in for
+    // the carrier, and the session's presence would otherwise be bound to that
+    // device.
+    //
+    // Refusing is the only honest answer. Trying each candidate in turn is
+    // worse than picking one: reading a private object needs a login, so a
+    // search would present the PIN to tokens that were never meant to receive
+    // it and spend their on-device retry counters.
+    let matching = io.matching_tokens()?;
+    let slot = match matching.as_slice() {
+        [only] => *only,
+        [] => {
+            // The token was there when the wait returned and is gone now.
+            // Saying so beats carrying the stale slot into the PIN prompt and
+            // surfacing the removal as whatever FFI error the provider
+            // happens to raise on a dead handle.
+            tracing::warn!(
+                target: "tessera.flow",
+                token_label = ?cfg.pkcs11_token_label,
+                "the token disappeared between the wait and the carrier check"
+            );
+            return Err(FlowError::Pkcs11(
+                tessera_core::token::pkcs11::Pkcs11Error::NoTokenAvailable,
+            ));
+        }
+        several => {
+            tracing::warn!(
+                target: "tessera.flow",
+                count = several.len(),
+                token_label = ?cfg.pkcs11_token_label,
+                "more than one connected token matches the configured selection; refusing to \
+                 choose which one carries the credential"
+            );
+            return Err(FlowError::TokenCarrierAmbiguous {
+                count: several.len(),
+            });
+        }
+    };
+
+    tracing::info!(
+        target: "tessera.flow",
+        ?slot,
+        token_label = ?cfg.pkcs11_token_label,
+        "token found for the pkcs12 carrier"
+    );
+
+    let token_serial = io.read_token_serial(slot)?;
+
+    let prompt_override = cfg.pkcs11_pin_prompt.clone();
+    let session = io.acquire_session(slot, &mut |default_prompt| {
+        prompt_pin(prompt_override.as_deref().unwrap_or(default_prompt))
+    })?;
+
+    let p12_bytes = session.read_private_data_object(object_label)?;
+    drop(session);
+
+    Ok(TokenCarrier {
+        p12_bytes,
+        token_serial,
     })
 }
 
@@ -992,6 +1255,19 @@ pub trait Pkcs11Io {
     fn wait_for_token(
         &self,
     ) -> Result<tessera_core::token::pkcs11::Slot, tessera_core::token::pkcs11::Pkcs11Error>;
+
+    /// Every slot whose token satisfies the configured `pkcs11_token_label`.
+    ///
+    /// The carrier path uses the count: with more than one candidate the
+    /// configuration has not said which device holds the credential, and
+    /// taking the first would decide it on the operator's behalf.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any [`tessera_core::token::pkcs11::Pkcs11Error`].
+    fn matching_tokens(
+        &self,
+    ) -> Result<Vec<tessera_core::token::pkcs11::Slot>, tessera_core::token::pkcs11::Pkcs11Error>;
 
     /// Read the token serial number on the supplied slot.  Used to fill
     /// `AuthContext.usb_serial` in mode B.
@@ -1041,6 +1317,13 @@ impl Pkcs11Io for RealPkcs11Io<'_> {
     ) -> Result<tessera_core::token::pkcs11::Slot, tessera_core::token::pkcs11::Pkcs11Error> {
         self.backend
             .wait_for_token(self.timeout, self.token_label.as_deref())
+    }
+
+    fn matching_tokens(
+        &self,
+    ) -> Result<Vec<tessera_core::token::pkcs11::Slot>, tessera_core::token::pkcs11::Pkcs11Error>
+    {
+        self.backend.find_slots(self.token_label.as_deref())
     }
 
     fn read_token_serial(
@@ -1124,8 +1407,6 @@ where
         pkcs11_challenge_response, select_mechanism, ExtractableKeyPolicy, FoundCertificate,
         FoundPrivateKey,
     };
-
-    ensure_pkcs11_presence_mode(deps.cfg)?;
 
     // Step 1 — pre_auth hooks (Stage 5). Same gate as the PKCS#12 path.
     //
@@ -1309,6 +1590,7 @@ where
         // token serial in `usb_serial` is the only identifier available.
         usb_vid_pid: None,
         usb_devnode: None,
+        carrier: tessera_proto::CarrierKind::Token,
         cert_cn: cert_cn_str,
         cert_serial: cert_serial_str,
         engineer_ski: &extras.engineer_ski,
@@ -1634,6 +1916,15 @@ pub struct InMemoryFlowIo {
     pub usb_error: Option<UsbError>,
     /// Optional canned error to return from `mount` (one-shot).
     pub mount_error: Option<MountError>,
+    /// Canned answer for the token carrier (one-shot). When absent the
+    /// default trait method runs and tries to load a real provider.
+    pub token_carrier: std::cell::RefCell<Option<Result<TokenCarrier, FlowError>>>,
+    /// How many times the flow asked for USB devices. A carrier that is
+    /// supposed to leave mass storage alone is only proven to do so by a
+    /// counter that stayed at zero.
+    pub usb_waits: std::cell::Cell<usize>,
+    /// How many times the flow mounted something.
+    pub mounts: std::cell::Cell<usize>,
 }
 
 impl InMemoryFlowIo {
@@ -1651,6 +1942,9 @@ impl InMemoryFlowIo {
             mountpoint,
             usb_error: None,
             mount_error: None,
+            token_carrier: std::cell::RefCell::new(None),
+            usb_waits: std::cell::Cell::new(0),
+            mounts: std::cell::Cell::new(0),
         }
     }
 }
@@ -1658,7 +1952,22 @@ impl InMemoryFlowIo {
 impl FlowIo for InMemoryFlowIo {
     type Ops = NoopMountOps;
 
+    fn read_token_carrier(
+        &self,
+        _cfg: &ValidatedConfig,
+        _object_label: &str,
+        _prompt_pin: &mut PinPrompterFn<'_>,
+    ) -> Result<TokenCarrier, FlowError> {
+        self.token_carrier
+            .borrow_mut()
+            .take()
+            .unwrap_or(Err(FlowError::Internal(
+                "no token carrier was staged for this test",
+            )))
+    }
+
     fn wait_for_usb(&self) -> Result<Vec<UsbDevice>, UsbError> {
+        self.usb_waits.set(self.usb_waits.get() + 1);
         if let Some(e) = &self.usb_error {
             // UsbError doesn't implement Clone; rebuild the most useful variants.
             return Err(match e {
@@ -1684,6 +1993,7 @@ impl FlowIo for InMemoryFlowIo {
     }
 
     fn mount(&self, _dev: &UsbDevice) -> Result<MountSession<Self::Ops>, MountError> {
+        self.mounts.set(self.mounts.get() + 1);
         if let Some(e) = &self.mount_error {
             return Err(match e {
                 MountError::UnsupportedFs(s) => MountError::UnsupportedFs(s.clone()),
@@ -2853,6 +3163,16 @@ level = "info"
         on_wait: std::cell::RefCell<Option<Result<Slot, Pkcs11Error>>>,
         on_serial: std::cell::RefCell<Option<Result<String, Pkcs11Error>>>,
         on_acquire: std::cell::RefCell<Option<Result<Pkcs11Session, P11Acquire>>>,
+        /// The slots that satisfy the configured selection.
+        ///
+        /// Deliberately independent of what `wait_for_token` hands back: the
+        /// two can disagree on real hardware — a token removed between the
+        /// wait and the check, or a second one whose slot came first — and a
+        /// stub that could not express the disagreement would let a flow that
+        /// uses the arrival slot pass.
+        matching: std::cell::RefCell<Vec<Slot>>,
+        /// Slots the flow actually operated on, in order.
+        used_slots: std::cell::RefCell<Vec<Slot>>,
     }
 
     impl StubPkcs11Io {
@@ -2861,10 +3181,15 @@ level = "info"
                 on_wait: std::cell::RefCell::new(None),
                 on_serial: std::cell::RefCell::new(None),
                 on_acquire: std::cell::RefCell::new(None),
+                matching: std::cell::RefCell::new(vec![Self::slot()]),
+                used_slots: std::cell::RefCell::new(Vec::new()),
             }
         }
         fn slot() -> Slot {
             Slot::try_from(0_u64).unwrap()
+        }
+        fn slot_n(n: u64) -> Slot {
+            Slot::try_from(n).unwrap()
         }
     }
 
@@ -2875,7 +3200,11 @@ level = "info"
                 .take()
                 .unwrap_or_else(|| Ok(Self::slot()))
         }
-        fn read_token_serial(&self, _slot: Slot) -> Result<String, Pkcs11Error> {
+        fn matching_tokens(&self) -> Result<Vec<Slot>, Pkcs11Error> {
+            Ok(self.matching.borrow().clone())
+        }
+        fn read_token_serial(&self, slot: Slot) -> Result<String, Pkcs11Error> {
+            self.used_slots.borrow_mut().push(slot);
             self.on_serial
                 .borrow_mut()
                 .take()
@@ -2883,9 +3212,10 @@ level = "info"
         }
         fn acquire_session(
             &self,
-            _slot: Slot,
+            slot: Slot,
             _pin_prompter: &mut PinPrompterFn<'_>,
         ) -> Result<Pkcs11Session, P11Acquire> {
+            self.used_slots.borrow_mut().push(slot);
             self.on_acquire
                 .borrow_mut()
                 .take()
@@ -2971,8 +3301,13 @@ level = "info"
         assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
     }
 
+    /// The signing token has the same presence hole as the token carrier and
+    /// is closed by the same poller, so strict monitoring no longer stops the
+    /// dispatcher before it reaches the provider. What stops this particular
+    /// login is the module path, which is where an unloadable provider
+    /// belongs.
     #[test]
-    fn dispatcher_rejects_strict_pkcs11_before_loading_module() {
+    fn dispatcher_no_longer_refuses_strict_pkcs11_before_loading_module() {
         let mut cfg = pkcs11_native_cfg();
         cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
         let verifier = build_verifier();
@@ -3000,14 +3335,24 @@ level = "info"
             "sess-p11-strict-dispatch".into(),
             |_| Ok(SecretString::from("unused")),
         )
-        .expect_err("strict pkcs11 must fail before loading the provider");
+        .expect_err("the fixture's module path loads nothing");
 
-        assert!(matches!(err, FlowError::Pkcs11StrictPresenceUnsupported));
-        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
+        assert!(
+            matches!(
+                err,
+                FlowError::Pkcs11(
+                    Pkcs11Error::ModulePathMissing(_) | Pkcs11Error::ModuleLoadFailed { .. }
+                )
+            ),
+            "the refusal must come from the provider, not from the monitoring mode: got {err:?}"
+        );
     }
 
+    /// Under strict monitoring the PKCS#11 path now reaches token discovery
+    /// instead of being refused ahead of it, and fails on whatever discovery
+    /// reports.
     #[test]
-    fn strict_pkcs11_presence_is_rejected_before_token_io() {
+    fn strict_pkcs11_presence_reaches_token_discovery() {
         let mut cfg = pkcs11_native_cfg();
         cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
         let verifier = build_verifier();
@@ -3036,13 +3381,15 @@ level = "info"
             "sess-p11-strict".into(),
             |_| Ok(SecretString::from("unused")),
         )
-        .expect_err("strict pkcs11 must fail before token I/O");
+        .expect_err("the stub has no token to find");
 
-        assert!(matches!(err, FlowError::Pkcs11StrictPresenceUnsupported));
-        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
         assert!(
-            stub.on_wait.borrow().is_some(),
-            "strict-mode rejection must happen before token discovery"
+            matches!(err, FlowError::Pkcs11(Pkcs11Error::TokenWaitTimeout { .. })),
+            "the refusal must come from discovery, not from the monitoring mode: got {err:?}"
+        );
+        assert!(
+            stub.on_wait.borrow().is_none(),
+            "token discovery must have been reached and consumed the stubbed answer"
         );
     }
 
@@ -4304,6 +4651,7 @@ level = "info"
             usb_serial: Some("TOKEN-SERIAL"),
             usb_vid_pid: None,
             usb_devnode: None,
+            carrier: tessera_proto::CarrierKind::UsbPartition,
             cert_cn: "alice",
             cert_serial: "00",
             engineer_ski: "",
@@ -4416,5 +4764,665 @@ level = "info"
     #[test]
     fn pkcs11_malformed_max_integrity_fails_closed() {
         assert_malformed_max_integrity_denied_for_backend("pkcs11");
+    }
+
+    // -----------------------------------------------------------------
+    // Envelope carrier: USB partition (default) vs data object on a token
+    // -----------------------------------------------------------------
+
+    /// The label the carrier tests read the envelope under.
+    const CARRIER_LABEL: &str = "tessera-credential";
+
+    /// Serial the fake token reports.
+    const CARRIER_TOKEN_SERIAL: &str = "483d4e1a";
+
+    fn token_carrier_cfg() -> ValidatedConfig {
+        let mut cfg = minimal_cfg();
+        cfg.pkcs12_source = tessera_core::config::validated::Pkcs12Source::TokenObject {
+            object_label: CARRIER_LABEL.to_owned(),
+        };
+        cfg
+    }
+
+    /// A flow-io that serves the envelope off a token and would notice any
+    /// touch of mass storage.
+    fn token_carrier_io(p12_name: &str) -> InMemoryFlowIo {
+        let io = InMemoryFlowIo::new(std::path::PathBuf::from("/nonexistent/never-mounted"));
+        *io.token_carrier.borrow_mut() = Some(Ok(TokenCarrier {
+            p12_bytes: fixture_bytes(p12_name),
+            token_serial: CARRIER_TOKEN_SERIAL.to_owned(),
+        }));
+        io
+    }
+
+    /// Monitor client that keeps what it was told to register.
+    ///
+    /// Removal enforcement is keyed on the fields recorded here, so "the flow
+    /// filled in an `AuthContext`" is not the property under test — what the
+    /// daemon received is.
+    /// What monitord was told about the medium: serial, VID/PID, devnode.
+    type RegisteredMedium = (Option<String>, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingMonitor {
+        opened: std::sync::Mutex<Vec<RegisteredMedium>>,
+    }
+
+    impl tessera_core::ipc::MonitorClient for RecordingMonitor {
+        fn hello(&self) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+        fn open_session(
+            &self,
+            info: &OpenSessionInfo<'_>,
+        ) -> Result<(), tessera_core::error::IpcError> {
+            #[allow(clippy::unwrap_used)]
+            self.opened.lock().unwrap().push((
+                info.usb_serial.map(str::to_owned),
+                info.usb_vid_pid.map(str::to_owned),
+                info.usb_devnode.map(str::to_owned),
+            ));
+            Ok(())
+        }
+        fn close_session(
+            &self,
+            _session_id: &str,
+            _reason: &str,
+        ) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+        fn ping(&self) -> Result<(), tessera_core::error::IpcError> {
+            Ok(())
+        }
+    }
+
+    /// What one authentication attempt did, beyond its verdict.
+    struct CarrierRun {
+        outcome: Result<FlowOutcome<NoopMountOps>, FlowError>,
+        prompts: Vec<String>,
+        usb_waits: usize,
+        mounts: usize,
+        registered: Vec<RegisteredMedium>,
+    }
+
+    /// Drive one authentication over the given carrier.
+    fn run_carrier(
+        cfg: &ValidatedConfig,
+        io: &InMemoryFlowIo,
+        verifier: &dyn Stage2TrustVerifier,
+        host_id_hash: &str,
+        pin: &str,
+    ) -> CarrierRun {
+        let monitor = RecordingMonitor::default();
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
+        let deps = Deps {
+            cfg,
+            trust: verifier,
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash,
+            host_id_source: HostIdSourceKind::Override,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: roles.stage(),
+            device_tags: empty_device_tags(),
+        };
+        let prompts = std::cell::RefCell::new(Vec::new());
+        let outcome = authenticate(
+            deps,
+            io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-carrier".into(),
+            |prompt| {
+                prompts.borrow_mut().push(prompt.to_owned());
+                Ok(SecretString::from(pin.to_string()))
+            },
+        );
+        #[allow(clippy::unwrap_used)]
+        let registered = monitor.opened.lock().unwrap().clone();
+        CarrierRun {
+            outcome,
+            prompts: prompts.into_inner(),
+            usb_waits: io.usb_waits.get(),
+            mounts: io.mounts.get(),
+            registered,
+        }
+    }
+
+    /// A configuration that says nothing about the carrier keeps mounting the
+    /// USB partition it always mounted.
+    #[test]
+    fn an_absent_source_key_still_reads_the_usb_partition() {
+        let cfg = minimal_cfg();
+        assert_eq!(
+            cfg.pkcs12_source,
+            tessera_core::config::validated::Pkcs12Source::UsbPartition,
+            "an installation that predates the token carrier must not change behaviour"
+        );
+
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let run = run_carrier(&cfg, &io, &build_verifier(), "host-T-hash", "correct-pin");
+
+        let outcome = run.outcome.expect("the USB carrier still authenticates");
+        assert!(outcome.mount.is_some(), "the mount guard is still returned");
+        assert_eq!(outcome.auth_ctx.usb_serial.as_deref(), Some("MOCK"));
+        assert_eq!(run.usb_waits, 1, "the USB bus is still consulted");
+        assert_eq!(run.mounts, 1, "the partition is still mounted");
+    }
+
+    /// A CCID token has no filesystem, so the token carrier must not wait on
+    /// the USB bus or mount anything at all.
+    #[test]
+    fn the_token_carrier_never_touches_mass_storage() {
+        let cfg = token_carrier_cfg();
+        let io = token_carrier_io("leaf_rsa.p12");
+        let run = run_carrier(&cfg, &io, &build_verifier(), "host-T-hash", "correct-pin");
+
+        let outcome = run.outcome.expect("the token carrier authenticates");
+        assert_eq!(run.usb_waits, 0, "wait_for_usb must not be called");
+        assert_eq!(run.mounts, 0, "nothing may be mounted");
+        assert!(
+            outcome.mount.is_none(),
+            "there is no mount to hand back to the caller"
+        );
+    }
+
+    /// The serial in `usb_serial` is what the daemon matches a removal event
+    /// against. An empty one there means the session outlives the carrier
+    /// being pulled out, and nothing else in the flow would notice.
+    #[test]
+    fn the_token_carrier_records_the_token_serial_for_removal_enforcement() {
+        let cfg = token_carrier_cfg();
+        let io = token_carrier_io("leaf_rsa.p12");
+        let run = run_carrier(&cfg, &io, &build_verifier(), "host-T-hash", "correct-pin");
+
+        let outcome = run.outcome.expect("the token carrier authenticates");
+        assert_eq!(
+            outcome.auth_ctx.usb_serial.as_deref(),
+            Some(CARRIER_TOKEN_SERIAL),
+            "the carrier identity must be the token's serial, not empty"
+        );
+        assert_eq!(
+            run.registered,
+            vec![(Some(CARRIER_TOKEN_SERIAL.to_owned()), None, None)],
+            "the daemon has to receive that same serial, and a token has no \
+             VID/PID or devnode to bind to"
+        );
+    }
+
+    /// Trust verifier that records what each attempt presented to it.
+    ///
+    /// The presented chain is the one input to verification that differs
+    /// between the carriers, and nothing downstream reports it, so a test that
+    /// wanted to see the difference had to look here.
+    struct RecordingVerifier {
+        inner: OpensslVerifier,
+        presented: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl RecordingVerifier {
+        fn new() -> Self {
+            Self {
+                inner: build_verifier(),
+                presented: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn presented_counts(&self) -> Vec<usize> {
+            self.presented.lock().unwrap().clone()
+        }
+    }
+
+    impl Stage2TrustVerifier for RecordingVerifier {
+        fn verify(
+            &self,
+            leaf: &Certificate,
+            presented: &[Certificate],
+        ) -> Result<tessera_core::trust::openssl_verifier::Stage2VerifiedChain, TrustError>
+        {
+            self.presented.lock().unwrap().push(presented.len());
+            self.inner.verify(leaf, presented)
+        }
+    }
+
+    /// The one place where the input to verification depends on the carrier.
+    ///
+    /// A USB medium can hold `certs/chain.pem` beside the container and the
+    /// flow appends it to what the bundle itself presented; a token object
+    /// holds the envelope and nothing else, so nothing is appended and the
+    /// path must be built from `[trust]` alone.
+    ///
+    /// The difference goes in the strict direction — the token presents fewer
+    /// intermediates, never more — which is why it is checked rather than
+    /// removed. An installation whose path only closed because of the file on
+    /// the flash drive will stop authenticating when it moves to a token,
+    /// until those intermediates are in the device's trust configuration.
+    #[test]
+    fn only_the_usb_carrier_adds_intermediates_from_beside_the_container() {
+        let usb_cfg = minimal_cfg();
+        let tmp = stage_p12_mount("leaf_rsa.p12", true);
+        assert!(
+            tmp.path().join("certs/chain.pem").exists(),
+            "this pair is only honest if the USB side really carries a chain file"
+        );
+        let usb_io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let usb_verifier = RecordingVerifier::new();
+        let usb = run_carrier(
+            &usb_cfg,
+            &usb_io,
+            &usb_verifier,
+            "host-T-hash",
+            "correct-pin",
+        );
+        usb.outcome.expect("usb carrier authenticates");
+
+        let token_cfg = token_carrier_cfg();
+        let token_io = token_carrier_io("leaf_rsa.p12");
+        let token_verifier = RecordingVerifier::new();
+        let token = run_carrier(
+            &token_cfg,
+            &token_io,
+            &token_verifier,
+            "host-T-hash",
+            "correct-pin",
+        );
+        token.outcome.expect("token carrier authenticates");
+
+        let usb_presented = usb_verifier.presented_counts();
+        let token_presented = token_verifier.presented_counts();
+        assert_eq!(usb_presented.len(), 1, "one verification each");
+        assert_eq!(token_presented.len(), 1);
+        assert!(
+            usb_presented[0] > token_presented[0],
+            "the chain file beside the container must reach the verifier: usb presented \
+             {usb_presented:?}, token presented {token_presented:?}"
+        );
+    }
+
+    /// Everything after the envelope is the same code for both carriers, so
+    /// the same container must produce the same verdict, the same prompts and
+    /// the same session payload — differing only in what carried it.
+    #[test]
+    fn both_carriers_run_the_same_checks_after_the_envelope() {
+        let verifier = build_verifier();
+
+        let usb_cfg = minimal_cfg();
+        // With the chain file present, so that the one input that legitimately
+        // differs between the carriers is exercised rather than avoided by the
+        // choice of fixture. The intermediates are in `[trust]` as well, which
+        // is what the token carrier requires and what keeps the two outcomes
+        // comparable at all.
+        let tmp = stage_p12_mount("leaf_rsa.p12", true);
+        let usb_io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let usb = run_carrier(&usb_cfg, &usb_io, &verifier, "host-T-hash", "correct-pin");
+
+        let token_cfg = token_carrier_cfg();
+        let token_io = token_carrier_io("leaf_rsa.p12");
+        let token = run_carrier(
+            &token_cfg,
+            &token_io,
+            &verifier,
+            "host-T-hash",
+            "correct-pin",
+        );
+
+        let usb_ctx = usb.outcome.expect("usb carrier").auth_ctx;
+        let token_ctx = token.outcome.expect("token carrier").auth_ctx;
+
+        assert_eq!(usb_ctx.cert_cn, token_ctx.cert_cn);
+        assert_eq!(usb_ctx.cert_serial, token_ctx.cert_serial);
+        assert_eq!(usb_ctx.cert_not_after, token_ctx.cert_not_after);
+        assert_eq!(usb_ctx.cert_max_integrity, token_ctx.cert_max_integrity);
+        assert_eq!(
+            format!("{:?}", usb_ctx.cert_ident),
+            format!("{:?}", token_ctx.cert_ident)
+        );
+        assert_eq!(usb_ctx.home_dir, token_ctx.home_dir);
+        assert_eq!(usb_ctx.host_id, token_ctx.host_id);
+        assert_eq!(
+            usb_ctx.role.as_ref().map(|r| r.role.as_str()),
+            token_ctx.role.as_ref().map(|r| r.role.as_str())
+        );
+        assert_eq!(
+            usb_ctx.role.as_ref().map(|r| r.role_version),
+            token_ctx.role.as_ref().map(|r| r.role_version)
+        );
+        assert_eq!(
+            usb.prompts, token.prompts,
+            "the container PIN is asked for the same way either side"
+        );
+
+        // What legitimately differs is the medium.
+        assert_eq!(usb_ctx.usb_serial.as_deref(), Some("MOCK"));
+        assert_eq!(token_ctx.usb_serial.as_deref(), Some(CARRIER_TOKEN_SERIAL));
+        assert!(usb_ctx.usb_vid_pid.is_some());
+        assert!(token_ctx.usb_vid_pid.is_none());
+    }
+
+    /// The PIN budget and the trust check must fail identically on both
+    /// carriers: the checks after the envelope do not know where it came from.
+    #[test]
+    fn both_carriers_fail_the_same_way_after_the_envelope() {
+        let verifier = build_verifier();
+
+        let usb_cfg = minimal_cfg();
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let usb_io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let usb = run_carrier(&usb_cfg, &usb_io, &verifier, "host-T-hash", "wrong-pin");
+
+        let token_cfg = token_carrier_cfg();
+        let token_io = token_carrier_io("leaf_rsa.p12");
+        let token = run_carrier(&token_cfg, &token_io, &verifier, "host-T-hash", "wrong-pin");
+
+        let usb_err = usb.outcome.err().expect("a wrong PIN denies the login");
+        let token_err = token.outcome.err().expect("a wrong PIN denies the login");
+        assert!(matches!(usb_err, FlowError::MaxTries), "got {usb_err:?}");
+        assert!(
+            matches!(token_err, FlowError::MaxTries),
+            "got {token_err:?}"
+        );
+        assert_eq!(usb.prompts.len(), 3, "the budget is three attempts");
+        assert_eq!(
+            usb.prompts, token.prompts,
+            "the same prompts in the same order"
+        );
+
+        // The chain check is likewise unaware of the carrier.
+        let foreign = build_verifier_with_a_foreign_anchor();
+        let tmp = stage_p12_mount("leaf_rsa.p12", false);
+        let usb_io = InMemoryFlowIo::new(tmp.path().to_path_buf());
+        let usb = run_carrier(&usb_cfg, &usb_io, &foreign, "host-T-hash", "correct-pin");
+        let token_io = token_carrier_io("leaf_rsa.p12");
+        let token = run_carrier(
+            &token_cfg,
+            &token_io,
+            &foreign,
+            "host-T-hash",
+            "correct-pin",
+        );
+        let usb_err = usb.outcome.err().expect("an unbuildable chain denies");
+        let token_err = token.outcome.err().expect("an unbuildable chain denies");
+        assert!(matches!(usb_err, FlowError::Trust(_)), "got {usb_err:?}");
+        assert!(
+            matches!(token_err, FlowError::Trust(_)),
+            "got {token_err:?}"
+        );
+        assert_eq!(usb_err.pam_code(), token_err.pam_code());
+    }
+
+    /// Same verifier as [`build_verifier`] but anchored at an unrelated CA, so
+    /// the fixture leaf has no path to a trusted root.
+    fn build_verifier_with_a_foreign_anchor() -> OpensslVerifier {
+        let ca = Certificate::from_pem(&fixture_bytes("ca_site.pem")).unwrap();
+        OpensslVerifier::new(OpensslVerifierConfig {
+            anchors: vec![ca],
+            intermediates: vec![],
+            crl_pems: vec![],
+            crl_strict: false,
+            crl_max_age: None,
+            max_supported_profile_version:
+                tessera_core::trust::openssl_verifier::DEFAULT_MAX_SUPPORTED_PROFILE_VERSION,
+            clock_skew: Duration::from_secs(60),
+            signature_alg_whitelist: vec![
+                "sha256WithRSAEncryption".into(),
+                "ecdsa-with-SHA256".into(),
+            ],
+            spki_pins: vec![],
+            max_depth: 4,
+            gost_engine_path: None,
+            revocation_mode: tessera_core::config::validated::RevocationMode::None,
+            ocsp_responder_url: None,
+            ocsp_timeout: Duration::from_secs(5),
+            ocsp_cache_dir: std::path::PathBuf::from("/var/cache/tessera/ocsp"),
+            ocsp_cache_ttl: Duration::ZERO,
+        })
+        .unwrap()
+    }
+
+    /// A carrier that holds no usable credential must answer the same on both
+    /// media. In a stack written as `[success=done authinfo_unavail=ignore
+    /// default=die]` the difference between 9 and 7 is the difference between
+    /// falling through to the next module and refusing the login, and a
+    /// mistake made at issuance should not decide that by carrier type.
+    #[test]
+    fn a_carrier_without_a_usable_credential_answers_alike_on_both_media() {
+        let usb_missing = FlowError::Discovery(DiscoveryError::P12NotFound {
+            path: PathBuf::from("certs/user.p12"),
+        });
+        let label = || "tessera-credential".to_owned();
+        let token_cases = [
+            FlowError::Pkcs11(Pkcs11Error::DataObjectNotFound { label: label() }),
+            FlowError::Pkcs11(Pkcs11Error::DataObjectNotPrivate { label: label() }),
+            FlowError::Pkcs11(Pkcs11Error::DataObjectUnreadable {
+                label: label(),
+                attribute: "CKA_VALUE",
+            }),
+            FlowError::Pkcs11(Pkcs11Error::DataObjectAmbiguous {
+                label: label(),
+                count: 2,
+            }),
+        ];
+        for token_case in token_cases {
+            assert_eq!(
+                token_case.pam_code(),
+                usb_missing.pam_code(),
+                "{token_case:?} must map like the USB carrier's missing credential"
+            );
+            assert_eq!(token_case.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
+        }
+    }
+
+    /// The token that gets used is the one the ambiguity check passed, not the
+    /// one the provider enumerated first. A flow that kept the arrival slot
+    /// would present the PIN to a device the check never looked at.
+    #[test]
+    fn the_token_used_is_the_one_the_check_passed() {
+        let cfg = token_carrier_cfg();
+        let stub = StubPkcs11Io::new();
+        // Arrival says slot 0; the configured selection matches only slot 3.
+        *stub.on_wait.borrow_mut() = Some(Ok(StubPkcs11Io::slot_n(0)));
+        *stub.matching.borrow_mut() = vec![StubPkcs11Io::slot_n(3)];
+
+        // The stub cannot hand back a real session, so the read fails; which
+        // slot it failed on is the point.
+        let outcome = read_token_carrier_with(&stub, &cfg, CARRIER_LABEL, &mut |_| {
+            Ok(SecretString::from("pin".to_string()))
+        });
+        assert!(outcome.is_err(), "the stub has no session to give");
+
+        let used = stub.used_slots.borrow().clone();
+        assert!(
+            !used.is_empty(),
+            "the flow must have operated on some slot: {used:?}"
+        );
+        assert!(
+            used.iter().all(|s| *s == StubPkcs11Io::slot_n(3)),
+            "every operation must use the checked slot, got {used:?}"
+        );
+    }
+
+    /// A token present when the wait returned and gone by the time the
+    /// selection is checked leaves nothing to read. Carrying the stale slot
+    /// onward would surface the removal as whatever the provider raises on a
+    /// dead handle, after the engineer has been asked for a PIN.
+    #[test]
+    fn a_token_that_vanished_between_the_wait_and_the_check_is_not_used() {
+        let cfg = token_carrier_cfg();
+        let stub = StubPkcs11Io::new();
+        *stub.on_wait.borrow_mut() = Some(Ok(StubPkcs11Io::slot_n(0)));
+        stub.matching.borrow_mut().clear();
+
+        let prompts = std::cell::Cell::new(0_usize);
+        let err = read_token_carrier_with(&stub, &cfg, CARRIER_LABEL, &mut |_| {
+            prompts.set(prompts.get() + 1);
+            Ok(SecretString::from("pin".to_string()))
+        })
+        .expect_err("there is no token left to read the carrier from");
+
+        assert!(
+            matches!(err, FlowError::Pkcs11(Pkcs11Error::NoTokenAvailable)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            prompts.get(),
+            0,
+            "no PIN may be asked for a token that left"
+        );
+        assert!(
+            stub.used_slots.borrow().is_empty(),
+            "the stale slot must not be touched: {:?}",
+            stub.used_slots.borrow()
+        );
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
+    }
+
+    /// Which token carries the credential must come from the configuration.
+    /// With a second token connected the flow has nothing to go on, and
+    /// picking the first would let that token stand in for the carrier.
+    #[test]
+    fn two_matching_tokens_are_refused_before_the_pin_prompt() {
+        let cfg = token_carrier_cfg();
+        let stub = StubPkcs11Io::new();
+        *stub.matching.borrow_mut() = vec![StubPkcs11Io::slot_n(0), StubPkcs11Io::slot_n(1)];
+
+        let prompts = std::cell::Cell::new(0_usize);
+        let err = read_token_carrier_with(&stub, &cfg, CARRIER_LABEL, &mut |_| {
+            prompts.set(prompts.get() + 1);
+            Ok(SecretString::from("unused".to_string()))
+        })
+        .expect_err("an ambiguous carrier must not be chosen for the operator");
+
+        assert!(
+            matches!(err, FlowError::TokenCarrierAmbiguous { count: 2 }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            prompts.get(),
+            0,
+            "a search across tokens would present the PIN to a device that was never meant \
+             to receive it"
+        );
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
+    }
+
+    /// The refusal names what to do about it: the message is the only thing
+    /// an engineer at a locked screen has to go on.
+    #[test]
+    fn the_ambiguity_refusal_names_the_key_that_resolves_it() {
+        let shown = FlowError::TokenCarrierAmbiguous { count: 3 }.to_string();
+        assert!(shown.contains("pkcs11_token_label"), "{shown}");
+        assert!(shown.contains('3'), "{shown}");
+    }
+
+    /// One matching token is the unambiguous case and must go through: the
+    /// guard is a check on the selection, not a new precondition on the flow.
+    #[test]
+    fn a_single_matching_token_is_read_without_complaint() {
+        let cfg = token_carrier_cfg();
+        let stub = StubPkcs11Io::new();
+        assert_eq!(stub.matching.borrow().len(), 1);
+
+        let err = read_token_carrier_with(&stub, &cfg, CARRIER_LABEL, &mut |_| {
+            Ok(SecretString::from("pin".to_string()))
+        })
+        .expect_err("the stub cannot hand back a real session");
+        assert!(
+            !matches!(err, FlowError::TokenCarrierAmbiguous { .. }),
+            "a single candidate is not ambiguous: got {err:?}"
+        );
+    }
+
+    /// A token that reports no serial is refused before the engineer is asked
+    /// for a PIN: it could never be matched by a removal event, so a session
+    /// opened on it would survive the carrier being taken away.
+    #[test]
+    fn a_token_without_a_serial_is_refused_before_the_pin_prompt() {
+        let cfg = token_carrier_cfg();
+        let stub = StubPkcs11Io::new();
+        *stub.on_serial.borrow_mut() = Some(Err(Pkcs11Error::TokenSerialMissing));
+
+        let prompts = std::cell::Cell::new(0_usize);
+        let err = read_token_carrier_with(&stub, &cfg, CARRIER_LABEL, &mut |_| {
+            prompts.set(prompts.get() + 1);
+            Ok(SecretString::from("unused".to_string()))
+        })
+        .expect_err("a serial-less token cannot carry a session");
+
+        assert!(
+            matches!(err, FlowError::Pkcs11(Pkcs11Error::TokenSerialMissing)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            prompts.get(),
+            0,
+            "the PIN must not be spent on a token that was never usable"
+        );
+        assert_eq!(err.pam_code(), 9, "PAM_AUTHINFO_UNAVAIL");
+    }
+
+    /// And the refusal stops the whole authentication rather than falling
+    /// back to another carrier.
+    #[test]
+    fn a_serial_less_token_stops_the_authentication() {
+        let cfg = token_carrier_cfg();
+        let io = InMemoryFlowIo::new(std::path::PathBuf::from("/nonexistent/never-mounted"));
+        *io.token_carrier.borrow_mut() =
+            Some(Err(FlowError::Pkcs11(Pkcs11Error::TokenSerialMissing)));
+
+        let run = run_carrier(&cfg, &io, &build_verifier(), "host-T-hash", "correct-pin");
+        let err = run.outcome.err().expect("authentication must not continue");
+        assert!(
+            matches!(err, FlowError::Pkcs11(Pkcs11Error::TokenSerialMissing)),
+            "got {err:?}"
+        );
+        assert!(run.registered.is_empty(), "no session may be registered");
+        assert_eq!(run.usb_waits, 0, "and no fallback to mass storage");
+        assert_eq!(run.mounts, 0);
+    }
+
+    /// Strict monitoring promises that a session dies with its carrier. The
+    /// daemon establishes a token's presence by polling the provider for its
+    /// serial, so the promise is one this carrier can keep and the login is
+    /// no longer refused at the dispatcher.
+    #[test]
+    fn strict_monitoring_is_accepted_for_the_token_carrier() {
+        let mut cfg = token_carrier_cfg();
+        cfg.monitor.fail_mode = tessera_core::config::validated::MonitorFailMode::Strict;
+        let io = token_carrier_io("leaf_rsa.p12");
+
+        let monitor = StubClient;
+        let exec = tessera_core::hooks::NoopExecutor::new();
+        let roles = RoleFixture::serv();
+        let deps = Deps {
+            cfg: &cfg,
+            trust: &build_verifier(),
+            monitor: &monitor,
+            hook_executor: &exec,
+            host_id_hash: "host-T-hash",
+            host_id_source: HostIdSourceKind::Override,
+            pam_target: tessera_proto::SessionTarget::Unknown,
+            role_stage: roles.stage(),
+            device_tags: empty_device_tags(),
+        };
+        let outcome = authenticate(
+            deps,
+            &io,
+            RoleFixture::ACCOUNT,
+            "ssh",
+            "sess-strict-token".into(),
+            |_| Ok(SecretString::from("correct-pin".to_string())),
+        )
+        .expect("strict presence is enforceable on a token carrier");
+
+        assert!(
+            io.token_carrier.borrow().is_none(),
+            "the carrier object must actually be read, or the login was refused elsewhere"
+        );
+        assert_eq!(
+            outcome.auth_ctx.usb_serial.as_deref(),
+            Some(CARRIER_TOKEN_SERIAL),
+            "the session must carry the token serial the presence monitor matches on"
+        );
     }
 }

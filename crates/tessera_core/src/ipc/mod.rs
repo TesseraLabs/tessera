@@ -57,6 +57,12 @@ pub struct OpenSessionInfo<'a> {
     /// when available. Part of the same device-topology binding as
     /// [`Self::usb_vid_pid`]. `None` for PKCS#11 tokens.
     pub usb_devnode: Option<&'a str>,
+    /// Which namespace [`Self::usb_serial`] belongs to.
+    ///
+    /// The daemon watches a block-device serial through udev and a token
+    /// serial by polling the provider; nothing in the serial itself says
+    /// which, so the side that knows says it.
+    pub carrier: tessera_proto::CarrierKind,
     /// Common-Name from the validated end-entity certificate.
     pub cert_cn: &'a str,
     /// Hex serial of the validated end-entity certificate.

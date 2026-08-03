@@ -23,7 +23,12 @@ gost-tests = []
 # PKCS#11 provider (softhsm2, librtpkcs11ecp, etc.).  When the feature is on
 # but no module is available at runtime (e.g. on macOS dev hosts), each test
 # prints `skipped: ...` and returns `Ok`.
-pkcs11-tests = []
+#
+# It also turns on the issuing tool's token-writing path, because the data
+# object the reader is tested against has to be put on the token by the code
+# that will really put it there — a fixture written by anything else would
+# prove the reader works on objects nobody ships.
+pkcs11-tests = ["tessera_issuer/pkcs11"]
 # Enables in-process MacBackend mock for unit tests on dev hosts without
 # libpdp.
 mac-tests = ["dep:mockall"]

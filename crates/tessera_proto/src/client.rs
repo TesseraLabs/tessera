@@ -6,6 +6,25 @@ use uuid::Uuid;
 
 use crate::session_target::SessionTarget;
 
+/// What kind of carrier the session's `usb_serial` names.
+///
+/// The serial alone does not say which namespace it belongs to, and the two
+/// are unrelated: a block-device descriptor serial is looked up in udev, a
+/// token serial is only ever answered by a PKCS#11 provider. A daemon that
+/// guessed from its own configuration would guess wrong exactly when the
+/// configuration has just changed — sessions restored from the registry after
+/// an operator switched a host from a USB medium to a token carry serials of
+/// the previous kind, and judging those in the new namespace would end every
+/// one of them at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CarrierKind {
+    /// A USB block device, observed through udev.
+    UsbPartition,
+    /// A PKCS#11 token, observed by polling the provider.
+    Token,
+}
+
 /// Metadata captured by the PAM module at session open time.
 ///
 /// Used as the input to [`crate::ClientMessage::SessionOpen`] so that callers
@@ -38,6 +57,13 @@ pub struct SessionOpenPayload {
     /// Optional NDJSON field; absent for PKCS#11 tokens and v1 clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usb_devnode: Option<String>,
+    /// Which namespace [`Self::usb_serial`] belongs to.
+    ///
+    /// Additive optional field within `PROTOCOL_VERSION` 2. `None` means the
+    /// frame predates it, which the daemon treats as "do not judge this
+    /// session in the token namespace" — see [`CarrierKind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<CarrierKind>,
     /// Hex-encoded host id hash.
     pub host_id_hash: String,
     /// Wall clock time the PAM module decided the session was authenticated.
@@ -130,6 +156,10 @@ pub enum ClientMessage {
         /// field; see [`SessionOpenPayload::usb_devnode`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usb_devnode: Option<String>,
+        /// Which namespace `usb_serial` belongs to. Optional NDJSON field;
+        /// see [`SessionOpenPayload::carrier`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        carrier: Option<CarrierKind>,
         /// Host id hash.
         host_id_hash: String,
         /// Opened at (unix seconds).

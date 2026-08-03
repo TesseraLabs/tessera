@@ -17,9 +17,23 @@ fn awake_is_not_in_grace() {
 }
 
 #[test]
-fn suspending_is_always_in_grace() {
+fn suspending_is_in_grace() {
     let s = SuspendState::SuspendingAt(Instant::now());
     assert!(s.is_in_grace_window(5));
+}
+
+/// A `PrepareForSleep(true)` whose matching `false` never arrives must not
+/// suppress removals for the rest of the daemon's life. Under strict
+/// monitoring that would be a promise of continuous presence with no
+/// enforcement behind it, and nothing in the daemon would say so.
+///
+/// Safe to bound because the monotonic clock does not run while the machine
+/// is suspended: reaching this state means the daemon has been awake that
+/// long since the announcement.
+#[test]
+fn a_suspend_announcement_without_a_resume_stops_suppressing() {
+    let s = SuspendState::SuspendingAt(Instant::now() - Duration::from_secs(10));
+    assert!(!s.is_in_grace_window(5));
 }
 
 #[test]

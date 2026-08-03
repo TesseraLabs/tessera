@@ -239,6 +239,10 @@ pub(crate) enum Msg {
     FilePlaintextKeyWarning,
     /// Secret prompt caption for the PKCS#11 token PIN.
     SecretPromptTokenPin,
+    /// Secret prompt caption for the PIN of the token a credential is being
+    /// written to. Deliberately not the same caption as the CA token's PIN:
+    /// the two are different devices with their own attempt counters.
+    SecretPromptCarrierPin,
     /// Secret prompt caption for the file backend's CA key passphrase.
     SecretPromptKeyPassphrase,
     /// Secret prompt caption for the PKCS#12 container password.
@@ -327,6 +331,9 @@ impl Msg {
                  (openssl pkcs8 -topk8) or use a PKCS#11/Vault backend in production"
             }
             Msg::SecretPromptTokenPin => "Tessera token PIN",
+            Msg::SecretPromptCarrierPin => {
+                "PIN of the Tessera carrier token receiving the credential"
+            }
             Msg::SecretPromptKeyPassphrase => "Tessera CA key passphrase",
             Msg::SecretPromptContainerPassphrase => "Tessera credential container password",
             Msg::SecretEnvWarning => {
@@ -402,6 +409,9 @@ impl Msg {
                  (openssl pkcs8 -topk8) или используйте бэкенд PKCS#11/Vault в проде"
             }
             Msg::SecretPromptTokenPin => "PIN токена Tessera",
+            Msg::SecretPromptCarrierPin => {
+                "PIN токена-носителя Tessera, на который пишется удостоверение"
+            }
             Msg::SecretPromptKeyPassphrase => "пароль ключа УЦ Tessera",
             Msg::SecretPromptContainerPassphrase => "пароль контейнера удостоверения Tessera",
             Msg::SecretEnvWarning => {

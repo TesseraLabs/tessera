@@ -69,3 +69,22 @@ pub fn notify_ready(h: &mut NotifyHandle) {
     h.counter.fetch_add(1, Ordering::SeqCst);
     h.sent = true;
 }
+
+/// Send one `WATCHDOG=1` keepalive.
+///
+/// Unlike [`notify_ready`] this is meant to be called repeatedly: withholding
+/// it is how the daemon asks systemd to restart it (see `daemon::watchdog`).
+pub fn notify_watchdog(h: &NotifyHandle) {
+    let result = match h.sender {
+        NotifySender::System => sd_notify::notify(&[sd_notify::NotifyState::Watchdog]),
+        NotifySender::Test => Ok(()),
+    };
+    if let Err(e) = result {
+        tracing::debug!(
+            target: "tessera.monitord",
+            error = %e,
+            "sd_notify(WATCHDOG=1) failed (no NOTIFY_SOCKET?)"
+        );
+    }
+    h.counter.fetch_add(1, Ordering::SeqCst);
+}

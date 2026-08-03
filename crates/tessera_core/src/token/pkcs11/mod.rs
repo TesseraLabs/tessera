@@ -33,6 +33,7 @@
 
 mod backend;
 pub mod cert_lookup;
+pub mod data_object;
 pub mod error;
 pub mod info;
 pub mod key_lookup;
@@ -48,6 +49,7 @@ mod waiter;
 pub use backend::{context_adopt_count, context_init_count};
 pub use backend::{LockingMode, Pkcs11Backend};
 pub use cert_lookup::FoundCertificate;
+pub use data_object::FoundDataObject;
 pub use error::Pkcs11Error;
 pub use info::read_token_serial;
 pub use key_lookup::{ExtractableKeyPolicy, ExtractableProbe, ExtractableState, FoundPrivateKey};

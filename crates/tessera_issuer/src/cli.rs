@@ -439,9 +439,39 @@ struct PrepareCarrierArgs {
     /// Label of the token data object holding the container.
     #[arg(long)]
     object_label: Option<String>,
+    /// Token label to select. Worth naming whenever more than one token is
+    /// plugged in: without it the first slot with a token wins, which is as
+    /// likely to be the CA token as the carrier.
+    #[arg(long)]
+    token_label: Option<String>,
+    /// pinentry program for the token PIN prompt. Naming one pins the secret
+    /// source: no other source is consulted.
+    #[arg(long, conflicts_with_all = ["pin_stdin", "pin_file"])]
+    pinentry: Option<PathBuf>,
+    /// Read the token PIN as one line from standard input.
+    #[arg(long, conflicts_with_all = ["pin_file"])]
+    pin_stdin: bool,
+    /// Read the token PIN as one line from a file readable only by its owner.
+    /// The flag takes the file's path, never the PIN itself.
+    #[arg(long)]
+    pin_file: Option<PathBuf>,
     /// Replace an existing container without asking.
     #[arg(long)]
     force: bool,
+}
+
+#[cfg(feature = "pkcs11")]
+impl PrepareCarrierArgs {
+    /// The PIN source the operator named, if any.
+    fn pin_source(&self) -> Option<secret::FlagSource> {
+        if let Some(program) = self.pinentry.clone() {
+            return Some(secret::FlagSource::Pinentry(program));
+        }
+        if self.pin_stdin {
+            return Some(secret::FlagSource::Stdin);
+        }
+        self.pin_file.clone().map(secret::FlagSource::File)
+    }
 }
 
 /// Flags for `issuer issue-crl`.
@@ -1550,19 +1580,24 @@ fn check_chain_against_container(container: &[u8], chain: &[Vec<u8>]) -> Result<
 /// which it never does without a yes.
 fn prepare_carrier(args: &PrepareCarrierArgs, locale: Locale) -> Result<(), CliError> {
     if args.module.is_some() || args.object_label.is_some() {
-        // The passive-token carrier is a separate piece of work. Saying so is
-        // the whole behaviour here: a stub that reported success would send an
-        // engineer to a device with an empty token.
-        return Err(CliError::Usage(
-            crate::carrier::lay_out_token()
-                .err()
-                .map_or_else(String::new, |e| e.to_string()),
-        ));
+        return prepare_token_carrier(args, locale);
     }
     let media = args
         .media
         .as_deref()
         .ok_or_else(|| CliError::Usage("--media is required".to_owned()))?;
+
+    // A mounted carrier reads no PIN and selects no token, so the flags that
+    // supply those are refused rather than dropped. Every other incompatible
+    // combination this command can be given is refused out loud; a `--pin-file`
+    // accepted and ignored would let an operator believe a PIN was involved in
+    // protecting what was just written to a plain directory.
+    if let Some(flag) = token_only_flag(args) {
+        return Err(CliError::Usage(format!(
+            "{flag} describes a token carrier; a run with --media takes neither a PIN nor a \
+             token label"
+        )));
+    }
 
     if let Some(relative) = args.container_path.as_deref() {
         crate::carrier::check_container_path(relative)
@@ -1600,6 +1635,119 @@ fn prepare_carrier(args: &PrepareCarrierArgs, locale: Locale) -> Result<(), CliE
         println!("  {}", path.display());
     }
     Ok(())
+}
+
+/// The first flag given that only a token carrier can act on, if any.
+///
+/// Named separately from the check that uses it so the list is one place: these
+/// are declared unconditionally on the command (a build without the `pkcs11`
+/// feature has them too, and can act on none of them).
+fn token_only_flag(args: &PrepareCarrierArgs) -> Option<&'static str> {
+    [
+        ("--pinentry", args.pinentry.is_some()),
+        ("--pin-stdin", args.pin_stdin),
+        ("--pin-file", args.pin_file.is_some()),
+        ("--token-label", args.token_label.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(flag, given)| given.then_some(flag))
+}
+
+/// `prepare-carrier` against a passive token: write the container into a
+/// private data object.
+///
+/// Only the container travels this way. The trust chain stays on the device
+/// side, and a run that asks for both is refused rather than half-served: an
+/// operator told the carrier was prepared would not go looking for the chain.
+#[cfg(feature = "pkcs11")]
+fn prepare_token_carrier(args: &PrepareCarrierArgs, locale: Locale) -> Result<(), CliError> {
+    use crate::carrier::{Overwrite, TokenTarget};
+    use crate::pkcs11::PinSource as _;
+
+    let module = args
+        .module
+        .as_deref()
+        .ok_or_else(|| CliError::Usage("--object-label needs --module".to_owned()))?;
+    let object_label = args
+        .object_label
+        .as_deref()
+        .ok_or_else(|| CliError::Usage("--module needs --object-label".to_owned()))?;
+    if args.media.is_some() || args.container_path.is_some() {
+        return Err(CliError::Usage(
+            "--media and --container-path describe a mounted carrier; a token takes \
+             --module and --object-label"
+                .to_owned(),
+        ));
+    }
+    if args.chain.is_some() {
+        return Err(CliError::Usage(
+            "a token carries the container only; place the chain on the device or on a \
+             mounted carrier"
+                .to_owned(),
+        ));
+    }
+    crate::carrier::check_object_label(object_label).map_err(|e| CliError::Usage(e.to_string()))?;
+
+    // The size is judged from the directory entry first, so a file far too big
+    // to be a container is refused without a copy of it in memory. It is not
+    // the check that decides — a length read separately from the bytes can be
+    // stale — only the one that keeps the obvious case cheap.
+    if let Ok(metadata) = std::fs::metadata(&args.p12) {
+        let claimed = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        crate::carrier::check_container_fits(claimed)
+            .map_err(|e| CliError::Usage(e.to_string()))?;
+    }
+    let container = read_file(&args.p12)?;
+    // Before the PIN is asked for: a container that cannot be written is not
+    // worth interrupting the operator over.
+    crate::carrier::check_container_fits(container.len())
+        .map_err(|e| CliError::Usage(e.to_string()))?;
+
+    let pin =
+        pin::CliPinSource::for_carrier(args.pin_source(), args.token_label.as_deref(), locale)
+            .pin()
+            .map_err(|e| CliError::Usage(e.to_string()))?;
+    let overwrite = if args.force {
+        Overwrite::Allow
+    } else {
+        Overwrite::Refuse
+    };
+
+    let written = crate::carrier::lay_out_token(
+        &TokenTarget {
+            module_path: module,
+            token_label: args.token_label.as_deref(),
+            object_label,
+        },
+        &container,
+        &pin,
+        overwrite,
+    )
+    .map_err(|e| match e {
+        // The replacement is a second decision, and it is taken with the token
+        // in hand rather than in an answer typed after a PIN prompt.
+        crate::carrier::CarrierError::TokenObjectExists(_) => {
+            CliError::Usage(format!("{e}; re-run with --force"))
+        }
+        other => CliError::Io(other.to_string()),
+    })?;
+
+    println!("{}", Msg::CliCarrierWritten.text(locale));
+    println!(
+        "  {} ({} bytes) -> {} {}",
+        written.object_label, written.bytes, written.token_label, written.token_serial
+    );
+    Ok(())
+}
+
+/// The refusal a build without the PKCS#11 feature gives for a token carrier.
+#[cfg(not(feature = "pkcs11"))]
+fn prepare_token_carrier(_args: &PrepareCarrierArgs, _locale: Locale) -> Result<(), CliError> {
+    Err(CliError::Usage(
+        crate::carrier::lay_out_token()
+            .err()
+            .map_or_else(String::new, |e| e.to_string()),
+    ))
 }
 
 /// Decide whether an existing container may be replaced.
@@ -2085,6 +2233,11 @@ mod secret {
         pub(super) explicit: Option<&'a FlagSource>,
         /// The prompt caption shown to the operator.
         pub(super) caption: Msg,
+        /// Which device the caption is about, when the tool can be more
+        /// specific than the caption alone — the token label of a carrier, say.
+        /// An operator with two tokens plugged in has to be able to tell from
+        /// the prompt which one the PIN is going to.
+        pub(super) subject: Option<&'a str>,
         /// The environment variable of last resort.
         pub(super) env_var: &'static str,
         /// The flags that can name a source, for the message shown when none of
@@ -2192,7 +2345,8 @@ mod secret {
         request: &Request<'_>,
         ports: &mut Ports<'_>,
     ) -> Result<Option<SecretString>, SecretError> {
-        let caption = request.caption.text(request.locale);
+        let caption = prompt_caption(request);
+        let caption = caption.as_str();
         match rung {
             Rung::Pinentry(program) => match super::prompt::ask(program, caption) {
                 Some(secret) => Ok(Some(secret)),
@@ -2230,6 +2384,21 @@ mod secret {
                 warn(&mut *ports.warn, &warning);
                 accept(request, value, request.env_var)
             }
+        }
+    }
+
+    /// The caption a prompt carries: the request's own, with the device it is
+    /// about appended when there is one.
+    ///
+    /// The subject is what stops a PIN going to the wrong device. Two tokens on
+    /// one workstation is the ordinary case for an operator preparing a
+    /// credential, and each has its own attempt counter — a PIN presented to
+    /// the other one is not a typo to retry, it is one attempt spent.
+    fn prompt_caption(request: &Request<'_>) -> String {
+        let caption = request.caption.text(request.locale);
+        match request.subject {
+            Some(subject) => format!("{caption} ({subject})"),
+            None => caption.to_owned(),
         }
     }
 
@@ -2455,8 +2624,8 @@ mod secret {
 
         use super::{
             accept, climb, console_failure_is_fatal, env_warning, error, line_error,
-            read_secret_file, resolve_with, rungs, unchecked_gate_notice, Facts, FlagSource, Msg,
-            PathBuf, Ports, Request, Rung, SecretError,
+            prompt_caption, read_secret_file, resolve_with, rungs, unchecked_gate_notice, Facts,
+            FlagSource, Msg, PathBuf, Ports, Request, Rung, SecretError,
         };
         use crate::l10n::Locale;
         use secrecy::ExposeSecret as _;
@@ -2478,10 +2647,32 @@ mod secret {
             Request {
                 explicit,
                 caption: Msg::SecretPromptTokenPin,
+                subject: None,
                 env_var: "TESSERA_ISSUER_PIN",
                 flags: FLAGS,
                 locale: Locale::En,
             }
+        }
+
+        /// The prompt has to name the device when the request knows it: an
+        /// operator with the CA token plugged in beside the carrier decides
+        /// which PIN to type from this line alone.
+        #[test]
+        fn a_prompt_names_the_device_it_is_asking_about() {
+            let named = Request {
+                caption: Msg::SecretPromptCarrierPin,
+                subject: Some("Rutoken Lite 483d4e1a"),
+                ..request(None)
+            };
+            let shown = prompt_caption(&named);
+            assert!(shown.contains("Rutoken Lite 483d4e1a"), "{shown}");
+            assert!(shown.contains("carrier"), "{shown}");
+            // With nothing to name, the caption stands alone rather than
+            // growing an empty pair of brackets.
+            assert_eq!(
+                prompt_caption(&request(None)),
+                Msg::SecretPromptTokenPin.text(Locale::En)
+            );
         }
 
         /// A process that has every non-flag source available.
@@ -2809,8 +3000,18 @@ mod secret {
     }
 }
 
-/// The PIN provider for the CLI's PKCS#11 backend: the shared secret ladder,
-/// captioned as the token PIN.
+/// The PIN providers for the CLI's PKCS#11 paths: the shared secret ladder,
+/// captioned and sourced per device.
+///
+/// The ladder is the same for both. What must not be shared is its last rung.
+/// The signing backend's PIN belongs to the CA token, and a scripted issuance
+/// keeps it in [`CA_PIN_ENV`] for the whole run; adding a `prepare-carrier`
+/// step to that script would, with no flag and no terminal, walk the same
+/// ladder down to the same variable and present the CA token's PIN to the
+/// engineer's carrier. That is not a prompt to retry — it is one attempt spent
+/// on a counter that locks the carrier after a few, and the token then reports
+/// a login failure rather than "that PIN belongs to the other device". So the
+/// carrier reads its own variable, and its prompt names the token it is for.
 #[cfg(feature = "pkcs11")]
 mod pin {
     use secrecy::SecretString;
@@ -2822,21 +3023,55 @@ mod pin {
 
     /// The flags that name a PIN source, for the message shown when none did.
     const PIN_FLAGS: &str = "--pinentry <path>, --pin-file <path>, --pin-stdin";
-    /// The environment variable of last resort.
-    const PIN_ENV: &str = "TESSERA_ISSUER_PIN";
+    /// The environment variable of last resort for the signing backend's token.
+    const CA_PIN_ENV: &str = "TESSERA_ISSUER_PIN";
+    /// The environment variable of last resort for a carrier token.
+    const CARRIER_PIN_ENV: &str = "TESSERA_CARRIER_PIN";
 
     /// A [`PinSource`] backed by the ladder in [`super::secret`].
     pub(super) struct CliPinSource {
         /// The source the operator named, if any.
         explicit: Option<FlagSource>,
+        /// The prompt caption: which device the PIN is for.
+        caption: Msg,
+        /// The token the PIN is going to, when one was named.
+        subject: Option<String>,
+        /// The environment variable of last resort.
+        env_var: &'static str,
         /// The operator-message locale.
         locale: Locale,
     }
 
     impl CliPinSource {
-        /// A PIN source over the source `explicit` names, else the full ladder.
+        /// A PIN source for the signing backend's token.
         pub(super) fn new(explicit: Option<FlagSource>, locale: Locale) -> Self {
-            Self { explicit, locale }
+            Self {
+                explicit,
+                caption: Msg::SecretPromptTokenPin,
+                subject: None,
+                env_var: CA_PIN_ENV,
+                locale,
+            }
+        }
+
+        /// A PIN source for the token a credential is being written to.
+        ///
+        /// `token_label` is the label the operator selected the carrier by, and
+        /// it goes into the prompt: with the CA token plugged in beside the
+        /// carrier, "token PIN" alone does not say which one is being asked
+        /// about.
+        pub(super) fn for_carrier(
+            explicit: Option<FlagSource>,
+            token_label: Option<&str>,
+            locale: Locale,
+        ) -> Self {
+            Self {
+                explicit,
+                caption: Msg::SecretPromptCarrierPin,
+                subject: token_label.map(str::to_owned),
+                env_var: CARRIER_PIN_ENV,
+                locale,
+            }
         }
     }
 
@@ -2844,8 +3079,9 @@ mod pin {
         fn pin(&self) -> Result<SecretString, Pkcs11SignError> {
             secret::resolve(&Request {
                 explicit: self.explicit.as_ref(),
-                caption: Msg::SecretPromptTokenPin,
-                env_var: PIN_ENV,
+                caption: self.caption,
+                subject: self.subject.as_deref(),
+                env_var: self.env_var,
                 flags: PIN_FLAGS,
                 locale: self.locale,
             })
@@ -2938,6 +3174,7 @@ mod p12pass {
         let secret = secret::resolve(&Request {
             explicit: explicit.as_ref(),
             caption: Msg::SecretPromptContainerPassphrase,
+            subject: None,
             env_var: P12_ENV,
             flags: P12_FLAGS,
             locale,
@@ -2994,6 +3231,7 @@ mod keypass {
             secret::resolve(&Request {
                 explicit: self.explicit.as_ref(),
                 caption: Msg::SecretPromptKeyPassphrase,
+                subject: None,
                 env_var: KEY_ENV,
                 flags: KEY_FLAGS,
                 locale: self.locale,
@@ -4192,8 +4430,49 @@ mod prepare_carrier_tests {
         );
     }
 
+    /// A PIN flag on a mounted-carrier run is refused, not dropped. The command
+    /// refuses every other incompatible combination out loud, and an operator
+    /// who passed `--pin-file` and saw a success would have every reason to
+    /// think a PIN was protecting what landed in a plain directory. Holds in a
+    /// build without the token backend too: the flags are declared there as
+    /// well, and mean even less.
     #[test]
-    fn refuses_a_token_carrier_rather_than_pretending_to_write() {
+    fn a_mounted_carrier_refuses_the_flags_that_belong_to_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let pin_file = dir.path().join("pin.txt");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(&pin_file, b"12345678\n").unwrap();
+
+        for extra in [
+            arg("--pin-file", &pin_file),
+            vec!["--pin-stdin".to_owned()],
+            vec!["--token-label".to_owned(), "Rutoken Lite".to_owned()],
+            arg("--pinentry", Path::new("/usr/bin/pinentry")),
+        ] {
+            let media = dir.path().join(extra.join("-").replace(['/', '-'], "_"));
+            let mut argv = arg("--p12", &p12);
+            argv.extend(arg("--media", &media));
+            argv.extend(extra.clone());
+            match run_argv(&argv) {
+                Err(CliError::Usage(message)) => assert!(
+                    message.contains(extra.first().map_or("", String::as_str)),
+                    "the refusal must name the flag: {message}"
+                ),
+                other => panic!("{extra:?} must be refused, got {other:?}"),
+            }
+            assert!(
+                !media.exists(),
+                "{extra:?}: a refused run must lay nothing out"
+            );
+        }
+    }
+
+    /// A build that cannot reach a token says so instead of writing nothing
+    /// and reporting success.
+    #[cfg(not(feature = "pkcs11"))]
+    #[test]
+    fn a_build_without_the_token_backend_refuses_rather_than_pretending() {
         let dir = tempfile::tempdir().unwrap();
         let p12 = dir.path().join("ivanov.p12");
         std::fs::write(&p12, b"container").unwrap();
@@ -4205,13 +4484,97 @@ mod prepare_carrier_tests {
         ]);
         argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
 
-        let err = run_argv(&argv).expect_err("the token carrier is not implemented");
+        let err = run_argv(&argv).expect_err("this build cannot reach a token");
         let CliError::Usage(message) = err else {
             panic!("expected a usage refusal, got {err:?}");
         };
         assert!(
-            message.contains("not implemented"),
-            "the refusal must say so plainly: {message}"
+            message.contains("pkcs11"),
+            "the refusal must name what is missing: {message}"
+        );
+    }
+
+    /// The two carriers are not mixed in one run. Half-serving the request
+    /// would leave an operator told the carrier was prepared and no chain
+    /// anywhere.
+    #[cfg(feature = "pkcs11")]
+    #[test]
+    fn a_token_run_refuses_the_flags_that_belong_to_a_mounted_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let chain = dir.path().join("chain.pem");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(&chain, b"chain").unwrap();
+
+        let token = |extra: Vec<String>| {
+            let mut argv = arg("--p12", &p12);
+            argv.extend([
+                "--module".to_owned(),
+                "/nonexistent/__tessera_no_module__.so".to_owned(),
+            ]);
+            argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
+            argv.extend(extra);
+            run_argv(&argv)
+        };
+
+        for extra in [
+            arg("--media", dir.path()),
+            arg("--chain", &chain),
+            vec!["--container-path".to_owned(), "certs/x.p12".to_owned()],
+        ] {
+            let err = token(extra.clone()).expect_err("mixed carriers must be refused");
+            assert!(matches!(err, CliError::Usage(_)), "{extra:?}: got {err:?}");
+        }
+    }
+
+    /// Half a token target is a typo, not a request: `--module` without a label
+    /// would write where nothing looks for it.
+    #[cfg(feature = "pkcs11")]
+    #[test]
+    fn a_token_run_needs_both_the_module_and_the_object_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        std::fs::write(&p12, b"container").unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend([
+            "--module".to_owned(),
+            "/nonexistent/__tessera_no_module__.so".to_owned(),
+        ]);
+        let err = run_argv(&argv).expect_err("--module alone is not a target");
+        assert!(matches!(err, CliError::Usage(_)), "got {err:?}");
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
+        let err = run_argv(&argv).expect_err("--object-label alone is not a target");
+        assert!(matches!(err, CliError::Usage(_)), "got {err:?}");
+    }
+
+    /// The size is judged before the PIN is asked for. The test process has no
+    /// PIN source at all, so a check made in the wrong order would fail on the
+    /// missing PIN — and on a real token it would not fail at all, it would
+    /// truncate.
+    #[cfg(feature = "pkcs11")]
+    #[test]
+    fn an_oversized_container_is_refused_before_the_operator_is_asked_for_a_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        std::fs::write(&p12, vec![0xAB; 48 * 1024]).unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend([
+            "--module".to_owned(),
+            "/nonexistent/__tessera_no_module__.so".to_owned(),
+        ]);
+        argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
+
+        let err = run_argv(&argv).expect_err("48 KiB must be refused");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("49152") && message.contains("32768"),
+            "the refusal must name both sizes: {message}"
         );
     }
 

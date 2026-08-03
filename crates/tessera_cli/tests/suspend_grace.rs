@@ -30,6 +30,7 @@ fn session(serial: &str) -> ActiveSession {
         target: SessionTarget::logind("c1"),
         usb_serial: Some(serial.into()),
         usb_vid_pid: None,
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
@@ -56,6 +57,7 @@ async fn suspend_window_blocks_actions() {
         suspend_grace_seconds: 5,
         on_usb_removed: OnUsbRemoved::Lock,
         registry_store: store,
+        monitor_fail_mode: tessera_core::config::validated::MonitorFailMode::Permissive,
     };
     let shutdown = CancellationToken::new();
     let _h = spawn_state_manager(
@@ -99,6 +101,7 @@ async fn after_resume_grace_expires_actions_resume() {
         suspend_grace_seconds: 1, // very short suspend grace for the test
         on_usb_removed: OnUsbRemoved::Lock,
         registry_store: store,
+        monitor_fail_mode: tessera_core::config::validated::MonitorFailMode::Permissive,
     };
     let shutdown = CancellationToken::new();
     let _h = spawn_state_manager(

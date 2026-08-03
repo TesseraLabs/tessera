@@ -143,6 +143,7 @@ async fn spawn_inner(
         suspend_grace_seconds: 5,
         on_usb_removed,
         registry_store: store,
+        monitor_fail_mode: tessera_core::config::validated::MonitorFailMode::Permissive,
     };
     let state_handle =
         spawn_state_manager(cfg, registry, event_rx, action_tx, udev, shutdown.clone());
