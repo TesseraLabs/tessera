@@ -21,14 +21,19 @@
 #        - if file contains `auth ... pam_parsec_mac.so` → AFTER it
 #          (avoids success=done jump skipping pam_parsec_mac, which
 #          breaks account-phase on Astra SE with МКЦ enabled);
-#        - else → BEFORE the first `auth` line.
+#        - else → BEFORE the first auth-phase line, i.e. either a literal
+#          `auth ...` directive OR `@include common-auth` (many stacks,
+#          e.g. Debian/Astra /etc/pam.d/sudo, deliver the entire auth
+#          phase via the latter, with no literal `auth` line at all).
 #      Idempotent: line already present ⇒ skipped.
 #   3. Additionally inserts `session required pam_tessera.so` AFTER
-#      `@include common-session` (or after the last session-phase line
-#      if common-session is absent), so our session-phase runs AFTER
-#      `pam_systemd.so` has populated `XDG_SESSION_ID` in the PAM
-#      environment. Without this, monitord cannot bind USB-removal
-#      actions (Lock/Logout) to the user's logind session.
+#      `@include common-session` (matching both the plain form and
+#      variants like `common-session-noninteractive`; or after the last
+#      session-phase line if no common-session* include is present), so
+#      our session-phase runs AFTER `pam_systemd.so` has populated
+#      `XDG_SESSION_ID` in the PAM environment. Without this, monitord
+#      cannot bind USB-removal actions (Lock/Logout) to the user's
+#      logind session.
 #      Idempotent: line already present ⇒ skipped.
 #   4. Backs up to <target>.bak.<UTC-timestamp> before any edit (single
 #      backup per invocation even if both insertions run).
@@ -110,6 +115,19 @@ target="$1"
 #   session required pam_tessera.so
 SESSION_LINE_RE='^[[:space:]]*session[[:space:]]+required[[:space:]]+pam_tessera\.so[[:space:]]*$'
 SESSION_LINE_CANONICAL='session    required   pam_tessera.so'
+
+# Regex for "the first auth-phase line", used as the before-first-auth
+# anchor in Pass 1 below when no `pam_parsec_mac.so` line is present.
+# Matches either a literal `auth ...` directive, or `@include common-auth`
+# — the standard Debian/Astra auth-phase include. Real stacks (e.g.
+# /etc/pam.d/sudo) commonly deliver the entire auth phase via the latter
+# with no literal `auth` line at all; without this the include would fall
+# through to the EOF-append fallback and land after common-auth (and even
+# after the session-line), defeating cert-only auth. Boundary-safe like
+# the common-session anchor in Pass 2: matches trailing whitespace,
+# hyphen, or EOL, so it wouldn't misfire on an unrelated `@include`, though
+# no `common-auth-*` sibling is known to exist in stock Debian/Astra PAM.
+FIRST_AUTH_LINE_RE='^[[:space:]]*(auth[[:space:]]|@include[[:space:]]+common-auth([[:space:]]|-|$))'
 
 # Copy permissions+owner from a reference file to a tmpfile.
 preserve_attrs() {
@@ -202,7 +220,7 @@ if [[ $need_include -eq 1 ]]; then
     inserted=0
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ $inserted -eq 0 && "$insert_mode" == "before-first-auth" \
-              && "$line" =~ ^[[:space:]]*auth[[:space:]] ]]; then
+              && "$line" =~ $FIRST_AUTH_LINE_RE ]]; then
             printf '%s\n' "$include_line" >> "$tmpfile"
             inserted=1
         fi
@@ -225,10 +243,14 @@ fi
 
 # -----------------------------------------------------------------------------
 # Pass 2: insert `session required pam_tessera.so` after @include common-session
-# (or after the last session-phase line if common-session is absent).
+# (or after the last session-phase line if no common-session* include is
+# present).
 #
 # Anchor priority:
 #   1. last line matching `^[[:space:]]*@include[[:space:]]+common-session`
+#      followed by whitespace, EOL, or a hyphen — this also matches
+#      sibling includes like `common-session-noninteractive` (used by
+#      sudo/su/cron on Debian-family systems)
 #   2. last line matching `^[[:space:]]*session[[:space:]]` (any module)
 #   3. append at EOF
 # -----------------------------------------------------------------------------
@@ -237,7 +259,7 @@ if [[ $need_session -eq 1 ]]; then
 
     # Find anchor line number (1-based). Use grep -n to be deterministic.
     anchor_line=""
-    if anchor_line=$(grep -nE '^[[:space:]]*@include[[:space:]]+common-session([[:space:]]|$)' \
+    if anchor_line=$(grep -nE '^[[:space:]]*@include[[:space:]]+common-session([[:space:]]|-|$)' \
                         "$tmpfile" | tail -1 | cut -d: -f1) && [[ -n "$anchor_line" ]]; then
         :
     elif anchor_line=$(grep -nE '^[[:space:]]*session[[:space:]]' \

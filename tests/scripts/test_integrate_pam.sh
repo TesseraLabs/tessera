@@ -5,7 +5,11 @@
 #   - session required pam_tessera.so is added AFTER @include common-session;
 #   - both lines are idempotent;
 #   - --unintegrate removes both, idempotently;
-#   - Astra SE placement: include after pam_parsec_mac, session after common-session.
+#   - Astra SE placement: include after pam_parsec_mac, session after common-session;
+#   - Debian/Astra sudo-style stacks: session-line lands after
+#     @include common-session-noninteractive, and @include tessera* lands
+#     before @include common-auth (not at EOF) when there is no literal
+#     `auth` line at all.
 
 set -euo pipefail
 
@@ -128,3 +132,70 @@ test -n "$common_ses" && test -n "$cert_ses" && [ "$cert_ses" -gt "$common_ses" 
     || { echo "FAIL: session line ($cert_ses) must come AFTER @include common-session ($common_ses)" >&2; exit 1; }
 
 echo "ok: integrate-pam.sh inserts after pam_parsec_mac AND after common-session on Astra SE stacks"
+
+# -----------------------------------------------------------------------------
+# Case 4: common-session-noninteractive (real /etc/pam.d/sudo shape on
+#         Astra Linux / Debian-family systems) — the anchor-1 regex must
+#         match this sibling include too, not just plain common-session,
+#         so the session-line lands AFTER it (not after the earlier
+#         pam_limits.so session line).
+# -----------------------------------------------------------------------------
+cat > "$WORK/sudo_noninteractive" <<'EOF'
+account requisite pam_sudo.so
+
+# Set up user limits from /etc/security/limits.conf.
+session    required   pam_limits.so
+
+@include common-auth
+@include common-account
+@include common-session-noninteractive
+EOF
+"$HELPER" --mode=cert-only "$WORK/sudo_noninteractive"
+
+limits_ses=$(line_of '^session[[:space:]]+required[[:space:]]+pam_limits\.so' "$WORK/sudo_noninteractive")
+common_ses_ni=$(line_of '^@include[[:space:]]+common-session-noninteractive$' "$WORK/sudo_noninteractive")
+cert_ses=$(line_of '^session[[:space:]]+required[[:space:]]+pam_tessera\.so' "$WORK/sudo_noninteractive")
+
+test -n "$limits_ses" && test -n "$common_ses_ni" && test -n "$cert_ses" \
+    || { echo "FAIL: expected anchor lines missing in sudo_noninteractive fixture" >&2; exit 1; }
+[ "$common_ses_ni" -gt "$limits_ses" ] \
+    || { echo "FAIL: fixture invariant broken — common-session-noninteractive ($common_ses_ni) must come after pam_limits ($limits_ses)" >&2; exit 1; }
+test "$cert_ses" -gt "$common_ses_ni" \
+    || { echo "FAIL: session line ($cert_ses) must come AFTER @include common-session-noninteractive ($common_ses_ni)" >&2; exit 1; }
+
+echo "ok: integrate-pam.sh inserts after @include common-session-noninteractive (Astra/Debian sudo stack)"
+
+# -----------------------------------------------------------------------------
+# Case 5: Debian/Astra sudo-style stack with NO literal `auth` line at all —
+#         the entire auth phase is delivered via `@include common-auth`.
+#         The before-first-auth anchor must recognize that include, so
+#         `@include tessera-only` lands BEFORE it, not after common-auth
+#         (which would let pam_unix prompt for a password first) and not
+#         appended at EOF (which would land it after the session-line too).
+# -----------------------------------------------------------------------------
+cat > "$WORK/sudo_authinclude" <<'EOF'
+#%PAM-1.0
+
+account requisite pam_sudo.so
+
+# Set up user limits from /etc/security/limits.conf.
+session    required   pam_limits.so
+
+@include common-auth
+@include common-account
+@include common-session-noninteractive
+EOF
+"$HELPER" --mode=cert-only "$WORK/sudo_authinclude"
+
+include_ln=$(line_of '^@include[[:space:]]+tessera-only$' "$WORK/sudo_authinclude")
+common_auth_ln=$(line_of '^@include[[:space:]]+common-auth$' "$WORK/sudo_authinclude")
+total_lines=$(wc -l < "$WORK/sudo_authinclude" | tr -d ' ')
+
+test -n "$include_ln" && test -n "$common_auth_ln" \
+    || { echo "FAIL: expected anchor lines missing in sudo_authinclude fixture" >&2; exit 1; }
+test "$include_ln" -lt "$common_auth_ln" \
+    || { echo "FAIL: @include tessera-only ($include_ln) must come BEFORE @include common-auth ($common_auth_ln)" >&2; exit 1; }
+test "$include_ln" -ne "$total_lines" \
+    || { echo "FAIL: @include tessera-only landed at EOF (line $include_ln of $total_lines) instead of before common-auth" >&2; exit 1; }
+
+echo "ok: integrate-pam.sh inserts @include before @include common-auth when no literal auth line exists"
