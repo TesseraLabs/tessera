@@ -26,11 +26,17 @@
 
 ### Requirement: Грабля №1 — позиция @include vs pam_parsec_mac
 
-`integrate-pam.sh` ДОЛЖЕН (MUST) вставлять `@include tessera*` ПОСЛЕ строки `auth ... pam_parsec_mac.so` (если есть; иначе перед первой auth-строкой) (integrate-pam.sh:196–214). Причина: `success=done` в cert-only обрывает auth-стек до pam_parsec_mac → его account/session инстансы падают «Can't obtain required data» → login deny (баг до 0.3.8, исправлен).
+`integrate-pam.sh` ДОЛЖЕН (MUST) вставлять `@include tessera*` ПОСЛЕ строки `auth ... pam_parsec_mac.so` (если есть; иначе перед первой auth-строкой) (integrate-pam.sh:213–239). Причина: `success=done` в cert-only обрывает auth-стек до pam_parsec_mac → его account/session инстансы падают «Can't obtain required data» → login deny (баг до 0.3.8, исправлен).
+
+«Первая auth-строка» — это либо литеральная строка `auth ...`, либо `@include common-auth` (и варианты `common-auth-*`): многие стеки (Debian/Astra `/etc/pam.d/sudo`, `/etc/pam.d/sshd`) доставляют всю auth-фазу через `@include common-auth`, без единой литеральной `auth`-строки. Якорь `FIRST_AUTH_LINE_RE` (integrate-pam.sh:130) ДОЛЖЕН (MUST) матчить оба случая — до фикса матчил только литеральную `auth`-строку, и такие стеки получали `@include tessera*` дописанным в конец файла (после `@include common-auth`), что ломало cert-only-семантику: пароль успевал отработать раньше, чем tessera вообще запускалась (баг до 0.5.0, исправлен).
 
 #### Scenario: Присутствует pam_parsec_mac
 - **WHEN** в стеке есть строка `auth ... pam_parsec_mac.so`
 - **THEN** `@include tessera*` вставляется ПОСЛЕ неё, чтобы `success=done` не оборвал auth-стек до pam_parsec_mac
+
+#### Scenario: Auth-фаза только через @include common-auth
+- **WHEN** в стеке нет литеральной `auth`-строки, а auth-фаза доставляется через `@include common-auth` (и нет `pam_parsec_mac`)
+- **THEN** `@include tessera*` вставляется ПЕРЕД `@include common-auth`, а не дописывается в конец файла
 
 ### Requirement: Грабля №2 — two-include pattern (session после pam_systemd)
 
