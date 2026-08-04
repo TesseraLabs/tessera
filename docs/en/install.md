@@ -224,7 +224,7 @@ sudo tessera check
 What is checked:
 
 - **The PAM stack.** It scans `/etc/pam.d/{login,fly-dm,fly-dm-np,sshd,sudo,su}`
-  and raises an ERROR in two cases:
+  and raises an ERROR in three cases:
   1. `@include tessera-*` stands BEFORE `auth required pam_parsec_mac.so`
      (on Astra SE this kills the account phase with "Can't obtain required data").
      Check id: `pam_stack_misorder`.
@@ -233,11 +233,21 @@ What is checked:
      `XDG_SESSION_ID` is not yet available at the moment of `pam_sm_open_session`,
      `UpdateSessionTarget` is not sent, and monitord cannot call
      logind Logout/Lock on USB removal. Check id:
-     `pam_stack_session_misorder`. Both errors suggest the fix command
-     via `integrate-pam.sh`. The health check for the session phase writes
-     `pam_stack_session_ok` (INFO) when the order is correct, or
-     `pam_stack_session_no_systemd` (INFO) if the stack has no
-     pam_systemd at all — typical for sysvinit/OpenRC hosts.
+     `pam_stack_session_misorder`.
+  3. There is no literal `auth ... pam_parsec_mac.so` line (a stack with no
+     МКЦ, or an auth phase delivered entirely via `@include common-auth`, as
+     on stock Debian/Astra `sudo`/`sshd`), but `@include tessera-*` stands
+     AFTER `@include common-auth` — `pam_unix.so` from `common-auth` gets to
+     authenticate by password before tessera's own snippet ever runs,
+     defeating `cert-only`/`optional`. Fixed by `--unintegrate` followed by
+     re-integrating. Check id: `pam_stack_common_auth_misorder`, with an
+     INFO counterpart `pam_stack_common_auth_ok` when the order is correct.
+
+  Every ERROR suggests the fix command via `integrate-pam.sh`. The health
+  check for the session phase additionally writes `pam_stack_session_ok`
+  (INFO) when the order is correct, or `pam_stack_session_no_systemd`
+  (INFO) if the stack has no pam_systemd at all — typical for
+  sysvinit/OpenRC hosts.
 - **`[mac].runtime` vs the kernel.** `runtime=required` without an active
   `parsec_strict_mode()=1` is an ERROR (`required` in strict mode without a
   МКЦ kernel makes the daemon useless). `auto` + a missing kernel is a WARN

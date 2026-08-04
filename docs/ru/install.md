@@ -218,7 +218,7 @@ sudo tessera check
 Что проверяется:
 
 - **PAM-стек.** Сканирует `/etc/pam.d/{login,fly-dm,fly-dm-np,sshd,sudo,su}`
-  и валит ERROR в двух случаях:
+  и валит ERROR в трёх случаях:
   1. `@include tessera-*` стоит ПЕРЕД `auth required pam_parsec_mac.so`
      (на Astra SE это убивает account-фазу с «Can't obtain required data»).
      Check id: `pam_stack_misorder`.
@@ -227,11 +227,21 @@ sudo tessera check
      `XDG_SESSION_ID` ещё не доступен на момент `pam_sm_open_session`,
      `UpdateSessionTarget` не отправляется, monitord не умеет вызвать
      logind Logout/Lock при извлечении USB. Check id:
-     `pam_stack_session_misorder`. Обе ошибки подсказывают команду фикса
-     через `integrate-pam.sh`. Хелсчек для session-фазы пишет
-     `pam_stack_session_ok` (INFO) при корректном порядке или
-     `pam_stack_session_no_systemd` (INFO) если в стеке вообще нет
-     pam_systemd — типично для sysvinit/OpenRC хостов.
+     `pam_stack_session_misorder`.
+  3. Нет литеральной строки `auth ... pam_parsec_mac.so` (стек без МКЦ или
+     auth-фаза целиком через `@include common-auth`, как в стоковых
+     `sudo`/`sshd` на Debian/Astra), но `@include tessera-*` стоит ПОСЛЕ
+     `@include common-auth` — `pam_unix.so` из `common-auth` успевает
+     аутентифицировать по паролю раньше, чем вообще выполнится снипет
+     tessera, что срывает `cert-only`/`optional`. Чинится через
+     `--unintegrate` и повторную интеграцию. Check id:
+     `pam_stack_common_auth_misorder`, INFO-парой
+     `pam_stack_common_auth_ok` при корректном порядке.
+
+  Все ERROR подсказывают команду фикса через `integrate-pam.sh`. Хелсчек
+  для session-фазы дополнительно пишет `pam_stack_session_ok` (INFO) при
+  корректном порядке или `pam_stack_session_no_systemd` (INFO) если в
+  стеке вообще нет pam_systemd — типично для sysvinit/OpenRC хостов.
 - **`[mac].runtime` vs ядро.** `runtime=required` без активного
   `parsec_strict_mode()=1` — ERROR (`required` в strict-mode без МКЦ
   ядра делает демона бесполезным). `auto` + отсутствующее ядро — WARN
