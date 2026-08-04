@@ -324,6 +324,69 @@ fn startup_check_pam_legacy_certauth_include_not_recognized() {
     assert!(report.records.is_empty(), "got: {report:#?}");
 }
 
+#[test]
+fn startup_check_pam_common_auth_misorder_emits_error() {
+    // Stock Astra/Debian `/etc/pam.d/sudo` shape: auth phase delivered
+    // purely via @include common-auth, no literal pam_parsec_mac.so line.
+    // A pre-fix integrate-pam.sh would have appended @include tessera-only
+    // at EOF, i.e. AFTER common-auth.
+    let tmp = tempfile::tempdir().expect("tmp");
+    let svc = tmp.path().join("sudo");
+    let mut f = fs::File::create(&svc).expect("svc");
+    writeln!(
+        f,
+        "@include common-auth\n\
+         @include common-account\n\
+         @include tessera-only"
+    )
+    .expect("write");
+
+    let mut report = StartupCheckReport::default();
+    startup_check::pam_stack::check(tmp.path(), &mut report);
+
+    let errs: Vec<_> = report
+        .records
+        .iter()
+        .filter(|r| r.severity == StartupCheckSeverity::Error)
+        .collect();
+    assert_eq!(errs.len(), 1, "expected one ERROR record, got {report:#?}");
+    let err = errs[0];
+    assert_eq!(err.check, "pam_stack_common_auth_misorder");
+    assert!(err.message.contains("sudo"), "msg: {}", err.message);
+    assert!(
+        err.message.contains("integrate-pam.sh"),
+        "expected admin fix hint in: {}",
+        err.message
+    );
+}
+
+#[test]
+fn startup_check_pam_common_auth_correct_order_emits_info() {
+    // Fixed integrate-pam.sh output: @include tessera-only inserted BEFORE
+    // @include common-auth.
+    let tmp = tempfile::tempdir().expect("tmp");
+    let svc = tmp.path().join("sudo");
+    let mut f = fs::File::create(&svc).expect("svc");
+    writeln!(
+        f,
+        "@include tessera-only\n\
+         @include common-auth\n\
+         @include common-account"
+    )
+    .expect("write");
+
+    let mut report = StartupCheckReport::default();
+    startup_check::pam_stack::check(tmp.path(), &mut report);
+
+    assert_eq!(report.count(StartupCheckSeverity::Error), 0);
+    let oks: Vec<_> = report
+        .records
+        .iter()
+        .filter(|r| r.check == "pam_stack_common_auth_ok")
+        .collect();
+    assert_eq!(oks.len(), 1, "{report:#?}");
+}
+
 // ---------------------------------------------------------------------------
 // MAC runtime cross-check
 // ---------------------------------------------------------------------------

@@ -199,3 +199,63 @@ test "$include_ln" -ne "$total_lines" \
     || { echo "FAIL: @include tessera-only landed at EOF (line $include_ln of $total_lines) instead of before common-auth" >&2; exit 1; }
 
 echo "ok: integrate-pam.sh inserts @include before @include common-auth when no literal auth line exists"
+
+# -----------------------------------------------------------------------------
+# Case 6: mode switch on an already-integrated file must be EXCLUSIVE — the
+#         old @include tessera* variant must be replaced, not left alongside
+#         the newly requested one (M1 regression: --mode=2fa then
+#         --mode=cert-only on the same file used to leave BOTH
+#         `@include tessera` and `@include tessera-only` present, silently
+#         defeating cert-only's lockout semantics).
+# -----------------------------------------------------------------------------
+cat > "$WORK/switch" <<'EOF'
+auth       required   pam_unix.so
+account    required   pam_unix.so
+session    required   pam_unix.so
+EOF
+"$HELPER" --mode=2fa "$WORK/switch"
+grep -q '^@include tessera$' "$WORK/switch" \
+    || { echo "FAIL: --mode=2fa did not add @include tessera" >&2; exit 1; }
+
+"$HELPER" --mode=cert-only "$WORK/switch"
+
+family_count=$(grep -cE '^[[:space:]]*@include[[:space:]]+tessera(-optional|-only)?[[:space:]]*$' "$WORK/switch")
+test "$family_count" -eq 1 \
+    || { echo "FAIL: expected exactly one @include tessera* line after mode switch, found $family_count" >&2; exit 1; }
+grep -q '^@include tessera-only$' "$WORK/switch" \
+    || { echo "FAIL: @include tessera-only missing after switch to --mode=cert-only" >&2; exit 1; }
+if grep -qx '@include tessera' "$WORK/switch"; then
+    echo "FAIL: stale @include tessera (2fa) line survived the switch to cert-only" >&2
+    exit 1
+fi
+grep -qE '^session[[:space:]]+required[[:space:]]+pam_tessera\.so' "$WORK/switch" \
+    || { echo "FAIL: session line lost/broken across mode switch" >&2; exit 1; }
+
+echo "ok: integrate-pam.sh switches from --mode=2fa to --mode=cert-only exclusively (no duplicate @include lines)"
+
+# Reverse direction: cert-only -> 2fa must be equally exclusive (not
+# directionally asymmetric).
+cat > "$WORK/switch_reverse" <<'EOF'
+auth       required   pam_unix.so
+account    required   pam_unix.so
+session    required   pam_unix.so
+EOF
+"$HELPER" --mode=cert-only "$WORK/switch_reverse"
+grep -q '^@include tessera-only$' "$WORK/switch_reverse" \
+    || { echo "FAIL: --mode=cert-only did not add @include tessera-only" >&2; exit 1; }
+
+"$HELPER" --mode=2fa "$WORK/switch_reverse"
+
+family_count_rev=$(grep -cE '^[[:space:]]*@include[[:space:]]+tessera(-optional|-only)?[[:space:]]*$' "$WORK/switch_reverse")
+test "$family_count_rev" -eq 1 \
+    || { echo "FAIL: expected exactly one @include tessera* line after reverse mode switch, found $family_count_rev" >&2; exit 1; }
+grep -q '^@include tessera$' "$WORK/switch_reverse" \
+    || { echo "FAIL: @include tessera missing after switch to --mode=2fa" >&2; exit 1; }
+if grep -qx '@include tessera-only' "$WORK/switch_reverse"; then
+    echo "FAIL: stale @include tessera-only (cert-only) line survived the switch to 2fa" >&2
+    exit 1
+fi
+grep -qE '^session[[:space:]]+required[[:space:]]+pam_tessera\.so' "$WORK/switch_reverse" \
+    || { echo "FAIL: session line lost/broken across reverse mode switch" >&2; exit 1; }
+
+echo "ok: integrate-pam.sh switches from --mode=cert-only to --mode=2fa exclusively (no duplicate @include lines, not directionally asymmetric)"

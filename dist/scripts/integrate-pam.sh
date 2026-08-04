@@ -185,9 +185,24 @@ fi
 
 include_line="@include ${snippet}"
 
+# Regex matching ANY tessera-family include line, regardless of mode. Same
+# pattern --unintegrate already uses to strip the family; kept identical so
+# "which line counts as tessera" never drifts between the two code paths.
+TESSERA_FAMILY_RE='^[[:space:]]*@include[[:space:]]+tessera(-optional|-only)?[[:space:]]*$'
+
 # Decide which actions are still needed (for idempotence + backup-skip).
+# Mode switches must be exclusive: if the file already carries a DIFFERENT
+# tessera-family variant than the one requested now, that forces a rewrite
+# (need_include=1) even though the exact target line isn't present yet —
+# Pass 1 below strips the foreign variant while inserting the new one, so
+# at most one `@include tessera*` line ever exists at a time.
+has_foreign_variant=0
+if grep -E "$TESSERA_FAMILY_RE" "$target" | grep -qvxF "$include_line"; then
+    has_foreign_variant=1
+fi
+
 need_include=1
-if grep -qxF "$include_line" "$target"; then
+if [[ $has_foreign_variant -eq 0 ]] && grep -qxF "$include_line" "$target"; then
     need_include=0
 fi
 need_session=1
@@ -219,6 +234,13 @@ if [[ $need_include -eq 1 ]]; then
 
     inserted=0
     while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $TESSERA_FAMILY_RE ]]; then
+            # Strip any pre-existing tessera-family include line (e.g. a
+            # different mode's snippet from a prior run) — the requested
+            # $include_line is (re)inserted at the anchor below, so mode
+            # switches stay exclusive instead of piling up a second line.
+            continue
+        fi
         if [[ $inserted -eq 0 && "$insert_mode" == "before-first-auth" \
               && "$line" =~ $FIRST_AUTH_LINE_RE ]]; then
             printf '%s\n' "$include_line" >> "$tmpfile"
