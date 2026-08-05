@@ -23,7 +23,7 @@ cat /etc/astra_version 2>/dev/null || cat /etc/os-release
 Expected output: version `1.7.5` or newer. On other Astra Linux
 editions (the "Oryol", "Voronezh", and "Smolensk" 1.7+ security
 levels — increasing grade, up to state-secret) the procedure is
-identical. On Ubuntu/Debian it is best-effort, without GOST.
+identical. On Ubuntu/Debian it is best-effort.
 
 ### 1.2 Kernel check
 
@@ -44,42 +44,46 @@ sudo apt install -y \
     libudev1 \
     libdbus-1-3 \
     libsystemd0 \
-    pcsc-lite \
     pcscd \
     opensc-pkcs11 \
-    gost-engine \
     pamtester
 ```
 
-The exact package names match the Astra SE 1.7 repository. On
-Ubuntu 22.04 the `gost-engine` package is not in the main repository —
-you have to build it from source or take it from a third-party PPA, and
-in that case the GOST functionality will not work (see the README,
-"Supported operating systems" section).
-
-### 1.4 Checking `gost-engine`
-
-```bash
-openssl engine gost -t
-```
-
-Expected: the output contains `[ available ]` and a list of available
-algorithms, including `id-GostR3411-2012-256` (Streebog-256) and
-`gost2012_256` (GOST 34.10-2012-256).
-
-### Verification (section 1)
+If `apt install` can't find `pamtester` (or other packages above) on
+Ubuntu/Debian, check whether the `universe`/`multiverse` component is
+enabled (`sudo add-apt-repository universe && sudo apt update` on
+Ubuntu): `pamtester` is a real `.deb` dependency (see
+`debian/control`), it just doesn't live in `main`. **On Astra SE
+`pamtester` isn't packaged at all** — not in any component
+(`main`/`contrib`/`non-free`/`non-free-firmware`) of either
+`repository-main` or `repository-extended`; `apt-cache search
+pamtester` there is always empty, no repository will fix it. It builds
+from source in about a minute (upstream hasn't moved since 2005,
+version is always `0.1.2`, the only dependency is `libpam0g-dev`):
 
 ```bash
-openssl dgst -engine gost -md_gost12_256 /etc/hostname
+sudo apt install -y build-essential libpam0g-dev
+cd /tmp
+wget -L "https://sourceforge.net/projects/pamtester/files/pamtester/0.1.2/pamtester-0.1.2.tar.gz/download" -O pamtester-0.1.2.tar.gz
+# fallback mirror of the same tarball if SourceForge serves an
+# interstitial page instead of the file:
+#   wget http://deb.debian.org/debian/pool/main/p/pamtester/pamtester_0.1.2.orig.tar.gz -O pamtester-0.1.2.tar.gz
+tar xzf pamtester-0.1.2.tar.gz
+cd pamtester-0.1.2
+./configure && make
+sudo make install
 ```
 
-Expected: a 64-character hexadecimal hash in the output. If you got
-`engine "gost" set.` without a hash, `gost-engine` connected but
-something went wrong with the algorithm; the `gost-engine` version is
-probably out of sync with the system OpenSSL. See the "What to do if…"
-section.
+Installs to `/usr/local/bin/pamtester` — it lands on `PATH`
+automatically, and is used exactly as in §10 from there on.
 
-### 1.5 Preflight: USBGuard and Astra ЗПС (DIGSIG)
+> Sections 3–4 (issuing a test CA and credentials) are plain `openssl`
+> invocations with no engine at all (ECDSA P-256 is supported by the
+> built-in `default` provider everywhere, including macOS), don't have
+> to run on the target Astra machine, and are split into a separate
+> document — [cert-issuance-lab.md](cert-issuance-lab.md).
+
+### 1.4 Preflight: USBGuard and Astra ЗПС (DIGSIG)
 
 Before installation it is worth making sure that the environment will
 not block either the token on the USB bus or the launch of
@@ -134,37 +138,56 @@ not go through — `pam_tessera.so` simply does not load. See also
 
 ### 2.1 Download
 
+Releases are published on GitHub:
+[github.com/TesseraLabs/tessera/releases](https://github.com/TesseraLabs/tessera/releases).
+The release publishes only the `.deb` in two variants (`…-astra.deb`
+and `…-ubuntu.deb`), plus `.changes` and `.buildinfo` for audit — there
+are no ready-made checksum files there; the operator computes them on a
+trusted machine (see §2.2). Download the variant you need via the `gh`
+CLI or manually from the browser:
+
 ```bash
-# The release link is a placeholder; replace it with the real URL after
-# v0.5.0 is published (usually GitHub Releases or the Astra Linux
-# internal repository). The release publishes only the `.deb` in two
-# variants (`…-astra.deb` and `…-ubuntu.deb`, plus `.changes` and
-# `.buildinfo` for audit) — there are no ready-made checksum files there;
-# the operator computes them on a trusted machine (see §2.2).
-wget https://example.test/releases/tessera_0.5.0-1_amd64.deb
+gh release download v0.5.0 --repo TesseraLabs/tessera --pattern '*-astra.deb'
+# or for an Ubuntu target:
+# gh release download v0.5.0 --repo TesseraLabs/tessera --pattern '*-ubuntu.deb'
 ```
 
 ### 2.2 Generating the checksums (trusted machine)
 
 The checksums are computed by the builder or the operator on a
 **trusted** machine (not the target) with the `generate-checksums.sh`
-script:
+script. The script lives in the repository
+(`scripts/generate-checksums.sh`) and is not bundled into the `.deb` —
+the trusted machine needs either a clone of `tessera` at the matching
+tag (`git clone --branch v0.5.0 --depth 1
+https://github.com/TesseraLabs/tessera.git`) or just the file itself:
 
 ```bash
-scripts/generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
+curl -fsSL -o generate-checksums.sh \
+    https://raw.githubusercontent.com/TesseraLabs/tessera/v0.5.0/scripts/generate-checksums.sh
+chmod +x generate-checksums.sh
+./generate-checksums.sh tessera_0.5.0-1_amd64.deb checksums
 ```
 
 The script puts a `checksums.txt` file into the `checksums/` directory —
-a combined report of SHA-256 and Streebog-256 (GOST R 34.11-2012-256) for
-the `.deb` itself and for every file inside the package — plus standalone
-`*.sha256` and `*.streebog256` files. The Streebog-256 section requires
-`gost-engine` (on Astra SE 1.7+ it is available by default); without it
-the section is skipped, and SHA-256 is still computed.
+a SHA-256 report for the `.deb` itself and for every file inside the
+package — plus standalone `*.sha256` files. (The script can also emit a
+Streebog-256 section when `gost-engine` is present, but this ECDSA-only
+scenario doesn't use it.)
 
 Three things are delivered to the target machine: the `.deb` itself,
-`checksums.txt`, and a copy of `verify-checksums.sh` (the script is
-self-contained — the only external thing it needs is `openssl` with
-`gost-engine` for the GOST section).
+`checksums.txt` (generated on the trusted machine in §2.2, transferred
+manually — scp, USB, etc.), and `verify-checksums.sh` (the script is
+self-contained — the only external thing it needs is `openssl`). Unlike
+`checksums.txt`, the script itself is a static repository file, so it's simpler to download it
+directly on the target machine rather than copy it from the trusted
+one:
+
+```bash
+curl -fsSL -o verify-checksums.sh \
+    https://raw.githubusercontent.com/TesseraLabs/tessera/v0.5.0/scripts/verify-checksums.sh
+chmod +x verify-checksums.sh
+```
 
 ### 2.3 Verifying on the target machine
 
@@ -174,12 +197,9 @@ self-contained — the only external thing it needs is `openssl` with
 
 Expected: `OK: N checksum(s) verified`. The script (described in
 [scripts/verify-checksums.sh](../../scripts/verify-checksums.sh)) checks
-both sums: SHA-256 always, Streebog-256 only if `checksums.txt` has a GOST
-section and `gost-engine` is available on the machine. A non-zero exit
-code means either a checksum mismatch (code 1) or a launch problem:
-invalid arguments (2) or a missing `gost-engine` when a GOST section is
-present (3). In any of these cases do not install the package until the
-cause is understood.
+the SHA-256 sum. A non-zero exit code means either a checksum mismatch
+(code 1) or a launch problem: invalid arguments (2). In any of these
+cases do not install the package until the cause is understood.
 
 ### 2.4 Installation
 
@@ -187,8 +207,8 @@ cause is understood.
 sudo apt install ./tessera_0.5.0-1_amd64.deb
 ```
 
-`apt` will pull in the missing dependencies (`libgost-engine | gost-engine`,
-`libpkcs11-helper1`, `librtpkcs11ecp`).
+`apt` will pull in the missing dependencies (`libpkcs11-helper1`,
+`librtpkcs11ecp`).
 
 ### 2.4½ Preflight check (`tessera check`)
 
@@ -204,7 +224,7 @@ sudo tessera check
 What is checked:
 
 - **The PAM stack.** It scans `/etc/pam.d/{login,fly-dm,fly-dm-np,sshd,sudo,su}`
-  and raises an ERROR in two cases:
+  and raises an ERROR in three cases:
   1. `@include tessera-*` stands BEFORE `auth required pam_parsec_mac.so`
      (on Astra SE this kills the account phase with "Can't obtain required data").
      Check id: `pam_stack_misorder`.
@@ -213,11 +233,21 @@ What is checked:
      `XDG_SESSION_ID` is not yet available at the moment of `pam_sm_open_session`,
      `UpdateSessionTarget` is not sent, and monitord cannot call
      logind Logout/Lock on USB removal. Check id:
-     `pam_stack_session_misorder`. Both errors suggest the fix command
-     via `integrate-pam.sh`. The health check for the session phase writes
-     `pam_stack_session_ok` (INFO) when the order is correct, or
-     `pam_stack_session_no_systemd` (INFO) if the stack has no
-     pam_systemd at all — typical for sysvinit/OpenRC hosts.
+     `pam_stack_session_misorder`.
+  3. There is no literal `auth ... pam_parsec_mac.so` line (a stack with no
+     МКЦ, or an auth phase delivered entirely via `@include common-auth`, as
+     on stock Debian/Astra `sudo`/`sshd`), but `@include tessera-*` stands
+     AFTER `@include common-auth` — `pam_unix.so` from `common-auth` gets to
+     authenticate by password before tessera's own snippet ever runs,
+     defeating `cert-only`/`optional`. Fixed by `--unintegrate` followed by
+     re-integrating. Check id: `pam_stack_common_auth_misorder`, with an
+     INFO counterpart `pam_stack_common_auth_ok` when the order is correct.
+
+  Every ERROR suggests the fix command via `integrate-pam.sh`. The health
+  check for the session phase additionally writes `pam_stack_session_ok`
+  (INFO) when the order is correct, or `pam_stack_session_no_systemd`
+  (INFO) if the stack has no pam_systemd at all — typical for
+  sysvinit/OpenRC hosts.
 - **`[mac].runtime` vs the kernel.** `runtime=required` without an active
   `parsec_strict_mode()=1` is an ERROR (`required` in strict mode without a
   МКЦ kernel makes the daemon useless). `auto` + a missing kernel is a WARN
@@ -282,53 +312,26 @@ test -d /run/tessera && echo "runtime dir OK"
 test -S /run/tessera/monitord.sock && echo "socket OK"
 ```
 
-Expected: version `0.5.0`, both `OK` lines.
+Expected: version `0.5.0`. On a **fresh** machine where
+`/etc/tessera/config.toml` does not exist yet (see the `.deb`'s
+post-install hint — `cp config.toml.example config.toml`), the other
+two lines are expected to stay empty: the daemon starts, but a valid
+`config.toml` needs material from §3 (CA), §7 (cert extensions) and §8
+(role store) that doesn't exist yet at this point in the walkthrough.
+Both lines should only appear after `systemctl restart tessera` at the
+end of §8 — the full daemon/socket check happens there, in Verification
+(section 8) and the §10 smoke test.
 
-## 3. Creating a test CA (GOST)
+## 3. Creating a test CA
 
-> The test CA is only suitable for a lab deployment. For production an
-> external CA is used — see [docs/operations.md](operations.md).
+Split into a separate document — [cert-issuance-lab.md §"Creating a
+test CA"](cert-issuance-lab.md#creating-a-test-ca): directory, CA key,
+self-signed certificate, verification. All plain `openssl` invocations
+with no engine (ECDSA P-256), runnable on the administrator's
+workstation, not the target Astra machine.
 
-### 3.1 Directory
-
-```bash
-mkdir -p /tmp/ca && cd /tmp/ca
-```
-
-### 3.2 CA key
-
-```bash
-openssl genpkey -engine gost -algorithm gost2012_256 \
-    -pkeyopt paramset:A -out ca.key
-chmod 0600 ca.key
-```
-
-### 3.3 CA certificate
-
-```bash
-openssl req -new -x509 -engine gost -key ca.key \
-    -out ca.pem -days 3650 \
-    -subj "/CN=tessera Test CA/O=Test/OU=Internal" \
-    -addext "extendedKeyUsage=clientAuth" \
-    -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
-    -addext "keyUsage=critical,keyCertSign,cRLSign"
-```
-
-### 3.4 Check
-
-```bash
-openssl x509 -in ca.pem -text -noout | head -30
-```
-
-Expected line: `Signature Algorithm: GOST R 34.10-2012 with GOST R 34.11-2012 (256 bit)`.
-
-### Verification (section 3)
-
-```bash
-openssl verify -CAfile ca.pem ca.pem
-```
-
-Expected: `ca.pem: OK`.
+The result of this section is `ca.pem` and `ca.key` in `/tmp/ca/`,
+needed further in §4 and §5.
 
 ## 4. Creating a test role account
 
@@ -342,108 +345,17 @@ repository ships a ready-made role slice for it, `dist/roles/serv.toml`,
 which is needed in §8. The login account is called `serv` as well; it is
 created in §8, together with the role store.
 
-### 4.1 Key
+The key, the CSR, both required extensions
+(`pam_cert_host_binding`, `pam_cert_allowed_roles`) and packing into
+P12 are in a separate document: [cert-issuance-lab.md §"Creating the
+role account's
+credential"](cert-issuance-lab.md#creating-the-role-accounts-credential).
+That document also has the OID table, the fail-closed behavior when
+extensions are missing (see §7 and §10 of this document), and getting
+`host_id_hash` via `sudo tessera dump-host-id` from the target machine.
 
-```bash
-openssl genpkey -engine gost -algorithm gost2012_256 \
-    -pkeyopt paramset:A -out serv.key
-chmod 0600 serv.key
-```
-
-### 4.2 CSR
-
-```bash
-openssl req -new -engine gost -key serv.key -out serv.csr \
-    -subj "/CN=service-engineer/UID=serv"
-```
-
-The engineer's identity lives in the credential and in the issuance
-journal, not in the name of the login account. The `CN` does not affect
-authorization: the decision is made from the extensions in §4.3.
-
-### 4.3 Signing the CSR
-
-The leaf must carry **two** extensions:
-
-| Extension | OID | Question it answers |
-|-----------|-----|---------------------|
-| `pam_cert_host_binding` | `2.25.183976554325829274683049824615098` | on which devices the bearer may log in |
-| `pam_cert_allowed_roles` | `2.25.185305973969816596290730578528098241367` | which roles the bearer may activate |
-
-Each is a `SEQUENCE OF UTF8String`; `pam_cert_allowed_roles` is issued
-non-critical. The OIDs and the ASN.1 syntax are from
-[cert-issuance.md](cert-issuance.md).
-
-There is no separate list of permitted accounts, and none is needed. The
-name of the login account IS the role, so `pam_cert_allowed_roles`
-answers both questions at once — "which roles the bearer may activate"
-and "into which accounts the bearer is admitted": it is the same string.
-Two lists over one string would describe an unrealizable state:
-"admitted into `serv`, but not entitled to be `serv`".
-
-Without either of the two the module rejects authentication
-**fail-closed**: a missing host extension yields `HostExtensionMissing`,
-and a missing `pam_cert_allowed_roles` means the credential grants no
-role at all — while a role is required at every login. In both cases §7
-will not find the OID in the credential, and `pamtester` in §10 will not
-pass.
-
-First find out this machine's `host_id_hash` — the source the daemon uses
-right now (the row with `active_under_current_config=yes`, column
-`hash_hex`):
-
-```bash
-HOST_HASH=$(sudo tessera dump-host-id | awk -F'\t' '$7 == "yes" { print $3 }')
-echo "host_id_hash = ${HOST_HASH}"   # 64 hex characters
-```
-
-Assemble the `extfile` with both extensions (host — only this machine,
-role, which is also the login account, — only `serv`):
-
-```bash
-cat > serv.ext <<EOF
-extendedKeyUsage = clientAuth
-keyUsage = critical,digitalSignature
-
-# Host: only this machine (host_id_hash obtained above)
-2.25.183976554325829274683049824615098 = ASN1:SEQUENCE:hb
-# Roles, which are also the login accounts: only serv
-2.25.185305973969816596290730578528098241367 = ASN1:SEQUENCE:ar
-
-[ hb ]
-e0 = UTF8String:sha256:${HOST_HASH}
-
-[ ar ]
-e0 = UTF8String:serv
-EOF
-```
-
-Sign the CSR with this `extfile`:
-
-```bash
-openssl x509 -req -engine gost -in serv.csr \
-    -CA ca.pem -CAkey ca.key -CAcreateserial \
-    -out serv.pem -days 365 \
-    -extfile serv.ext
-```
-
-### 4.4 Packing into P12
-
-```bash
-openssl pkcs12 -export -engine gost -inkey serv.key -in serv.pem \
-    -out serv.p12 -name serv -passout pass:test
-chmod 0600 serv.p12
-```
-
-### Verification (section 4)
-
-```bash
-openssl pkcs12 -in serv.p12 -nokeys -passin pass:test \
-    | openssl x509 -noout -subject
-```
-
-Expected: `subject=CN=service-engineer, UID=serv` (the exact RDN order
-depends on the OpenSSL version).
+The result of this section is `serv.p12` in `/tmp/ca/`, ready to be
+copied onto the USB media (§5).
 
 ## 5. Preparing the USB media (`pkcs12` mode / Mode A)
 
@@ -546,7 +458,8 @@ pkcs11-tool --module /usr/lib/librtpkcs11ecp.so \
 
 `pkcs11-tool` expects the key and certificate as separate DER/PEM objects,
 not as a PKCS#12 container. First extract them from `serv.p12` (the
-password is from §4.4):
+password is from [cert-issuance-lab.md §"Packing into
+P12"](cert-issuance-lab.md#6-packing-into-p12)):
 
 ```bash
 openssl pkcs12 -in serv.p12 -nocerts -nodes -passin pass:test \
@@ -574,9 +487,6 @@ Wipe the temporary private key that was lying in the clear on disk:
 ```bash
 shred -u serv.token.key serv.token.key.der 2>/dev/null || shred -u serv.token.key
 ```
-
-> The behavior of `--write-object` for GOST keys depends on the token model
-> and the `librtpkcs11ecp` version — check it on your token model.
 
 ### Verification (section 6)
 
@@ -1044,24 +954,33 @@ sudo tessera check
 The name passed to `pamtester` is the name of the role account, which is
 also the requested role.
 
-### 10.1 Authentication
+### 10.1 Full cycle: auth + account + session
+
+The `AuthContext` that `pam_sm_authenticate` stores via `pam_set_data`
+only lives within one `pam_start()`/`pam_end()` — that is, one process
+reading and writing the same PAM handle. Three separate `pamtester`
+invocations are three independent handles, and the `account`/`session`
+phases of such a run tell you nothing about how `pam_tessera` actually
+behaves in the service under test — the module simply won't find the
+context left by a previous invocation. That's why every operation that
+must happen within a single login is passed to `pamtester` as one
+list — so a single `pam_start()` covers the whole run:
 
 ```bash
-pamtester sudo serv authenticate
+pamtester sudo serv authenticate acct_mgmt open_session close_session
 ```
 
-Positive result: `pamtester: successfully authenticated`.
+Positive result: `pamtester` prints `successfully` for each operation in
+turn (four lines).
 
-### 10.2 Session
+> `pamtester` is not a full login stack (it has no privilege separation
+> between processes, unlike `sshd` or `login`), so this smoke test
+> confirms the PAM stack and `pam_tessera` are correct, but does not
+> replace checking through a real service. The difference, and the
+> follow-up verification order, are in [pam-integration.md
+> §9](pam-integration.md#9-pamtester-does-not-replace-a-real-login).
 
-```bash
-pamtester sudo serv open_session
-pamtester sudo serv close_session
-```
-
-Positive result: both calls return `pamtester: successfully ...`.
-
-### 10.3 Negative test: remove the USB
+### 10.2 Negative test: remove the USB
 
 In one terminal, run:
 
@@ -1088,7 +1007,7 @@ The full diagnostics reference is **[docs/troubleshooting.md](troubleshooting.md
 - fly-dm and the greeter (the wallpaper is not visible) — see also [fly-dm-greeter.md](fly-dm-greeter.md)
 - Clone-image / golden image (`dump-host-id` empty, a repeated flip) — see also [clone-image.md](clone-image.md)
 - Security incidents (a compromised cert, a lost token, CA worst-case, DIGSIG)
-- Installation / `gost-engine`
+
 ## 12. Hosts without systemd: SysV init
 
 The package installs **both** init variants: `tessera.service` (systemd)

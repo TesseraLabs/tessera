@@ -14,6 +14,14 @@
 //! ordering invariant is violated. It does NOT auto-repair — admins keep
 //! the autonomy to override — but it surfaces the regression on every
 //! daemon start so a stray edit doesn't sit unnoticed.
+//!
+//! A second, independent invariant covers hosts with no literal
+//! `pam_parsec_mac.so` auth line at all — the stock Debian/Astra
+//! `sudo`/`sshd` shape, whose auth phase is delivered purely via
+//! `@include common-auth`. A host integrated by a pre-fix
+//! `integrate-pam.sh` may carry `@include tessera-*` appended AFTER
+//! `@include common-auth`, letting `pam_unix.so` authenticate a plain
+//! password before tessera's gating snippet is ever reached.
 
 use std::path::Path;
 
@@ -52,6 +60,7 @@ pub fn check(pam_d_root: &Path, report: &mut StartupCheckReport) {
 pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport) {
     let mut include_line: Option<usize> = None;
     let mut parsec_line: Option<usize> = None;
+    let mut common_auth_line: Option<usize> = None;
     let mut session_tessera_line: Option<usize> = None;
     let mut systemd_anchor_line: Option<usize> = None;
 
@@ -64,6 +73,8 @@ pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport
             include_line.get_or_insert(idx);
         } else if is_auth_parsec_mac(line) {
             parsec_line.get_or_insert(idx);
+        } else if is_common_auth_include(line) {
+            common_auth_line.get_or_insert(idx);
         }
         if is_session_pam_tessera(line) {
             session_tessera_line.get_or_insert(idx);
@@ -105,8 +116,19 @@ pub fn evaluate_service(path: &Path, text: &str, report: &mut StartupCheckReport
                 ),
             ));
         }
-        // Either include missing (service not integrated) or pam_parsec_mac
-        // missing (host without МКЦ). Both are common; no log noise.
+        // No literal `auth ... pam_parsec_mac.so` line, so the check above
+        // can't anchor on it. This is exactly the stock Debian/Astra
+        // `sudo`/`sshd` shape, where the whole auth phase is delivered via
+        // `@include common-auth` (no literal `auth` line at all). A host
+        // integrated by a pre-fix integrate-pam.sh got `@include tessera-*`
+        // appended at EOF, i.e. AFTER common-auth — so pam_unix in
+        // common-auth can authenticate a plain password before tessera's
+        // gating snippet is ever reached, defeating cert-only/optional mode.
+        (Some(inc), None) => {
+            evaluate_common_auth_misorder(path, inc, common_auth_line, report);
+        }
+        // Include missing entirely (service not integrated). Common; no
+        // log noise.
         _ => {}
     }
 
@@ -194,6 +216,72 @@ fn is_auth_parsec_mac(line: &str) -> bool {
         return false;
     }
     line.contains("pam_parsec_mac.so")
+}
+
+/// Second, independent auth-phase misorder check (post-`integrate-pam.sh`
+/// EOF-append-bug fix): fires when there is no literal `pam_parsec_mac.so`
+/// auth line to anchor the original check against (`parsec_line == None`),
+/// but tessera's own `@include` lands AFTER `@include common-auth`. Split
+/// out of `evaluate_service` to keep that function under clippy's line
+/// limit.
+fn evaluate_common_auth_misorder(
+    path: &Path,
+    inc: usize,
+    common_auth_line: Option<usize>,
+    report: &mut StartupCheckReport,
+) {
+    match common_auth_line {
+        Some(ca) if inc > ca => {
+            report.push(StartupCheckRecord::error(
+                "pam_stack_common_auth_misorder",
+                format!(
+                    "PAM stack misorder in {path}: @include tessera-* (line {inc}) appears \
+                     AFTER @include common-auth (line {ca}). No literal pam_parsec_mac.so \
+                     auth line is present, so common-auth's pam_unix.so can authenticate a \
+                     plain password before tessera's gating snippet ever runs, defeating \
+                     cert-only/optional mode. Run: \
+                     sudo /usr/share/tessera/integrate-pam.sh --unintegrate {path} && \
+                     sudo /usr/share/tessera/integrate-pam.sh --mode=<your-mode> {path}",
+                    path = path.display(),
+                    inc = inc + 1,
+                    ca = ca + 1,
+                ),
+            ));
+        }
+        Some(_) => {
+            report.push(StartupCheckRecord::info(
+                "pam_stack_common_auth_ok",
+                format!(
+                    "PAM stack {path}: @include tessera-* correctly placed before @include \
+                     common-auth",
+                    path = path.display()
+                ),
+            ));
+        }
+        // No common-auth include either: custom stack, nothing to anchor
+        // against. Stay silent.
+        None => {}
+    }
+}
+
+fn is_common_auth_include(line: &str) -> bool {
+    // Matches `@include common-auth` and its variants (e.g.
+    // `common-auth-something`), mirroring the `@include common-auth` half
+    // of `FIRST_AUTH_LINE_RE` in dist/scripts/integrate-pam.sh:
+    // `^[[:space:]]*(auth[[:space:]]|@include[[:space:]]+common-auth([[:space:]]|-|$))`.
+    // This is the anchor stock Debian/Astra `/etc/pam.d/sudo` and
+    // `/etc/pam.d/sshd` use to deliver the whole auth phase — no literal
+    // `auth ...` line at all.
+    let mut it = line.split_whitespace();
+    let Some(first) = it.next() else { return false };
+    if first != "@include" {
+        return false;
+    }
+    let Some(name) = it.next() else { return false };
+    if it.next().is_some() {
+        return false;
+    }
+    name == "common-auth" || name.starts_with("common-auth-")
 }
 
 fn is_session_pam_tessera(line: &str) -> bool {
