@@ -125,6 +125,50 @@ pub enum Pkcs11Error {
     /// [`crate::x509::TrustError::CertParse`] already wraps it.
     #[error("pkcs#11 certificate value did not parse: {0}")]
     CertificateParseFailed(String),
+    /// No `CKO_DATA` object on the token carries the requested label.
+    /// Distinct from [`Pkcs11Error::DataObjectUnreadable`] because the two
+    /// send an engineer to different places: this one says the object is
+    /// not on this token, that one says it is and could not be read.
+    #[error("pkcs#11 data object {label:?} not found")]
+    DataObjectNotFound {
+        /// The `CKA_LABEL` that was searched for.
+        label: String,
+    },
+    /// A `CKO_DATA` object carries the label but a mandatory attribute could
+    /// not be read from it.  `CKA_PRIVATE` counts as mandatory: a provider
+    /// that will not say whether the object is behind the PIN must not be
+    /// read as saying it is not.
+    #[error("pkcs#11 data object {label:?} is missing {attribute}")]
+    DataObjectUnreadable {
+        /// The `CKA_LABEL` that was searched for.
+        label: String,
+        /// The attribute the token did not report.
+        attribute: &'static str,
+    },
+    /// Several equally private `CKO_DATA` objects carry the requested label.
+    /// Refused rather than resolved: the token gives no order and no age, so
+    /// the choice would fall to whatever the provider enumerated first, and an
+    /// engineer whose credential was replaced could go on authenticating with
+    /// the one that was meant to be gone.
+    #[error("pkcs#11 data object {label:?} is on the token {count} times")]
+    DataObjectAmbiguous {
+        /// The `CKA_LABEL` that was searched for.
+        label: String,
+        /// How many objects carried it.
+        count: usize,
+    },
+    /// The data object holding a secret is stored with `CKA_PRIVATE = FALSE`,
+    /// so its contents can be read off the token without the PIN.  Refused
+    /// rather than used: the PKCS#12 envelope carries an extractable private
+    /// key, and general-purpose tools create data objects public by default.
+    #[error(
+        "pkcs#11 data object {label:?} is stored without CKA_PRIVATE, so it can be read \
+         without the PIN; write the container as a private object"
+    )]
+    DataObjectNotPrivate {
+        /// The `CKA_LABEL` of the offending object.
+        label: String,
+    },
     /// `find_private_key_for_cert` (T09) returned no match for the
     /// supplied `CKA_ID`.  `cka_id_hex` is a short hex prefix used for
     /// log correlation — never the full identifier.

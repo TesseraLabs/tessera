@@ -112,6 +112,31 @@ pub enum IssueError {
     /// proof of possession failed and no certificate is issued.
     #[error("CSR proof-of-possession failed: self-signature does not verify")]
     CsrProofOfPossession,
+    /// A leaf key of a type the device's challenge-response does not verify was
+    /// requested. Refused before any key is generated: a certificate over an
+    /// unverifiable key is a successful issuance that fails at the login screen.
+    #[error("unsupported leaf key type '{requested}'; supported: {supported}")]
+    UnsupportedKeyType {
+        /// The type the operator asked for.
+        requested: String,
+        /// Every accepted value, comma-separated.
+        supported: String,
+    },
+    /// Generating the leaf key pair failed inside the key implementation.
+    #[error("leaf key generation failed: {0}")]
+    KeyGeneration(String),
+    /// The PKCS#12 container could not be assembled, could not be read back, or
+    /// did not match what went into it. The artifact is withheld.
+    #[error("pkcs12 container: {0}")]
+    Container(String),
+    /// An operator-supplied container password is below the length floor.
+    #[error("container password is {actual} characters; the minimum is {minimum}")]
+    PassphraseTooShort {
+        /// The length of the supplied password, in characters.
+        actual: usize,
+        /// The smallest accepted length, in characters.
+        minimum: usize,
+    },
     /// The issuance could not be journaled, so the artifact is withheld
     /// (fail-closed).
     #[error("journal: {0}")]

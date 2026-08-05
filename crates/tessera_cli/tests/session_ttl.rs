@@ -41,6 +41,7 @@ fn session(id: u128, opened_at: SystemTime, bounded_ttl_secs: Option<u64>) -> Ac
         target: SessionTarget::logind("c1"),
         usb_serial: Some("AB".into()),
         usb_vid_pid: None,
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at,
@@ -72,6 +73,7 @@ fn spawn(registry: SessionRegistry) -> Harness {
         suspend_grace_seconds: 5,
         on_usb_removed: OnUsbRemoved::Logout,
         registry_store: store,
+        monitor_fail_mode: tessera_core::config::validated::MonitorFailMode::Permissive,
     };
     let shutdown = CancellationToken::new();
     let _h = spawn_state_manager(

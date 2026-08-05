@@ -28,3 +28,7 @@
 | ROLE-002 | PASS | 2026-07-27 | 0.5.0-1 | ubuntu-container | Был красным до перепроводки role-selection: модуль спрашивал роль prompt'ом вместо вывода из имени учётной записи входа. Закрыт изменением role-account-login |
 | ROLE-004 | PASS | 2026-07-27 | 0.5.0-1 | ubuntu-container | Был красным до перепроводки role-selection: модуль спрашивал роль prompt'ом вместо вывода из имени учётной записи входа. Закрыт изменением role-account-login |
 | ROLE-005 | PASS | 2026-07-27 | 0.5.0-1 | ubuntu-container |  |
+| TOK-001 | SKIP | 2026-08-03 | 0.5.0-1 | ubuntu-container |  |
+| TOK-002 | SKIP | 2026-08-03 | 0.5.0-1 | ubuntu-container |  |
+| TOK-003 | SKIP | 2026-08-03 | 0.5.0-1 | ubuntu-container |  |
+| TOK-004 | SKIP | 2026-08-03 | 0.5.0-1 | ubuntu-container |  |

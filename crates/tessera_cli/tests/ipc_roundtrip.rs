@@ -33,6 +33,7 @@ async fn full_session_lifecycle_via_real_socket() {
         target: SessionTarget::logind("c1"),
         usb_serial: Some("AB".into()),
         usb_vid_pid: None,
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_devnode: None,
         host_id_hash: "host".into(),
         opened_at: SystemTime::UNIX_EPOCH,

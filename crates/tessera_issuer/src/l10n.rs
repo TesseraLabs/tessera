@@ -193,6 +193,23 @@ impl Caption {
 pub(crate) enum Msg {
     /// CLI: a certificate was written (a path follows).
     CliCertWritten,
+    /// CLI: a PKCS#12 container was written (a path follows).
+    CliContainerWritten,
+    /// CLI: the heading above a generated container password, warning that it
+    /// is shown once and is not recoverable.
+    CliContainerPassphraseHeading,
+    /// CLI: a password was generated but there is no terminal to show it on.
+    CliContainerPassphraseNoTerminal,
+    /// CLI: the artifacts were laid out on a carrier (paths follow).
+    CliCarrierWritten,
+    /// CLI: the carrier already holds one of the artifacts; asks whether to
+    /// replace it (a path follows).
+    CliCarrierOverwriteAsk,
+    /// CLI: the operator declined replacing an existing artifact (full line).
+    CliCarrierOverwriteDeclined,
+    /// CLI: an artifact would be replaced but nothing can ask the operator
+    /// (a path follows).
+    CliCarrierOverwriteNeedsConfirmation,
     /// CLI: a CRL was written (a path follows).
     CliCrlWritten,
     /// CLI: a CSR was written (a path follows).
@@ -220,6 +237,46 @@ pub(crate) enum Msg {
     /// File backend: the CA key file is unencrypted (full-line warning printed
     /// once at startup, to stderr).
     FilePlaintextKeyWarning,
+    /// Secret prompt caption for the PKCS#11 token PIN.
+    SecretPromptTokenPin,
+    /// Secret prompt caption for the PIN of the token a credential is being
+    /// written to. Deliberately not the same caption as the CA token's PIN:
+    /// the two are different devices with their own attempt counters.
+    SecretPromptCarrierPin,
+    /// Secret prompt caption for the file backend's CA key passphrase.
+    SecretPromptKeyPassphrase,
+    /// Secret prompt caption for the PKCS#12 container password.
+    SecretPromptContainerPassphrase,
+    /// Secret ladder: the value came from an environment variable (the variable
+    /// name follows); printed to stderr.
+    SecretEnvWarning,
+    /// Secret ladder: no source produced a secret (the flags that would name one
+    /// follow).
+    SecretUnavailableFlags,
+    /// Secret ladder: the sources needing no flag (a variable name follows).
+    SecretUnavailableFallbacks,
+    /// Secret ladder: the secret file is reachable beyond its owner (the path and
+    /// mode follow).
+    SecretFileBeyondOwner,
+    /// Secret ladder: the secret file could not be read (a detail follows).
+    SecretFileUnreadable,
+    /// Secret ladder: this platform does not check file permissions, so the
+    /// owner-only gate did not run (the path follows); printed to stderr.
+    SecretFileUncheckedPlatform,
+    /// CLI: a secret-source flag belongs to a backend other than the selected
+    /// one (the flags and the backend follow).
+    CliSecretFlagForeignBackend,
+    /// Secret ladder: standard input could not be read (a detail follows).
+    SecretStdinUnreadable,
+    /// Secret ladder: the console prompt failed (a detail follows).
+    SecretConsoleFailed,
+    /// Secret ladder: the pinentry program returned nothing (its path follows).
+    SecretPinentryFailed,
+    /// Secret ladder: the source produced an empty value (its name follows).
+    SecretEmpty,
+    /// Secret ladder: the source produced no line break within the accepted
+    /// length (the source and the bound follow).
+    SecretTooLong,
 }
 
 #[cfg(feature = "cli")]
@@ -236,6 +293,27 @@ impl Msg {
     fn en(self) -> &'static str {
         match self {
             Msg::CliCertWritten => "certificate written to",
+            Msg::CliContainerWritten => "PKCS#12 container written to",
+            Msg::CliContainerPassphraseHeading => {
+                "container password — shown once, it cannot be recovered later; \
+                 deliver it by a channel other than the container's:"
+            }
+            Msg::CliContainerPassphraseNoTerminal => {
+                "a container password was generated but standard error is not a terminal; \
+                 printing it would leave it in the captured output. Re-run naming a password \
+                 source: --p12-passphrase-file <path>, --p12-passphrase-stdin, \
+                 --p12-passphrase-prompt"
+            }
+            Msg::CliCarrierWritten => "carrier prepared:",
+            Msg::CliCarrierOverwriteAsk => {
+                "this file is already on the carrier and may belong to another engineer; \
+                 replace it? [y/N]:"
+            }
+            Msg::CliCarrierOverwriteDeclined => "declined: the carrier was left as it was",
+            Msg::CliCarrierOverwriteNeedsConfirmation => {
+                "this file is already on the carrier and nothing can ask for confirmation here; \
+                 re-run with --force once you have checked what it is:"
+            }
             Msg::CliCrlWritten => "CRL written to",
             Msg::CliCsrWritten => "CSR written to",
             Msg::CliCsrSubject => "CSR subject:",
@@ -252,6 +330,40 @@ impl Msg {
                 "warning: the CA key file is unencrypted; encrypt it \
                  (openssl pkcs8 -topk8) or use a PKCS#11/Vault backend in production"
             }
+            Msg::SecretPromptTokenPin => "Tessera token PIN",
+            Msg::SecretPromptCarrierPin => {
+                "PIN of the Tessera carrier token receiving the credential"
+            }
+            Msg::SecretPromptKeyPassphrase => "Tessera CA key passphrase",
+            Msg::SecretPromptContainerPassphrase => "Tessera credential container password",
+            Msg::SecretEnvWarning => {
+                "warning: the secret was read from an environment variable; its value is \
+                 visible to child processes and lands in memory dumps —"
+            }
+            Msg::SecretUnavailableFlags => "no secret source available; pass one of",
+            Msg::SecretUnavailableFallbacks => {
+                "or provide a pinentry program on PATH, an interactive terminal, \
+                 or the environment variable"
+            }
+            Msg::SecretFileBeyondOwner => {
+                "the secret file is readable by group or others; restrict it to its owner \
+                 (chmod 600):"
+            }
+            Msg::SecretFileUnreadable => "cannot read the secret file:",
+            Msg::SecretFileUncheckedPlatform => {
+                "warning: this platform does not check file permissions, so the secret file was \
+                 accepted unchecked; keep it in a directory only its owner can enter —"
+            }
+            Msg::CliSecretFlagForeignBackend => {
+                "this flag names a secret source for another backend and would be ignored:"
+            }
+            Msg::SecretStdinUnreadable => "cannot read the secret from standard input:",
+            Msg::SecretConsoleFailed => "the console secret prompt failed:",
+            Msg::SecretPinentryFailed => "the pinentry program returned no secret:",
+            Msg::SecretEmpty => "the secret source returned an empty value:",
+            Msg::SecretTooLong => {
+                "the secret source gave no line break within the accepted length:"
+            }
         }
     }
 
@@ -259,6 +371,27 @@ impl Msg {
     fn ru(self) -> &'static str {
         match self {
             Msg::CliCertWritten => "сертификат записан в",
+            Msg::CliContainerWritten => "контейнер PKCS#12 записан в",
+            Msg::CliContainerPassphraseHeading => {
+                "пароль контейнера — показан один раз, восстановить его позже нельзя; \
+                 передайте его каналом, отличным от канала контейнера:"
+            }
+            Msg::CliContainerPassphraseNoTerminal => {
+                "пароль контейнера порождён, но стандартный поток ошибок — не терминал; \
+                 печать оставила бы пароль в перехваченном выводе. Повторите, назвав источник \
+                 пароля: --p12-passphrase-file <путь>, --p12-passphrase-stdin, \
+                 --p12-passphrase-prompt"
+            }
+            Msg::CliCarrierWritten => "носитель подготовлен:",
+            Msg::CliCarrierOverwriteAsk => {
+                "этот файл уже лежит на носителе, возможно от другого инженера; \
+                 заменить его? [y/N]:"
+            }
+            Msg::CliCarrierOverwriteDeclined => "отменено: носитель оставлен как был",
+            Msg::CliCarrierOverwriteNeedsConfirmation => {
+                "этот файл уже лежит на носителе, а спросить подтверждение здесь не у кого; \
+                 разберитесь, что это, и повторите с --force:"
+            }
             Msg::CliCrlWritten => "CRL записан в",
             Msg::CliCsrWritten => "CSR записан в",
             Msg::CliCsrSubject => "субъект CSR:",
@@ -274,6 +407,40 @@ impl Msg {
             Msg::FilePlaintextKeyWarning => {
                 "предупреждение: файл ключа УЦ не зашифрован; зашифруйте его \
                  (openssl pkcs8 -topk8) или используйте бэкенд PKCS#11/Vault в проде"
+            }
+            Msg::SecretPromptTokenPin => "PIN токена Tessera",
+            Msg::SecretPromptCarrierPin => {
+                "PIN токена-носителя Tessera, на который пишется удостоверение"
+            }
+            Msg::SecretPromptKeyPassphrase => "пароль ключа УЦ Tessera",
+            Msg::SecretPromptContainerPassphrase => "пароль контейнера удостоверения Tessera",
+            Msg::SecretEnvWarning => {
+                "предупреждение: секрет прочитан из переменной окружения; её значение \
+                 видно дочерним процессам и попадает в дампы памяти —"
+            }
+            Msg::SecretUnavailableFlags => "нет доступного источника секрета; задайте один из",
+            Msg::SecretUnavailableFallbacks => {
+                "либо обеспечьте программу pinentry на PATH, интерактивный терминал \
+                 или переменную окружения"
+            }
+            Msg::SecretFileBeyondOwner => {
+                "файл секрета доступен на чтение группе или остальным; ограничьте доступ \
+                 владельцем (chmod 600):"
+            }
+            Msg::SecretFileUnreadable => "не удалось прочитать файл секрета:",
+            Msg::SecretFileUncheckedPlatform => {
+                "предупреждение: на этой платформе права файла не проверяются, файл секрета принят \
+                 без проверки; держите его в каталоге, доступном только владельцу —"
+            }
+            Msg::CliSecretFlagForeignBackend => {
+                "этот флаг задаёт источник секрета для другого бэкенда и был бы проигнорирован:"
+            }
+            Msg::SecretStdinUnreadable => "не удалось прочитать секрет со стандартного ввода:",
+            Msg::SecretConsoleFailed => "не удалось запросить секрет в консоли:",
+            Msg::SecretPinentryFailed => "программа pinentry не вернула секрет:",
+            Msg::SecretEmpty => "источник секрета вернул пустое значение:",
+            Msg::SecretTooLong => {
+                "источник секрета не дал перевода строки в пределах допустимой длины:"
             }
         }
     }

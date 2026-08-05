@@ -7,8 +7,8 @@ use std::time::Duration;
 use crate::config::raw::{
     RawCertIntegrityMode, RawConfig, RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback,
     RawHostIdentity, RawLogging, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor,
-    RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawRevocation, RawRevocationMode,
-    RawRoles, RawTags, RawTagsMode, RawTrust, RawTrustOverride,
+    RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawPkcs12Source, RawRevocation,
+    RawRevocationMode, RawRoles, RawTags, RawTagsMode, RawTrust, RawTrustOverride,
 };
 use crate::error::TrustError;
 use crate::hooks::{validate_hook, HookConfig};
@@ -52,6 +52,8 @@ pub struct ValidatedConfig {
     pub pkcs12_path_pattern: Option<String>,
     /// PIN prompt.
     pub pkcs12_pin_prompt: Option<String>,
+    /// Which carrier the PKCS#12 envelope is read from.
+    pub pkcs12_source: Pkcs12Source,
     /// Optional path to the gost-engine `.so`.
     ///
     /// Validated to be a readable file when `Some`.  Only meaningful with
@@ -271,6 +273,23 @@ pub enum Mode {
     Pkcs11,
 }
 
+/// Which carrier `mode = "pkcs12"` reads the envelope from.
+///
+/// The object label travels inside the token variant rather than beside it, so
+/// there is no state where the flow is told to read from a token without being
+/// told which object to read — the label is how the token is searched, and a
+/// missing one has no safe fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pkcs12Source {
+    /// A partition on a USB medium (the default).
+    UsbPartition,
+    /// A `CKO_DATA` object on a PKCS#11 token.
+    TokenObject {
+        /// `CKA_LABEL` the envelope was written under.
+        object_label: String,
+    },
+}
+
 /// USB removed action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnUsbRemoved {
@@ -325,6 +344,13 @@ pub struct MonitorSection {
     /// Maximum number of concurrent client connections accepted by the
     /// monitord IPC server.
     pub max_concurrent_connections: u32,
+    /// Interval between presence polls of a PKCS#11 token carrier.
+    ///
+    /// The daemon establishes token presence by asking the provider rather
+    /// than by waiting for an event, so this interval is the floor on
+    /// detection latency: a removal is noticed no later than one interval
+    /// plus [`Self::usb_removed_grace`].
+    pub token_poll_interval: Duration,
 }
 
 /// Trust section.
@@ -560,6 +586,7 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             pkcs11_allow_unreported_extractable: raw.pkcs11_allow_unreported_extractable,
             pkcs12_path_pattern: validate_pkcs12_path_pattern(raw.pkcs12_path_pattern.as_deref())?,
             pkcs12_pin_prompt: raw.pkcs12_pin_prompt.clone(),
+            pkcs12_source: validate_pkcs12_source(raw, mode)?,
             gost_engine_path,
             usb_wait: validate_usb_wait_seconds(raw.usb_wait_seconds)?,
             usb_allowed_devices: validate_usb_allowed_devices(&raw.usb_allowed_devices)?,
@@ -1083,6 +1110,71 @@ fn validate_pkcs12_path_pattern(raw: Option<&str>) -> Result<Option<String>, Err
     Ok(Some(value.to_owned()))
 }
 
+/// Validate `pkcs12_source` together with the keys that belong to it.
+///
+/// A key that only means something for the other carrier is refused rather
+/// than ignored: an operator who names a token object and finds the login
+/// still mounting a USB stick has no way to tell that the key they set was
+/// dropped on the floor.
+fn validate_pkcs12_source(raw: &RawConfig, mode: Mode) -> Result<Pkcs12Source, Error> {
+    match raw.pkcs12_source {
+        RawPkcs12Source::UsbPartition => {
+            if raw.pkcs12_token_object_label.is_some() {
+                return Err(Error::ConfigInvalid {
+                    reason: "pkcs12_token_object_label only applies to \
+                             pkcs12_source = \"token_object\""
+                        .to_owned(),
+                });
+            }
+            Ok(Pkcs12Source::UsbPartition)
+        }
+        RawPkcs12Source::TokenObject => {
+            if !matches!(mode, Mode::Pkcs12) {
+                return Err(Error::ConfigInvalid {
+                    reason: "pkcs12_source applies to mode = \"pkcs12\" only".to_owned(),
+                });
+            }
+            let Some(label) = raw.pkcs12_token_object_label.as_deref() else {
+                return Err(Error::ConfigInvalid {
+                    reason: "pkcs12_token_object_label is required when \
+                             pkcs12_source = \"token_object\""
+                        .to_owned(),
+                });
+            };
+            validate_label_bytes(
+                "pkcs12_token_object_label",
+                label,
+                PKCS12_TOKEN_OBJECT_LABEL_MAX_LEN,
+            )?;
+            // The module is what the login loads to reach the token at all,
+            // and mode = "pkcs12" does not otherwise require one. Catching it
+            // here means the operator hears about it when they write the
+            // config, not when an engineer is standing at a locked screen.
+            if raw.pkcs11_module.is_none() {
+                return Err(Error::ConfigInvalid {
+                    reason: "pkcs11_module is required when pkcs12_source = \"token_object\""
+                        .to_owned(),
+                });
+            }
+            // A token has no filesystem, so nothing resolves a path pattern on
+            // it. Left accepted, an administrator could edit the pattern and
+            // watch it change nothing — the position this change already took
+            // for `pkcs12_token_object_label` on the USB carrier.
+            if raw.pkcs12_path_pattern.is_some() {
+                return Err(Error::ConfigInvalid {
+                    reason: "pkcs12_path_pattern describes a file on a mounted carrier; a token \
+                             carries the envelope in the object named by \
+                             pkcs12_token_object_label"
+                        .to_owned(),
+                });
+            }
+            Ok(Pkcs12Source::TokenObject {
+                object_label: label.to_owned(),
+            })
+        }
+    }
+}
+
 /// Safe-by-default signature algorithms applied when
 /// `trust.allowed_signature_algorithms` is omitted or empty.
 ///
@@ -1544,16 +1636,28 @@ const PKCS11_MAX_PIN_ATTEMPTS_RANGE: std::ops::RangeInclusive<u32> = 1..=5;
 /// inside the PAM stack.
 const PKCS11_SLOT_WAIT_RANGE: std::ops::RangeInclusive<u32> = 0..=60;
 
+/// Longest `pkcs12_token_object_label` accepted.
+///
+/// Larger than [`PKCS11_LABEL_MAX_LEN`] because this label is not ours to
+/// shorten: it has to name whatever the issuing tool wrote, and that tool's
+/// bound on an object label is 128 bytes. A stricter limit here would make a
+/// legally written envelope unreachable from the config.
+const PKCS12_TOKEN_OBJECT_LABEL_MAX_LEN: usize = 128;
+
 fn validate_pkcs11_label(field: &str, value: &str) -> Result<(), Error> {
+    validate_label_bytes(field, value, PKCS11_LABEL_MAX_LEN)
+}
+
+fn validate_label_bytes(field: &str, value: &str, max_len: usize) -> Result<(), Error> {
     if value.is_empty() {
         return Err(Error::ConfigInvalid {
             reason: format!("{field} must be non-empty when set"),
         });
     }
-    if value.len() > PKCS11_LABEL_MAX_LEN {
+    if value.len() > max_len {
         return Err(Error::ConfigInvalid {
             reason: format!(
-                "{field} must be at most {PKCS11_LABEL_MAX_LEN} bytes (got {})",
+                "{field} must be at most {max_len} bytes (got {})",
                 value.len()
             ),
         });
@@ -1653,6 +1757,22 @@ const MONITORD_MAX_CONNS_CAP: u32 = 4096;
 const MONITORD_USB_REMOVED_GRACE_MAX: u64 = 600;
 /// Hard cap on suspend grace window (seconds).
 const MONITORD_SUSPEND_GRACE_MAX: u64 = 600;
+/// Interval between token-presence polls when the operator sets none.
+///
+/// Two seconds keeps the worst-case detection latency at one interval plus
+/// the removal grace while leaving the reader idle most of the time. On the
+/// bench a poll of two connected tokens costs well under 200 ms.
+const DEFAULT_TOKEN_POLL_INTERVAL_SECS: u64 = 2;
+/// Lower bound on the token-poll interval (seconds).
+///
+/// Zero would be a busy loop against the provider rather than a faster
+/// monitor: the poll itself is not instantaneous.
+const TOKEN_POLL_INTERVAL_MIN: u64 = 1;
+/// Upper bound on the token-poll interval (seconds).
+///
+/// Matched to the removal-grace cap: beyond it the promise "the session ends
+/// with its carrier" stops meaning anything an operator would recognise.
+const TOKEN_POLL_INTERVAL_MAX: u64 = 600;
 
 #[allow(clippy::too_many_lines)]
 fn validate_monitor(
@@ -1800,6 +1920,17 @@ fn validate_monitor(
         });
     }
 
+    let token_poll_interval_seconds = raw
+        .token_poll_interval_seconds
+        .unwrap_or(DEFAULT_TOKEN_POLL_INTERVAL_SECS);
+    if !(TOKEN_POLL_INTERVAL_MIN..=TOKEN_POLL_INTERVAL_MAX).contains(&token_poll_interval_seconds) {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "monitor.token_poll_interval_seconds must be in {TOKEN_POLL_INTERVAL_MIN}..={TOKEN_POLL_INTERVAL_MAX} (got {token_poll_interval_seconds})"
+            ),
+        });
+    }
+
     Ok(MonitorSection {
         socket_path,
         timeout: Duration::from_millis(timeout_ms),
@@ -1811,6 +1942,7 @@ fn validate_monitor(
         on_usb_removed_hook_path,
         idle_timeout: Duration::from_secs(idle_timeout_seconds),
         max_concurrent_connections,
+        token_poll_interval: Duration::from_secs(token_poll_interval_seconds),
     })
 }
 
@@ -2444,5 +2576,195 @@ account_lookup_timeout_seconds = 5
         assert_eq!(roles.dir, PathBuf::from(&roles_dir));
         assert_eq!(roles.default_session_ttl, Duration::from_hours(2));
         assert_eq!(roles.account_lookup_timeout, Duration::from_secs(5));
+    }
+
+    /// Build a raw config whose PKCS#12 keys are whatever `extra` says.
+    ///
+    /// Only the source keys are exercised here, so the anchors are never
+    /// stat'd — `validate_pkcs12_source` is called directly.
+    fn raw_with(extra: &str) -> RawConfig {
+        raw_from("pkcs12_path_pattern = \"user.p12\"", extra)
+    }
+
+    /// Same, minus the key that belongs to the mounted carrier.
+    fn raw_with_no_pattern(extra: &str) -> RawConfig {
+        raw_from("", extra)
+    }
+
+    fn raw_from(pattern: &str, extra: &str) -> RawConfig {
+        let module_path: PathBuf =
+            PathBuf::from(crate::test_support::absolute("/usr/lib/pkcs11/module.so"));
+        let module = crate::test_support::toml_path(&module_path);
+        let toml_src = format!(
+            r#"
+crypto_backend = "openssl"
+mode = "pkcs12"
+{pattern}
+pkcs11_module = {module}
+{extra}
+
+[trust]
+anchors = ["/etc/tessera/anchors/ca.pem"]
+
+[host_identity]
+sources = ["dmi_board_serial"]
+
+[logging]
+level = "info"
+"#
+        );
+        toml::from_str(&toml_src).expect("raw parse")
+    }
+
+    /// A token has no filesystem, so the path pattern names nothing there.
+    /// Accepting it would let an administrator edit the pattern and see no
+    /// effect — the mirror of the label check on the USB carrier.
+    #[test]
+    fn a_path_pattern_with_the_token_source_is_refused() {
+        let raw = raw_with(
+            "pkcs12_source = \"token_object\"\n\
+             pkcs12_token_object_label = \"tessera-credential\"",
+        );
+        assert!(raw.pkcs12_path_pattern.is_some(), "the fixture sets one");
+        let err = validate_pkcs12_source(&raw, Mode::Pkcs12)
+            .expect_err("the pattern has no meaning on a token");
+        assert!(
+            matches!(&err, Error::ConfigInvalid { reason }
+                if reason.contains("pkcs12_path_pattern")),
+            "got {err:?}"
+        );
+    }
+
+    /// The refusal is symmetric: the USB carrier rejects the token's key and
+    /// the token rejects the USB carrier's key.
+    #[test]
+    fn each_carrier_refuses_the_other_carriers_key() {
+        let usb_with_token_key = raw_with("pkcs12_token_object_label = \"tessera-credential\"");
+        assert!(validate_pkcs12_source(&usb_with_token_key, Mode::Pkcs12).is_err());
+
+        let token_with_usb_key = raw_with(
+            "pkcs12_source = \"token_object\"\n\
+             pkcs12_token_object_label = \"tessera-credential\"",
+        );
+        assert!(validate_pkcs12_source(&token_with_usb_key, Mode::Pkcs12).is_err());
+    }
+
+    // The carrier source no longer depends on the monitoring mode; that
+    // pairing is exercised end to end against `load_validated_config` in
+    // `tests/config_token_presence.rs`, where the mode is actually read.
+
+    /// An installation that predates the token carrier says nothing about the
+    /// source, and must keep reading the USB partition it always read.
+    #[test]
+    fn an_absent_source_key_is_the_usb_partition() {
+        let raw = raw_with("");
+        assert_eq!(
+            validate_pkcs12_source(&raw, Mode::Pkcs12).expect("no source key is valid"),
+            Pkcs12Source::UsbPartition
+        );
+    }
+
+    #[test]
+    fn a_token_source_carries_the_object_label() {
+        let raw = raw_with_no_pattern(
+            "pkcs12_source = \"token_object\"\n\
+             pkcs12_token_object_label = \"tessera-credential\"",
+        );
+        assert_eq!(
+            validate_pkcs12_source(&raw, Mode::Pkcs12).expect("a labelled token source is valid"),
+            Pkcs12Source::TokenObject {
+                object_label: "tessera-credential".to_owned()
+            }
+        );
+    }
+
+    /// The token is searched by label and by nothing else, so there is no
+    /// default that could stand in for one the operator did not give.
+    #[test]
+    fn a_token_source_without_a_label_is_refused() {
+        let raw = raw_with("pkcs12_source = \"token_object\"");
+        let err = validate_pkcs12_source(&raw, Mode::Pkcs12)
+            .expect_err("a token source without a label is not usable");
+        assert!(
+            matches!(&err, Error::ConfigInvalid { reason }
+                if reason.contains("pkcs12_token_object_label")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_token_source_without_a_module_is_refused() {
+        let toml_src = r#"
+crypto_backend = "openssl"
+mode = "pkcs12"
+pkcs12_path_pattern = "user.p12"
+pkcs12_source = "token_object"
+pkcs12_token_object_label = "tessera-credential"
+
+[trust]
+anchors = ["/etc/tessera/anchors/ca.pem"]
+
+[host_identity]
+sources = ["dmi_board_serial"]
+
+[logging]
+level = "info"
+"#;
+        let raw: RawConfig = toml::from_str(toml_src).expect("raw parse");
+        let err = validate_pkcs12_source(&raw, Mode::Pkcs12)
+            .expect_err("there is no token to read without a provider");
+        assert!(
+            matches!(&err, Error::ConfigInvalid { reason }
+                if reason.contains("pkcs11_module")),
+            "got {err:?}"
+        );
+    }
+
+    /// A key that names a token object while the login mounts a USB stick is
+    /// a mistake the operator has to hear about, not one to absorb quietly.
+    #[test]
+    fn an_object_label_without_the_token_source_is_refused() {
+        let raw = raw_with("pkcs12_token_object_label = \"tessera-credential\"");
+        let err = validate_pkcs12_source(&raw, Mode::Pkcs12)
+            .expect_err("the label has no meaning for the USB carrier");
+        assert!(
+            matches!(&err, Error::ConfigInvalid { reason }
+                if reason.contains("pkcs12_token_object_label")),
+            "got {err:?}"
+        );
+    }
+
+    /// `mode = "pkcs11"` signs on the token and never reads an envelope, so a
+    /// source key there would describe a carrier nothing consults.
+    #[test]
+    fn a_token_source_is_refused_outside_the_pkcs12_mode() {
+        let raw = raw_with_no_pattern(
+            "pkcs12_source = \"token_object\"\n\
+             pkcs12_token_object_label = \"tessera-credential\"",
+        );
+        let err = validate_pkcs12_source(&raw, Mode::Pkcs11)
+            .expect_err("the source key belongs to the pkcs12 mode");
+        assert!(
+            matches!(&err, Error::ConfigInvalid { reason }
+                if reason.contains("mode")),
+            "got {err:?}"
+        );
+    }
+
+    /// The bound has to admit every label the issuing tool will write, or an
+    /// envelope that went onto the token cleanly becomes unreachable.
+    #[test]
+    fn the_label_bound_matches_what_the_issuing_tool_writes() {
+        let longest = "x".repeat(PKCS12_TOKEN_OBJECT_LABEL_MAX_LEN);
+        let raw = raw_with_no_pattern(&format!(
+            "pkcs12_source = \"token_object\"\npkcs12_token_object_label = \"{longest}\""
+        ));
+        assert!(validate_pkcs12_source(&raw, Mode::Pkcs12).is_ok());
+
+        let too_long = "x".repeat(PKCS12_TOKEN_OBJECT_LABEL_MAX_LEN + 1);
+        let raw = raw_with_no_pattern(&format!(
+            "pkcs12_source = \"token_object\"\npkcs12_token_object_label = \"{too_long}\""
+        ));
+        assert!(validate_pkcs12_source(&raw, Mode::Pkcs12).is_err());
     }
 }

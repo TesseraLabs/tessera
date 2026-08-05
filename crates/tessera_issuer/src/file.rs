@@ -269,33 +269,22 @@ enum KeyForm {
     Encrypted(Zeroizing<Vec<u8>>),
 }
 
-/// Check permissions (Unix) and read the key file into a zeroizing buffer.
+/// Check permissions and read the key file into a zeroizing buffer.
 ///
-/// The permission gate runs on the file's metadata, before any content is read,
-/// so an over-permissive key is refused without the bytes ever entering memory.
+/// The permission gate runs on the open handle before any content is read, so
+/// an over-permissive key is refused without the bytes ever entering memory and
+/// the file that is read is the file that was checked. It is the same gate the
+/// CLI's secret files pass through ([`crate::secret_file`]), including its
+/// platform difference.
 fn read_key_file(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, FileSignError> {
-    let metadata = std::fs::metadata(path).map_err(|e| classify_io(path, &e))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(FileSignError::Permissions {
-                path: path.to_path_buf(),
-                mode: mode & 0o7777,
-            });
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No Unix permission model to enforce; existence is confirmed by the
-        // metadata call above.
-        let _ = &metadata;
-    }
-
-    let bytes = std::fs::read(path).map_err(|e| classify_io(path, &e))?;
-    Ok(Zeroizing::new(bytes))
+    let opened = crate::secret_file::open(path).map_err(|e| match e {
+        crate::secret_file::OpenError::Io(e) => classify_io(path, &e),
+        crate::secret_file::OpenError::BeyondOwner(refusal) => FileSignError::Permissions {
+            path: path.to_path_buf(),
+            mode: refusal.mode,
+        },
+    })?;
+    opened.read_all().map_err(|e| classify_io(path, &e))
 }
 
 /// Map a filesystem error to a typed key-file error.

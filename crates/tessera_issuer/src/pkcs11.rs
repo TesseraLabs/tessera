@@ -213,23 +213,7 @@ impl<P: PinSource> Pkcs11Signer<P> {
 
     /// Resolve the slot to sign in: the labelled token, or the first present.
     fn find_slot(&self) -> Result<Slot, Pkcs11SignError> {
-        let slots = self
-            .ctx
-            .get_slots_with_token()
-            .map_err(|e| Pkcs11SignError::Session(e.to_string()))?;
-        let Some(want) = self.config.token_label.as_deref() else {
-            return slots.into_iter().next().ok_or(Pkcs11SignError::NoToken);
-        };
-        for slot in slots {
-            let info = self
-                .ctx
-                .get_token_info(slot)
-                .map_err(|e| Pkcs11SignError::Session(e.to_string()))?;
-            if info.label().trim_end() == want {
-                return Ok(slot);
-            }
-        }
-        Err(Pkcs11SignError::TokenNotFound(want.to_owned()))
+        find_slot_in(&self.ctx, self.config.token_label.as_deref())
     }
 
     /// Resolve the algorithm `key_id` signs with, or `None` when the signer
@@ -302,6 +286,37 @@ impl<P: PinSource> SignatureBackend for Pkcs11Signer<P> {
             .map_err(|e| SignError::Backend(e.to_string()))?;
         Ok(Signature { algorithm, bytes })
     }
+}
+
+/// Resolve the slot to work in: the one whose token carries `want`, or the
+/// first slot with a token present when no label is given.
+///
+/// Shared with the carrier layout, which reaches a token for a reason that has
+/// nothing to do with signing. Naming a label matters more there than here: an
+/// operator preparing a credential often has the CA token plugged in beside the
+/// carrier, and "the first slot" would then be the wrong one.
+///
+/// # Errors
+///
+/// - [`Pkcs11SignError::NoToken`] when no slot reports a present token.
+/// - [`Pkcs11SignError::TokenNotFound`] when none matches `want`.
+/// - [`Pkcs11SignError::Session`] when slot enumeration fails.
+pub(crate) fn find_slot_in(ctx: &Pkcs11, want: Option<&str>) -> Result<Slot, Pkcs11SignError> {
+    let slots = ctx
+        .get_slots_with_token()
+        .map_err(|e| Pkcs11SignError::Session(e.to_string()))?;
+    let Some(want) = want else {
+        return slots.into_iter().next().ok_or(Pkcs11SignError::NoToken);
+    };
+    for slot in slots {
+        let info = ctx
+            .get_token_info(slot)
+            .map_err(|e| Pkcs11SignError::Session(e.to_string()))?;
+        if info.label().trim_end() == want {
+            return Ok(slot);
+        }
+    }
+    Err(Pkcs11SignError::TokenNotFound(want.to_owned()))
 }
 
 /// Find the private-key object whose `CKA_LABEL` equals `label`.

@@ -62,6 +62,7 @@ fn seeded_session(uid: u32, ski: &str) -> ActiveSession {
         target: SessionTarget::logind("c1"),
         usb_serial: Some("AB".into()),
         usb_vid_pid: None,
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_devnode: None,
         host_id_hash: "host".into(),
         opened_at: SystemTime::UNIX_EPOCH,

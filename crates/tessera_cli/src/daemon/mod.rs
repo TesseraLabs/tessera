@@ -15,6 +15,8 @@ use std::time::Duration;
 
 mod singleton;
 mod stale_mounts;
+mod token_presence;
+mod watchdog;
 use singleton::{DaemonLock, LockError};
 
 use clap::Args;
@@ -310,15 +312,14 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
             OnUsbRemoved::Hook { path }
         }
     };
+    let credential_mode = credential_mode_for(&validated);
     let cfg = StateConfig {
-        credential_mode: match validated.mode {
-            tessera_core::config::validated::Mode::Pkcs12 => CredentialMode::Pkcs12,
-            tessera_core::config::validated::Mode::Pkcs11 => CredentialMode::Pkcs11,
-        },
+        credential_mode,
         grace_seconds,
         suspend_grace_seconds,
         on_usb_removed,
         registry_store: store.clone(),
+        monitor_fail_mode: monitor_cfg.fail_mode,
     };
 
     let state_handle = spawn_state_manager(
@@ -379,6 +380,44 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
             }
         }))
     };
+
+    // Strict monitoring promises the session ends with its carrier. Two ways
+    // to hold that promise without being able to keep it are known and both
+    // are refused here rather than discovered at a locked screen: a carrier
+    // nothing polls, and a stalled poll nothing recovers from. The check runs
+    // before the socket is bound so it surfaces in `systemctl status`.
+    if let Some(refusal) = strict_presence_refusal(
+        monitor_cfg.fail_mode,
+        credential_mode,
+        token_presence_module(&validated).is_some(),
+        watchdog::recovery_available(),
+    ) {
+        anyhow::bail!("{}", refusal.message());
+    }
+
+    let (token_presence_handle, poller_liveness) = match token_presence_module(&validated) {
+        Some(module) => {
+            let (handle, liveness) = token_presence::spawn(
+                module,
+                validated.pkcs11_locking_mode,
+                monitor_cfg.token_poll_interval,
+                event_tx.clone(),
+                shutdown_tok.clone(),
+            );
+            (Some(handle), Some(liveness))
+        }
+        None => (None, None),
+    };
+    // Feeding the systemd watchdog only while the poller answers is what turns
+    // a call hung inside the provider — which nothing in this process can
+    // cancel — into a restart that restores observation.
+    let watchdog_handle = watchdog::spawn(
+        poller_liveness,
+        monitor_cfg
+            .token_poll_interval
+            .saturating_add(token_presence::POLL_CALL_TIMEOUT),
+        shutdown_tok.clone(),
+    );
 
     let logind_handle = if args.no_dbus {
         None
@@ -442,6 +481,12 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     if let Some(h) = logind_handle {
         handles.push(h);
     }
+    if let Some(h) = token_presence_handle {
+        handles.push(h);
+    }
+    if let Some(h) = watchdog_handle {
+        handles.push(h);
+    }
     shutdown::graceful_finish(handles, Duration::from_secs(5), &socket_path).await;
 
     // Удерживаем singleton-замок живым до самого конца run_async. `daemon_lock`
@@ -463,6 +508,7 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         usb_serial: None,
         usb_vid_pid: None,
         usb_devnode: None,
+        carrier: None,
         host_id_hash: String::new(),
         opened_at: std::time::SystemTime::UNIX_EPOCH,
         cert_cn: String::new(),
@@ -473,4 +519,317 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
         session_expiry: None,
     };
     Ok(())
+}
+
+/// Which identifier namespace the daemon should read `usb_serial` in.
+///
+/// The distinction is the carrier, not the authentication mode. A USB medium
+/// puts a block-device serial there and the daemon can look that device up in
+/// udev; a PKCS#11 token — whether it signs (`mode = "pkcs11"`) or merely
+/// carries the envelope (`pkcs12_source = "token_object"`) — puts a token
+/// serial there, and no block device answers to it.
+///
+/// Reading a token serial as a block-device serial is not a cosmetic mistake:
+/// the session-open path would find no such device and refuse the login, and
+/// the removal path would let any USB stick whose descriptor serial collides
+/// with the token's end somebody's session.
+/// Why a host configured for strict monitoring must not start.
+///
+/// Strict promises the session ends with its carrier. Two ways to hold that
+/// promise without being able to keep it are known, and neither announces
+/// itself later: the daemon would run, answer IPC, and enforce nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrictPresenceRefusal {
+    /// A token carrier with no provider for the daemon to ask.
+    NoPollableModule,
+    /// No way to replace a process whose poll has stalled inside the provider.
+    NoRecoveryMechanism,
+}
+
+impl StrictPresenceRefusal {
+    /// The operator-facing reason, naming both ways out.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::NoPollableModule => {
+                "monitor.fail_mode = \"strict\" promises continuous carrier presence, but this \
+                 token carrier has no pkcs11_module for the daemon to poll. Set pkcs11_module, \
+                 or use monitor.fail_mode = \"permissive\"."
+            }
+            Self::NoRecoveryMechanism => {
+                "monitor.fail_mode = \"strict\" promises continuous carrier presence, but no \
+                 systemd watchdog is configured (WATCHDOG_USEC is unset). A PKCS#11 call that \
+                 hangs inside the provider cannot be cancelled from within this process, so \
+                 without WatchdogSec the daemon would keep running while observing nothing. \
+                 Set WatchdogSec= in the unit (the shipped tessera.service does), or use \
+                 monitor.fail_mode = \"permissive\"."
+            }
+        }
+    }
+}
+
+/// Whether this configuration promises more than the daemon can deliver.
+///
+/// Only strict monitoring of a token carrier can: a USB carrier is watched by
+/// udev, which needs neither a provider nor a restart to keep working, and
+/// permissive promises nothing that lost observation would break.
+fn strict_presence_refusal(
+    fail_mode: tessera_core::config::validated::MonitorFailMode,
+    credential_mode: CredentialMode,
+    has_pollable_module: bool,
+    recovery_available: bool,
+) -> Option<StrictPresenceRefusal> {
+    if fail_mode != tessera_core::config::validated::MonitorFailMode::Strict
+        || credential_mode != CredentialMode::Pkcs11
+    {
+        return None;
+    }
+    if !has_pollable_module {
+        return Some(StrictPresenceRefusal::NoPollableModule);
+    }
+    if !recovery_available {
+        return Some(StrictPresenceRefusal::NoRecoveryMechanism);
+    }
+    None
+}
+
+/// The PKCS#11 module whose tokens the daemon should poll for presence, or
+/// `None` when the carrier is observable through udev instead.
+///
+/// Both token carriers are covered by the one answer: a token that signs
+/// (`mode = "pkcs11"`) and a token that only carries the envelope
+/// (`pkcs12_source = "token_object"`) are equally invisible to the block
+/// subsystem, and the session records the same kind of serial for both.
+///
+/// A token carrier without a module is a configuration the validator refuses,
+/// so reaching that case means a config built in code. It is logged rather
+/// than polled with a guessed path — and logged loudly, because it is the one
+/// shape in which the daemon runs with presence enforcement silently absent.
+fn token_presence_module(validated: &tessera_core::config::ValidatedConfig) -> Option<PathBuf> {
+    if credential_mode_for(validated) != CredentialMode::Pkcs11 {
+        return None;
+    }
+    let module = validated.pkcs11_module.clone();
+    if module.is_none() {
+        tracing::error!(
+            target: "tessera.monitord",
+            audit_level = "CRITICAL",
+            "token carrier configured without pkcs11_module; token presence is NOT observed"
+        );
+    }
+    module
+}
+
+fn credential_mode_for(validated: &tessera_core::config::ValidatedConfig) -> CredentialMode {
+    use tessera_core::config::validated::{Mode, Pkcs12Source};
+
+    match (validated.mode, &validated.pkcs12_source) {
+        (Mode::Pkcs12, Pkcs12Source::UsbPartition) => CredentialMode::Pkcs12,
+        (Mode::Pkcs11, _) | (Mode::Pkcs12, Pkcs12Source::TokenObject { .. }) => {
+            CredentialMode::Pkcs11
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod credential_mode_tests {
+    use super::{credential_mode_for, token_presence_module, CredentialMode};
+    use tessera_core::config::validated::{Mode, Pkcs12Source};
+
+    /// A validated config whose carrier keys are the ones under test.
+    ///
+    /// Built through the real validator so the mapping is exercised against
+    /// what an operator's file actually produces.
+    fn cfg(mode: Mode, source: &Pkcs12Source) -> tessera_core::config::ValidatedConfig {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let anchor = dir.path().join("ca.pem");
+        std::fs::write(
+            &anchor,
+            "-----BEGIN CERTIFICATE-----\nXX\n-----END CERTIFICATE-----\n",
+        )
+        .expect("anchor");
+        let (mode_key, source_keys) = match (mode, source) {
+            (Mode::Pkcs11, _) => ("pkcs11", String::new()),
+            (Mode::Pkcs12, Pkcs12Source::UsbPartition) => ("pkcs12", String::new()),
+            (Mode::Pkcs12, Pkcs12Source::TokenObject { object_label }) => (
+                "pkcs12",
+                format!(
+                    "pkcs12_source = \"token_object\"\npkcs12_token_object_label = \"{object_label}\"\n"
+                ),
+            ),
+        };
+        let body = format!(
+            r#"crypto_backend = "openssl"
+mode = "{mode_key}"
+pkcs11_module = "/bin/sh"
+usb_wait_seconds = 10
+on_usb_removed = "lock"
+usb_removed_grace_seconds = 5
+suspend_grace_seconds = 5
+monitor_fail_mode = "permissive"
+{source_keys}
+[trust]
+anchors = ["{anchor}"]
+intermediates = []
+max_chain_depth = 5
+clock_skew_seconds = 60
+allowed_signature_algorithms = []
+
+[trust.revocation]
+mode = "none"
+crl_paths = []
+
+[trust.pinning]
+enabled = false
+allowed_root_spki_sha256 = []
+
+[host_identity]
+sources = ["hostname"]
+fallback = "warn"
+custom_command_timeout_seconds = 5
+
+[logging]
+level = "info"
+"#,
+            anchor = anchor.display()
+        );
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).expect("config");
+        tessera_core::config::load_validated_config(&path).expect("validate config")
+    }
+
+    #[test]
+    fn a_usb_carrier_is_read_in_the_block_device_namespace() {
+        assert_eq!(
+            credential_mode_for(&cfg(Mode::Pkcs12, &Pkcs12Source::UsbPartition)),
+            CredentialMode::Pkcs12
+        );
+    }
+
+    /// The envelope came off a token, so `usb_serial` holds a token serial.
+    /// Judged as a block-device serial it matches no device, and the daemon
+    /// would answer the login with `DEVICE_GONE`.
+    #[test]
+    fn a_token_carrier_is_not_read_in_the_block_device_namespace() {
+        assert_eq!(
+            credential_mode_for(&cfg(
+                Mode::Pkcs12,
+                &Pkcs12Source::TokenObject {
+                    object_label: "tessera-credential".to_owned()
+                }
+            )),
+            CredentialMode::Pkcs11
+        );
+    }
+
+    #[test]
+    fn a_signing_token_is_unchanged() {
+        assert_eq!(
+            credential_mode_for(&cfg(Mode::Pkcs11, &Pkcs12Source::UsbPartition)),
+            CredentialMode::Pkcs11
+        );
+    }
+
+    /// The only configuration that promises more than the daemon can deliver
+    /// is strict monitoring of a token carrier without something to poll or
+    /// something to restart it. Both halves are refused at startup, where an
+    /// operator sees them in `systemctl status`, rather than at a locked
+    /// screen — or, worse, at a screen that never locks.
+    #[test]
+    fn strict_monitoring_without_observation_refuses_to_start() {
+        use super::{strict_presence_refusal, StrictPresenceRefusal};
+        use tessera_core::config::validated::MonitorFailMode::Strict;
+
+        assert_eq!(
+            strict_presence_refusal(Strict, CredentialMode::Pkcs11, false, true),
+            Some(StrictPresenceRefusal::NoPollableModule),
+            "a token carrier with no provider to ask observes nothing"
+        );
+        assert_eq!(
+            strict_presence_refusal(Strict, CredentialMode::Pkcs11, true, false),
+            Some(StrictPresenceRefusal::NoRecoveryMechanism),
+            "a stalled poll with no way to replace the process observes nothing either"
+        );
+    }
+
+    /// Everything else must start. A refusal that fired too widely would take
+    /// the fleet down on upgrade, which is worse than the hole it closes.
+    #[test]
+    fn every_other_configuration_still_starts() {
+        use super::strict_presence_refusal;
+        use tessera_core::config::validated::MonitorFailMode::{Permissive, Strict};
+
+        assert_eq!(
+            strict_presence_refusal(Strict, CredentialMode::Pkcs11, true, true),
+            None,
+            "a pollable token carrier with a watchdog keeps its promise"
+        );
+        for module in [false, true] {
+            for recovery in [false, true] {
+                assert_eq!(
+                    strict_presence_refusal(Permissive, CredentialMode::Pkcs11, module, recovery),
+                    None,
+                    "permissive promises nothing that lost observation would break \
+                     (module={module}, recovery={recovery})"
+                );
+                assert_eq!(
+                    strict_presence_refusal(Strict, CredentialMode::Pkcs12, module, recovery),
+                    None,
+                    "a USB carrier is watched by udev, which needs neither \
+                     (module={module}, recovery={recovery})"
+                );
+            }
+        }
+    }
+
+    /// An operator who hits either refusal must be told both ways out, or the
+    /// message only says the daemon will not start.
+    #[test]
+    fn each_refusal_names_both_ways_out() {
+        use super::StrictPresenceRefusal;
+
+        for refusal in [
+            StrictPresenceRefusal::NoPollableModule,
+            StrictPresenceRefusal::NoRecoveryMechanism,
+        ] {
+            let message = refusal.message();
+            assert!(
+                message.contains("permissive"),
+                "{refusal:?} must offer the mode that makes no such promise: {message}"
+            );
+            assert!(
+                message.contains("pkcs11_module") || message.contains("WatchdogSec"),
+                "{refusal:?} must name the setting that fixes it: {message}"
+            );
+        }
+    }
+
+    /// The presence hole is the same for a token that signs and a token that
+    /// merely carries the envelope, so both must get the poller — and the USB
+    /// carrier, whose removal udev reports, must not.
+    #[test]
+    fn every_token_carrier_gets_a_presence_poller() {
+        let signing = cfg(Mode::Pkcs11, &Pkcs12Source::UsbPartition);
+        assert_eq!(
+            token_presence_module(&signing).as_deref(),
+            signing.pkcs11_module.as_deref(),
+            "a signing token has the same presence hole and the same fix"
+        );
+
+        let carrier = cfg(
+            Mode::Pkcs12,
+            &Pkcs12Source::TokenObject {
+                object_label: "tessera-credential".to_owned(),
+            },
+        );
+        assert_eq!(
+            token_presence_module(&carrier).as_deref(),
+            carrier.pkcs11_module.as_deref()
+        );
+
+        assert!(
+            token_presence_module(&cfg(Mode::Pkcs12, &Pkcs12Source::UsbPartition)).is_none(),
+            "polling a provider for a USB stick would ask the wrong subsystem entirely"
+        );
+    }
 }

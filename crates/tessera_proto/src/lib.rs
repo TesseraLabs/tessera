@@ -22,7 +22,7 @@ pub mod system_time_serde;
 pub mod version;
 pub mod wire;
 
-pub use client::{ClientMessage, SessionOpenPayload};
+pub use client::{CarrierKind, ClientMessage, SessionOpenPayload};
 pub use cp::client::{Client, ClientError};
 pub use cp::{
     Admission, AuthVerdict, CpClientMessage, CpServerMessage, Denial, DenialReason, RoleSummary,

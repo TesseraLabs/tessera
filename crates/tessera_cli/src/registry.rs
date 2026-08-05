@@ -53,6 +53,14 @@ pub struct ActiveSession {
     /// [`Self::usb_vid_pid`].
     #[serde(default)]
     pub usb_devnode: Option<String>,
+    /// Which namespace [`Self::usb_serial`] belongs to.
+    ///
+    /// `None` for a record written before the field existed. Presence
+    /// enforcement that would judge the serial in the wrong namespace is
+    /// skipped for those rather than guessed at — see
+    /// [`Self::watched_by_token_poll`].
+    #[serde(default)]
+    pub carrier: Option<tessera_proto::CarrierKind>,
     /// Hex host id hash.
     pub host_id_hash: String,
     /// Wall-clock open time.
@@ -84,6 +92,25 @@ pub struct ActiveSession {
         with = "tessera_proto::system_time_serde::option"
     )]
     pub session_expiry: Option<SystemTime>,
+}
+
+impl ActiveSession {
+    /// Whether the token-presence poll may judge this session.
+    ///
+    /// Requires both a serial to compare and a record that the serial is a
+    /// token serial. A record from before the carrier kind was transmitted
+    /// says nothing about which namespace it belongs to, and the daemon's own
+    /// configuration is not evidence about a session opened under a previous
+    /// one: after a host is switched from a USB medium to a token, the
+    /// restored sessions still carry block-device serials, which no provider
+    /// will ever report — judging them here would end all of them at once.
+    ///
+    /// Skipping them means such a session keeps the behaviour it had when it
+    /// was opened, until its owner logs in again.
+    #[must_use]
+    pub fn watched_by_token_poll(&self) -> bool {
+        self.usb_serial.is_some() && self.carrier == Some(tessera_proto::CarrierKind::Token)
+    }
 }
 
 /// Two-level state held under one mutex: `by_id` is the primary store,

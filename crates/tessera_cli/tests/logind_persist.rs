@@ -30,6 +30,7 @@ fn session_with_logind_id(uuid_seed: u128, logind_id: &str) -> ActiveSession {
         pam_user: "alice".into(),
         pam_service: "ssh".into(),
         target: SessionTarget::logind(logind_id),
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_serial: Some("AB".into()),
         usb_vid_pid: None,
         usb_devnode: None,
@@ -69,6 +70,7 @@ async fn logind_session_removed_persists_registry_snapshot() {
         suspend_grace_seconds: 30,
         on_usb_removed: OnUsbRemoved::Lock,
         registry_store: store.clone(),
+        monitor_fail_mode: tessera_core::config::validated::MonitorFailMode::Permissive,
     };
     let shutdown = CancellationToken::new();
     let _h = spawn_state_manager(

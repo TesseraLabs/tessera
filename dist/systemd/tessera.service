@@ -14,6 +14,38 @@ Type=notify
 ExecStart=/usr/bin/tessera daemon --config /etc/tessera/config.toml
 Restart=on-failure
 RestartSec=5s
+# A PKCS#11 call blocked inside the provider cannot be cancelled from within
+# the daemon: the thread stays in the vendor library, and with it the only
+# view the daemon has of whether a token carrier is still present. The daemon
+# withholds the WATCHDOG=1 keepalive while its presence poll is not returning,
+# so systemd replaces the process — and the first poll after the restart
+# re-establishes presence from scratch. Hosts whose carrier is a USB medium
+# run no poll and are fed unconditionally.
+#
+# How long the daemon may stay blind after a poll stalls is the sum of four
+# terms, not one:
+#
+#   2 x (token_poll_interval_seconds + 5s call timeout)  before the daemon
+#                                                        judges the poll stalled
+# + WatchdogSec                                          before systemd acts on
+#                                                        the withheld keepalive
+# + RestartSec                                           before the new process
+# + one poll cycle                                       before its first poll
+#                                                        returns
+#
+# The last term is not a wait for the interval to elapse: the new process
+# polls before its first sleep, so what is counted there is the poll itself.
+#
+# With the shipped defaults (2s interval, 45s here, 5s RestartSec) that is
+# 14 + 45 + 5 + 2 = 66 seconds. Raising WatchdogSec widens the window one for
+# one. The first two terms are what the daemon controls; the stall threshold is
+# derived from the poll cadence rather than from this value, so a deliberately
+# slow poll interval cannot turn into a restart loop.
+#
+# Under monitor.fail_mode = "strict" the daemon refuses to start when this is
+# absent: strict promises continuous presence, and without a way to recover
+# from a stalled poll that promise outlives the first stall.
+WatchdogSec=45s
 # Run as a dedicated system user (created by postinst). The daemon does
 # NOT need root: mount(2) is performed by pam_tessera.so inside the PAM
 # caller's context; the daemon's privileged actions (LockSession /

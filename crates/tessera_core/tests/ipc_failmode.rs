@@ -48,6 +48,7 @@ fn open_info() -> OpenSessionInfo<'static> {
         target: SessionTarget::Unknown,
         usb_serial: None,
         usb_vid_pid: None,
+        carrier: tessera_proto::CarrierKind::UsbPartition,
         usb_devnode: None,
         cert_cn: "",
         cert_serial: "",

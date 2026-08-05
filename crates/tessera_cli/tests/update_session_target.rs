@@ -36,6 +36,7 @@ fn seed_session(uuid: Uuid) -> ActiveSession {
         target: SessionTarget::tty("/dev/tty1"),
         usb_serial: Some("AB12CD".into()),
         usb_vid_pid: None,
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
