@@ -9,6 +9,7 @@ pub mod validated;
 pub use raw::RawConfig;
 pub use validated::ValidatedConfig;
 
+use crate::config::raw::RawMode;
 use crate::Error;
 
 fn canonicalize_root_file(path: &mut PathBuf, field: &str) -> Result<(), Error> {
@@ -81,8 +82,10 @@ pub fn load_privileged_validated_config(path: &Path) -> Result<ValidatedConfig, 
             canonicalize_root_file(path, "trust_override intermediate")?;
         }
     }
-    if let Some(path) = raw.pkcs11_module.as_mut() {
-        canonicalize_root_file(path, "pkcs11_module")?;
+    if raw.mode == RawMode::Pkcs11 {
+        if let Some(path) = raw.pkcs11_module.as_mut() {
+            canonicalize_root_file(path, "pkcs11_module")?;
+        }
     }
     if let Some(path) = raw.gost_engine_path.as_mut() {
         canonicalize_root_file(path, "gost_engine_path")?;

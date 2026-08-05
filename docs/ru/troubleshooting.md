@@ -481,6 +481,33 @@ sudo /sbin/pdpl-user --ilevel 63 service
 sudo systemctl restart fly-dm
 ```
 
+**Причина 4: раздельные вызовы `pamtester` (или любого другого
+PAM-клиента) на auth и на session вместо одной транзакции.**
+Порядок строк в `/etc/pam.d/*` при этом абсолютно корректен —
+`pam_parsec_mac.so` кладёт данные через `pam_set_data()` в
+auth-инстансе и читает их через `pam_get_data()` в account/session-
+инстансе, но это API привязано к конкретному `pamh`: два разных
+вызова `pamtester` — это два разных процесса и два независимых
+`pam_start()`/`pam_end()`, второй физически не видит того, что
+положил первый. Симптом текстуально совпадает с причиной 1 (тот же
+`Can't obtain required data`), но чинится не правкой файла, а
+командой:
+
+```bash
+# неверно — три отдельные PAM-транзакции:
+pamtester login serv authenticate
+pamtester login serv acct_mgmt
+
+# верно — одна транзакция на весь цикл:
+pamtester login serv authenticate acct_mgmt open_session close_session
+```
+
+Если `grep` из причины 1 показал корректный порядок строк, а ошибка
+всё равно есть — прежде чем подозревать МКЦ-ядро (причины 2–3),
+проверьте, не был ли прогон разбит на несколько отдельных вызовов
+`pamtester`. Подробности — [pam-integration.md
+§9](pam-integration.md#9-pamtester-не-заменяет-реальный-вход).
+
 ### `parsec.mac=0` + `pam_parsec_mac` в стеке
 
 **Симптом:** МКЦ-ядро отключено через GRUB (`parsec.mac=0`), но

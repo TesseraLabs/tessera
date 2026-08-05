@@ -239,14 +239,81 @@ See [fly-dm-greeter.md](fly-dm-greeter.md) — the wallpaper writer for
 ## 5. sudo
 
 ```bash
-sudo /usr/share/tessera/integrate-pam.sh /etc/pam.d/sudo
+sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sudo
 ```
+
+**For role accounts (password locked via `passwd -l`, see
+[install.md §8.4](install.md#84-closing-the-remaining-ways-into-a-role-account)),
+the mode must be `--mode=cert-only`.** Both `2fa` and `optional` fall
+through to `pam_unix.so` on some branch of the stack — and `pam_unix`
+on a locked password (`!`/`*` in `/etc/shadow`) always refuses, and
+that refusal looks like "the cert didn't work" even though the real
+cause is the password. `cert-only` is the only mode in which
+`pam_unix` never takes part in the decision at all. Regular
+(non-role) accounts with a normal password work fine under any of the
+three modes — the choice there is described in §1.
+
+A separate concern is keeping other engineers out of the role account
+via `sudo -u serv` / `sudo -i -u serv`: that's runas scoping, unrelated
+to whether `tessera` is wired in here — the recipe (the
+`tessera-roles` group, a negation in `sudoers`, checking with
+`sudo -l -U`) is in [install.md §8.4 "`su` and
+`sudo -u`"](install.md#84-closing-the-remaining-ways-into-a-role-account).
 
 ## 6. login
 
 ```bash
-sudo /usr/share/tessera/integrate-pam.sh /etc/pam.d/login
+sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/login
 ```
+
+Same reason as in §5: a role account logs into `login` with a locked
+password, so the mode is `cert-only` only.
+
+## 6½ sshd
+
+```bash
+sudo /usr/share/tessera/integrate-pam.sh --mode=cert-only /etc/pam.d/sshd
+```
+
+Like `login`/`sudo`, `sshd` needs `--mode=cert-only` for role
+accounts, for the same locked-password reason.
+
+`sshd` also needs its own `Match User` block closing every login
+method except keyboard-interactive (the one PAM/Tessera comes through)
+— the recipe, the `Match`-scope trap, and both `sshd -T -C` checks are
+in [install.md §8.4 "`sshd`: leave a single authentication
+method"](install.md#84-closing-the-remaining-ways-into-a-role-account).
+
+> **Known limitation: privilege separation.** OpenSSH with
+> `UsePrivilegeSeparation` enabled (the default on every target
+> distribution) runs the PAM auth phase and the session-open phase in
+> **different** processes/PAM handles. The `AuthContext` that
+> `pam_sm_authenticate` stores via `pam_set_data` only lives within
+> one `pam_start()`/`pam_end()` — it does not survive the transition
+> between privsep processes. In practice this means a real `ssh`
+> certificate login in `cert-only` mode can pass the auth phase
+> successfully and then immediately break on session open. The
+> `pamtester` smoke test (§9 below) will not show this — `pamtester`
+> itself doesn't separate privileges and keeps one process for the
+> whole run. The only reliable check is a real SSH connection (see §9
+> "Verifying with a real login"). If it drops right after entering the
+> PIN, that's this limitation, not a misconfiguration — temporarily
+> roll back the integration (`--unintegrate`) and use `login`/`fly-dm`
+> for certificate login until this is fixed.
+
+## 6¾ su
+
+`su` **does not need**, and should not get, `tessera` integration.
+Blocking the switch into a role account is enough at the
+`pam_succeed_if.so` level (`requisite … notingroup tessera-roles`,
+recipe and both checks in [install.md §8.4 "`su` and
+`sudo -u`"](install.md#84-closing-the-remaining-ways-into-a-role-account)):
+that rule blocks switching into `serv` for everyone, `root` included,
+without the `tessera` PAM stack being involved at all. There's no need
+to add `@include tessera*` here — `su` shouldn't grow its own
+certificate-login path; the bearer already went through `tessera` in
+whichever service (`login`/`sshd`/`fly-dm`) gave them their current
+session.
 
 ## 7. The PAM stack with МКЦ in mind
 
@@ -294,18 +361,56 @@ documentation are in the commercial distribution (see
 - Full recovery from the rescue target — see
   [troubleshooting.md §4](troubleshooting.md#4-pam-stack-and-lockout).
 
-## 9. Verification
+## 9. `pamtester` does not replace a real login
+
+The `AuthContext` that `pam_sm_authenticate` stores via `pam_set_data`
+only lives within one `pam_start()`/`pam_end()` — one process reading
+and writing the same PAM handle. Three separate `pamtester` calls
+(`authenticate`, `open_session`, `close_session` invoked one at a
+time) are three independent PAM transactions: the `account`/`session`
+phases of such a run won't see the context left by the auth phase of a
+previous call, and will fail with an error unrelated to how the module
+actually behaves. The correct invocation passes every operation as one
+list, so a single `pam_start()` covers the whole run:
 
 ```bash
-pamtester sudo alice authenticate
+pamtester sudo alice authenticate acct_mgmt open_session close_session
 ```
 
-Expected: `Authentication successful` (with the USB media or token
-inserted).
+Expected: `pamtester` prints `successfully` for each operation in turn
+(with the USB media or token inserted).
 
 ```bash
 sudo tessera check    # catches pam_stack_session_misorder etc.
 ```
+
+### `pamtester` ≠ a real login
+
+`pamtester` is not a full login stack: it does not separate
+privileges between processes the way `sshd` does (see §6½, "Known
+limitation") or the way `login`/`fly-dm` sometimes does in a
+display-manager configuration, and it doesn't go through the PAM
+conversation the way a real service does (PIN prompt, TTY, X11
+session). A successful `pamtester` run confirms the PAM stack itself
+is correct (line order, `pam_tessera` is invoked, `AuthContext`
+crosses phases within one process) — but it does not guarantee a real
+login through the service under test will behave the same way.
+
+### Verifying with a real login
+
+After `pamtester`, always verify with a live login on every integrated
+service:
+
+```bash
+ssh serv@<host>                 # sshd
+login: serv                     # login (local console/TTY)
+sudo -u serv -i                 # sudo, if the caller has runas rights
+```
+
+Expected: a PIN prompt, a successful login, and — for services with a
+session phase — a working USB-removal reaction (`lock`/`logout`) when
+the token is removed. `pamtester` doesn't check that either, since it
+never opens a real logind session.
 
 ## 10. Hosts without systemd: SysV init
 

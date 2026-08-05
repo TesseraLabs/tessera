@@ -5,11 +5,16 @@ set -e
 
 cleanup_pam_includes() {
     # P1-M: remove "@include tessera" / "@include tessera-optional" /
-    # "@include tessera-only" lines left behind by manual
+    # "@include tessera-only" lines, as well as the standalone
+    # "session required pam_tessera.so" line inserted separately by
+    # `integrate-pam.sh` (since 0.3.12), left behind by manual
     # `integrate-pam.sh` invocations from common service files.
     # Idempotent: missing files and missing lines are silently ignored.
     # We do NOT touch files that admins haven't edited because they will
-    # not contain the include line.
+    # not contain these lines.
+    # Keep the session-line regex identical to SESSION_LINE_RE in
+    # dist/scripts/integrate-pam.sh so both cleanup paths agree on what
+    # counts as "the session line".
     for svc in /etc/pam.d/login \
                /etc/pam.d/sshd \
                /etc/pam.d/sudo \
@@ -18,6 +23,8 @@ cleanup_pam_includes() {
                /etc/pam.d/common-auth; do
         [ -f "$svc" ] || continue
         sed -i -E '/^[[:space:]]*@include[[:space:]]+tessera(-optional|-only)?[[:space:]]*$/d' \
+            "$svc" 2>/dev/null || true
+        sed -i -E '/^[[:space:]]*session[[:space:]]+required[[:space:]]+pam_tessera\.so[[:space:]]*$/d' \
             "$svc" 2>/dev/null || true
     done
 }
@@ -41,7 +48,13 @@ case "$1" in
             systemctl daemon-reload >/dev/null 2>&1 || true
         fi
         ;;
-    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    remove)
+        cleanup_pam_includes
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload >/dev/null 2>&1 || true
         fi
