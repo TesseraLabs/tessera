@@ -193,32 +193,61 @@ pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
     select_end_entity(&unencrypted::certificates_in_clear(bytes))
 }
 
-/// The certificate of a container that carries exactly one in the clear.
+/// The certificate the container's key is paired with.
 ///
 /// For the caller that does not display a certificate but *records* it — the
 /// enrollment report and its `device_enrolled` audit event. There the name has
-/// to be the certificate the device will authenticate with, and
+/// to be the certificate the device will actually authenticate with, and
 /// [`try_extract_cert_without_pin`] cannot promise that: it picks the single
-/// non-CA certificate, while the authentication path lets OpenSSL follow the
-/// key's `localKeyID`, and on a container whose CA precedes its leaf the two
-/// answers differ. An audit record naming a certificate the device never
-/// authenticates with is worse than one naming none.
+/// non-CA certificate, which on a container carrying a CA where the leaf was
+/// expected is a different certificate from the one the authentication path
+/// uses. An audit record naming a certificate the device never authenticates
+/// with is worse than one naming none.
 ///
-/// A container holding a single certificate leaves the two rules nothing to
-/// disagree about, so that is the only shape answered here. Anything else — a
-/// leaf with its chain beside it, a container whose certificates are encrypted,
-/// malformed bytes — yields `None`, and the caller records nothing.
+/// So this reproduces the authentication path's own choice instead of
+/// approximating it: `PKCS12_parse` pairs the key with the certificate whose
+/// bag carries the same `localKeyId`, and so does this. The pairing is
+/// available without the password — the key bag lies in an unencrypted
+/// `id-data` safe and only its *attributes* are read, never its value. No
+/// password is consulted and no key material is interpreted; the `unencrypted`
+/// module states exactly what the walk touches.
+///
+/// `None` when the container has no key bag in the clear, when the key bag
+/// carries no `localKeyId`, when no certificate bag repeats it, or when more
+/// than one does. `None` as well when the paired certificate is a CA: an audit
+/// event must not name a certificate authority as the device's credential, and
+/// a container that pairs its key with one is not an issuance of ours.
 ///
 /// The certificates this can see are those in the clear; one kept in an
 /// encrypted safe stays invisible to it, as it does to every part of this
-/// module. No password is consulted and the certificate is not validated
-/// against any trust anchor.
+/// module. The certificate is not validated against any trust anchor.
 #[must_use]
-pub fn try_extract_sole_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
-    match unencrypted::certificates_in_clear(bytes).as_slice() {
-        [only] => Certificate::from_der(only).ok(),
-        _ => None,
+pub fn try_extract_key_paired_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
+    let bags = unencrypted::bags_in_clear(bytes);
+    let token = bags.key_local_key_id?;
+
+    let mut paired = None;
+    for candidate in &bags.certificates {
+        if candidate.local_key_id.as_deref() != Some(token.as_slice()) {
+            continue;
+        }
+        if paired.is_some() {
+            // Two bags claiming the same key: which of them the authentication
+            // path would settle on is not something to guess at in a record.
+            return None;
+        }
+        paired = Some(candidate);
     }
+
+    let cert = Certificate::from_der(&paired?.der).ok()?;
+    // A certificate whose `basicConstraints` do not decode is refused for the
+    // same reason a CA is: the record would be asserting something about a
+    // certificate this Engine could not read.
+    let bc = cert.basic_constraints().ok()?;
+    if bc.is_some_and(|bc| bc.is_ca) {
+        return None;
+    }
+    Some(cert)
 }
 
 /// The one non-CA certificate a container carries, if there is exactly one.

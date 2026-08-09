@@ -2412,9 +2412,11 @@ const MAX_SHOWN_HOST_DESCRIPTORS: usize = 4;
 ///
 /// Only raw descriptors reach the cut — a wildcard and a `sha256:` digest are
 /// both fixed-length forms the parser has already constrained and are rendered
-/// whole. A raw descriptor is a host name or a `machine_id`, which fit several
-/// times over, so the cut costs nothing an engineer needed to read; what it buys
-/// is that a descriptor of arbitrary length cannot push the rest of the message
+/// whole. A raw descriptor is a host name or a `machine_id`: the `machine_id` is
+/// 32 hex characters and a deployed host name is far shorter than this, so in
+/// practice nothing an engineer needed to read is lost. A fully qualified name
+/// may run to 253 characters (RFC 1035), and one of those is cut — which is the
+/// point: a descriptor of arbitrary length must not push the rest of the message
 /// off the screen.
 const MAX_HOST_DESCRIPTOR_CHARS: usize = 96;
 

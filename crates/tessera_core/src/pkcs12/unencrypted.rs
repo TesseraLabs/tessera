@@ -8,16 +8,18 @@
 //! `AuthenticatedSafe` itself instead.
 //!
 //! What it reads is deliberately narrow: the bags of the *unencrypted* `id-data`
-//! safes, and among them only the certificate bags. Encrypted safes are stepped
-//! over rather than decrypted, and a key bag is dropped on its bag identifier.
-//! No password is consulted anywhere on this path.
+//! safes, and among them the certificate bags plus the *attributes* of the key
+//! bag. Encrypted safes are stepped over rather than decrypted. No password is
+//! consulted anywhere on this path, and no key material is interpreted.
 //!
-//! What the ASN.1 decoder does with a key bag before that, precisely: decoding a
-//! safe decodes *all* of its bags, so a shrouded key bag's value is copied as an
+//! What the ASN.1 decoder does with a key bag, precisely: decoding a safe
+//! decodes *all* of its bags, so a shrouded key bag's value is copied as an
 //! opaque TLV and its bag attributes (`friendlyName`, `localKeyID`) are decoded
-//! with it. Nothing interprets that value or reaches into it: it is the
-//! password-encrypted blob, and this path holds no password. What the code then
-//! discards on the bag identifier is a copy it already made.
+//! with it. The walk reads the attributes — `localKeyID` is the token that pairs
+//! a key with its certificate, and reading it is what lets a caller name the
+//! certificate the device will actually authenticate with. The bag's *value*,
+//! the password-encrypted key blob, is never looked into: this path holds no
+//! password, and the copy the decoder made of it is dropped with the rest.
 //!
 //! Nothing here decides anything. A malformed container, an unreadable safe or a
 //! bag that does not decode all yield "no certificate": this is a diagnostic
@@ -44,6 +46,9 @@ use pkcs12::safe_bag::SafeBag;
 /// `id-data` (PKCS#7): the content type of a safe whose bags lie in the clear.
 const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
 
+/// PKCS#9 `localKeyId`: the token that pairs a certificate bag with a key bag.
+const OID_LOCAL_KEY_ID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.21");
+
 /// Safes a container may hold and still be answered about.
 ///
 /// An issued container has two (certificates in the clear, key encrypted);
@@ -64,33 +69,59 @@ const MAX_CERTIFICATES: usize = 16;
 /// same as to an ambiguous one: nothing.
 const MAX_CERTIFICATE_BYTES: usize = 256 * 1024;
 
-/// Every certificate reachable without the container's password, in container
-/// order.
-///
-/// Certificates that sit in an encrypted safe are not among them — reaching
-/// those would need the password, which is exactly what this path must not
-/// touch.
-pub(super) fn certificates_in_clear(bytes: &[u8]) -> Vec<Vec<u8>> {
+/// A certificate read in the clear, together with the pairing token its bag
+/// carried.
+pub(super) struct ClearCertificate {
+    /// The certificate itself, DER.
+    pub der: Vec<u8>,
+    /// The bag's `localKeyId` attribute value as it was encoded, or `None` when
+    /// the bag carried none. The token is opaque — nothing derives or verifies
+    /// it, it is only compared with the key bag's.
+    pub local_key_id: Option<Vec<u8>>,
+}
+
+/// What one walk over a container's unencrypted safes found.
+#[derive(Default)]
+pub(super) struct ClearBags {
+    /// Every certificate reachable without the container's password, in
+    /// container order.
+    ///
+    /// Certificates that sit in an encrypted safe are not among them —
+    /// reaching those would need the password, which is exactly what this path
+    /// must not touch.
+    pub certificates: Vec<ClearCertificate>,
+    /// The `localKeyId` of the container's key bag, when exactly one key bag
+    /// lies in the clear and carries one.
+    ///
+    /// Two key bags leave no single "the container's key" to pair against, so
+    /// the token is dropped and the caller is left without a pairing rather
+    /// than with one of two.
+    pub key_local_key_id: Option<Vec<u8>>,
+}
+
+/// Walks the container's unencrypted safes.
+pub(super) fn bags_in_clear(bytes: &[u8]) -> ClearBags {
     let Ok(pfx) = Pfx::from_der(bytes) else {
-        return Vec::new();
+        return ClearBags::default();
     };
     // A container in public-key privacy mode wraps its authenticated safe in
     // `signedData` instead of `id-data`. Its content is not octets this path can
     // read, and refusing it on its declared type says so, rather than leaving it
     // to whether the octet-string decode happens to fail on the bytes inside.
     let Some(auth_safe) = data_payload(&pfx.auth_safe) else {
-        return Vec::new();
+        return ClearBags::default();
     };
     let Ok(safes) = Vec::<ContentInfo>::from_der(&auth_safe) else {
-        return Vec::new();
+        return ClearBags::default();
     };
 
     if safes.len() > MAX_SAFES {
-        return Vec::new();
+        return ClearBags::default();
     }
 
-    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut out = ClearBags::default();
     let mut collected_bytes = 0usize;
+    let mut key_bags = 0usize;
     for safe in &safes {
         // An `id-encryptedData` safe is stepped over: opening it needs the
         // password. A container that hides its certificates that way simply has
@@ -108,9 +139,15 @@ pub(super) fn certificates_in_clear(bytes: &[u8]) -> Vec<Vec<u8>> {
             continue;
         };
         for bag in &bags {
-            // The one bag type this path reads. Everything else — a shrouded
-            // key bag above all — is dropped on its identifier, without its
-            // content being looked into.
+            if is_key_bag(bag.bag_id) {
+                // Only the bag's attributes are read. Its value — the
+                // password-encrypted key — is left where it is; nothing here
+                // holds a password, and nothing here would know what to do with
+                // the plaintext if it did.
+                key_bags = key_bags.saturating_add(1);
+                out.key_local_key_id = local_key_id(bag);
+                continue;
+            }
             if bag.bag_id != pkcs12::PKCS_12_CERT_BAG_OID {
                 continue;
             }
@@ -122,17 +159,61 @@ pub(super) fn certificates_in_clear(bytes: &[u8]) -> Vec<Vec<u8>> {
             };
             let der = cert.cert_value.as_bytes();
             collected_bytes = collected_bytes.saturating_add(der.len());
-            if out.len() >= MAX_CERTIFICATES || collected_bytes > MAX_CERTIFICATE_BYTES {
+            if out.certificates.len() >= MAX_CERTIFICATES || collected_bytes > MAX_CERTIFICATE_BYTES
+            {
                 // Nothing, rather than what was gathered so far: the caller
                 // names a certificate only when the container leaves no doubt
                 // which one it is, and a truncated list could remove the very
                 // certificate that made the choice ambiguous.
-                return Vec::new();
+                return ClearBags::default();
             }
-            out.push(der.to_vec());
+            out.certificates.push(ClearCertificate {
+                der: der.to_vec(),
+                local_key_id: local_key_id(bag),
+            });
         }
     }
+
+    if key_bags != 1 {
+        out.key_local_key_id = None;
+    }
     out
+}
+
+/// Every certificate reachable without the container's password, in container
+/// order.
+pub(super) fn certificates_in_clear(bytes: &[u8]) -> Vec<Vec<u8>> {
+    bags_in_clear(bytes)
+        .certificates
+        .into_iter()
+        .map(|cert| cert.der)
+        .collect()
+}
+
+/// Whether a bag identifier is one of the two bag types that carry a private
+/// key.
+///
+/// An issued container shrouds its key, and so does every writer this Engine
+/// has met; the plain key bag is accepted alongside it because a container that
+/// carries one still pairs its certificate the same way, and refusing it would
+/// silently drop the pairing rather than say anything about it.
+fn is_key_bag(bag_id: ObjectIdentifier) -> bool {
+    bag_id == pkcs12::PKCS_12_PKCS8_KEY_BAG_OID || bag_id == pkcs12::PKCS_12_KEY_BAG_OID
+}
+
+/// The bag's `localKeyId` attribute value, encoded, or `None` when the bag
+/// carries no such attribute.
+///
+/// The value is handed back as its DER rather than as a parsed token: it is
+/// opaque by definition — RFC 7292 requires only that the paired bags carry the
+/// *same* value — so comparing the encodings is exactly the question that has
+/// to be answered, and no shape has to be assumed of what is inside.
+fn local_key_id(bag: &SafeBag) -> Option<Vec<u8>> {
+    bag.bag_attributes
+        .as_ref()?
+        .iter()
+        .find(|attribute| attribute.oid == OID_LOCAL_KEY_ID)
+        .and_then(|attribute| attribute.values.to_der().ok())
 }
 
 /// The bag's value with the mandatory `[0] EXPLICIT` wrapper removed.

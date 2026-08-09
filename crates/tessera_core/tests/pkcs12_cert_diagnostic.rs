@@ -16,7 +16,8 @@
 
 use secrecy::SecretString;
 use tessera_core::pkcs12::{
-    try_extract_cert_without_pin, try_extract_sole_cert_without_pin, LoadedKeyMaterial, Pkcs12Error,
+    try_extract_cert_without_pin, try_extract_key_paired_cert_without_pin, LoadedKeyMaterial,
+    Pkcs12Error,
 };
 
 /// Certificates encrypted (`-certpbe AES-256-CBC`): the older layout, which
@@ -33,6 +34,9 @@ const CA_BEFORE_LEAF: &[u8] = include_bytes!("fixtures/ca_before_leaf.p12");
 
 /// The password that opens the fixture containers. Public test material.
 const FIXTURE_PIN: &str = "correct-pin";
+
+/// The password [`our_container`] shrouds its key under. Public test material.
+const CONTAINER_PASS: &str = "container-pass";
 
 /// A container our own issuer assembles, with `leaf_der` and `chain_der` as
 /// given.
@@ -53,7 +57,7 @@ fn our_container(leaf_der: &[u8], chain_der: &[Vec<u8>]) -> Vec<u8> {
             leaf_der,
             chain_der,
         },
-        "container-pass",
+        CONTAINER_PASS,
         &mut OsEntropy,
     )
     .expect("the issuer assembles its own container")
@@ -90,8 +94,8 @@ fn an_encrypted_key_does_not_stop_the_read() {
     let cert = try_extract_cert_without_pin(CLEAR_CERTS)
         .expect("an encrypted key bag must not hide the certificates beside it");
     assert_eq!(cert.subject_cn().unwrap(), "alice");
-    // The import report reads its serial through this same call, and an empty
-    // one there is what an unreadable certificate looked like.
+    // The serial is read here too, though the import report reaches it by its
+    // own call: an unreadable certificate is what an empty serial used to mean.
     assert_eq!(
         cert.serial_hex(),
         "44E056A8B426D4727A82EC2A41EDFFFEA4B3D0E3"
@@ -189,12 +193,79 @@ fn the_non_ca_is_chosen_over_a_ca_that_precedes_it() {
     );
 }
 
+/// The serial of `leaf_rsa.pem`, pinned by `tests/fixtures/gen.sh`.
+const LEAF_RSA_SERIAL: &str = "44E056A8B426D4727A82EC2A41EDFFFEA4B3D0E3";
+
 #[test]
-fn a_container_whose_two_readers_could_disagree_yields_no_recorded_certificate() {
-    // The enrollment report and its audit event read the container through the
-    // sole-certificate call, and this fixture is exactly why: the login screen's
-    // rule names the leaf, `PKCS12_parse` names the CA above it, and a record
-    // that picked either would be a record of something that did not happen.
+fn a_container_of_our_issuance_records_the_serial_of_its_leaf() {
+    // The ordinary issued container: the leaf and its chain together in the
+    // clear, the key paired with the leaf. This is what every enrollment
+    // carries, so an empty serial here is an empty serial in every report and
+    // in every `device_enrolled` event.
+    let leaf = fixture_der("leaf_rsa.pem");
+    let bytes = our_container(&leaf, &[fixture_der("int.pem")]);
+
+    let cert = try_extract_key_paired_cert_without_pin(&bytes)
+        .expect("an issued container names the certificate its key belongs to");
+    assert_eq!(cert.subject_cn().unwrap(), "alice");
+    assert_eq!(
+        cert.serial_hex(),
+        LEAF_RSA_SERIAL,
+        "the serial recorded is the leaf's, and it is not empty"
+    );
+}
+
+#[test]
+fn a_foreign_container_records_the_certificate_its_key_is_paired_with() {
+    // Written by `openssl`, not by us: leaf and chain in the clear, key
+    // shrouded and paired with the leaf. Nothing about the pairing is our own
+    // convention.
+    let cert = try_extract_key_paired_cert_without_pin(CLEAR_CERTS)
+        .expect("a container written by openssl pairs its key the same way");
+    assert_eq!(cert.subject_cn().unwrap(), "alice");
+    assert_eq!(cert.serial_hex(), LEAF_RSA_SERIAL);
+
+    // And it is the certificate the device will authenticate with: this
+    // fixture's key really is the leaf's, so `PKCS12_parse` can be asked the
+    // same question with the password and has to give the same answer. A record
+    // is only worth making if the two agree.
+    let authenticated =
+        LoadedKeyMaterial::from_p12(CLEAR_CERTS, &SecretString::from(FIXTURE_PIN.to_owned()))
+            .expect("the fixture opens with its own password")
+            .end_entity;
+    assert_eq!(cert.serial_hex(), authenticated.serial_hex());
+}
+
+#[test]
+fn a_key_paired_with_a_certificate_authority_records_nothing() {
+    // `ca_before_leaf.p12` holds the intermediate's key, so the pairing names
+    // the intermediate — the same certificate `PKCS12_parse` returns, which the
+    // assertion below fixes. But an audit event must not call a certificate
+    // authority the device's credential, so the record stays empty even though
+    // the two readers agree here.
+    let authenticated =
+        LoadedKeyMaterial::from_p12(CA_BEFORE_LEAF, &SecretString::from(FIXTURE_PIN.to_owned()))
+            .expect("the fixture opens with its own password")
+            .end_entity;
+    assert_eq!(
+        authenticated.subject_cn().unwrap(),
+        "CertAuth Test Intermediate"
+    );
+    assert!(
+        authenticated
+            .basic_constraints()
+            .unwrap()
+            .is_some_and(|bc| bc.is_ca),
+        "the certificate the key is paired with is a CA, which is what the guard turns away"
+    );
+
+    assert!(
+        try_extract_key_paired_cert_without_pin(CA_BEFORE_LEAF).is_none(),
+        "a CA must not be recorded as the device's certificate"
+    );
+
+    // The login screen keeps its own answer: there a certificate is named to a
+    // human, and the two rules are allowed to differ.
     assert_eq!(
         try_extract_cert_without_pin(CA_BEFORE_LEAF)
             .expect("the diagnostic still names one")
@@ -202,63 +273,208 @@ fn a_container_whose_two_readers_could_disagree_yields_no_recorded_certificate()
             .unwrap(),
         "alice"
     );
-    assert_eq!(
-        LoadedKeyMaterial::from_p12(CA_BEFORE_LEAF, &SecretString::from(FIXTURE_PIN.to_owned()))
-            .expect("the fixture opens with its own password")
-            .end_entity
-            .subject_cn()
-            .unwrap(),
-        "CertAuth Test Intermediate"
-    );
-
-    assert!(
-        try_extract_sole_cert_without_pin(CA_BEFORE_LEAF).is_none(),
-        "a container the two readers answer differently about must be recorded without a serial"
-    );
 }
 
 #[test]
-fn a_container_of_one_certificate_yields_it_for_the_record() {
-    // One certificate leaves the two readers nothing to disagree about, so this
-    // is the shape — and the only shape — a serial is recorded from.
-    let bytes = container_with_certificates(&[fixture_der("leaf_rsa.pem")]);
-    let cert = try_extract_sole_cert_without_pin(&bytes)
-        .expect("a container holding one certificate is unambiguous");
-    assert_eq!(cert.subject_cn().unwrap(), "alice");
-    assert_eq!(
-        cert.serial_hex(),
-        "44E056A8B426D4727A82EC2A41EDFFFEA4B3D0E3"
+fn the_bag_order_does_not_decide_which_certificate_is_recorded() {
+    // The CA bag comes first and the leaf second, both carrying a pairing
+    // token; only the leaf's matches the key's. A reader that took the first
+    // bag, or the first one that parses, would record the CA.
+    let bytes = paired_container(
+        &[
+            (fixture_der("int.pem"), Some(b"ca-token".as_slice())),
+            (fixture_der("leaf_rsa.pem"), Some(b"leaf-token".as_slice())),
+        ],
+        KeyBag::Paired(b"leaf-token"),
     );
+    let cert = try_extract_key_paired_cert_without_pin(&bytes)
+        .expect("the bag carrying the key's token is the one recorded");
+    assert_eq!(cert.serial_hex(), LEAF_RSA_SERIAL);
 }
 
 #[test]
-fn a_certificate_beside_its_chain_yields_nothing_for_the_record() {
-    // The ordinary issued container, leaf and intermediate together: the login
-    // screen names the leaf from it, but the record stays silent rather than
-    // rest on a rule the authentication path does not share.
-    let bytes = container_with_certificates(&[fixture_der("leaf_rsa.pem"), fixture_der("int.pem")]);
-    assert_eq!(
-        try_extract_cert_without_pin(&bytes)
-            .expect("the diagnostic names the non-CA")
-            .subject_cn()
-            .unwrap(),
-        "alice"
-    );
-    assert!(try_extract_sole_cert_without_pin(&bytes).is_none());
+fn a_container_that_names_no_pairing_records_nothing() {
+    let leaf = || fixture_der("leaf_rsa.pem");
+    for (what, bytes) in [
+        (
+            "no key bag at all",
+            paired_container(&[(leaf(), Some(b"token".as_slice()))], KeyBag::Absent),
+        ),
+        (
+            "a key bag carrying no localKeyId",
+            paired_container(&[(leaf(), Some(b"token".as_slice()))], KeyBag::Unpaired),
+        ),
+        (
+            "a key whose token no certificate repeats",
+            paired_container(
+                &[(leaf(), Some(b"token".as_slice()))],
+                KeyBag::Paired(b"another-token"),
+            ),
+        ),
+        (
+            "certificates carrying no localKeyId",
+            paired_container(&[(leaf(), None)], KeyBag::Paired(b"token")),
+        ),
+        (
+            "two bags claiming the same key",
+            paired_container(
+                &[
+                    (leaf(), Some(b"token".as_slice())),
+                    (fixture_der("leaf_ecdsa.pem"), Some(b"token".as_slice())),
+                ],
+                KeyBag::Paired(b"token"),
+            ),
+        ),
+        ("two key bags, each with its own token", two_key_bags()),
+    ] {
+        assert!(
+            try_extract_key_paired_cert_without_pin(&bytes).is_none(),
+            "{what} must be recorded without a serial"
+        );
+    }
 }
 
 #[test]
-fn a_container_with_nothing_readable_yields_nothing_for_the_record() {
+fn a_container_with_nothing_readable_records_nothing() {
     for (what, bytes) in [
         ("certificates kept encrypted", ENCRYPTED_CERTS),
         ("random bytes", &b"not a container at all"[..]),
         ("an empty buffer", &b""[..]),
+        ("a truncated container", &CLEAR_CERTS[..64]),
+        (
+            "a container without a key bag",
+            &container_with_certificates(&[fixture_der("leaf_rsa.pem")]),
+        ),
     ] {
         assert!(
-            try_extract_sole_cert_without_pin(bytes).is_none(),
+            try_extract_key_paired_cert_without_pin(bytes).is_none(),
             "{what} must yield no certificate rather than panic"
         );
     }
+
+    // Structurally plausible garbage: the walk reads bag attributes now, and
+    // that must not become a way to panic on hostile bytes.
+    let mut shredded = CLEAR_CERTS.to_vec();
+    for byte in shredded.iter_mut().skip(32) {
+        *byte ^= 0xA5;
+    }
+    assert!(try_extract_key_paired_cert_without_pin(&shredded).is_none());
+}
+
+/// A certificate a hand-assembled container carries, with the pairing token its
+/// bag is to declare (`None` for a bag with no attributes).
+type PairedCertificate<'a> = (Vec<u8>, Option<&'a [u8]>);
+
+/// What key bag a hand-assembled container carries.
+#[derive(Clone, Copy)]
+enum KeyBag<'a> {
+    /// None at all — a certificate-only container.
+    Absent,
+    /// A key bag with no attributes, so nothing to pair against.
+    Unpaired,
+    /// A key bag carrying the given pairing token.
+    Paired(&'a [u8]),
+}
+
+/// The `localKeyId` attribute set carrying `token`.
+fn pairing_attributes(token: &[u8]) -> x509_cert::attr::Attributes {
+    use der::asn1::{Any, ObjectIdentifier, OctetString, SetOfVec};
+    use der::{Decode as _, Encode as _};
+    use x509_cert::attr::{Attribute, Attributes};
+
+    let octets = OctetString::new(token.to_vec()).unwrap();
+    let value = Any::from_der(&octets.to_der().unwrap()).unwrap();
+    let mut attributes = Attributes::new();
+    attributes
+        .insert(Attribute {
+            oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.21"),
+            values: SetOfVec::try_from(vec![value]).unwrap(),
+        })
+        .unwrap();
+    attributes
+}
+
+/// A key bag whose value is opaque filler.
+///
+/// Nothing on the password-free path looks inside a key bag's value, so the
+/// bytes only have to be a well-formed TLV — which is the point: a test that
+/// packaged a real key would be testing the writer, not the pairing.
+fn filler_key_bag(token: Option<&[u8]>) -> pkcs12::safe_bag::SafeBag {
+    use der::asn1::OctetString;
+    use der::Encode as _;
+
+    pkcs12::safe_bag::SafeBag {
+        bag_id: pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
+        bag_value: OctetString::new(b"an encrypted key would be here".to_vec())
+            .unwrap()
+            .to_der()
+            .unwrap(),
+        bag_attributes: token.map(pairing_attributes),
+    }
+}
+
+/// A container holding the given certificates — each with the pairing token it
+/// is to carry — beside the given key bag.
+///
+/// Assembled here rather than by our own writer, which pairs its key with the
+/// leaf and refuses anything else. The layouts that need answering are the ones
+/// a foreign drive can carry.
+fn paired_container(certs: &[PairedCertificate<'_>], key: KeyBag<'_>) -> Vec<u8> {
+    use der::asn1::OctetString;
+    use der::Encode as _;
+    use pkcs12::cert_type::CertBag;
+    use pkcs12::safe_bag::SafeBag;
+
+    let mut bags: Vec<SafeBag> = certs
+        .iter()
+        .map(|(der, token)| SafeBag {
+            bag_id: pkcs12::PKCS_12_CERT_BAG_OID,
+            bag_value: CertBag {
+                cert_id: pkcs12::PKCS_12_X509_CERT_OID,
+                cert_value: OctetString::new(der.clone()).unwrap(),
+            }
+            .to_der()
+            .unwrap(),
+            bag_attributes: token.map(pairing_attributes),
+        })
+        .collect();
+    match key {
+        KeyBag::Absent => {}
+        KeyBag::Unpaired => bags.push(filler_key_bag(None)),
+        KeyBag::Paired(token) => bags.push(filler_key_bag(Some(token))),
+    }
+
+    container_of_safes(&[id_data_holding(&bags.to_der().unwrap())])
+}
+
+/// A container carrying one certificate and two key bags, each with its own
+/// token — one of which the certificate repeats.
+///
+/// Two keys leave no single "the container's key" to pair against, and picking
+/// the one that happens to match would be picking the answer that produces an
+/// answer.
+fn two_key_bags() -> Vec<u8> {
+    use der::asn1::OctetString;
+    use der::Encode as _;
+    use pkcs12::cert_type::CertBag;
+    use pkcs12::safe_bag::SafeBag;
+
+    let leaf = fixture_der("leaf_rsa.pem");
+    let bags = vec![
+        SafeBag {
+            bag_id: pkcs12::PKCS_12_CERT_BAG_OID,
+            bag_value: CertBag {
+                cert_id: pkcs12::PKCS_12_X509_CERT_OID,
+                cert_value: OctetString::new(leaf).unwrap(),
+            }
+            .to_der()
+            .unwrap(),
+            bag_attributes: Some(pairing_attributes(b"first")),
+        },
+        filler_key_bag(Some(b"first")),
+        filler_key_bag(Some(b"second")),
+    ];
+    container_of_safes(&[id_data_holding(&bags.to_der().unwrap())])
 }
 
 #[test]

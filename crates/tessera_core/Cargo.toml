@@ -60,9 +60,12 @@ libloading = { workspace = true }
 # PKCS#12 container structure, read without the password: the login screen's
 # "wrong drive against wrong password" diagnostic walks the container's safes
 # itself because `PKCS12_parse` gives up at the encrypted key. Only the ASN.1
-# layout is used; every cryptographic step on this path is absent by design —
-# `pkcs12` is taken as the workspace declares it, which is without the `kdf`
-# feature, so the key derivation is not linked into a build that only reads.
+# layout is used; every cryptographic step on this path is absent by design, and
+# this crate accordingly takes `pkcs12` as the workspace declares it, without the
+# `kdf` feature. That is a statement about what this crate asks for, not about
+# what ends up linked: features are additive, so a build whose graph also holds
+# `tessera_issuer` — `cargo build --workspace`, for one — links the derivation
+# because the issuer needs it for the container MAC.
 der = { workspace = true }
 pkcs12 = { workspace = true }
 cms = { workspace = true }
@@ -98,6 +101,10 @@ tracing-subscriber = { workspace = true }
 # `tessera_issuer` depends only on `tessera_ext`.
 tessera_issuer = { path = "../tessera_issuer", version = "0.5.0", features = ["test-support"] }
 p256 = { workspace = true }
+# Bag attributes, for the tests that hand-assemble a PKCS#12 container: the
+# `localKeyId` pairing has to be exercised on layouts our own writer refuses to
+# produce, and those are exactly the ones a foreign drive can carry.
+x509-cert = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"

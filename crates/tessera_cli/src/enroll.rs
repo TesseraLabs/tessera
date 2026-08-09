@@ -165,11 +165,11 @@ fn resolve_host_id_prefix8(config: &Path) -> String {
 /// nicety, never a gate.
 ///
 /// The serial goes into the report and into the `device_enrolled` audit event,
-/// so it must be the certificate the device will authenticate with. That holds
-/// only where the container leaves no room for two readers to disagree, which is
-/// why the read is the sole-certificate one rather than the login screen's:
-/// there the certificate is merely named to a human, here it is written down as
-/// what happened.
+/// so it must be the certificate the device will actually authenticate with.
+/// That is why the read pairs the container's key with its certificate by
+/// `localKeyId` — the same choice the authentication path makes — rather than
+/// using the login screen's rule, which names a certificate to a human and may
+/// legitimately differ. Here it is written down as what happened.
 fn read_p12_serial(pkg: &EnrollmentPackage, import_root: &Path) -> String {
     // `EnrollmentPackage::p12_file()` is a bare name validated by the core's
     // parser; join it under the package root we were given.
@@ -177,7 +177,7 @@ fn read_p12_serial(pkg: &EnrollmentPackage, import_root: &Path) -> String {
     let Ok(bytes) = std::fs::read(&p12_path) else {
         return String::new();
     };
-    match pkcs12::try_extract_sole_cert_without_pin(&bytes) {
+    match pkcs12::try_extract_key_paired_cert_without_pin(&bytes) {
         Some(cert) => cert.serial_hex(),
         None => String::new(),
     }
