@@ -11,13 +11,25 @@ use thiserror::Error;
 /// callers without consuming the original.
 #[derive(Debug, Clone, Error)]
 pub enum GostEngineError {
+    /// No `gost_engine_path` was configured, so there is no engine this
+    /// process is permitted to load.
+    ///
+    /// Loading an engine means handing libcrypto a shared library and then
+    /// making it the default implementation for RSA, DSA, DH, RAND and every
+    /// digest — process-wide, for the rest of this process's life. The only
+    /// file allowed to do that is the one the operator named. Without a name
+    /// there is nothing to load, and asking libcrypto to go and find a `gost`
+    /// engine on its own would let an inherited `OPENSSL_ENGINES` decide
+    /// which library that is.
+    #[error("gost-engine cannot be loaded: no gost_engine_path is configured")]
+    PathNotConfigured,
     /// The configured engine path does not exist or is not a regular file.
     #[error("gost-engine path is missing or not a regular file: {0:?}")]
     PathMissing(PathBuf),
     /// The engine could not be located by libcrypto.
     ///
-    /// Returned when `ENGINE_by_id` returns NULL (the engine is not
-    /// registered and is not findable on disk via `OPENSSL_ENGINES`).
+    /// Returned when the `dynamic` loader engine itself is absent (libcrypto
+    /// built without ENGINE support).
     #[error("gost-engine is not available: {0}")]
     NotAvailable(String),
     /// The engine .so could not be dynamically loaded by libcrypto.

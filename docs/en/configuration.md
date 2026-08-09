@@ -169,14 +169,26 @@ first poll — **66 seconds with the defaults**. Every second added to
 | `allowed_signature_algorithms`  | list of strings | `[]` | OIDs or names                      | Signature whitelist. Empty/omitted is replaced by a safe default: `sha256/384/512WithRSAEncryption`, `ecdsa-with-SHA256/384/512` (no SHA-1 and no GOST). | The SHA-1/MD5/weak-RSA ban applies even without explicit configuration; GOST requires an explicit opt-in. |
 | `max_supported_profile_version` | integer      | compiled-in default | `u32`                   | Maximum understood `pam_cert_profile_version`; a cert with a higher version rejects the whole chain (fail-closed, version-gate). | Protection against silently ignoring the unknown semantics of newer profile versions. |
 
-Entries are compared **exactly** (no substrings) against the OpenSSL
-display form of the certificate's algorithm (see `pre_validate_end_entity`
-in [`crates/tessera_core/src/x509/pre_validate.rs`](../../crates/tessera_core/src/x509/)):
+An entry and a certificate are compared as **whole algorithms**, never as
+substrings: the entry is resolved through the table below, the certificate
+through its own OID, and it is the algorithms that must match (see
+`whitelist_permits` in
+[`crates/tessera_core/src/x509/sig_alg.rs`](../../crates/tessera_core/src/x509/)).
+The same signature may therefore be written under any of its names — e.g.
+`"sha256WithRSAEncryption"` and `"1.2.840.113549.1.1.11"` are equivalent.
 
 - RSA: `"sha256WithRSAEncryption"`, `"sha384WithRSAEncryption"`, `"sha512WithRSAEncryption"`
+  (or `"rsa-with-sha256"`, `"rsa-with-sha384"`, `"rsa-with-sha512"`)
 - ECDSA: `"ecdsa-with-SHA256"`, `"ecdsa-with-SHA384"`, `"ecdsa-with-SHA512"`
-- GOST R 34.10-2012-256: `"id-tc26-signwithdigest-gost3410-12-256"`
-- GOST R 34.10-2012-512: `"id-tc26-signwithdigest-gost3410-12-512"`
+- GOST R 34.10-2012-256: `"id-tc26-signwithdigest-gost3410-2012-256"`
+- GOST R 34.10-2012-512: `"id-tc26-signwithdigest-gost3410-2012-512"`
+  (both GOST entries are also accepted with the year written `-12-`:
+  `"id-tc26-signwithdigest-gost3410-12-256"`)
+
+A name outside this table matches only itself, character for character, while
+a certificate always presents a dotted OID. A name that is not in the table
+(`"sha1WithRSAEncryption"`, `"RSASSA-PSS"`, `"ED25519"`) therefore matches no
+certificate at all: to allow such an algorithm, write its dotted OID.
 
 ### The `[trust.revocation]` section
 

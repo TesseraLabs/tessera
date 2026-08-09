@@ -275,9 +275,26 @@ impl Certificate {
     }
 
     /// Dotted OID of the certificate's signature algorithm.
+    ///
+    /// Returns [`sig_alg::UNKNOWN_SIGNATURE_ALGORITHM`] if the OID cannot be
+    /// decoded; that placeholder is refused by every allow-list, so an
+    /// algorithm we could not identify can never be accepted.
     #[must_use]
     pub fn signature_algorithm(&self) -> String {
-        self.inner.signature_algorithm().object().to_string()
+        // The OID is decoded from its own DER bytes rather than formatted by
+        // libcrypto.  `Display for Asn1ObjectRef` calls `OBJ_obj2txt` in
+        // "print the long name if you know it" mode, so what it produces
+        // depends on which OIDs that particular libcrypto knows: its built-in
+        // object table plus whatever engines and providers have registered
+        // since the process started.  The same GOST certificate therefore
+        // reads as `1.2.643.7.1.1.3.2` on one host and as
+        // `GOST R 34.10-2012 with GOST R 34.11-2012 (256 bit)` on another —
+        // or on the same host once an engine is loaded.  How a certificate
+        // parses must not depend on that, so we never ask libcrypto to name
+        // the OID.
+        let object = self.inner.signature_algorithm().object().to_owned();
+        der::oid_to_dotted(object.as_slice())
+            .unwrap_or_else(|_| sig_alg::UNKNOWN_SIGNATURE_ALGORITHM.to_string())
     }
 
     /// Classified signature algorithm.  Wrapper over

@@ -670,14 +670,26 @@ mod tests {
         }
     }
 
-    /// GOST chain: the engine hook must run (and fail closed when the
-    /// engine is unavailable) before responder-signature verification is
-    /// reached.  Gated and self-skipping like `builds_request_for_gost_issuer`:
+    /// GOST chain: the engine hook must run (and fail closed when no engine
+    /// can be loaded) before responder-signature verification is reached.
+    /// Gated and self-skipping like `builds_request_for_gost_issuer`:
     /// the GOST fixtures (`tests/fixtures/gost/`, produced by `gen_gost.sh`
     /// on a Linux host with gost-engine) may be absent locally.
+    ///
+    /// Both directions are asserted. Without a configured engine path the
+    /// responder exchange must be refused outright — the certificates that
+    /// trigger the hook come off the wire, so they must not be able to make
+    /// this process load an engine of their own choosing. With the path the
+    /// engine loads and verification proceeds far enough to reject the
+    /// (RSA-signed) response on its signature.
+    ///
+    /// This is the only test in the crate's own unit-test binary that loads a
+    /// real engine, which makes it the one that can invalidate what the
+    /// `gost::engine` tests observe; it takes their lock for that reason.
     #[test]
     #[cfg(feature = "gost-tests")]
     fn gost_chain_loads_engine_before_responder_signature_check() {
+        let _lock = crate::gost::engine::lock_engine_cell_for_test();
         let subject_path = fixture_path("gost/gost_ee_256.pem");
         let issuer_path = fixture_path("gost/gost_ca_256.pem");
         if !subject_path.exists() || !issuer_path.exists() {
@@ -687,18 +699,39 @@ mod tests {
         let subject = load_cert("gost/gost_ee_256.pem");
         let issuer = load_cert("gost/gost_ca_256.pem");
         let anchors = vec![load_cert("gost/gost_ca_256.pem")];
-        let ctx = OcspVerifyContext {
+        let response = load_der("ocsp/good.der");
+
+        let unconfigured = OcspVerifyContext {
             anchors: &anchors,
             untrusted: &[],
             clock_skew: Duration::from_secs(60),
             gost_engine_path: None,
         };
-        // good.der is RSA-signed: with the engine present the GOST chain
-        // simply fails signature verification; without it the engine hook
-        // must refuse *before* `OCSP_basic_verify` is reached.
-        let err = verify_ocsp_response(&load_der("ocsp/good.der"), &subject, &issuer, None, &ctx)
-            .unwrap_err();
-        if crate::gost::engine::is_available_after_attempt(None) {
+        let err = verify_ocsp_response(&response, &subject, &issuer, None, &unconfigured)
+            .expect_err("a GOST chain with no configured engine must not verify");
+        assert!(
+            matches!(err, TrustError::OcspEngineUnavailable { .. }),
+            "no engine configured, expected fail-closed engine error, got {err:?}"
+        );
+
+        let Some(engine) = crate::test_support::gost_engine_path() else {
+            eprintln!(
+                "skipped (second half): no gost-engine on this host; set {} to run it.",
+                crate::test_support::GOST_ENGINE_PATH_ENV,
+            );
+            return;
+        };
+        let configured = OcspVerifyContext {
+            anchors: &anchors,
+            untrusted: &[],
+            clock_skew: Duration::from_secs(60),
+            gost_engine_path: Some(&engine),
+        };
+        // good.der is RSA-signed, so with the engine loaded the exchange gets
+        // past the hook and dies on the responder signature instead.
+        let err = verify_ocsp_response(&response, &subject, &issuer, None, &configured)
+            .expect_err("good.der is signed by a different responder");
+        if crate::gost::engine::is_available() {
             assert!(
                 matches!(err, TrustError::OcspSignatureInvalid { .. }),
                 "engine available, expected signature mismatch, got {err:?}"
@@ -706,7 +739,8 @@ mod tests {
         } else {
             assert!(
                 matches!(err, TrustError::OcspEngineUnavailable { .. }),
-                "engine unavailable, expected fail-closed engine error, got {err:?}"
+                "engine at {} did not load, expected fail-closed engine error, got {err:?}",
+                engine.display(),
             );
         }
     }

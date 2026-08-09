@@ -21,8 +21,19 @@
 //!
 //! libcrypto's ENGINE table is process-global mutable state.  All
 //! load/finish operations are serialised through [`LOAD_MUTEX`] so that
-//! two threads racing through `EngineHandle::by_id` cannot drive
+//! two threads racing through [`EngineHandle::load_dynamic`] cannot drive
 //! libcrypto into an undefined state.
+//!
+//! # No lookup by id
+//!
+//! There is deliberately no `ENGINE_by_id("gost")` wrapper here. That call
+//! makes libcrypto search the ambient engine directory / `OPENSSL_ENGINES`
+//! and `dlopen` whatever it finds under that name, and the caller then pins
+//! the result as the default implementation for every algorithm class. The
+//! only supported way in is [`EngineHandle::load_dynamic`], which loads the
+//! exact file the operator configured. The one `ENGINE_by_id` call that
+//! remains asks for `"dynamic"` — libcrypto's own built-in loader engine,
+//! which is not searched for on disk.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_uint, CStr, CString};
@@ -195,60 +206,6 @@ fn clear_ambient_registration(id_c: &CStr) {
 }
 
 impl EngineHandle {
-    /// Look the engine up by ID via libcrypto's standard search path.
-    ///
-    /// This calls `ENGINE_load_builtin_engines` first (idempotent inside
-    /// libcrypto) and then `ENGINE_by_id`.  If the engine is found it is
-    /// `ENGINE_init`'d; otherwise an `Err(NotAvailable)` is returned.
-    ///
-    /// # Errors
-    ///
-    /// * [`GostEngineError::NotAvailable`] — `ENGINE_by_id` returned NULL.
-    /// * [`GostEngineError::LoadFailed`] — `ENGINE_init` returned 0.
-    pub(crate) fn by_id(id: &str) -> Result<Self, GostEngineError> {
-        let id_c = CString::new(id).map_err(|e| {
-            GostEngineError::NotAvailable(format!("engine id contains NUL byte: {e}"))
-        })?;
-
-        let _guard = LOAD_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // SAFETY: idempotent libcrypto initialiser; safe to call from any
-        // thread, repeatedly, with no preconditions.
-        unsafe {
-            ENGINE_load_builtin_engines();
-        }
-
-        // SAFETY: `id_c.as_ptr()` is a NUL-terminated C string valid for
-        // the duration of the call.  `ENGINE_by_id` returns either a
-        // valid `*mut ENGINE` (with one reference for us) or NULL.
-        let raw = unsafe { ENGINE_by_id(id_c.as_ptr()) };
-        let Some(raw) = NonNull::new(raw) else {
-            return Err(GostEngineError::NotAvailable(format!(
-                "ENGINE_by_id({id:?}) returned NULL — engine not registered \
-                 (check OPENSSL_ENGINES and that the .so is installed)"
-            )));
-        };
-
-        // SAFETY: `raw` is a valid `*mut ENGINE` returned by libcrypto
-        // and the LOAD_MUTEX is held; `ENGINE_init` increments the
-        // structural reference count.
-        let init_rc = unsafe { ENGINE_init(raw.as_ptr()) };
-        if init_rc != 1 {
-            // Drop the structural reference we got from ENGINE_by_id.
-            // SAFETY: `raw` is a valid pointer we own a reference to.
-            unsafe {
-                let _ = ENGINE_free(raw.as_ptr());
-            }
-            return Err(GostEngineError::LoadFailed(format!(
-                "ENGINE_init({id:?}) returned {init_rc}"
-            )));
-        }
-
-        Ok(Self { raw })
-    }
-
     /// Load an engine via libcrypto's `dynamic` loader.
     ///
     /// Equivalent to the OpenSSL config snippet:
@@ -462,22 +419,6 @@ pub(crate) fn digest_available(name: &str) -> bool {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn by_id_returns_not_available_for_unknown_engine() {
-        // A name almost certainly not registered on any host.
-        let res = EngineHandle::by_id("nonexistent_engine_zzzqwx");
-        assert!(
-            matches!(res, Err(GostEngineError::NotAvailable(_))),
-            "expected NotAvailable, got {res:?}",
-        );
-    }
-
-    #[test]
-    fn by_id_rejects_nul_bytes() {
-        let res = EngineHandle::by_id("bad\0engine");
-        assert!(matches!(res, Err(GostEngineError::NotAvailable(_))));
-    }
 
     #[test]
     fn load_dynamic_returns_path_missing_for_nonexistent_path() {

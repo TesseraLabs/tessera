@@ -177,14 +177,26 @@ PKCS#11-модуль загружается и инициализируется 
 | `allowed_signature_algorithms`  | список строк | `[]`  | OID или имена                      | Whitelist подписей. Пустой/опущенный — подменяется безопасным дефолтом: `sha256/384/512WithRSAEncryption`, `ecdsa-with-SHA256/384/512` (без SHA-1 и без ГОСТ). | Запрет SHA-1/MD5/слабых RSA действует и без явной настройки; ГОСТ требует явного opt-in. |
 | `max_supported_profile_version` | целое      | компилируемый дефолт | `u32`                 | Максимальная понимаемая версия `pam_cert_profile_version`; серт с большей версией отклоняет всю цепь (fail-closed, version-gate). | Защита от «тихого» игнорирования незнакомых семантик новых версий профиля. |
 
-Записи сравниваются **точно** (без подстрок) с OpenSSL display-формой алгоритма
-сертификата (см. `pre_validate_end_entity` в
-[`crates/tessera_core/src/x509/pre_validate.rs`](../../crates/tessera_core/src/x509/)):
+Запись и алгоритм сертификата сравниваются **целыми алгоритмами**, без
+подстрок: запись распознаётся по таблице ниже, сертификат — по своему OID, и
+совпасть должны именно алгоритмы (см. `whitelist_permits` в
+[`crates/tessera_core/src/x509/sig_alg.rs`](../../crates/tessera_core/src/x509/)).
+Одну и ту же подпись поэтому можно записать любым из её имён — например,
+`"sha256WithRSAEncryption"` и `"1.2.840.113549.1.1.11"` равнозначны.
 
 - RSA: `"sha256WithRSAEncryption"`, `"sha384WithRSAEncryption"`, `"sha512WithRSAEncryption"`
+  (либо `"rsa-with-sha256"`, `"rsa-with-sha384"`, `"rsa-with-sha512"`)
 - ECDSA: `"ecdsa-with-SHA256"`, `"ecdsa-with-SHA384"`, `"ecdsa-with-SHA512"`
-- ГОСТ Р 34.10-2012-256: `"id-tc26-signwithdigest-gost3410-12-256"`
-- ГОСТ Р 34.10-2012-512: `"id-tc26-signwithdigest-gost3410-12-512"`
+- ГОСТ Р 34.10-2012-256: `"id-tc26-signwithdigest-gost3410-2012-256"`
+- ГОСТ Р 34.10-2012-512: `"id-tc26-signwithdigest-gost3410-2012-512"`
+  (обе записи ГОСТ принимаются и с годом `-12-`:
+  `"id-tc26-signwithdigest-gost3410-12-256"`)
+
+Имя вне этой таблицы совпадает только само с собой — символ в символ, — а
+сертификат всегда предъявляет точечный OID. Поэтому имя, которого в таблице
+нет (`"sha1WithRSAEncryption"`, `"RSASSA-PSS"`, `"ED25519"`), не совпадёт ни
+с одним сертификатом: чтобы разрешить такой алгоритм, записывайте его
+точечный OID.
 
 ### Секция `[trust.revocation]`
 

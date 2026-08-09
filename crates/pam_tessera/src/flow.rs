@@ -667,6 +667,7 @@ where
         3,
         deps.cfg.pkcs12_pin_prompt.as_deref(),
         &mut prompt_pin,
+        deps.cfg.gost_engine_path.as_deref(),
     ) {
         Ok(m) => m,
         Err(AcquireError::MaxTries) => {

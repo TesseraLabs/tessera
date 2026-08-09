@@ -8,17 +8,35 @@
 //!
 //! Wrong-PIN failures are classified into [`Pkcs12Error::WrongPin`] so the PAM
 //! layer can drive a bounded retry loop without leaking the PIN.
+//!
+//! # GOST containers
+//!
+//! Decoding the private key out of a container is the first step of the login
+//! that needs an algorithm implementation rather than plain ASN.1, and for a
+//! GOST key libcrypto has none of its own: the implementation lives in
+//! `gost-engine`, which has to be registered before the decode. A host that
+//! registers the engine in its system `openssl.cnf` does not help here —
+//! libcrypto only reads that file when it is initialised with config loading,
+//! and the OpenSSL binding this crate uses does not ask for it. So a process
+//! that has not loaded the engine itself sees a GOST container as an
+//! unsupported key algorithm. [`LoadedKeyMaterial::from_p12`] therefore loads
+//! the engine and retries once when a container fails to open — on a
+//! deployment that configured the engine's path, and only there; see
+//! [`parse_with_gost_retry`].
 
 pub mod error;
 mod unencrypted;
 
 pub use error::{AcquireError, P12EnvelopeError, Pkcs12Error};
 
-use openssl::pkcs12::Pkcs12;
+use std::path::Path;
+
+use openssl::pkcs12::{ParsedPkcs12_2, Pkcs12};
 use openssl::pkey::{PKey, Private};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
+use crate::gost::engine;
 use crate::pam_conv::PamConvError;
 use crate::x509::Certificate;
 
@@ -54,6 +72,13 @@ impl std::fmt::Debug for LoadedKeyMaterial {
 impl LoadedKeyMaterial {
     /// Decrypt a PKCS#12 bundle with the supplied PIN.
     ///
+    /// `gost_engine_path` is the operator-configured
+    /// [`crate::config::ValidatedConfig::gost_engine_path`], passed through to
+    /// the engine load that a GOST container needs (see the module docs and
+    /// [`parse_with_gost_retry`]). `None` means the deployment named no engine,
+    /// and then no engine is loaded here at all — a container that needs one
+    /// fails as an unsupported algorithm.
+    ///
     /// # Errors
     ///
     /// Returns [`Pkcs12Error::WrongPin`] when the bundle's MAC fails to verify
@@ -61,11 +86,13 @@ impl LoadedKeyMaterial {
     /// [`Pkcs12Error::MissingCert`] when the bundle is well-formed but lacks a
     /// required component.  Any other DER / OpenSSL failure becomes
     /// [`Pkcs12Error::Corrupt`].
-    pub fn from_p12(bytes: &[u8], pin: &SecretString) -> Result<Self, Pkcs12Error> {
+    pub fn from_p12(
+        bytes: &[u8],
+        pin: &SecretString,
+        gost_engine_path: Option<&Path>,
+    ) -> Result<Self, Pkcs12Error> {
         let p12 = Pkcs12::from_der(bytes).map_err(|e| Pkcs12Error::Corrupt(e.to_string()))?;
-        let parsed = p12
-            .parse2(pin.expose_secret())
-            .map_err(|e| classify_parse_error(&e))?;
+        let parsed = parse_with_gost_retry(&p12, pin, gost_engine_path)?;
 
         let pkey = parsed.pkey.ok_or(Pkcs12Error::MissingKey)?;
         let cert = parsed.cert.ok_or(Pkcs12Error::MissingCert)?;
@@ -103,6 +130,13 @@ impl LoadedKeyMaterial {
 
     /// Materialise the private key as an OpenSSL handle.
     ///
+    /// Reading the stored DER back needs the same algorithm implementation the
+    /// container needed to open in the first place, and for a GOST key that
+    /// implementation only exists once `gost-engine` is registered. No engine
+    /// argument is needed here regardless: a GOST container cannot have been
+    /// opened at all without the engine, and an engine, once loaded, stays
+    /// pinned for the life of the process.
+    ///
     /// # Errors
     ///
     /// Returns [`Pkcs12Error::Corrupt`] if the stored PKCS#8 DER is rejected by
@@ -113,15 +147,236 @@ impl LoadedKeyMaterial {
     }
 }
 
+/// Open a container, giving `gost-engine` a chance when the first attempt
+/// fails on an algorithm libcrypto alone does not implement.
+///
+/// The happy path is one `PKCS12_parse` call and nothing else: an RSA or ECDSA
+/// container opens on libcrypto's own implementations, and no engine is
+/// touched on hosts that have none installed.
+///
+/// A GOST container instead fails that first call with an unsupported
+/// key-algorithm error, because nothing in this process has registered the
+/// engine that implements GOST yet. The engine is loaded here — through the
+/// same process-global loader every other GOST entry point uses, with the
+/// operator-configured path, so the load stays as explicit and as
+/// path-verified as it is everywhere else — and the container is opened a
+/// second time, now that the algorithm exists.
+///
+/// A failure recognised as a wrong PIN is never retried: a second attempt
+/// would only repeat the key derivation. Neither is anything retried once the
+/// engine is already loaded — then the first failure is the real answer. Every
+/// other failure is treated as possibly the algorithm one: the error stacks
+/// OpenSSL produces for it differ between versions and between the provider
+/// and legacy decode paths, so the decision here rests on what can be retried
+/// safely rather than on matching a message. The cost of that breadth is one
+/// engine-load attempt on a container that is simply broken — on a login that
+/// was going to fail anyway. When the engine cannot be loaded the first error
+/// is what the caller gets, since it describes the container rather than the
+/// host.
+///
+/// On a GOST container the wrong PIN cannot be told apart from the missing
+/// algorithm, and deliberately so: the MAC cannot be computed at all before
+/// the engine exists, so the PIN has not yet entered into it. Both therefore
+/// reach the retry. What bounds that is the second condition below — after the
+/// first attempt the engine is loaded, so every later PIN in the same loop
+/// goes straight to the wrong-PIN answer, and a load that failed is remembered
+/// process-wide and not attempted again. One load attempt per process,
+/// whatever the engineer types.
+///
+/// That the *failure* is remembered too is a deliberate choice with a cost.
+/// `sshd` forks per connection, so it pays nothing; a display manager is one
+/// process for the whole session, so there a broken engine stays broken until
+/// the service restarts, even if an administrator fixes the file in between.
+/// The alternative — retrying the load on every attempt — would `dlopen` a
+/// suspect library and mutate libcrypto's global ENGINE registration table
+/// repeatedly, driven by whoever is standing at the prompt, and it would not
+/// fix anything: an engine that fails to load fails for reasons an
+/// administrator has to correct, not reasons that pass on their own. So the
+/// failure is latched, and instead every attempt that trips over the latched
+/// failure logs it — see the `tessera.gost` warning below — so a stale latch
+/// is visible rather than silent.
+///
+/// The breadth of the retry is also why it needs the operator to have named
+/// the engine — see [`should_retry_with_engine`].
+fn parse_with_gost_retry(
+    p12: &Pkcs12,
+    pin: &SecretString,
+    gost_engine_path: Option<&Path>,
+) -> Result<ParsedPkcs12_2, Pkcs12Error> {
+    // One reading of the engine state for the whole call: the classification
+    // below and the retry decision after it must agree about it, and another
+    // thread loading the engine in between would otherwise make them disagree.
+    let engine_loaded = engine::is_available();
+
+    let first = match p12.parse2(pin.expose_secret()) {
+        Ok(parsed) => return Ok(parsed),
+        Err(e) => classify_parse_error(&e, engine_loaded),
+    };
+
+    if !should_retry_with_engine(&first, gost_engine_path, engine_loaded) {
+        return Err(first);
+    }
+
+    let load = engine::ensure_loaded_with_path(gost_engine_path);
+
+    // The loader talks to libcrypto through raw FFI and leaves whatever it
+    // pushed on this thread's OpenSSL error queue behind — on the failing path
+    // especially, but a load that succeeds can leave entries too. Nothing
+    // reads them, and a queue that outlives the call surfaces them inside an
+    // unrelated error somewhere later. (The `parse2` above needs no such
+    // draining: the binding drained the queue to build the `ErrorStack` it
+    // returned.)
+    let _ = openssl::error::ErrorStack::get();
+
+    if let Err(source) = load {
+        // What the engineer is shown describes the container, because that is
+        // all they can act on — so without this line the most likely field
+        // failure of the whole feature (engine absent, wrong ABI, registers no
+        // Streebog) reads as "the container is corrupt" and leaves no trace of
+        // the engine at all. The path is root-owned configuration, not
+        // anything the carrier supplied, and the rest of the crate logs such
+        // paths plainly.
+        //
+        // Emitted per attempt rather than once per process: the outcome is
+        // cached, and on a display manager — one process for the whole session
+        // — a "first time only" line would scroll away and never return.
+        // Debug-formatted rather than unwrapped: the retry gate only lets a
+        // configured path through, so this is always `Some` — and if that ever
+        // stops being true the log says so instead of inventing a placeholder.
+        tracing::warn!(
+            target: "tessera.gost",
+            error = %source,
+            path = ?gost_engine_path,
+            "gost_engine_load_failed_container_left_unopened"
+        );
+        return Err(first);
+    }
+
+    tracing::debug!(
+        target: "tessera.pkcs12",
+        "pkcs12_reopened_after_gost_engine_load"
+    );
+    // The engine is loaded now, so a MAC failure from here on really is a
+    // wrong PIN — which is what `true` tells the classifier.
+    p12.parse2(pin.expose_secret())
+        .map_err(|e| classify_parse_error(&e, true))
+}
+
+/// Whether opening the container a second time can plausibly succeed.
+///
+/// Three conditions, all required:
+///
+/// * the deployment named the engine's `.so` in `gost_engine_path`;
+/// * the engine is not loaded yet (`engine_loaded` is
+///   [`engine::is_available`]) — once it is, the first failure is the final
+///   answer;
+/// * the first failure was not recognised as a wrong PIN.
+///
+/// The configured path is what makes this safe to reach from an
+/// unauthenticated caller. The recognition of a wrong PIN goes by the text of
+/// an OpenSSL error stack, which differs between OpenSSL versions and between
+/// the provider and legacy decode paths, so a container that anyone can place
+/// on a USB device — malformed, written by another tool, encrypted under an
+/// algorithm this libcrypto does not have — can land on the retry branch at
+/// the first PIN prompt. With a path, the retry loads exactly the file the
+/// operator named. Without one, it would ask libcrypto to find `gost` along
+/// `OPENSSL_ENGINES` and then make whatever it found the default
+/// implementation for RSA, DSA, DH, RAND and every digest: a process-wide
+/// substitution of the crypto this login runs on, chosen by an inherited
+/// environment variable, on a host that never agreed to any engine. Config
+/// validation refuses that same fallback in the same words, and so does the
+/// loader itself — [`engine::ensure_loaded_with_path`] rejects a `None` path
+/// outright, so this condition is a second lock on the same door rather than
+/// the only one.
+///
+/// The condition is the configured path rather than "the allow-list names a
+/// GOST algorithm", because the path is what removes the lookup, and it is
+/// what this function would have to pass to the loader anyway. Nothing is lost
+/// on a real GOST deployment: validation rejects a config that allows GOST
+/// signatures without `gost_engine_path`, so on any host where a GOST
+/// certificate could be accepted at all, the path is set.
+fn should_retry_with_engine(
+    first: &Pkcs12Error,
+    gost_engine_path: Option<&Path>,
+    engine_loaded: bool,
+) -> bool {
+    gost_engine_path.is_some() && !engine_loaded && matches!(first, Pkcs12Error::Corrupt(_))
+}
+
+/// Markers that say libcrypto could not find an algorithm the container asks
+/// for, rather than that the PIN was wrong.
+///
+/// These have to be looked for *before* the wrong-PIN table, because a
+/// container whose MAC uses a digest this process cannot resolve fails inside
+/// `PKCS12_verify_mac`, and OpenSSL may report that as a MAC verify failure
+/// sitting on top of the real cause. Rewriting the MAC's digest OID in an RSA
+/// container to an unassigned one produces, on OpenSSL 3.6:
+///
+/// ```text
+/// digital envelope routines:inner_evp_generic_fetch:unsupported
+/// PKCS12 routines:pkcs12_gen_mac:unknown digest algorithm
+/// PKCS12 routines:PKCS12_verify_mac:mac generation error
+/// PKCS12 routines:PKCS12_parse:mac verify failure
+/// ```
+///
+/// That is one observation, not the general form: the same libcrypto given a
+/// container whose MAC names a digest it knows of but was built without
+/// reports `key gen error` instead of `unknown digest algorithm`, and emits no
+/// `mac verify failure` line at all. Which lines appear varies with the
+/// OpenSSL version, with why the lookup failed, and with whether the provider
+/// or the legacy path was taken — which is why this is a set of markers rather
+/// than a parse of a fixed shape, and why matching any one of them is enough.
+///
+/// Reading only a trailing `mac verify failure` turns "this host has no GOST
+/// implementation" into "the engineer mistyped the PIN": the login is then
+/// re-prompted to exhaustion and the engine is never loaded.
+///
+/// Every entry names a *lookup* that failed. A genuinely wrong PIN, on a host
+/// that has the algorithms, never produces one — the digest and the cipher
+/// both resolve, and only the comparison or the decryption fails. See
+/// [`classify_message`] for why "on a host that has the algorithms" is load
+/// bearing enough to be a condition rather than a comment.
+const ALGORITHM_UNAVAILABLE_MARKERS: &[&str] = &[
+    "unknown digest algorithm",
+    "mac generation error",
+    "inner_evp_generic_fetch:unsupported",
+];
+
 /// Map an OpenSSL `parse2` error stack into [`Pkcs12Error`].
 ///
 /// OpenSSL 0.10 surfaces wrong-PIN failures as `mac verify failure` (modern
 /// OpenSSL 3.x) or `wrong password` / `bad decrypt` (older 1.1.x).  Any other
 /// message is treated as structural corruption — retrying the PIN will not
 /// help and the caller should bail out.
-fn classify_parse_error(e: &openssl::error::ErrorStack) -> Pkcs12Error {
-    let raw = e.to_string();
+fn classify_parse_error(e: &openssl::error::ErrorStack, engine_loaded: bool) -> Pkcs12Error {
+    classify_message(&e.to_string(), engine_loaded)
+}
+
+/// The message half of [`classify_parse_error`], split out so the table of
+/// recognised wrong-PIN spellings can be tested without an OpenSSL error
+/// stack to produce them.
+///
+/// `engine_loaded` decides whether the missing-algorithm markers are consulted
+/// at all. They are a way of asking "does this process have the algorithm the
+/// container names", and once the engine is loaded the answer is yes and the
+/// question is spent. Leaving them in play past that point is not merely
+/// redundant, it is unsafe in the direction that costs an engineer their
+/// login: OpenSSL leaves an `inner_evp_generic_fetch:unsupported` entry on the
+/// error queue even when the fetch it describes then succeeded through the
+/// legacy path, and the queue is drained wholesale into one string. A wrong
+/// PIN on a GOST container could therefore arrive carrying both that marker
+/// and a genuine `mac verify failure`, and be read as a broken container —
+/// ending the login on the first mistyped PIN instead of re-prompting. Once
+/// the engine is loaded a MAC failure means what it says.
+fn classify_message(raw: &str, engine_loaded: bool) -> Pkcs12Error {
     let lc = raw.to_lowercase();
+    if !engine_loaded
+        && ALGORITHM_UNAVAILABLE_MARKERS
+            .iter()
+            .any(|marker| lc.contains(marker))
+    {
+        return Pkcs12Error::Corrupt(raw.to_string());
+    }
     if lc.contains("mac verify")
         || lc.contains("wrong password")
         || lc.contains("bad decrypt")
@@ -129,7 +384,7 @@ fn classify_parse_error(e: &openssl::error::ErrorStack) -> Pkcs12Error {
     {
         Pkcs12Error::WrongPin
     } else {
-        Pkcs12Error::Corrupt(raw)
+        Pkcs12Error::Corrupt(raw.to_string())
     }
 }
 
@@ -260,6 +515,8 @@ pub const DEFAULT_PKCS12_PIN_PROMPT: &str = "Smart-card PIN: ";
 ///
 /// `max_tries == 0` returns `MaxTries` without invoking the prompter.
 ///
+/// `gost_engine_path` is passed through to [`LoadedKeyMaterial::from_p12`].
+///
 /// # Errors
 ///
 /// * [`AcquireError::Conv`] — the PAM conv layer failed (propagated).
@@ -271,6 +528,7 @@ pub fn acquire_p12_material_with_prompter<F>(
     max_tries: u8,
     prompt: Option<&str>,
     mut prompter: F,
+    gost_engine_path: Option<&Path>,
 ) -> Result<LoadedKeyMaterial, AcquireError>
 where
     F: FnMut(&str) -> Result<SecretString, PamConvError>,
@@ -278,7 +536,7 @@ where
     let prompt = prompt.unwrap_or(DEFAULT_PKCS12_PIN_PROMPT);
     for _ in 0..max_tries {
         let pin = prompter(prompt)?;
-        match LoadedKeyMaterial::from_p12(bytes, &pin) {
+        match LoadedKeyMaterial::from_p12(bytes, &pin, gost_engine_path) {
             Ok(m) => return Ok(m),
             Err(Pkcs12Error::WrongPin) => {
                 tracing::debug!(target: "tessera.pkcs12", "pkcs12_pin_invalid");
@@ -349,6 +607,181 @@ mod tests {
 
     fn cn_of(cert: &Certificate) -> String {
         cert.subject_cn().expect("the fixtures carry a CN")
+    }
+
+    /// A path that need not exist: the decision is taken before anything is
+    /// loaded, so only "the operator named a file" matters here.
+    fn engine_path() -> &'static Path {
+        Path::new("/usr/lib/x86_64-linux-gnu/engines-1.1/gost.so")
+    }
+
+    #[test]
+    fn an_unopenable_container_is_retried_when_the_engine_is_configured() {
+        // The GOST case: the container failed on something that is not a PIN,
+        // the engine has not been loaded yet, and the operator said where it
+        // is.
+        assert!(should_retry_with_engine(
+            &Pkcs12Error::Corrupt("unsupported algorithm".into()),
+            Some(engine_path()),
+            false,
+        ));
+    }
+
+    #[test]
+    fn nothing_is_retried_without_a_configured_engine_path() {
+        // Retrying here would load `gost` from wherever OPENSSL_ENGINES points
+        // and make it the default implementation for everything — on a host
+        // whose configuration never mentioned an engine.
+        assert!(!should_retry_with_engine(
+            &Pkcs12Error::Corrupt("unsupported algorithm".into()),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_wrong_pin_is_never_retried() {
+        for loaded in [false, true] {
+            assert!(!should_retry_with_engine(
+                &Pkcs12Error::WrongPin,
+                Some(engine_path()),
+                loaded,
+            ));
+        }
+    }
+
+    #[test]
+    fn nothing_is_retried_once_the_engine_is_loaded() {
+        // The algorithm already exists in this process, so the first failure
+        // is the real answer and a second attempt would only repeat it.
+        assert!(!should_retry_with_engine(
+            &Pkcs12Error::Corrupt("unsupported algorithm".into()),
+            Some(engine_path()),
+            true,
+        ));
+    }
+
+    #[test]
+    fn a_missing_component_is_never_retried() {
+        // The container opened; the engine has nothing to do with what it
+        // turned out not to carry.
+        for first in [Pkcs12Error::MissingKey, Pkcs12Error::MissingCert] {
+            assert!(!should_retry_with_engine(
+                &first,
+                Some(engine_path()),
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn wrong_pin_messages_are_classified_as_a_wrong_pin() {
+        // The spellings OpenSSL 1.1.x and 3.x use for the same event; each
+        // must keep the PIN loop prompting instead of aborting the login.
+        for message in [
+            "error:11800071:PKCS12 routines:PKCS12_parse:mac verify failure",
+            "error:06065064:digital envelope routines:EVP_DecryptFinal_ex:bad decrypt",
+            "wrong password",
+            "invalid MAC",
+        ] {
+            assert!(
+                matches!(classify_message(message, false), Pkcs12Error::WrongPin),
+                "{message} must classify as a wrong PIN",
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_algorithm_outranks_the_mac_verify_line_on_top_of_it() {
+        // The exact stack a container whose MAC names a digest this process
+        // cannot resolve produces — a GOST container before gost-engine is
+        // registered, and the fixture `tests/pin_loop.rs` builds by rewriting
+        // one OID. `mac verify failure` is the last line; reading it alone
+        // sends the login back to the PIN prompt and never loads the engine.
+        let stack = "error:0308010C:digital envelope routines:inner_evp_generic_fetch:\
+                     unsupported:crypto/evp/evp_fetch.c:376:Global default library context, \
+                     Algorithm (2.16.840.1.101.3.4.2.127 : 0), Properties (<null>), \
+                     error:11800076:PKCS12 routines:pkcs12_gen_mac:unknown digest algorithm:\
+                     crypto/pkcs12/p12_mutl.c:227:, \
+                     error:1180006D:PKCS12 routines:PKCS12_verify_mac:mac generation error:\
+                     crypto/pkcs12/p12_mutl.c:348:, \
+                     error:11800071:PKCS12 routines:PKCS12_parse:mac verify failure:\
+                     crypto/pkcs12/p12_kiss.c:71:";
+        assert!(
+            matches!(classify_message(stack, false), Pkcs12Error::Corrupt(_)),
+            "a MAC that could not be computed is not a wrong PIN",
+        );
+    }
+
+    #[test]
+    fn each_missing_algorithm_marker_outranks_a_wrong_pin_line() {
+        // Every marker has to win on its own: OpenSSL versions differ in which
+        // of these lines they emit, and a stack carrying only one of them is
+        // still a missing algorithm rather than a wrong PIN.
+        for marker in ALGORITHM_UNAVAILABLE_MARKERS {
+            let stack = format!("something:{marker}, PKCS12_parse:mac verify failure");
+            assert!(
+                matches!(classify_message(&stack, false), Pkcs12Error::Corrupt(_)),
+                "{marker} must outrank the mac-verify line",
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_wrong_pin_is_still_a_wrong_pin() {
+        // The guard above must not swallow the ordinary case: none of the
+        // markers names anything a correct-algorithm, wrong-password failure
+        // produces, so these keep re-prompting.
+        for message in [
+            "error:11800071:PKCS12 routines:PKCS12_parse:mac verify failure:p12_kiss.c:71:",
+            "error:06065064:digital envelope routines:EVP_DecryptFinal_ex:bad decrypt",
+        ] {
+            assert!(
+                matches!(classify_message(message, false), Pkcs12Error::WrongPin),
+                "{message} must still cost only one attempt, not the whole login",
+            );
+        }
+    }
+
+    #[test]
+    fn once_the_engine_is_loaded_a_mac_failure_is_a_wrong_pin_again() {
+        // The markers answer "does this process have the algorithm". With the
+        // engine loaded the answer is yes, so a MAC failure is what it says it
+        // is. This matters because OpenSSL leaves a fetch-unsupported entry on
+        // the error queue even where the fetch then succeeded through the
+        // legacy path, and the whole queue is drained into one string: a wrong
+        // PIN on a GOST container can arrive carrying both. Classified as
+        // `Corrupt`, it would end the login on the first mistyped PIN.
+        for stack in [
+            "error:0308010C:digital envelope routines:inner_evp_generic_fetch:unsupported, \
+             error:11800071:PKCS12 routines:PKCS12_parse:mac verify failure",
+            "error:1180006D:PKCS12 routines:PKCS12_verify_mac:mac generation error, \
+             error:11800071:PKCS12 routines:PKCS12_parse:mac verify failure",
+        ] {
+            assert!(
+                matches!(classify_message(stack, true), Pkcs12Error::WrongPin),
+                "with the engine loaded this must cost one attempt, not the login: {stack}",
+            );
+            // And the same bytes before the load still say "no algorithm",
+            // which is the case the markers exist for.
+            assert!(
+                matches!(classify_message(stack, false), Pkcs12Error::Corrupt(_)),
+                "without the engine this must not be read as a wrong PIN: {stack}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_message_is_classified_as_corrupt() {
+        // Everything the wrong-PIN table does not name is treated as possibly
+        // the algorithm failure — the branch the engine retry sits behind.
+        assert!(matches!(
+            classify_message(
+                "error:0308010C:digital envelope routines:inner_evp_generic_fetch:unsupported",
+                false,
+            ),
+            Pkcs12Error::Corrupt(_),
+        ));
     }
 
     #[test]
