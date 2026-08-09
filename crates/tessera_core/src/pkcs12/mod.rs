@@ -8,17 +8,34 @@
 //!
 //! Wrong-PIN failures are classified into [`Pkcs12Error::WrongPin`] so the PAM
 //! layer can drive a bounded retry loop without leaking the PIN.
+//!
+//! # GOST containers
+//!
+//! Decoding the private key out of a container is the first step of the login
+//! that needs an algorithm implementation rather than plain ASN.1, and for a
+//! GOST key libcrypto has none of its own: the implementation lives in
+//! `gost-engine`, which has to be registered before the decode. A host that
+//! registers the engine in its system `openssl.cnf` does not help here —
+//! libcrypto only reads that file when it is initialised with config loading,
+//! and the OpenSSL binding this crate uses does not ask for it. So a process
+//! that has not loaded the engine itself sees a GOST container as an
+//! unsupported key algorithm. [`LoadedKeyMaterial::from_p12`] therefore loads
+//! the engine and retries once when a container fails to open — see
+//! [`parse_with_gost_retry`].
 
 pub mod error;
 mod unencrypted;
 
 pub use error::{AcquireError, P12EnvelopeError, Pkcs12Error};
 
-use openssl::pkcs12::Pkcs12;
+use std::path::Path;
+
+use openssl::pkcs12::{ParsedPkcs12_2, Pkcs12};
 use openssl::pkey::{PKey, Private};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
+use crate::gost::engine;
 use crate::pam_conv::PamConvError;
 use crate::x509::Certificate;
 
@@ -54,6 +71,12 @@ impl std::fmt::Debug for LoadedKeyMaterial {
 impl LoadedKeyMaterial {
     /// Decrypt a PKCS#12 bundle with the supplied PIN.
     ///
+    /// `gost_engine_path` is the operator-configured
+    /// [`crate::config::ValidatedConfig::gost_engine_path`], passed through to
+    /// the engine load that a GOST container needs (see the module docs and
+    /// [`parse_with_gost_retry`]). `None` means "let libcrypto find the engine
+    /// by id", the same fallback the rest of the crate uses.
+    ///
     /// # Errors
     ///
     /// Returns [`Pkcs12Error::WrongPin`] when the bundle's MAC fails to verify
@@ -61,11 +84,13 @@ impl LoadedKeyMaterial {
     /// [`Pkcs12Error::MissingCert`] when the bundle is well-formed but lacks a
     /// required component.  Any other DER / OpenSSL failure becomes
     /// [`Pkcs12Error::Corrupt`].
-    pub fn from_p12(bytes: &[u8], pin: &SecretString) -> Result<Self, Pkcs12Error> {
+    pub fn from_p12(
+        bytes: &[u8],
+        pin: &SecretString,
+        gost_engine_path: Option<&Path>,
+    ) -> Result<Self, Pkcs12Error> {
         let p12 = Pkcs12::from_der(bytes).map_err(|e| Pkcs12Error::Corrupt(e.to_string()))?;
-        let parsed = p12
-            .parse2(pin.expose_secret())
-            .map_err(|e| classify_parse_error(&e))?;
+        let parsed = parse_with_gost_retry(&p12, pin, gost_engine_path)?;
 
         let pkey = parsed.pkey.ok_or(Pkcs12Error::MissingKey)?;
         let cert = parsed.cert.ok_or(Pkcs12Error::MissingCert)?;
@@ -103,6 +128,13 @@ impl LoadedKeyMaterial {
 
     /// Materialise the private key as an OpenSSL handle.
     ///
+    /// Reading the stored DER back needs the same algorithm implementation the
+    /// container needed to open in the first place, and for a GOST key that
+    /// implementation only exists once `gost-engine` is registered. No engine
+    /// argument is needed here regardless: a GOST container cannot have been
+    /// opened at all without the engine, and an engine, once loaded, stays
+    /// pinned for the life of the process.
+    ///
     /// # Errors
     ///
     /// Returns [`Pkcs12Error::Corrupt`] if the stored PKCS#8 DER is rejected by
@@ -111,6 +143,57 @@ impl LoadedKeyMaterial {
     pub fn private_key(&self) -> Result<PKey<Private>, Pkcs12Error> {
         PKey::private_key_from_pkcs8(&self.key).map_err(|e| Pkcs12Error::Corrupt(e.to_string()))
     }
+}
+
+/// Open a container, giving `gost-engine` a chance when the first attempt
+/// fails on an algorithm libcrypto alone does not implement.
+///
+/// The happy path is one `PKCS12_parse` call and nothing else: an RSA or ECDSA
+/// container opens on libcrypto's own implementations, and no engine is
+/// touched on hosts that have none installed.
+///
+/// A GOST container instead fails that first call with an unsupported
+/// key-algorithm error, because nothing in this process has registered the
+/// engine that implements GOST yet. The engine is loaded here — through the
+/// same process-global loader every other GOST entry point uses, with the
+/// operator-configured path, so the load stays as explicit and as
+/// path-verified as it is everywhere else — and the container is opened a
+/// second time, now that the algorithm exists.
+///
+/// A wrong PIN is never retried: it fails the container MAC, which says
+/// nothing about algorithms, and a second attempt would only repeat the key
+/// derivation. Neither is anything retried once the engine is already loaded —
+/// then the first failure is the real answer. Every other failure is treated
+/// as possibly the algorithm one: the error stacks OpenSSL produces for it
+/// differ between versions and between the provider and legacy decode paths,
+/// so the decision here rests on what can be retried safely rather than on
+/// matching a message. The cost of that breadth is one engine-load attempt on
+/// a container that is simply broken — on a login that was going to fail
+/// anyway. When the engine cannot be loaded the first error is what the caller
+/// gets, since it describes the container rather than the host.
+fn parse_with_gost_retry(
+    p12: &Pkcs12,
+    pin: &SecretString,
+    gost_engine_path: Option<&Path>,
+) -> Result<ParsedPkcs12_2, Pkcs12Error> {
+    let first = match p12.parse2(pin.expose_secret()) {
+        Ok(parsed) => return Ok(parsed),
+        Err(e) => classify_parse_error(&e),
+    };
+
+    if !matches!(first, Pkcs12Error::Corrupt(_)) || engine::is_available() {
+        return Err(first);
+    }
+    if engine::ensure_loaded_with_path(gost_engine_path).is_err() {
+        return Err(first);
+    }
+
+    tracing::debug!(
+        target: "tessera.pkcs12",
+        "pkcs12_reopened_after_gost_engine_load"
+    );
+    p12.parse2(pin.expose_secret())
+        .map_err(|e| classify_parse_error(&e))
 }
 
 /// Map an OpenSSL `parse2` error stack into [`Pkcs12Error`].
@@ -260,6 +343,8 @@ pub const DEFAULT_PKCS12_PIN_PROMPT: &str = "Smart-card PIN: ";
 ///
 /// `max_tries == 0` returns `MaxTries` without invoking the prompter.
 ///
+/// `gost_engine_path` is passed through to [`LoadedKeyMaterial::from_p12`].
+///
 /// # Errors
 ///
 /// * [`AcquireError::Conv`] — the PAM conv layer failed (propagated).
@@ -271,6 +356,7 @@ pub fn acquire_p12_material_with_prompter<F>(
     max_tries: u8,
     prompt: Option<&str>,
     mut prompter: F,
+    gost_engine_path: Option<&Path>,
 ) -> Result<LoadedKeyMaterial, AcquireError>
 where
     F: FnMut(&str) -> Result<SecretString, PamConvError>,
@@ -278,7 +364,7 @@ where
     let prompt = prompt.unwrap_or(DEFAULT_PKCS12_PIN_PROMPT);
     for _ in 0..max_tries {
         let pin = prompter(prompt)?;
-        match LoadedKeyMaterial::from_p12(bytes, &pin) {
+        match LoadedKeyMaterial::from_p12(bytes, &pin, gost_engine_path) {
             Ok(m) => return Ok(m),
             Err(Pkcs12Error::WrongPin) => {
                 tracing::debug!(target: "tessera.pkcs12", "pkcs12_pin_invalid");

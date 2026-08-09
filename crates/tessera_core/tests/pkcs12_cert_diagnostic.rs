@@ -95,9 +95,12 @@ fn an_encrypted_key_does_not_stop_the_read() {
 
     // The same bytes still need the password for the key: nothing above weakened
     // the authentication path.
-    let material =
-        LoadedKeyMaterial::from_p12(CLEAR_CERTS, &SecretString::from(FIXTURE_PIN.to_owned()))
-            .expect("the fixture opens with its own password");
+    let material = LoadedKeyMaterial::from_p12(
+        CLEAR_CERTS,
+        &SecretString::from(FIXTURE_PIN.to_owned()),
+        None,
+    )
+    .expect("the fixture opens with its own password");
     assert_eq!(material.end_entity.subject_cn().unwrap(), "alice");
 }
 
@@ -150,8 +153,9 @@ fn a_destroyed_key_bag_leaves_the_certificate_readable() {
 
     // And the damage is real: the authentication path no longer opens these
     // bytes even with the right password.
-    let err = LoadedKeyMaterial::from_p12(&bytes, &SecretString::from(FIXTURE_PIN.to_owned()))
-        .expect_err("a shredded key bag must not authenticate");
+    let err =
+        LoadedKeyMaterial::from_p12(&bytes, &SecretString::from(FIXTURE_PIN.to_owned()), None)
+            .expect_err("a shredded key bag must not authenticate");
     assert!(
         matches!(err, Pkcs12Error::WrongPin | Pkcs12Error::Corrupt(_)),
         "got {err:?}"
@@ -177,9 +181,12 @@ fn the_non_ca_is_chosen_over_a_ca_that_precedes_it() {
     // intermediate. The two answers differ here by construction, and nothing
     // claims otherwise; the conservative rule is what keeps the diagnostic quiet
     // whenever the choice is open, which is what the tests below pin down.
-    let material =
-        LoadedKeyMaterial::from_p12(CA_BEFORE_LEAF, &SecretString::from(FIXTURE_PIN.to_owned()))
-            .expect("the fixture opens with its own password");
+    let material = LoadedKeyMaterial::from_p12(
+        CA_BEFORE_LEAF,
+        &SecretString::from(FIXTURE_PIN.to_owned()),
+        None,
+    )
+    .expect("the fixture opens with its own password");
     assert_eq!(
         material.end_entity.subject_cn().unwrap(),
         "CertAuth Test Intermediate"

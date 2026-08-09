@@ -17,7 +17,7 @@ fn succeeds_on_first_try() {
         calls.set(calls.get() + 1);
         Ok(SecretString::from("correct-pin".to_string()))
     };
-    let m = acquire_p12_material_with_prompter(RSA, 3, None, prompter).unwrap();
+    let m = acquire_p12_material_with_prompter(RSA, 3, None, prompter, None).unwrap();
     assert_eq!(calls.get(), 1);
     assert_eq!(m.end_entity.subject_cn().unwrap(), "alice");
 }
@@ -34,7 +34,7 @@ fn succeeds_on_third_try() {
         };
         Ok(SecretString::from(pin.to_string()))
     };
-    let m = acquire_p12_material_with_prompter(RSA, 3, None, prompter).unwrap();
+    let m = acquire_p12_material_with_prompter(RSA, 3, None, prompter, None).unwrap();
     assert_eq!(calls.get(), 3);
     assert_eq!(m.end_entity.subject_cn().unwrap(), "alice");
 }
@@ -46,7 +46,7 @@ fn fails_after_three_wrong_pins() {
         calls.set(calls.get() + 1);
         Ok(SecretString::from("nope".to_string()))
     };
-    let err = acquire_p12_material_with_prompter(RSA, 3, None, prompter).unwrap_err();
+    let err = acquire_p12_material_with_prompter(RSA, 3, None, prompter, None).unwrap_err();
     assert!(matches!(err, AcquireError::MaxTries), "got {err:?}");
     assert_eq!(calls.get(), 3);
 }
@@ -58,7 +58,7 @@ fn conv_error_short_circuits() {
         calls.set(calls.get() + 1);
         Err(PamConvError::ConvFailed)
     };
-    let err = acquire_p12_material_with_prompter(RSA, 3, None, prompter).unwrap_err();
+    let err = acquire_p12_material_with_prompter(RSA, 3, None, prompter, None).unwrap_err();
     assert!(
         matches!(err, AcquireError::Conv(PamConvError::ConvFailed)),
         "got {err:?}"
@@ -73,7 +73,8 @@ fn corrupt_bundle_short_circuits() {
         calls.set(calls.get() + 1);
         Ok(SecretString::from("correct-pin".to_string()))
     };
-    let err = acquire_p12_material_with_prompter(b"not-a-p12", 3, None, prompter).unwrap_err();
+    let err =
+        acquire_p12_material_with_prompter(b"not-a-p12", 3, None, prompter, None).unwrap_err();
     assert!(matches!(err, AcquireError::Corrupt(_)), "got {err:?}");
     assert_eq!(calls.get(), 1, "should bail on first corrupt-bundle error");
 }
@@ -85,7 +86,7 @@ fn default_prompt_used_when_none_configured() {
         seen.borrow_mut().push(p.to_string());
         Ok(SecretString::from("correct-pin".to_string()))
     };
-    acquire_p12_material_with_prompter(RSA, 3, None, prompter).unwrap();
+    acquire_p12_material_with_prompter(RSA, 3, None, prompter, None).unwrap();
     assert_eq!(
         seen.borrow().as_slice(),
         [tessera_core::pkcs12::DEFAULT_PKCS12_PIN_PROMPT]
@@ -99,8 +100,8 @@ fn custom_prompt_reaches_prompter_on_every_attempt() {
         seen.borrow_mut().push(p.to_string());
         Ok(SecretString::from("nope".to_string()))
     };
-    let err =
-        acquire_p12_material_with_prompter(RSA, 2, Some("Введите ПИН: "), prompter).unwrap_err();
+    let err = acquire_p12_material_with_prompter(RSA, 2, Some("Введите ПИН: "), prompter, None)
+        .unwrap_err();
     assert!(matches!(err, AcquireError::MaxTries), "got {err:?}");
     assert_eq!(seen.borrow().as_slice(), ["Введите ПИН: ", "Введите ПИН: "]);
 }
@@ -112,7 +113,7 @@ fn zero_max_tries_is_max_tries_immediately() {
         calls.set(calls.get() + 1);
         Ok(SecretString::from("correct-pin".to_string()))
     };
-    let err = acquire_p12_material_with_prompter(RSA, 0, None, prompter).unwrap_err();
+    let err = acquire_p12_material_with_prompter(RSA, 0, None, prompter, None).unwrap_err();
     assert!(matches!(err, AcquireError::MaxTries), "got {err:?}");
     assert_eq!(calls.get(), 0);
 }
