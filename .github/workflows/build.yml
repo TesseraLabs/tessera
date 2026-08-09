@@ -228,6 +228,59 @@ jobs:
       - name: Show deb contents
         run: dpkg -c ../tessera_*.deb
 
+      - name: Verify trusted plugin keys landed in the built .deb
+        # Гейт «Verify trusted plugin keys are configured» выше проверяет
+        # ПЕРЕМЕННУЮ, а не результат: он остаётся зелёным, даже если
+        # переменная до `cargo build` не доехала (обёртка компилятора,
+        # переиспользованный объектный кэш, урезанное окружение). Без ключей
+        # закрытый плагин отвергается всегда, продукт молча уходит на
+        # StubBackend — то есть отказ тихий. Поэтому проверяем артефакт.
+        #
+        # Шаг стоит здесь, а не в job `release`: так он охраняет КАЖДУЮ
+        # сборку (включая PR), падает там же, где собран пакет, и
+        # непроверенный .deb не попадает даже в actions-артефакты, которые
+        # разработчики ставят на стенды. В `release` тот же шаг сработал бы
+        # только на теге — когда пакет уже собран и роздан.
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(../tessera_*.deb)
+          if [ ${#debs[@]} -ne 1 ]; then
+              echo "::error::expected exactly one ../tessera_*.deb, found ${#debs[@]}"
+              exit 1
+          fi
+          deb="${debs[0]}"
+          root="$(mktemp -d)"
+          dpkg-deb -x "$deb" "$root"
+
+          # Ищем ключ ПОДСТРОКОЙ в самом файле, а не строкой в выводе
+          # `strings`: rustc укладывает строковые литералы в .rodata подряд,
+          # без разделителей, поэтому ключ склеивается с соседними литералами
+          # и `strings | grep -x '[0-9a-f]{64}'` даёт ложный отрицательный
+          # результат на пакете, где ключ на самом деле есть.
+          IFS=',' read -ra keys <<< "$TESSERA_PLUGIN_PUBKEYS"
+          status=0
+          for binary in usr/bin/tessera lib/security/pam_tessera.so; do
+              if [ ! -f "$root/$binary" ]; then
+                  echo "::error::$deb does not contain $binary"
+                  status=1
+                  continue
+              fi
+              for key in "${keys[@]}"; do
+                  key="${key//[[:space:]]/}"
+                  [ -n "$key" ] || continue
+                  if grep -aqF -- "$key" "$root/$binary"; then
+                      echo "ok: $binary embeds ${key:0:16}…"
+                  else
+                      echo "::error::$binary does NOT embed trusted plugin key ${key:0:16}… — TESSERA_PLUGIN_PUBKEYS was set for the job but never reached rustc. The plugin signature check would reject every plugin and the product would silently fall back to StubBackend."
+                      status=1
+                  fi
+              done
+          done
+          rm -rf "$root"
+          exit $status
+
       - name: Stage artifacts inside workspace
         run: |
           set -euxo pipefail

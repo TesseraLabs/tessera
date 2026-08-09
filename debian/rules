@@ -34,8 +34,19 @@ override_dh_auto_clean:
 override_dh_auto_build:
 	# xtask is the e2e harness runner, not part of the product: it ships in no
 	# package and must not cost anything when building the .deb.
+	#
+	# DEB_CARGO_EXTRA_OPTIONS carries optional cargo flags (e.g. --features
+	# astra-mac) from the caller of dpkg-buildpackage. It arrives through the
+	# environment, so make exposes it here; unset means empty.
+	#
+	# Anything that changes what gets compiled into the binaries must be
+	# threaded through to these cargo invocations. Compile-time inputs read via
+	# option_env!/env! (TESSERA_PLUGIN_PUBKEYS) need no plumbing: make passes
+	# the inherited environment to recipe commands unchanged.
 	cargo build --release --workspace --exclude xtask --locked --offline \
-		|| cargo build --release --workspace --exclude xtask --locked
+		$(DEB_CARGO_EXTRA_OPTIONS) \
+		|| cargo build --release --workspace --exclude xtask --locked \
+			$(DEB_CARGO_EXTRA_OPTIONS)
 
 override_dh_auto_install:
 	# Place the cdylib at the canonical PAM module path with the expected

@@ -116,10 +116,18 @@ echo "info: cargo: $(cargo --version)"
 echo "info: rustc: $(rustc --version)"
 
 # --- Build -------------------------------------------------------------------
-# Optional extra cargo flags (e.g. --features astra-mac) propagated to the
-# in-tree cargo invocation here AND through dpkg-buildpackage to the
-# debian/rules override_dh_auto_build via DEB_CARGO_EXTRA_OPTIONS. The env
-# var is preserved so dpkg-buildpackage's restricted child env still sees it.
+# Optional extra cargo flags (e.g. --features astra-mac) reaching cargo through
+# dpkg-buildpackage → debian/rules → override_dh_auto_build.
+#
+# dpkg-buildpackage does NOT strip the environment unless it is invoked with
+# --sanitize-env (we do not pass it), and make hands the inherited environment
+# to recipe commands as-is. So the export below matters only for the case where
+# the caller set DEB_CARGO_EXTRA_OPTIONS as a plain shell variable; the same
+# holds for every other compile-time input (TESSERA_PLUGIN_PUBKEYS et al.),
+# which therefore needs no plumbing of its own here.
+#
+# Reaching cargo is not the same as landing in the binary: the workflow re-reads
+# the finished .deb and fails if the trusted plugin keys are not inside it.
 DEB_CARGO_EXTRA_OPTIONS="${DEB_CARGO_EXTRA_OPTIONS:-}"
 export DEB_CARGO_EXTRA_OPTIONS
 if [[ -n "$DEB_CARGO_EXTRA_OPTIONS" ]]; then
