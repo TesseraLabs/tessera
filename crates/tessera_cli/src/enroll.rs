@@ -165,11 +165,15 @@ fn resolve_host_id_prefix8(config: &Path) -> String {
 /// nicety, never a gate.
 ///
 /// The serial goes into the report and into the `device_enrolled` audit event,
-/// so it must be the certificate the device will actually authenticate with.
-/// That is why the read pairs the container's key with its certificate by
-/// `localKeyId` — the same choice the authentication path makes — rather than
-/// using the login screen's rule, which names a certificate to a human and may
-/// legitimately differ. Here it is written down as what happened.
+/// so it must be the certificate the device will actually authenticate with —
+/// and it is read here, ahead of the manifest signature check and with no
+/// signature at all in standalone mode, so the container has authenticated
+/// nothing when it is read. The authentication path's own choice cannot be
+/// reproduced without the password (`PKCS12_parse` matches the decrypted key
+/// against each certificate's public key), so the read used here is the
+/// conservative one: it names a certificate only where two independent rules
+/// agree on it and the container hides nothing, and stays silent everywhere
+/// else. An empty serial is a normal outcome; a wrong one would not be.
 fn read_p12_serial(pkg: &EnrollmentPackage, import_root: &Path) -> String {
     // `EnrollmentPackage::p12_file()` is a bare name validated by the core's
     // parser; join it under the package root we were given.
@@ -177,7 +181,7 @@ fn read_p12_serial(pkg: &EnrollmentPackage, import_root: &Path) -> String {
     let Ok(bytes) = std::fs::read(&p12_path) else {
         return String::new();
     };
-    match pkcs12::try_extract_key_paired_cert_without_pin(&bytes) {
+    match pkcs12::try_extract_unambiguous_cert_without_pin(&bytes) {
         Some(cert) => cert.serial_hex(),
         None => String::new(),
     }

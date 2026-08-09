@@ -193,58 +193,101 @@ pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
     select_end_entity(&unencrypted::certificates_in_clear(bytes))
 }
 
-/// The certificate the container's key is paired with.
+/// The certificate a container names beyond doubt, or nothing.
 ///
 /// For the caller that does not display a certificate but *records* it — the
 /// enrollment report and its `device_enrolled` audit event. There the name has
-/// to be the certificate the device will actually authenticate with, and
-/// [`try_extract_cert_without_pin`] cannot promise that: it picks the single
-/// non-CA certificate, which on a container carrying a CA where the leaf was
-/// expected is a different certificate from the one the authentication path
-/// uses. An audit record naming a certificate the device never authenticates
-/// with is worse than one naming none.
+/// to be the certificate the device will actually authenticate with, and the
+/// record is written before anything has authenticated: `read_p12_serial` runs
+/// ahead of the manifest signature check, and in standalone mode there is no
+/// signature at all. So the container is hostile input, and the rule below is
+/// built to be silent wherever it cannot prove that what it sees is what the
+/// authentication path will get.
 ///
-/// So this reproduces the authentication path's own choice instead of
-/// approximating it: `PKCS12_parse` pairs the key with the certificate whose
-/// bag carries the same `localKeyId`, and so does this. The pairing is
-/// available without the password — the key bag lies in an unencrypted
-/// `id-data` safe and only its *attributes* are read, never its value. No
-/// password is consulted and no key material is interpreted; the `unencrypted`
-/// module states exactly what the walk touches.
+/// It cannot reproduce that path. `PKCS12_parse` decrypts the private key and
+/// then returns the first recovered certificate whose *public key* matches it
+/// (`X509_check_private_key`); `localKeyId` it merely copies onto the resulting
+/// certificate as metadata. Matching public keys needs the key in the clear,
+/// which needs the password — which this path must not touch. `localKeyId` is
+/// no substitute: it is a free-form label written by whoever assembled the
+/// container, so on a hostile container it is chosen by the attacker.
 ///
-/// `None` when the container has no key bag in the clear, when the key bag
-/// carries no `localKeyId`, when no certificate bag repeats it, or when more
-/// than one does. `None` as well when the paired certificate is a CA: an audit
-/// event must not name a certificate authority as the device's credential, and
-/// a container that pairs its key with one is not an issuance of ours.
+/// What is done instead is to demand that two independent rules agree, on a
+/// container with nothing hidden in it. A certificate is named only when all of
+/// this holds:
+///
+/// 1. the container has no section this walk could not see into — no
+///    `id-encryptedData`, nothing that failed to decode, no nesting past the
+///    depth limit. Otherwise there may be candidates it never saw, and no
+///    "exactly one" can be concluded;
+/// 2. exactly one key bag lies in the clear, counting bags nested in a
+///    `safeContentsBag`;
+/// 3. its `localKeyId` is present, is a single non-empty `OCTET STRING` as
+///    PKCS#9 requires, and no bag anywhere in the container carried a
+///    `localKeyId` of another shape (OpenSSL refuses such a container outright);
+/// 4. exactly one certificate bag repeats that label;
+/// 5. that same certificate is the single non-CA among every certificate
+///    visible in the clear — that is, the rule [`try_extract_cert_without_pin`]
+///    applies independently arrives at the same bag;
+/// 6. and its `basicConstraints` are present and say `cA = FALSE`. The login
+///    screen's convention that an absent extension means `cA = FALSE` is right
+///    for naming a certificate to a human and too generous for a record: old
+///    roots are routinely issued without the extension.
+///
+/// Anything else yields `None`, and the report and the audit event carry no
+/// serial. On a container of our own issuance — leaf plus chain in the clear,
+/// the key labelled with the leaf, no `id-encryptedData` — both rules name the
+/// leaf, so the serial is recorded as before.
+///
+/// # What this still cannot promise
+///
+/// If the container's private key does not belong to the single visible non-CA
+/// certificate, this names that certificate and the authentication path finds no
+/// match at all. Checking that would mean comparing public keys, and the public
+/// key of a `pkcs8ShroudedKeyBag` cannot be read without decrypting it. The
+/// enrollment such a container produces fails at the first login rather than
+/// authenticating as somebody else, and no other reading of the container is
+/// available without its password.
 ///
 /// The certificates this can see are those in the clear; one kept in an
 /// encrypted safe stays invisible to it, as it does to every part of this
-/// module. The certificate is not validated against any trust anchor.
+/// module — and, per point 1, silences the answer entirely. The certificate is
+/// not validated against any trust anchor.
 #[must_use]
-pub fn try_extract_key_paired_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
+pub fn try_extract_unambiguous_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
     let bags = unencrypted::bags_in_clear(bytes);
-    let token = bags.key_local_key_id?;
+    if bags.hidden_content || bags.malformed_pairing {
+        return None;
+    }
+    let label = bags.key_local_key_id?;
 
-    let mut paired = None;
-    for candidate in &bags.certificates {
-        if candidate.local_key_id.as_deref() != Some(token.as_slice()) {
+    let mut labelled = None;
+    for (index, candidate) in bags.certificates.iter().enumerate() {
+        if candidate.local_key_id.as_deref() != Some(label.as_slice()) {
             continue;
         }
-        if paired.is_some() {
+        if labelled.is_some() {
             // Two bags claiming the same key: which of them the authentication
             // path would settle on is not something to guess at in a record.
             return None;
         }
-        paired = Some(candidate);
+        labelled = Some(index);
+    }
+    let labelled = labelled?;
+
+    // The second rule, arrived at without the label. Disagreement between the
+    // two is the whole reason this is checked: the label is written by whoever
+    // assembled the container, and on its own it proves nothing about which
+    // certificate the key belongs to.
+    if sole_non_ca(bags.certificates.iter().map(|cert| cert.der.as_slice())) != Some(labelled) {
+        return None;
     }
 
-    let cert = Certificate::from_der(&paired?.der).ok()?;
-    // A certificate whose `basicConstraints` do not decode is refused for the
-    // same reason a CA is: the record would be asserting something about a
-    // certificate this Engine could not read.
-    let bc = cert.basic_constraints().ok()?;
-    if bc.is_some_and(|bc| bc.is_ca) {
+    let cert = Certificate::from_der(&bags.certificates.get(labelled)?.der).ok()?;
+    // Present and `cA = FALSE`, not merely "not asserting cA = TRUE": a record
+    // asserting a certificate is an end-entity must not rest on an extension
+    // that is not there.
+    if cert.basic_constraints().ok()?.is_none_or(|bc| bc.is_ca) {
         return None;
     }
     Some(cert)
@@ -261,21 +304,32 @@ pub fn try_extract_key_paired_cert_without_pin(bytes: &[u8]) -> Option<Certifica
 /// generic message.
 ///
 /// This rule is *not* the one [`LoadedKeyMaterial::from_p12`] applies. OpenSSL
-/// picks the certificate whose `localKeyID` matches the container's key, which
-/// on a container carrying two non-CA certificates — a foreign drive, a
-/// mis-issued bundle, two issuances concatenated — can be a different one.
-/// Matching that would mean reading the key bag's attributes, and the whole
-/// point of this path is not to touch the key bag at all. Naming a certificate
-/// only when the choice is unambiguous keeps the diagnostic from confidently
-/// pointing an engineer at the wrong device, which is the very mistake it
-/// exists to prevent.
+/// decrypts the container's key and returns the first recovered certificate
+/// whose public key matches it, which on a container carrying two non-CA
+/// certificates — a foreign drive, a mis-issued bundle, two issuances
+/// concatenated — can be a different one. Reproducing that would mean reading
+/// the key, and no password is available here. Naming a certificate only when
+/// the choice is unambiguous keeps the diagnostic from confidently pointing an
+/// engineer at the wrong device, which is the very mistake it exists to prevent.
 ///
 /// Certificates that do not parse, and those whose `basicConstraints` do not
 /// decode, are passed over: a container may carry a bag this Engine cannot
 /// read, and that is no reason to lose the diagnostic carried by the others.
 fn select_end_entity(ders: &[Vec<u8>]) -> Option<Certificate> {
-    let mut candidate = None;
-    for der in ders {
+    let index = sole_non_ca(ders.iter().map(Vec::as_slice))?;
+    Certificate::from_der(ders.get(index)?).ok()
+}
+
+/// The position of the one non-CA certificate among those given, if there is
+/// exactly one.
+///
+/// Split out from [`select_end_entity`] so that
+/// [`try_extract_unambiguous_cert_without_pin`] can ask the same question and
+/// compare the *bag* it lands on, rather than compare two parsed certificates
+/// and have to decide what makes them the same one.
+fn sole_non_ca<'a>(ders: impl IntoIterator<Item = &'a [u8]>) -> Option<usize> {
+    let mut found = None;
+    for (index, der) in ders.into_iter().enumerate() {
         let Ok(cert) = Certificate::from_der(der) else {
             continue;
         };
@@ -285,12 +339,12 @@ fn select_end_entity(ders: &[Vec<u8>]) -> Option<Certificate> {
         if bc.is_some_and(|bc| bc.is_ca) {
             continue;
         }
-        if candidate.is_some() {
+        if found.is_some() {
             return None;
         }
-        candidate = Some(cert);
+        found = Some(index);
     }
-    candidate
+    found
 }
 
 /// PIN prompt used when the operator did not configure

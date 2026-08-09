@@ -15,15 +15,27 @@
 //! What the ASN.1 decoder does with a key bag, precisely: decoding a safe
 //! decodes *all* of its bags, so a shrouded key bag's value is copied as an
 //! opaque TLV and its bag attributes (`friendlyName`, `localKeyID`) are decoded
-//! with it. The walk reads the attributes — `localKeyID` is the token that pairs
-//! a key with its certificate, and reading it is what lets a caller name the
-//! certificate the device will actually authenticate with. The bag's *value*,
-//! the password-encrypted key blob, is never looked into: this path holds no
-//! password, and the copy the decoder made of it is dropped with the rest.
+//! with it. The walk reads the attributes — `localKeyID` is a label RFC 7292
+//! writers put on a key bag and on the certificate bag beside it. It is *not*
+//! how OpenSSL pairs the two: `PKCS12_parse` decrypts the key and then takes the
+//! first recovered certificate whose public key matches it
+//! (`X509_check_private_key`), keeping `localKeyID` only as metadata on the
+//! resulting certificate. Reproducing that here is impossible without the
+//! password, so what the label buys a caller is a second, independent opinion —
+//! never a proof. The bag's *value*, the password-encrypted key blob, is never
+//! looked into: this path holds no password, and the copy the decoder made of it
+//! is dropped with the rest.
 //!
 //! Nothing here decides anything. A malformed container, an unreadable safe or a
 //! bag that does not decode all yield "no certificate": this is a diagnostic
 //! path and its failure mode is silence, not an error the caller has to handle.
+//!
+//! The walk also records *what it could not see*: a safe of another content
+//! type, a section or a nested bag list that does not decode, nesting past the
+//! depth limit, a `localKeyId` attribute encoded in a way PKCS#9 does not allow.
+//! Any of those means the visible bags are not the whole container, and a caller
+//! that has to be right about the container — rather than merely helpful about
+//! it — reads those flags and says nothing.
 //!
 //! What the limits below do, and what they do not: the decoder is handed a
 //! whole section at a time, so every safe of the container and every bag of a
@@ -69,14 +81,26 @@ const MAX_CERTIFICATES: usize = 16;
 /// same as to an ambiguous one: nothing.
 const MAX_CERTIFICATE_BYTES: usize = 256 * 1024;
 
-/// A certificate read in the clear, together with the pairing token its bag
+/// Levels of `safeContentsBag` nesting the walk descends through.
+///
+/// RFC 7292 lets a bag list hold a bag list, and OpenSSL follows that with no
+/// stated bound. Here the bytes arrive on a device nobody has authenticated, so
+/// the descent is bounded outright; an issued container nests not at all, and
+/// two levels of slack cover a writer that wraps its bags for its own reasons.
+/// Deeper than this is not read — and, more to the point, is recorded as
+/// unread, so a caller that needs to have seen the whole container says nothing
+/// about it.
+const MAX_BAG_DEPTH: usize = 4;
+
+/// A certificate read in the clear, together with the pairing label its bag
 /// carried.
 pub(super) struct ClearCertificate {
     /// The certificate itself, DER.
     pub der: Vec<u8>,
-    /// The bag's `localKeyId` attribute value as it was encoded, or `None` when
-    /// the bag carried none. The token is opaque — nothing derives or verifies
-    /// it, it is only compared with the key bag's.
+    /// The contents of the bag's `localKeyId` attribute, or `None` when the bag
+    /// carried none (or carried one this Engine will not read — which also
+    /// raises [`ClearBags::malformed_pairing`]). The label is opaque: nothing
+    /// derives or verifies it, it is only compared with the key bag's.
     pub local_key_id: Option<Vec<u8>>,
 }
 
@@ -94,9 +118,25 @@ pub(super) struct ClearBags {
     /// lies in the clear and carries one.
     ///
     /// Two key bags leave no single "the container's key" to pair against, so
-    /// the token is dropped and the caller is left without a pairing rather
+    /// the label is dropped and the caller is left without a pairing rather
     /// than with one of two.
     pub key_local_key_id: Option<Vec<u8>>,
+    /// Whether the container holds something this walk could not see into: a
+    /// safe of another content type (`id-encryptedData` above all), a section or
+    /// a nested bag list that does not decode, or nesting past
+    /// [`MAX_BAG_DEPTH`].
+    ///
+    /// When this is set, the certificates above are a subset of the container's
+    /// of unknown size, and no property of the form "exactly one such
+    /// certificate" can be concluded from them.
+    pub hidden_content: bool,
+    /// Whether some bag carried a `localKeyId` attribute encoded otherwise than
+    /// PKCS#9 allows — not a single `OCTET STRING`, or an empty one.
+    ///
+    /// OpenSSL fails the whole container on such an attribute, so a caller that
+    /// wants its answer to be the authentication path's cannot treat the bag as
+    /// merely unlabelled.
+    pub malformed_pairing: bool,
 }
 
 /// Walks the container's unencrypted safes.
@@ -119,15 +159,14 @@ pub(super) fn bags_in_clear(bytes: &[u8]) -> ClearBags {
         return ClearBags::default();
     }
 
-    let mut out = ClearBags::default();
-    let mut collected_bytes = 0usize;
-    let mut key_bags = 0usize;
+    let mut walk = Walk::default();
     for safe in &safes {
         // An `id-encryptedData` safe is stepped over: opening it needs the
         // password. A container that hides its certificates that way simply has
         // none to show here, and `data_payload` turns it away on its declared
-        // content type.
+        // content type — but the fact that it was stepped over is written down.
         let Some(payload) = data_payload(safe) else {
+            walk.found.hidden_content = true;
             continue;
         };
         // A safe decodes whole or not at all, so one unreadable bag costs the
@@ -136,16 +175,59 @@ pub(super) fn bags_in_clear(bytes: &[u8]) -> ClearBags {
         // reach here yet holding a bag this decoder rejects is not the case the
         // diagnostic is for.
         let Ok(bags) = Vec::<SafeBag>::from_der(&payload) else {
+            walk.found.hidden_content = true;
             continue;
         };
-        for bag in &bags {
+        walk.visit(&bags, 1);
+    }
+
+    if walk.past_a_limit {
+        // Nothing, rather than what was gathered so far: a caller names a
+        // certificate only when the container leaves no doubt which one it is,
+        // and a truncated list could have lost the very certificate that made
+        // the choice ambiguous.
+        return ClearBags::default();
+    }
+    if walk.key_bags != 1 {
+        walk.found.key_local_key_id = None;
+    }
+    walk.found
+}
+
+/// One walk in progress over a container's bags.
+#[derive(Default)]
+struct Walk {
+    /// What has been read so far.
+    found: ClearBags,
+    /// Certificate bytes collected so far, against [`MAX_CERTIFICATE_BYTES`].
+    collected_bytes: usize,
+    /// Key bags met so far, at any nesting depth.
+    key_bags: usize,
+    /// Whether a count or a byte cap was passed, which discards the whole walk.
+    past_a_limit: bool,
+}
+
+impl Walk {
+    /// Reads one bag list, descending into the `safeContentsBag`s among them.
+    ///
+    /// `depth` counts the bag lists already entered, the container's own safe
+    /// being the first.
+    fn visit(&mut self, bags: &[SafeBag], depth: usize) {
+        for bag in bags {
+            if self.past_a_limit {
+                return;
+            }
+            if bag.bag_id == pkcs12::PKCS_12_SAFE_CONTENTS_BAG_OID {
+                self.visit_nested(bag, depth);
+                continue;
+            }
             if is_key_bag(bag.bag_id) {
                 // Only the bag's attributes are read. Its value — the
                 // password-encrypted key — is left where it is; nothing here
                 // holds a password, and nothing here would know what to do with
                 // the plaintext if it did.
-                key_bags = key_bags.saturating_add(1);
-                out.key_local_key_id = local_key_id(bag);
+                self.key_bags = self.key_bags.saturating_add(1);
+                self.found.key_local_key_id = self.pairing(bag);
                 continue;
             }
             if bag.bag_id != pkcs12::PKCS_12_CERT_BAG_OID {
@@ -158,26 +240,53 @@ pub(super) fn bags_in_clear(bytes: &[u8]) -> ClearBags {
                 continue;
             };
             let der = cert.cert_value.as_bytes();
-            collected_bytes = collected_bytes.saturating_add(der.len());
-            if out.certificates.len() >= MAX_CERTIFICATES || collected_bytes > MAX_CERTIFICATE_BYTES
+            self.collected_bytes = self.collected_bytes.saturating_add(der.len());
+            if self.found.certificates.len() >= MAX_CERTIFICATES
+                || self.collected_bytes > MAX_CERTIFICATE_BYTES
             {
-                // Nothing, rather than what was gathered so far: the caller
-                // names a certificate only when the container leaves no doubt
-                // which one it is, and a truncated list could remove the very
-                // certificate that made the choice ambiguous.
-                return ClearBags::default();
+                self.past_a_limit = true;
+                return;
             }
-            out.certificates.push(ClearCertificate {
+            let local_key_id = self.pairing(bag);
+            self.found.certificates.push(ClearCertificate {
                 der: der.to_vec(),
-                local_key_id: local_key_id(bag),
+                local_key_id,
             });
         }
     }
 
-    if key_bags != 1 {
-        out.key_local_key_id = None;
+    /// Descends into a `safeContentsBag`, or records that it was left unread.
+    ///
+    /// A bag list this walk does not enter is a place a key bag or a certificate
+    /// can hide, so refusing to descend and failing to descend are the same
+    /// outcome here: the container has content the walk has not seen.
+    fn visit_nested(&mut self, bag: &SafeBag, depth: usize) {
+        if depth >= MAX_BAG_DEPTH {
+            self.found.hidden_content = true;
+            return;
+        }
+        let Some(content) = bag_content(bag) else {
+            self.found.hidden_content = true;
+            return;
+        };
+        let Ok(inner) = Vec::<SafeBag>::from_der(&content) else {
+            self.found.hidden_content = true;
+            return;
+        };
+        self.visit(&inner, depth.saturating_add(1));
     }
-    out
+
+    /// The bag's pairing label, noting a malformed attribute on the walk.
+    fn pairing(&mut self, bag: &SafeBag) -> Option<Vec<u8>> {
+        match local_key_id(bag) {
+            Pairing::Absent => None,
+            Pairing::Label(bytes) => Some(bytes),
+            Pairing::Malformed => {
+                self.found.malformed_pairing = true;
+                None
+            }
+        }
+    }
 }
 
 /// Every certificate reachable without the container's password, in container
@@ -201,19 +310,45 @@ fn is_key_bag(bag_id: ObjectIdentifier) -> bool {
     bag_id == pkcs12::PKCS_12_PKCS8_KEY_BAG_OID || bag_id == pkcs12::PKCS_12_KEY_BAG_OID
 }
 
-/// The bag's `localKeyId` attribute value, encoded, or `None` when the bag
-/// carries no such attribute.
+/// What a bag says about the key it belongs to.
+enum Pairing {
+    /// The bag carries no `localKeyId` attribute.
+    Absent,
+    /// The bag carries one, encoded as PKCS#9 requires. The bytes inside are
+    /// opaque — RFC 7292 asks only that the paired bags carry the *same* ones.
+    Label(Vec<u8>),
+    /// The bag carries a `localKeyId` this Engine will not read: not a single
+    /// value, not an `OCTET STRING`, or an empty one.
+    Malformed,
+}
+
+/// What the bag's `localKeyId` attribute says.
 ///
-/// The value is handed back as its DER rather than as a parsed token: it is
-/// opaque by definition — RFC 7292 requires only that the paired bags carry the
-/// *same* value — so comparing the encodings is exactly the question that has
-/// to be answered, and no shape has to be assumed of what is inside.
-fn local_key_id(bag: &SafeBag) -> Option<Vec<u8>> {
-    bag.bag_attributes
-        .as_ref()?
+/// The shape is checked rather than compared as raw DER, for two reasons. PKCS#9
+/// defines the attribute as an `OCTET STRING` and OpenSSL enforces exactly that
+/// — it refuses the whole container otherwise — so a value of another type is a
+/// container the authentication path will never open, not a label to match on.
+/// And an attribute with *no* value encodes identically on a key bag and on a
+/// certificate bag (`31 00`), so comparing encodings would make two bags that
+/// say nothing about each other look paired.
+fn local_key_id(bag: &SafeBag) -> Pairing {
+    let Some(attributes) = bag.bag_attributes.as_ref() else {
+        return Pairing::Absent;
+    };
+    let Some(attribute) = attributes
         .iter()
         .find(|attribute| attribute.oid == OID_LOCAL_KEY_ID)
-        .and_then(|attribute| attribute.values.to_der().ok())
+    else {
+        return Pairing::Absent;
+    };
+    let mut values = attribute.values.iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return Pairing::Malformed;
+    };
+    if der::Tagged::tag(value) != der::Tag::OctetString || value.value().is_empty() {
+        return Pairing::Malformed;
+    }
+    Pairing::Label(value.value().to_vec())
 }
 
 /// The bag's value with the mandatory `[0] EXPLICIT` wrapper removed.
