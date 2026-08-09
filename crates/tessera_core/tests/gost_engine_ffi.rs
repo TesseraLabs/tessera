@@ -1,10 +1,10 @@
 //! Integration test for the public surface of `gost::engine`.
 //!
-//! These tests cover only the cross-platform contract: every host
-//! either has gost-engine registered (Linux build host with the
-//! library installed) or it does not (CI on macOS, dev hosts).  In
-//! both cases `ensure_loaded` and `is_available` must return
-//! consistent results without panicking.
+//! These tests cover the cross-platform contract of a config that names no
+//! engine, which is every config the fixture can produce: `ensure_loaded`
+//! must refuse, `is_available` must agree, and neither may panic. The load
+//! that a configured path performs is exercised by the `gost-tests` files,
+//! which need a real engine and real GOST material to say anything.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -53,22 +53,21 @@ fn validated(path: Option<&Path>) -> ValidatedConfig {
 }
 
 #[test]
-fn ensure_loaded_returns_consistent_result_with_is_available() {
+fn a_config_naming_no_engine_never_loads_one() {
+    // The fixture leaves `gost_engine_path` unset, which is the only shape a
+    // non-GOST deployment can have. There is nothing to load, and looking one
+    // up along `OPENSSL_ENGINES` is exactly what must not happen — so the
+    // answer is a refusal on every host, whether or not it ships an engine.
     let cfg = validated(None);
-    match ensure_loaded(&cfg) {
-        Ok(()) => {
-            assert!(is_available(), "Ok must imply is_available");
-        }
-        Err(
-            GostEngineError::NotAvailable(_)
-            | GostEngineError::LoadFailed(_)
-            | GostEngineError::SetDefaultFailed(_)
-            | GostEngineError::DigestUnavailable { .. },
-        ) => {
-            assert!(!is_available(), "Err must imply !is_available");
-        }
-        Err(other) => panic!("unexpected variant: {other:?}"),
-    }
+    let res = ensure_loaded(&cfg);
+    assert!(
+        matches!(res, Err(GostEngineError::PathNotConfigured)),
+        "expected a refusal, got {res:?}",
+    );
+    assert!(
+        !is_available(),
+        "a refused load must leave no engine behind"
+    );
 }
 
 #[test]

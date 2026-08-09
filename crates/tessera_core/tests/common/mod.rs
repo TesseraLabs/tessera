@@ -18,6 +18,9 @@
 
 use std::path::PathBuf;
 
+#[path = "../../src/test_support.rs"]
+mod test_support;
+
 /// Absolute path to `tests/fixtures/gost/`.
 #[must_use]
 pub fn gost_fixtures_dir() -> PathBuf {
@@ -47,50 +50,48 @@ pub fn gost_fixtures_present() -> bool {
 /// deployment must never fall back to an `OPENSSL_ENGINES` lookup — so a test
 /// that exercises that load has to supply a path just like an operator would.
 ///
-/// `TESSERA_TEST_GOST_ENGINE_PATH` wins when set; otherwise the engines
-/// directory this libcrypto was built with is asked for `gost.so`, which is
-/// where the distribution packages put it. Returns `None` when neither yields
-/// an existing file — the caller then has nothing to test and skips.
-#[must_use]
-pub fn gost_engine_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("TESSERA_TEST_GOST_ENGINE_PATH") {
-        let p = PathBuf::from(p);
-        return p.is_file().then_some(p);
-    }
-    let out = std::process::Command::new("openssl")
-        .args(["version", "-e"])
-        .output()
-        .ok()?;
-    // `ENGINESDIR: "/usr/lib/x86_64-linux-gnu/engines-1.1"`
-    let text = String::from_utf8(out.stdout).ok()?;
-    let dir = text.split('"').nth(1)?;
-    let candidate = PathBuf::from(dir).join("gost.so");
-    candidate.is_file().then_some(candidate)
-}
+/// Re-exported from the crate's own `test_support` so the unit tests and the
+/// integration tests agree on one definition of "where is the engine".
+pub use test_support::gost_engine_path;
 
-/// Combined skip-condition for GOST integration tests.
+/// The engine and the fixtures a GOST integration test needs, or `None`.
 ///
-/// Returns `true` and prints a `skipped: ...` line if either:
+/// Replaces the older boolean skip-check. Every GOST entry point in the
+/// product now insists on being told which shared library to load, so a test
+/// cannot merely establish that an engine *exists* — it has to carry the path
+/// into the config, the verifier or the CRL check it is exercising, exactly as
+/// a deployment does. Handing the path back is what makes that possible;
+/// returning a bare `true`/`false` would leave every caller passing `None` and
+/// quietly failing closed.
 ///
-/// * the fixtures aren't present (developer hasn't run `gen_gost.sh` yet,
-///   typical on macOS dev hosts), or
-/// * the gost-engine isn't loadable on this host.
-///
-/// Tests should treat the boolean as "skip the rest of the test".
+/// Prints a `skipped: ...` line and returns `None` when the fixtures are
+/// absent (no `gen_gost.sh` run on this host — the normal case on macOS dev
+/// hosts), when no engine can be located, or when the engine that was located
+/// refuses to load into this libcrypto.
 #[must_use]
-pub fn skip_unless_gost_ready() -> bool {
+pub fn gost_ready_engine() -> Option<PathBuf> {
     if !gost_fixtures_present() {
         eprintln!(
             "skipped: GOST fixtures missing under {}; run tests/fixtures/gen_gost.sh on a Linux host with gost-engine.",
             gost_fixtures_dir().display(),
         );
-        return true;
+        return None;
     }
-    if !tessera_core::gost::engine::is_available_after_attempt(None) {
-        eprintln!("skipped: gost-engine not available on this host (load attempt failed).");
-        return true;
+    let Some(engine) = gost_engine_path() else {
+        eprintln!(
+            "skipped: no gost-engine .so found on this host; set {} to the engine the fixtures were made with.",
+            test_support::GOST_ENGINE_PATH_ENV,
+        );
+        return None;
+    };
+    if !tessera_core::gost::engine::is_available_after_attempt(Some(&engine)) {
+        eprintln!(
+            "skipped: gost-engine at {} did not load into this libcrypto.",
+            engine.display(),
+        );
+        return None;
     }
-    false
+    Some(engine)
 }
 
 /// Loads a PEM-encoded fixture file and parses it as a [`Certificate`].

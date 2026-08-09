@@ -19,7 +19,47 @@
 //! tests pull the same file in through `#[path]` from `tests/common`, so both
 //! sides agree on one definition.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Environment variable naming the `gost-engine` shared library to test with.
+///
+/// Set it when the engine is not where `openssl version -e` says engines live
+/// — a self-built engine, or a host with several OpenSSL installations.
+// Reached only from the GOST tests, which are feature-gated, so the crate's
+// own unit-test build sees this as unused. `expect` is wrong here: it would
+// itself go unfulfilled in the builds where the item *is* used.
+#[allow(dead_code)]
+pub const GOST_ENGINE_PATH_ENV: &str = "TESSERA_TEST_GOST_ENGINE_PATH";
+
+/// Locate the `gost-engine` shared library on this host, if it has one.
+///
+/// Every GOST code path now requires the caller to name the engine's file —
+/// there is no lookup by id left anywhere — so a test that wants to exercise
+/// one has to produce that path itself. Returns `None` when no engine can be
+/// found, which callers treat as "skip", not as a failure: developer hosts
+/// and CI runners outside Astra have none.
+///
+/// [`GOST_ENGINE_PATH_ENV`] wins when it points at a real file; otherwise the
+/// engine directory reported by `openssl version -e` is probed for `gost.so`.
+// Unused in the builds that leave the GOST tests out; see the note on
+// `GOST_ENGINE_PATH_ENV`.
+#[allow(dead_code)]
+#[must_use]
+pub fn gost_engine_path() -> Option<PathBuf> {
+    if let Some(configured) = std::env::var_os(GOST_ENGINE_PATH_ENV) {
+        let configured = PathBuf::from(configured);
+        return configured.is_file().then_some(configured);
+    }
+    let out = std::process::Command::new("openssl")
+        .args(["version", "-e"])
+        .output()
+        .ok()?;
+    // `ENGINESDIR: "/usr/lib/x86_64-linux-gnu/engines-1.1"`
+    let text = String::from_utf8(out.stdout).ok()?;
+    let dir = text.split('"').nth(1)?;
+    let candidate = PathBuf::from(dir).join("gost.so");
+    candidate.is_file().then_some(candidate)
+}
 
 /// Absolute path to an existing system executable, standing in for a shell,
 /// a PKCS#11 module or a hook command wherever a fixture only needs a path

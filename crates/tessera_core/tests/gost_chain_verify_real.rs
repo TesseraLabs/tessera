@@ -24,9 +24,16 @@ use tessera_core::trust::openssl_verifier::{
     OpensslVerifier, OpensslVerifierConfig, Stage2TrustVerifier,
 };
 
-use crate::common::{load_pem_cert, skip_unless_gost_ready};
+use std::path::Path;
 
-fn build_verifier(anchor_pem: &str, intermediate_pem: Option<&str>, alg: &str) -> OpensslVerifier {
+use crate::common::{gost_ready_engine, load_pem_cert};
+
+fn build_verifier(
+    anchor_pem: &str,
+    intermediate_pem: Option<&str>,
+    alg: &str,
+    engine: Option<&Path>,
+) -> OpensslVerifier {
     let anchors = vec![load_pem_cert(anchor_pem)];
     let intermediates = match intermediate_pem {
         Some(p) => vec![load_pem_cert(p)],
@@ -44,7 +51,7 @@ fn build_verifier(anchor_pem: &str, intermediate_pem: Option<&str>, alg: &str) -
         signature_alg_whitelist: vec![alg.into()],
         spki_pins: vec![],
         max_depth: 4,
-        gost_engine_path: None,
+        gost_engine_path: engine.map(Path::to_path_buf),
         revocation_mode: tessera_core::config::validated::RevocationMode::None,
         ocsp_responder_url: None,
         ocsp_timeout: Duration::from_secs(5),
@@ -56,14 +63,15 @@ fn build_verifier(anchor_pem: &str, intermediate_pem: Option<&str>, alg: &str) -
 
 #[test]
 fn gost256_chain_verifies_when_engine_loaded() {
-    if skip_unless_gost_ready() {
+    let Some(engine) = gost_ready_engine() else {
         return;
-    }
+    };
     let leaf = load_pem_cert("gost_ee_256.pem");
     let v = build_verifier(
         "gost_ca_256.pem",
         None,
         "id-tc26-signwithdigest-gost3410-2012-256",
+        Some(&engine),
     );
     let res = v.verify(&leaf, &[]);
     assert!(res.is_ok(), "GOST 2012-256 chain verify failed: {res:?}");
@@ -71,14 +79,15 @@ fn gost256_chain_verifies_when_engine_loaded() {
 
 #[test]
 fn gost512_chain_verifies_when_engine_loaded() {
-    if skip_unless_gost_ready() {
+    let Some(engine) = gost_ready_engine() else {
         return;
-    }
+    };
     let leaf = load_pem_cert("gost_ee_512.pem");
     let v = build_verifier(
         "gost_ca_512.pem",
         None,
         "id-tc26-signwithdigest-gost3410-2012-512",
+        Some(&engine),
     );
     let res = v.verify(&leaf, &[]);
     assert!(res.is_ok(), "GOST 2012-512 chain verify failed: {res:?}");
@@ -86,12 +95,17 @@ fn gost512_chain_verifies_when_engine_loaded() {
 
 #[test]
 fn gost_chain_rejected_when_only_rsa_in_whitelist() {
-    if skip_unless_gost_ready() {
+    let Some(engine) = gost_ready_engine() else {
         return;
-    }
+    };
     let leaf = load_pem_cert("gost_ee_256.pem");
     // Whitelist contains only RSA — pre-validation must reject the GOST leaf.
-    let v = build_verifier("gost_ca_256.pem", None, "sha256WithRSAEncryption");
+    let v = build_verifier(
+        "gost_ca_256.pem",
+        None,
+        "sha256WithRSAEncryption",
+        Some(&engine),
+    );
     let err = v
         .verify(&leaf, &[])
         .expect_err("RSA-only whitelist must reject GOST leaf");
@@ -102,5 +116,36 @@ fn gost_chain_rejected_when_only_rsa_in_whitelist() {
             || msg.contains("algorithm")
             || msg.contains("PreValidate"),
         "unexpected reject reason: {msg}",
+    );
+}
+
+/// A GOST leaf presented to a verifier that was given no engine path is
+/// refused before anything else runs.
+///
+/// This is the reachable shape of the problem the engine hook creates: the
+/// certificate that decides whether the hook fires arrives from the device
+/// being authenticated, so on a deployment that named no engine it must not
+/// be able to cause one to be located and installed process-wide. The refusal
+/// stands even here, where the engine happens to be loaded already — the
+/// question the verifier answers is what its configuration permits, not what
+/// this process happens to have lying around.
+#[test]
+fn gost_leaf_is_refused_when_no_engine_is_configured() {
+    let Some(_engine) = gost_ready_engine() else {
+        return;
+    };
+    let leaf = load_pem_cert("gost_ee_256.pem");
+    let v = build_verifier(
+        "gost_ca_256.pem",
+        None,
+        "id-tc26-signwithdigest-gost3410-2012-256",
+        None,
+    );
+    let err = v
+        .verify(&leaf, &[])
+        .expect_err("a GOST leaf must not verify without a configured engine");
+    assert!(
+        matches!(err, tessera_core::x509::TrustError::EngineLoadFailed { .. }),
+        "expected a fail-closed engine error, got {err:?}",
     );
 }

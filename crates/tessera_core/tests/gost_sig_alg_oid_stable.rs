@@ -20,7 +20,7 @@
 
 mod common;
 
-use crate::common::{gost_fixtures_present, load_pem_cert, skip_unless_gost_ready};
+use crate::common::{gost_fixtures_present, gost_ready_engine, load_pem_cert};
 
 /// Dotted OID of `id-tc26-signwithdigest-gost3410-2012-256`.
 const GOST_2012_256_OID: &str = "1.2.643.7.1.1.3.2";
@@ -57,8 +57,8 @@ fn signature_algorithm_oid_survives_loading_the_gost_engine() {
         "without gost-engine the OID must already read as dotted",
     );
 
-    // `skip_unless_gost_ready` performs the engine load attempt.
-    if skip_unless_gost_ready() {
+    // `gost_ready_engine` performs the engine load attempt.
+    if gost_ready_engine().is_none() {
         return;
     }
 
