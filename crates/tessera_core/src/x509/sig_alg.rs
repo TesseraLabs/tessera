@@ -11,7 +11,45 @@
 //! Both dotted-OID strings (e.g. `"1.2.840.113549.1.1.11"`) and the human
 //! aliases used in the config (e.g. `"rsa-with-sha256"`,
 //! `"id-tc26-signwithdigest-gost3410-2012-256"`) are accepted by
-//! [`SignatureAlg::from_oid_string`].
+//! [`SignatureAlg::from_oid_string`].  Allow-list matching therefore runs
+//! through [`whitelist_permits`] and compares parsed values, never raw
+//! strings: the certificate side always yields a dotted OID while the
+//! config side is whatever spelling the operator chose.
+
+/// Placeholder produced instead of a dotted OID when a certificate's
+/// signature-algorithm OID cannot be decoded at all.
+///
+/// Kept distinct from any real OID so that [`whitelist_permits`] can refuse
+/// it outright: an algorithm we failed to identify must never be accepted,
+/// not even if a configuration happens to contain this same token.
+pub const UNKNOWN_SIGNATURE_ALGORITHM: &str = "unknown-signature-algorithm";
+
+/// Returns `true` if a certificate's signature-algorithm `oid` is permitted
+/// by `whitelist`.
+///
+/// `oid` is the dotted form read from the certificate; `whitelist` entries
+/// are configuration tokens, which may be dotted OIDs or the human aliases
+/// listed in the module documentation.  Both sides are parsed into
+/// [`SignatureAlg`] before comparison, so a config written as
+/// `sha256WithRSAEncryption` still matches a certificate carrying
+/// `1.2.840.113549.1.1.11`.
+///
+/// An algorithm outside the known table matches only a whitelist entry
+/// spelled character-for-character the same way, and
+/// [`UNKNOWN_SIGNATURE_ALGORITHM`] matches nothing at all.
+///
+/// An empty `whitelist` is *not* handled here — callers treat it as "no
+/// constraint" before reaching this function.
+#[must_use]
+pub fn whitelist_permits(oid: &str, whitelist: &[String]) -> bool {
+    if oid == UNKNOWN_SIGNATURE_ALGORITHM {
+        return false;
+    }
+    let alg = SignatureAlg::from_oid_string(oid);
+    whitelist
+        .iter()
+        .any(|entry| SignatureAlg::from_oid_string(entry) == alg)
+}
 
 /// Classified signature algorithm.
 ///
@@ -109,7 +147,51 @@ impl SignatureAlg {
 
 #[cfg(test)]
 mod tests {
-    use super::SignatureAlg;
+    use super::{whitelist_permits, SignatureAlg, UNKNOWN_SIGNATURE_ALGORITHM};
+
+    fn list(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn whitelist_permits_matches_alias_against_dotted_oid() {
+        let whitelist = list(&["sha256WithRSAEncryption", "ecdsa-with-SHA256"]);
+        assert!(whitelist_permits("1.2.840.113549.1.1.11", &whitelist));
+        assert!(whitelist_permits("1.2.840.10045.4.3.2", &whitelist));
+    }
+
+    #[test]
+    fn whitelist_permits_matches_gost_alias_against_dotted_oid() {
+        let whitelist = list(&["id-tc26-signwithdigest-gost3410-2012-256"]);
+        assert!(whitelist_permits("1.2.643.7.1.1.3.2", &whitelist));
+        assert!(!whitelist_permits("1.2.643.7.1.1.3.3", &whitelist));
+    }
+
+    #[test]
+    fn whitelist_permits_matches_dotted_oid_against_dotted_oid() {
+        let whitelist = list(&["1.2.840.113549.1.1.11"]);
+        assert!(whitelist_permits("1.2.840.113549.1.1.11", &whitelist));
+        assert!(!whitelist_permits("1.2.840.113549.1.1.5", &whitelist));
+    }
+
+    #[test]
+    fn whitelist_permits_matches_unknown_algorithms_only_verbatim() {
+        let whitelist = list(&["1.2.3.4.5"]);
+        assert!(whitelist_permits("1.2.3.4.5", &whitelist));
+        assert!(!whitelist_permits("1.2.3.4.6", &whitelist));
+    }
+
+    #[test]
+    fn whitelist_permits_rejects_substring_entries() {
+        let whitelist = list(&["sha"]);
+        assert!(!whitelist_permits("1.2.840.113549.1.1.11", &whitelist));
+    }
+
+    #[test]
+    fn whitelist_permits_never_accepts_the_unknown_placeholder() {
+        let whitelist = list(&[UNKNOWN_SIGNATURE_ALGORITHM, "sha256WithRSAEncryption"]);
+        assert!(!whitelist_permits(UNKNOWN_SIGNATURE_ALGORITHM, &whitelist));
+    }
 
     #[test]
     fn from_oid_string_parses_gost_oids() {

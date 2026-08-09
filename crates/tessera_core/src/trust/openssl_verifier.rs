@@ -118,11 +118,13 @@ pub struct OpensslVerifierConfig {
     pub crl_max_age: Option<Duration>,
     /// Permissible clock skew when comparing `notBefore`/`notAfter` against `now`.
     pub clock_skew: Duration,
-    /// Permissible signature-algorithm names.  Each entry is compared for
-    /// exact, case-sensitive equality against the algorithm's `Display`
-    /// form (substring matching was removed on purpose — it let
-    /// `sha1WithRSAEncryption` slip past a `sha` entry).  An empty list
-    /// means "no constraint"; see [`PreValidateConfig`].
+    /// Permissible signature-algorithm names, written either as a dotted OID
+    /// or as one of the aliases understood by
+    /// [`crate::x509::SignatureAlg`].  An entry must name exactly the same
+    /// algorithm as the certificate carries; entries are never
+    /// substring-matched (that let `sha1WithRSAEncryption` slip past a `sha`
+    /// entry).  An empty list means "no constraint"; see
+    /// [`PreValidateConfig`].
     pub signature_alg_whitelist: Vec<String>,
     /// SPKI pins.  Empty = disabled.
     pub spki_pins: Vec<SpkiPin>,

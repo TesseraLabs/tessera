@@ -14,9 +14,11 @@ pub struct PreValidateConfig {
     /// window against `now`.
     pub clock_skew: Duration,
 
-    /// Acceptable signature-algorithm names.  Each entry is matched
-    /// **exactly** (case-sensitive equality) against the certificate's
-    /// signature-algorithm display form as rendered by OpenSSL.
+    /// Acceptable signature-algorithm names.  Each entry is classified with
+    /// [`crate::x509::SignatureAlg`] and must name exactly the same algorithm
+    /// as the certificate's signature-algorithm OID; entries are never
+    /// substring-matched, and an entry naming an algorithm outside the known
+    /// table matches only the identical dotted OID.
     ///
     /// Accepted strings include `sha256WithRSAEncryption`,
     /// `sha384WithRSAEncryption`, `sha512WithRSAEncryption`,
@@ -71,15 +73,15 @@ pub fn pre_validate_end_entity(
         return Err(TrustError::Validity("expired"));
     }
 
-    // 3. signature algorithm whitelist (P1-A + P1-C):
+    // 3. signature algorithm whitelist:
     //    * empty whitelist == no constraint (matches operator intent of
     //      "I haven't configured this; accept anything sensible");
-    //    * non-empty whitelist requires **exact** equality against the
-    //      OpenSSL display form, not a substring match (substring matching
-    //      let `sha1WithRSAEncryption` slip past a `sha` whitelist entry).
+    //    * a non-empty whitelist matches whole algorithms, never substrings
+    //      (substring matching let `sha1WithRSAEncryption` slip past a `sha`
+    //      whitelist entry).
     let sig_alg = cert.signature_algorithm();
     if !cfg.signature_alg_whitelist.is_empty()
-        && !cfg.signature_alg_whitelist.iter().any(|w| w == &sig_alg)
+        && !super::sig_alg::whitelist_permits(&sig_alg, &cfg.signature_alg_whitelist)
     {
         return Err(TrustError::SignatureAlgorithm(sig_alg));
     }

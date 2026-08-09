@@ -1178,8 +1178,9 @@ fn validate_pkcs12_source(raw: &RawConfig, mode: Mode) -> Result<Pkcs12Source, E
 /// Safe-by-default signature algorithms applied when
 /// `trust.allowed_signature_algorithms` is omitted or empty.
 ///
-/// Entries are the OpenSSL display forms compared by `pre_validate_end_entity`
-/// (exact, case-sensitive equality). The list intentionally excludes SHA-1 and
+/// Entries are aliases understood by [`SignatureAlg`], which
+/// `pre_validate_end_entity` resolves to the same algorithm as the dotted OID
+/// a certificate carries. The list intentionally excludes SHA-1 and
 /// every other deprecated algorithm: an unconfigured deployment must still
 /// reject weak signatures rather than fall through to "accept anything".
 /// GOST is excluded so an unconfigured deployment does not pull in the

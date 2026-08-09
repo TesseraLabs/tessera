@@ -33,6 +33,30 @@ fi
 
 PASS="correct-pin"
 
+# The fixtures have to survive the same trust pipeline as a real engineer
+# certificate: the leaf must carry keyUsage=digitalSignature and
+# extendedKeyUsage=clientAuth with basicConstraints CA:FALSE, and the CA must
+# carry basicConstraints CA:TRUE with keyUsage=keyCertSign, or verification
+# stops at those gates long before any GOST-specific code runs.
+cat > gost_ext.cnf <<'EOF'
+[req]
+distinguished_name = dn
+
+[dn]
+
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+
+[v3_ee]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+EOF
+
 # 2) GOST-2012-256 self-signed CA.
 openssl req -x509 -engine gost -newkey gost2012_256 \
     -pkeyopt paramset:A \
@@ -40,7 +64,7 @@ openssl req -x509 -engine gost -newkey gost2012_256 \
     -out gost_ca_256.pem -days 3650 \
     -subj "/CN=tessera Test GOST CA 256" \
     -md_gost12_256 \
-    -config <(printf '[req]\ndistinguished_name=dn\n[dn]\n')
+    -config gost_ext.cnf -extensions v3_ca
 
 # 3) GOST-2012-512 self-signed CA.
 openssl req -x509 -engine gost -newkey gost2012_512 \
@@ -49,7 +73,7 @@ openssl req -x509 -engine gost -newkey gost2012_512 \
     -out gost_ca_512.pem -days 3650 \
     -subj "/CN=tessera Test GOST CA 512" \
     -md_gost12_512 \
-    -config <(printf '[req]\ndistinguished_name=dn\n[dn]\n')
+    -config gost_ext.cnf -extensions v3_ca
 
 # 4) GOST-2012-256 end-entity (signed by gost_ca_256).
 openssl req -engine gost -newkey gost2012_256 \
@@ -57,11 +81,12 @@ openssl req -engine gost -newkey gost2012_256 \
     -keyout gost_ee_256.key -nodes \
     -out gost_ee_256.csr \
     -subj "/CN=tessera-test-ee-256" \
-    -config <(printf '[req]\ndistinguished_name=dn\n[dn]\n')
+    -config gost_ext.cnf
 openssl x509 -req -engine gost \
     -in gost_ee_256.csr \
     -CA gost_ca_256.pem -CAkey gost_ca_256.key -CAcreateserial \
     -out gost_ee_256.pem -days 365 \
+    -extfile gost_ext.cnf -extensions v3_ee \
     -md_gost12_256
 
 # 5) GOST-2012-512 end-entity (signed by gost_ca_512).
@@ -70,11 +95,12 @@ openssl req -engine gost -newkey gost2012_512 \
     -keyout gost_ee_512.key -nodes \
     -out gost_ee_512.csr \
     -subj "/CN=tessera-test-ee-512" \
-    -config <(printf '[req]\ndistinguished_name=dn\n[dn]\n')
+    -config gost_ext.cnf
 openssl x509 -req -engine gost \
     -in gost_ee_512.csr \
     -CA gost_ca_512.pem -CAkey gost_ca_512.key -CAcreateserial \
     -out gost_ee_512.pem -days 365 \
+    -extfile gost_ext.cnf -extensions v3_ee \
     -md_gost12_512
 
 # 6) PKCS#12 bundles for the round-trip test.
@@ -136,6 +162,6 @@ openssl ca -gencrl -engine gost \
     }
 
 rm -rf gost_crl_db gost_crl_openssl.cnf
-rm -f *.csr *.srl
+rm -f *.csr *.srl gost_ext.cnf
 
 echo "GOST fixtures written to: $(pwd)"

@@ -40,8 +40,10 @@ const OID_EKU_ANY: &str = "2.5.29.37.0";
 /// Inputs to [`enforce_chain_policy`] that vary per verifier configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainPolicy<'a> {
-    /// Acceptable signature-algorithm display forms, matched for exact
-    /// equality against each non-anchor certificate's signature algorithm.
+    /// Acceptable signature-algorithm names, each of which must name the
+    /// same algorithm as a non-anchor certificate's signature-algorithm OID
+    /// for that certificate to pass (see
+    /// [`super::sig_alg::whitelist_permits`]).
     ///
     /// An empty slice means "no constraint", matching the semantics of
     /// [`super::pre_validate::PreValidateConfig::signature_alg_whitelist`].
@@ -109,7 +111,7 @@ fn validate_key_strength(cert: &Certificate) -> Result<(), TrustError> {
 /// An empty allow-list imposes no constraint, matching leaf pre-validation.
 fn check_signature_algorithm(cert: &Certificate, whitelist: &[String]) -> Result<(), TrustError> {
     let sig_alg = cert.signature_algorithm();
-    if !whitelist.is_empty() && !whitelist.iter().any(|w| w == &sig_alg) {
+    if !whitelist.is_empty() && !super::sig_alg::whitelist_permits(&sig_alg, whitelist) {
         return Err(TrustError::SignatureAlgorithm(sig_alg));
     }
     Ok(())

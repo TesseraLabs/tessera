@@ -78,16 +78,12 @@ fn ca_root_is_v3_and_self_signed_subject() {
 }
 
 #[test]
-fn signature_algorithm_is_dotted_or_named() {
+fn signature_algorithm_is_the_dotted_oid() {
     let cert = Certificate::from_pem(LEAF_PEM).unwrap();
     let alg = cert.signature_algorithm();
-    assert!(!alg.is_empty());
-    // OpenSSL renders this as either the LN or the dotted OID.
-    // For sha256WithRSAEncryption (OID 1.2.840.113549.1.1.11) we accept either.
-    assert!(
-        alg.contains("sha256") || alg.contains("RSA") || alg.contains("1.2.840.113549.1.1.11"),
-        "unexpected signature algorithm: {alg}"
-    );
+    // libcrypto knows this OID and would print `sha256WithRSAEncryption` for
+    // it; the accessor must report the dotted form regardless.
+    assert_eq!(alg, "1.2.840.113549.1.1.11", "expected the dotted OID");
 }
 
 #[test]
