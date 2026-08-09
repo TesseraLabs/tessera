@@ -59,6 +59,35 @@ use super::sys::{digest_available, EngineHandle};
 /// design contract requires.
 static ENGINE_RESULT: OnceLock<Result<EngineHandle, GostEngineError>> = OnceLock::new();
 
+/// Serialises the unit tests that reason about [`ENGINE_RESULT`].
+///
+/// The cell is process-global and, once loaded, stays loaded for the life of
+/// the process — so a test cannot assert "no engine is loaded", only "this
+/// call did not change that". Even the second, weaker claim needs two reads
+/// with nothing in between, and the crate's unit tests share one binary and
+/// one multi-threaded runner with the `gost-tests` tests that load a real
+/// engine on Astra. Without this lock the two reads straddle another test's
+/// load and the assertion becomes a coin flip that only ever lands wrong on
+/// the one host where the GOST coverage matters.
+///
+/// Every test that reads [`is_available`] or the cell around a call must
+/// hold this, including tests in other modules — [`crate::ocsp`] and
+/// [`super::algorithms`] both do.
+#[cfg(test)]
+static ENGINE_CELL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the [`ENGINE_CELL_LOCK`] for the duration of a test.
+///
+/// Poisoning is ignored: the lock guards no data of its own, and a test that
+/// panicked while holding it has already reported its own failure — turning
+/// that into a cascade of failures in every other test would only bury it.
+#[cfg(test)]
+pub(crate) fn lock_engine_cell_for_test() -> std::sync::MutexGuard<'static, ()> {
+    ENGINE_CELL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Idempotently load and pin the gost-engine.
 ///
 /// Returns the cached result of the first invocation; subsequent calls
@@ -267,6 +296,7 @@ mod tests {
         // DH, RAND and the digests. Refusing before the OnceLock also keeps
         // the refusal from being cached — reading the cell directly is the
         // only way to see that, and this module owns it.
+        let _lock = lock_engine_cell_for_test();
         let cell_was_initialised = ENGINE_RESULT.get().is_some();
         let res = ensure_loaded_with_path(None);
         assert!(
@@ -299,35 +329,24 @@ mod tests {
     }
 
     #[test]
-    fn is_available_matches_cached_result() {
-        // We can't assert false unconditionally because another test may
-        // have warmed the OnceLock; we can only assert that the answer is
-        // consistent with what `ensure_loaded` would now return.
-        let observed = is_available();
-        let cfg = validated_with_optional_path(None);
-        let res = ensure_loaded(&cfg);
-        // The observed value (taken before our ensure_loaded above) must
-        // match `is_available()` taken now: both look at the same cell.
-        assert_eq!(observed, is_available());
-        // And the cached result must be consistent with what we just got.
-        match res {
-            Ok(()) => assert!(is_available()),
-            Err(_) => assert!(!is_available()),
-        }
-    }
-
-    #[test]
     fn a_config_without_an_engine_path_never_loads_one() {
         // `needs_gost()` is false for this fixture, so validation lets the
         // path stay unset — and then no certificate, however it is signed,
         // can cause an engine to be loaded through this config.
+        //
+        // The claim is about this call, not about the process: on a host that
+        // ships an engine another test may legitimately have loaded one
+        // already, and `is_available()` would then be true for reasons that
+        // have nothing to do with this config.
+        let _lock = lock_engine_cell_for_test();
+        let before = is_available();
         let cfg = validated_with_optional_path(None);
         let res = ensure_loaded(&cfg);
         assert!(
             matches!(res, Err(GostEngineError::PathNotConfigured)),
             "expected a refusal, got {res:?}",
         );
-        assert!(!is_available());
+        assert_eq!(before, is_available(), "the refusal loaded an engine");
     }
 
     #[test]
@@ -353,6 +372,7 @@ mod tests {
         // The reachable shape of the attack: the algorithm classification
         // comes from a presented certificate, so it must not be able to pull
         // an engine into the process on its own.
+        let _lock = lock_engine_cell_for_test();
         let before = is_available();
         let res = ensure_loaded_if_signature_alg_gost(
             &SignatureAlg::IdTc26SignWithDigestGostR341012_256,
@@ -371,6 +391,7 @@ mod tests {
         // `is_available()` reading taken before and after the call is the
         // best non-invasive proxy we have to assert "no engine state was
         // mutated by this call".
+        let _lock = lock_engine_cell_for_test();
         let before = is_available();
         let res = ensure_loaded_if_signature_alg_gost(&SignatureAlg::RsaWithSha256, None);
         assert!(res.is_ok(), "rsa path must be Ok: {res:?}");
@@ -379,6 +400,7 @@ mod tests {
 
     #[test]
     fn ensure_loaded_if_any_gost_is_noop_on_empty_slice() {
+        let _lock = lock_engine_cell_for_test();
         let before = is_available();
         let res = ensure_loaded_if_any_gost(&[], None);
         assert!(res.is_ok(), "empty slice must be Ok: {res:?}");

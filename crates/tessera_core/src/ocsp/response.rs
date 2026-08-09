@@ -682,9 +682,14 @@ mod tests {
     /// this process load an engine of their own choosing. With the path the
     /// engine loads and verification proceeds far enough to reject the
     /// (RSA-signed) response on its signature.
+    ///
+    /// This is the only test in the crate's own unit-test binary that loads a
+    /// real engine, which makes it the one that can invalidate what the
+    /// `gost::engine` tests observe; it takes their lock for that reason.
     #[test]
     #[cfg(feature = "gost-tests")]
     fn gost_chain_loads_engine_before_responder_signature_check() {
+        let _lock = crate::gost::engine::lock_engine_cell_for_test();
         let subject_path = fixture_path("gost/gost_ee_256.pem");
         let issuer_path = fixture_path("gost/gost_ca_256.pem");
         if !subject_path.exists() || !issuer_path.exists() {

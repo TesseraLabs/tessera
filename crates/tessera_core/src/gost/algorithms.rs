@@ -111,11 +111,17 @@ fn nid_from_name(name: &'static str) -> Result<i32, GostEngineError> {
 mod tests {
     use super::*;
 
+    /// Each test here decides what to expect by reading whether an engine is
+    /// loaded, so the read and the call it describes must not straddle another
+    /// test's load — see [`engine::lock_engine_cell_for_test`].
+    use super::engine::lock_engine_cell_for_test;
+
     #[test]
     fn gost_2012_256_md_returns_not_available_without_engine() {
         // Engine has never been loaded in this test process (or the load
         // failed, which is what the stub guarantees).  Either way, the
         // digest helper must surface NotAvailable.
+        let _lock = lock_engine_cell_for_test();
         match gost_2012_256_md() {
             Ok(md) if engine::is_available() => assert_eq!(md.size(), 32),
             Ok(_) => panic!("digest resolved without engine being available"),
@@ -126,6 +132,7 @@ mod tests {
 
     #[test]
     fn gost_2012_512_md_returns_not_available_without_engine() {
+        let _lock = lock_engine_cell_for_test();
         match gost_2012_512_md() {
             Ok(md) if engine::is_available() => assert_eq!(md.size(), 64),
             Ok(_) => panic!("digest resolved without engine being available"),
@@ -145,6 +152,7 @@ mod tests {
 
     #[test]
     fn gost_signature_md_for_routes_gost_variants() {
+        let _lock = lock_engine_cell_for_test();
         let res_256 = gost_signature_md_for(&SignatureAlg::IdTc26SignWithDigestGostR341012_256);
         let res_512 = gost_signature_md_for(&SignatureAlg::IdTc26SignWithDigestGostR341012_512);
         if engine::is_available() {
