@@ -172,9 +172,10 @@ pub fn validate_p12_envelope(bytes: &[u8]) -> Result<(), P12EnvelopeError> {
 /// already recovered.
 ///
 /// The walk descends into a `safeContentsBag` (a bag list nested in a bag list,
-/// which RFC 7292 allows and OpenSSL reads), bounded by a depth limit. It did
-/// not until now, so a container whose writer wrapped its bags used to show this
-/// path nothing while opening normally at the login prompt.
+/// which RFC 7292 allows and OpenSSL reads), bounded by a depth limit. A
+/// container whose writer wrapped certificate bags that way opens normally at
+/// the login prompt, so a walk that stopped at the outer level would lose sight
+/// of exactly those certificates while the login itself succeeded.
 ///
 /// No password is consulted anywhere on this path and no key material is
 /// interpreted. A shrouded key bag is passed over by its bag identifier and its
@@ -221,19 +222,8 @@ pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
 /// decode, are passed over: a container may carry a bag this Engine cannot
 /// read, and that is no reason to lose the diagnostic carried by the others.
 fn select_end_entity(ders: &[Vec<u8>]) -> Option<Certificate> {
-    let index = sole_non_ca(ders.iter().map(Vec::as_slice))?;
-    Certificate::from_der(ders.get(index)?).ok()
-}
-
-/// The position of the one non-CA certificate among those given, if there is
-/// exactly one.
-///
-/// Kept apart from [`select_end_entity`] so that the counting — which is where
-/// "exactly one" is decided — reads on its own, without the parse that turns the
-/// answer into a [`Certificate`].
-fn sole_non_ca<'a>(ders: impl IntoIterator<Item = &'a [u8]>) -> Option<usize> {
     let mut found = None;
-    for (index, der) in ders.into_iter().enumerate() {
+    for der in ders {
         let Ok(cert) = Certificate::from_der(der) else {
             continue;
         };
@@ -246,7 +236,7 @@ fn sole_non_ca<'a>(ders: impl IntoIterator<Item = &'a [u8]>) -> Option<usize> {
         if found.is_some() {
             return None;
         }
-        found = Some(index);
+        found = Some(cert);
     }
     found
 }

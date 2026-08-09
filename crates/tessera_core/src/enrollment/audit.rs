@@ -8,14 +8,20 @@
 //! The bare [`emit_device_enrolled`] / [`emit_enrollment_rejected`] hooks
 //! (section 1) fix the event name and field schema. The enriched
 //! [`emit_device_enrolled_full`] / [`emit_enrollment_rejected_full`] variants
-//! (section 4) add the `host_id` prefix8 and the per-host certificate `serial`
-//! that only the CLI caller holds — these are the events the CLI emits on the
-//! enrollment path.
+//! (section 4) carry the `host_id` prefix8 and the per-host certificate
+//! `serial` that the caller supplies — these are the events the CLI emits on
+//! the enrollment path.
+//!
+//! `serial` is always empty today. It cannot be read out of the enrollment
+//! package's `.p12` without the PIN, and nothing else on the import path
+//! vouches for a value, so the field carries none; it stays in the schema and
+//! waits for a source that will be covered by a signature.
 
 /// `device_enrolled` — an enrollment package was successfully imported.
 /// Carries the applied `bundle_version` and the trust `mode`
-/// (`standalone` / `managed`). `host_id` prefix8 and the per-host serial are
-/// added by the CLI caller (section 2/4) which holds that context.
+/// (`standalone` / `managed`). The `host_id` prefix8 comes from the CLI caller
+/// (section 2/4), which holds that context; the `serial` field is emitted
+/// empty until a source under signature supplies it.
 pub const EVENT_DEVICE_ENROLLED: &str = "device_enrolled";
 
 /// `enrollment_rejected` — an import was rejected (fail-closed); the device
@@ -37,7 +43,7 @@ pub const MODE_STANDALONE: &str = "standalone";
 /// Trust-mode label `managed` for the `mode` field.
 pub const MODE_MANAGED: &str = "managed";
 
-/// Enrichment the CLI caller adds to an enrollment audit event: the device's
+/// Enrichment the caller adds to an enrollment audit event: the device's
 /// `host_id` prefix8 and the per-host certificate serial, neither of which the
 /// core import has in hand. Both are short, eyeballable identifiers; absent
 /// values are emitted as empty strings (the core-only call sites pass empties).
@@ -45,7 +51,10 @@ pub const MODE_MANAGED: &str = "managed";
 pub struct EnrollAuditIds<'a> {
     /// First 8 hex chars of the device `host_id` hash (`""` when unknown).
     pub host_id_prefix8: &'a str,
-    /// Per-host leaf certificate serial, uppercase hex (`""` when unknown).
+    /// Per-host leaf certificate serial, uppercase hex.
+    ///
+    /// Every caller passes `""` today: the serial cannot be derived from the
+    /// package `.p12` without the PIN, and no signed source carries it yet.
     pub serial: &'a str,
 }
 
@@ -54,14 +63,14 @@ pub struct EnrollAuditIds<'a> {
 /// `mode` is one of [`MODE_STANDALONE`] / [`MODE_MANAGED`]; `bundle_version`
 /// is the applied (managed) bundle version (`0` for standalone, which has no
 /// signed version). This bare variant carries empty `host_id`/`serial` fields;
-/// the CLI uses [`emit_device_enrolled_full`] to populate them.
+/// the CLI uses [`emit_device_enrolled_full`] to fill in the `host_id`.
 pub fn emit_device_enrolled(mode: &str, bundle_version: u64) {
     emit_device_enrolled_full(mode, bundle_version, EnrollAuditIds::default());
 }
 
-/// Emit `device_enrolled` with the CLI-supplied `host_id` prefix8 and per-host
-/// certificate serial (section 4 field layout: `host_id`, `serial`, `mode`,
-/// `bundle_version`).
+/// Emit `device_enrolled` with the caller-supplied identifiers (section 4 field
+/// layout: `host_id`, `serial`, `mode`, `bundle_version`). `serial` is empty
+/// until a signed source for it exists.
 pub fn emit_device_enrolled_full(mode: &str, bundle_version: u64, ids: EnrollAuditIds<'_>) {
     tracing::info!(
         target: "enrollment.audit",
@@ -82,8 +91,9 @@ pub fn emit_enrollment_rejected(reason: &str) {
     emit_enrollment_rejected_full(reason, EnrollAuditIds::default());
 }
 
-/// Emit `enrollment_rejected` with the CLI-supplied `host_id` prefix8 and (when
-/// known) the per-host certificate serial.
+/// Emit `enrollment_rejected` with the caller-supplied identifiers: the
+/// `host_id` prefix8, and the `serial` field that stays empty until a signed
+/// source for it exists.
 pub fn emit_enrollment_rejected_full(reason: &str, ids: EnrollAuditIds<'_>) {
     tracing::error!(
         target: "enrollment.audit",

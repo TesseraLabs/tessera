@@ -101,10 +101,6 @@ tracing-subscriber = { workspace = true }
 # `tessera_issuer` depends only on `tessera_ext`.
 tessera_issuer = { path = "../tessera_issuer", version = "0.5.0", features = ["test-support"] }
 p256 = { workspace = true }
-# Bag attributes, for the tests that hand-assemble a PKCS#12 container: the
-# `localKeyId` pairing has to be exercised on layouts our own writer refuses to
-# produce, and those are exactly the ones a foreign drive can carry.
-x509-cert = { workspace = true }
 
 [lints.rust]
 missing_docs = "deny"

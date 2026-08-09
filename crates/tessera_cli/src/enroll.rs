@@ -107,9 +107,8 @@ pub struct EnrollReport {
     pub host_id_prefix8: String,
     /// Per-host leaf certificate serial, uppercase hex.
     ///
-    /// Empty until the serial arrives from a source the device can verify: it
-    /// cannot be derived from the package `.p12` without the PIN, and a guess
-    /// does not belong in a record that outlives the import.
+    /// Always empty today; see where [`run`] sets it for why the package
+    /// `.p12` cannot supply it and what source would.
     pub serial: String,
 }
 
@@ -176,7 +175,7 @@ fn post_import_check(config: &Path) -> bool {
 
 /// Execute the enrollment. Imports the package (emitting the enriched
 /// `device_enrolled` / `enrollment_rejected` audit event via the core, with the
-/// resolved `host_id` prefix8 + per-host serial), then runs the post-import
+/// resolved `host_id` prefix8 and an empty serial), then runs the post-import
 /// `tessera check` when `run_check` is set. A failed check is fail-closed:
 /// [`EnrollError::PostCheckFailed`].
 pub fn run(opts: EnrollOptions) -> Result<EnrollReport, EnrollError> {

@@ -18,9 +18,13 @@
 //! password-encrypted key, this path holds no password, and the copy the
 //! decoder made is dropped with the rest of the walk.
 //!
-//! Nothing here decides anything. A malformed container, an unreadable safe or a
-//! bag that does not decode all yield "no certificate": this is a diagnostic
-//! path and its failure mode is silence, not an error the caller has to handle.
+//! Nothing here decides anything, and nothing here fails loudly: this is a
+//! diagnostic path whose failure mode is silence, not an error the caller has
+//! to handle. A container that does not decode as a whole — malformed bytes, an
+//! authenticated safe this path cannot read, a safe list it cannot decode —
+//! yields "no certificate". A single safe or a single bag that does not decode
+//! is stepped over instead, and the walk returns whatever the rest of the
+//! container held.
 //!
 //! What the limits below do, and what they do not: the decoder is handed a
 //! whole section at a time, so every safe of the container and every bag of a
