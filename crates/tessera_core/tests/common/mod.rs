@@ -41,6 +41,33 @@ pub fn gost_fixtures_present() -> bool {
     gost_fixtures_dir().join("gost_ca_256.pem").exists()
 }
 
+/// Path of the `gost-engine` shared object on this host, if one can be named.
+///
+/// The product loads the engine only from a configured path — an unconfigured
+/// deployment must never fall back to an `OPENSSL_ENGINES` lookup — so a test
+/// that exercises that load has to supply a path just like an operator would.
+///
+/// `TESSERA_TEST_GOST_ENGINE_PATH` wins when set; otherwise the engines
+/// directory this libcrypto was built with is asked for `gost.so`, which is
+/// where the distribution packages put it. Returns `None` when neither yields
+/// an existing file — the caller then has nothing to test and skips.
+#[must_use]
+pub fn gost_engine_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("TESSERA_TEST_GOST_ENGINE_PATH") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let out = std::process::Command::new("openssl")
+        .args(["version", "-e"])
+        .output()
+        .ok()?;
+    // `ENGINESDIR: "/usr/lib/x86_64-linux-gnu/engines-1.1"`
+    let text = String::from_utf8(out.stdout).ok()?;
+    let dir = text.split('"').nth(1)?;
+    let candidate = PathBuf::from(dir).join("gost.so");
+    candidate.is_file().then_some(candidate)
+}
+
 /// Combined skip-condition for GOST integration tests.
 ///
 /// Returns `true` and prints a `skipped: ...` line if either:

@@ -23,8 +23,10 @@ pub struct PreValidateConfig {
     /// Accepted strings include `sha256WithRSAEncryption`,
     /// `sha384WithRSAEncryption`, `sha512WithRSAEncryption`,
     /// `ecdsa-with-SHA256`, `ecdsa-with-SHA384`, `ecdsa-with-SHA512`,
-    /// `id-tc26-signwithdigest-gost3410-12-256`,
-    /// `id-tc26-signwithdigest-gost3410-12-512`.
+    /// `id-tc26-signwithdigest-gost3410-2012-256`,
+    /// `id-tc26-signwithdigest-gost3410-2012-512` (the GOST pair is also
+    /// accepted with the year written `-12-`), and any dotted OID.  The full
+    /// table is in [`crate::x509::SignatureAlg`].
     ///
     /// **An empty whitelist is interpreted as "no constraint": every
     /// signature algorithm is accepted.**  Operators that want to deny

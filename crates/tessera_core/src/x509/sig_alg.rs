@@ -9,12 +9,20 @@
 //! falls into [`SignatureAlg::Other`] with the original string preserved.
 //!
 //! Both dotted-OID strings (e.g. `"1.2.840.113549.1.1.11"`) and the human
-//! aliases used in the config (e.g. `"rsa-with-sha256"`,
-//! `"id-tc26-signwithdigest-gost3410-2012-256"`) are accepted by
-//! [`SignatureAlg::from_oid_string`].  Allow-list matching therefore runs
-//! through [`whitelist_permits`] and compares parsed values, never raw
-//! strings: the certificate side always yields a dotted OID while the
-//! config side is whatever spelling the operator chose.
+//! aliases used in the config are accepted by
+//! [`SignatureAlg::from_oid_string`].  The aliases are:
+//!
+//! * RSA — `"sha256WithRSAEncryption"`, `"sha384WithRSAEncryption"`,
+//!   `"sha512WithRSAEncryption"` and the `"rsa-with-sha256"` family;
+//! * ECDSA — `"ecdsa-with-SHA256"`, `"ecdsa-with-SHA384"`,
+//!   `"ecdsa-with-SHA512"` (either case in the digest name);
+//! * GOST R 34.10-2012 — `"id-tc26-signwithdigest-gost3410-2012-256"` and
+//!   `"…-2012-512"`, each also accepted with the year written `-12-`.
+//!
+//! Allow-list matching therefore runs through [`whitelist_permits`] and
+//! compares parsed values, never raw strings: the certificate side always
+//! yields a dotted OID while the config side is whatever spelling the
+//! operator chose.
 
 /// Placeholder produced instead of a dotted OID when a certificate's
 /// signature-algorithm OID cannot be decoded at all.
@@ -103,12 +111,15 @@ impl SignatureAlg {
             "1.2.840.10045.4.3.4" | "ecdsa-with-sha512" | "ecdsa-with-SHA512" => {
                 Self::EcdsaWithSha512
             }
-            "1.2.643.7.1.1.3.2" | "id-tc26-signwithdigest-gost3410-2012-256" => {
-                Self::IdTc26SignWithDigestGostR341012_256
-            }
-            "1.2.643.7.1.1.3.3" | "id-tc26-signwithdigest-gost3410-2012-512" => {
-                Self::IdTc26SignWithDigestGostR341012_512
-            }
+            // Both spellings of the year are accepted: `-2012-` is TC26's own
+            // and the one OpenSSL prints, `-12-` is what this product's
+            // documentation has told operators to write since the key existed.
+            "1.2.643.7.1.1.3.2"
+            | "id-tc26-signwithdigest-gost3410-2012-256"
+            | "id-tc26-signwithdigest-gost3410-12-256" => Self::IdTc26SignWithDigestGostR341012_256,
+            "1.2.643.7.1.1.3.3"
+            | "id-tc26-signwithdigest-gost3410-2012-512"
+            | "id-tc26-signwithdigest-gost3410-12-512" => Self::IdTc26SignWithDigestGostR341012_512,
             other => Self::Other(other.to_string()),
         }
     }
@@ -215,6 +226,37 @@ mod tests {
             SignatureAlg::from_oid_string("id-tc26-signwithdigest-gost3410-2012-512"),
             SignatureAlg::IdTc26SignWithDigestGostR341012_512
         );
+    }
+
+    #[test]
+    fn from_oid_string_parses_both_gost_year_spellings() {
+        // `-12-` is what docs/{ru,en}/configuration.md tells operators to
+        // write; a config copied from there must classify as GOST, or the
+        // "gost_engine_path is required" check never fires for it.
+        for (short, long) in [
+            (
+                "id-tc26-signwithdigest-gost3410-12-256",
+                "id-tc26-signwithdigest-gost3410-2012-256",
+            ),
+            (
+                "id-tc26-signwithdigest-gost3410-12-512",
+                "id-tc26-signwithdigest-gost3410-2012-512",
+            ),
+        ] {
+            assert_eq!(
+                SignatureAlg::from_oid_string(short),
+                SignatureAlg::from_oid_string(long),
+                "{short} must name the same algorithm as {long}",
+            );
+            assert!(SignatureAlg::from_oid_string(short).is_gost());
+        }
+    }
+
+    #[test]
+    fn whitelist_permits_matches_short_year_gost_alias_against_dotted_oid() {
+        let whitelist = list(&["id-tc26-signwithdigest-gost3410-12-512"]);
+        assert!(whitelist_permits("1.2.643.7.1.1.3.3", &whitelist));
+        assert!(!whitelist_permits("1.2.643.7.1.1.3.2", &whitelist));
     }
 
     #[test]

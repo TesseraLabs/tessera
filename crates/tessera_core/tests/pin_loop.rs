@@ -67,6 +67,33 @@ fn conv_error_short_circuits() {
 }
 
 #[test]
+fn a_configured_engine_path_does_not_disturb_a_container_that_opens() {
+    // An RSA container opens on libcrypto's own implementations, so the
+    // engine-retry branch must stay out of the way even where an operator
+    // configured an engine — including one whose file does not exist.
+    let engine = std::path::Path::new("/nonexistent/engines/gost.so");
+    let prompter = |_p: &str| Ok(SecretString::from("correct-pin".to_string()));
+    let m = acquire_p12_material_with_prompter(RSA, 3, None, prompter, Some(engine)).unwrap();
+    assert_eq!(m.end_entity.subject_cn().unwrap(), "alice");
+}
+
+#[test]
+fn the_pin_loop_never_makes_an_engine_the_default_implementation() {
+    // The retry may only load the engine an operator named. A host that
+    // configured none must come out of a full PIN loop with the process-global
+    // engine slot still empty — on a host that has a `gost` engine to find,
+    // this is what catches a retry that fell back to an OPENSSL_ENGINES
+    // lookup and made it the default for RSA, DSA, DH, RAND and the digests.
+    let prompter = |_p: &str| Ok(SecretString::from("nope".to_string()));
+    let err = acquire_p12_material_with_prompter(RSA, 2, None, prompter, None).unwrap_err();
+    assert!(matches!(err, AcquireError::MaxTries), "got {err:?}");
+    assert!(
+        !tessera_core::gost::engine::is_available(),
+        "the PIN loop loaded an engine on a deployment that configured none",
+    );
+}
+
+#[test]
 fn corrupt_bundle_short_circuits() {
     let calls = Cell::new(0_u8);
     let prompter = |_p: &str| {
