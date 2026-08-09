@@ -234,3 +234,110 @@ cases:
       - run: helpers/usb-loop.sh detach
       - run: rm -rf /tmp/issuer-e2e
       - run: helpers/setup/deploy-fixtures.sh
+
+  - id: ISS-006
+    title: Выпуск с ключом, порождённым инструментом, даёт удостоверение для входа
+    requirement: openspec/specs/credential-packaging/spec.md
+    requires: [service-manager, usb]
+    steps:
+      # Второй сквозной кейс, отличающийся от ISS-005 происхождением ключа.
+      # Там ключевую пару и контейнер делает openssl, а issuer только подписывает;
+      # здесь оба шага выполняет сам инструмент: пара порождается при выпуске,
+      # контейнер собирается им же, носитель раскладывается prepare-carrier.
+      # Проверяется именно эта сборка: контейнер чужого производства уже
+      # подтверждён соседним кейсом, а свой — нет, и разойтись они могут
+      # незаметно (порядок мешков, шифрование сертификатов, MAC).
+      - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
+      - run: |
+          rm -rf /tmp/issuer-gk && install -d -m 0700 /tmp/issuer-gk
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-gk/root.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-gk/root.key.pem -pubout \
+            -out /tmp/issuer-gk/root.spki.pem 2>/dev/null
+          N=$(( $(date -u +%s) - 300 ))
+          issuer issue-root --backend file --key-file /tmp/issuer-gk/root.key.pem \
+            --spki /tmp/issuer-gk/root.spki.pem --subject "CN=E2E Fleet Root" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role serv --max-ttl 7200 \
+            --journal /tmp/issuer-gk/journal.ndjson \
+            --out /tmp/issuer-gk/root.crt.pem
+      # Пароль подаётся файлом, а не аргументом: аргументы видны в списке
+      # процессов. Файл читается только владельцем — инструмент это проверяет.
+      - run: |
+          umask 077
+          printf '%s\n' "e2e-generated-pass" > /tmp/issuer-gk/pass
+      - run: |
+          N=$(( $(date -u +%s) - 300 ))
+          issuer issue-leaf --backend file --key-file /tmp/issuer-gk/root.key.pem \
+            --parent /tmp/issuer-gk/root.crt.pem \
+            --generate-key --key-type ecdsa-p256 \
+            --subject "CN=serv" --host '*' --role serv \
+            --not-before $N --not-after $(( N + 3600 )) \
+            --journal /tmp/issuer-gk/journal.ndjson \
+            --p12-passphrase-file /tmp/issuer-gk/pass \
+            --out-p12 /tmp/issuer-gk/leaf.p12
+        expect: { exit_code: 0, stdout_matches: 'PKCS#12 container written to' }
+      # Закрытый ключ отдельным файлом не сохраняется: он существует только
+      # внутри контейнера. Отдельного ключевого файла рядом быть не должно.
+      - expect_file: { path: /tmp/issuer-gk/leaf.p12, mode: "0600" }
+      - run: |
+          install -d /tmp/issuer-gk/media
+          issuer prepare-carrier --p12 /tmp/issuer-gk/leaf.p12 \
+            --chain /tmp/issuer-gk/root.crt.pem --media /tmp/issuer-gk/media
+        expect: { exit_code: 0, stdout_matches: 'carrier prepared' }
+      # Раскладка кладёт артефакты туда, где их ищет проверка на устройстве.
+      - expect_file: { path: /tmp/issuer-gk/media/certs/user.p12, exists: true }
+      - expect_file: { path: /tmp/issuer-gk/media/certs/chain.pem, exists: true }
+      - run: |
+          install -m 0640 -o root -g root /tmp/issuer-gk/root.crt.pem /etc/tessera/ca/bundle.pem
+      # На носитель едет контейнер из подготовленной раскладки. Саму запись
+      # на loop-устройство делает хелпер: продукт монтирует носитель штатным
+      # путём, а раскладку на нём подменять нечем — это граница кейса.
+      - run: helpers/usb-loop.sh attach /tmp/issuer-gk/media/certs/user.p12
+      - run: pam-drive certauth serv authenticate
+        stdin: "e2e-generated-pass"
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: rm -rf /tmp/issuer-gk
+      - run: helpers/setup/deploy-fixtures.sh
+
+  - id: ISS-007
+    title: Слишком короткий пароль контейнера отклоняет выпуск
+    requirement: openspec/specs/credential-packaging/spec.md
+    requires: [service-manager]
+    steps:
+      # Отказ наступает до подписи: удостоверение с паролем ниже порога не
+      # должно существовать вовсе. Кейс держит границу со стороны продукта —
+      # порог задан спекой, а не тем, что сегодня возвращает код.
+      - run: |
+          rm -rf /tmp/issuer-short && install -d -m 0700 /tmp/issuer-short
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-short/root.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-short/root.key.pem -pubout \
+            -out /tmp/issuer-short/root.spki.pem 2>/dev/null
+          N=$(( $(date -u +%s) - 300 ))
+          issuer issue-root --backend file --key-file /tmp/issuer-short/root.key.pem \
+            --spki /tmp/issuer-short/root.spki.pem --subject "CN=E2E Fleet Root" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role serv --max-ttl 7200 \
+            --journal /tmp/issuer-short/journal.ndjson \
+            --out /tmp/issuer-short/root.crt.pem
+          umask 077
+          printf '%s\n' "short" > /tmp/issuer-short/pass
+      - run: |
+          N=$(( $(date -u +%s) - 300 ))
+          issuer issue-leaf --backend file --key-file /tmp/issuer-short/root.key.pem \
+            --parent /tmp/issuer-short/root.crt.pem \
+            --generate-key --key-type ecdsa-p256 \
+            --subject "CN=serv" --host '*' --role serv \
+            --not-before $N --not-after $(( N + 3600 )) \
+            --journal /tmp/issuer-short/journal.ndjson \
+            --p12-passphrase-file /tmp/issuer-short/pass \
+            --out-p12 /tmp/issuer-short/leaf.p12
+        expect: { exit_code: 1, stderr_matches: 'the minimum is 12' }
+      # Ничего не написано: отказ до подписи не оставляет ни контейнера, ни следа.
+      - expect_file: { path: /tmp/issuer-short/leaf.p12, exists: false }
+    teardown:
+      - run: rm -rf /tmp/issuer-short
