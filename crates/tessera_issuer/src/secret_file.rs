@@ -19,6 +19,20 @@
 //! access this way and its ACLs are not comparable bit for bit, so there the
 //! gate passes and protection rests on the directory the file lives in. That
 //! difference is announced rather than assumed — see [`GATE_ENFORCED`].
+//!
+//! The two readers are reached by different builds. Whole-file reading serves
+//! the file backend's CA key and is there whenever that backend is; line
+//! reading serves the command line's secret ladder — `--pin-file`,
+//! `--key-passphrase-file`, `--pin-stdin` — and the announcement of an
+//! unenforced gate is the ladder's to make, so both are built with the CLI. A
+//! build with the file backend and no CLI has no caller for either.
+
+// In a build with the file backend but no command line, the line-reading half —
+// `read_line`, `read_first_line`, `ReadLineError`, its bound, and the gate's
+// reach — has no caller left. It is kept whole rather than split by feature so
+// the file and the gate stay described in one place; the readers themselves are
+// unconditional, and adding the CLI feature back puts every one of them to work.
+#![cfg_attr(not(feature = "cli"), allow(dead_code))]
 
 use std::io::Read as _;
 use std::path::Path;

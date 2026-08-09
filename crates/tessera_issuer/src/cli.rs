@@ -2642,6 +2642,29 @@ mod secret {
             }
         }
 
+        /// Assert that reading a secret file left nothing on the warning stream
+        /// beyond what the platform owes the operator.
+        ///
+        /// Where the owner-only gate runs the read is silent; where the platform
+        /// has no permission model to check, every accepted secret file is
+        /// announced as unchecked, so exactly that one line is expected.
+        fn assert_gate_warning_only(warnings: &[u8]) {
+            let printed = String::from_utf8(warnings.to_owned()).unwrap();
+            if crate::secret_file::GATE_ENFORCED {
+                assert!(printed.is_empty(), "unexpected warning: {printed:?}");
+            } else {
+                assert_eq!(
+                    printed.lines().count(),
+                    1,
+                    "the unchecked-permissions notice must be the only warning: {printed:?}"
+                );
+                assert!(
+                    printed.contains(Msg::SecretFileUncheckedPlatform.text(Locale::En)),
+                    "{printed:?} must announce that the permission gate did not run"
+                );
+            }
+        }
+
         /// A PIN-shaped request over `explicit`.
         fn request(explicit: Option<&FlagSource>) -> Request<'_> {
             Request {
@@ -2931,7 +2954,9 @@ mod secret {
             )
             .unwrap();
             assert_eq!(secret.expose_secret(), "s3cret");
-            assert!(warnings.is_empty(), "unexpected warning: {warnings:?}");
+            // The environment held a different secret and was never reached, so
+            // its warning is absent; the platform's own notice may be there.
+            assert_gate_warning_only(&warnings);
         }
 
         /// A console prompt that could not start hands the ladder on; one the
