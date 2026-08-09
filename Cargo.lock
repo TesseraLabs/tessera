@@ -2683,7 +2683,9 @@ name = "tessera_core"
 version = "0.5.0"
 dependencies = [
  "chrono",
+ "cms",
  "cryptoki",
+ "der 0.7.10",
  "foreign-types",
  "hex",
  "libc",
@@ -2694,6 +2696,7 @@ dependencies = [
  "openssl-sys",
  "p256",
  "parking_lot",
+ "pkcs12",
  "proptest",
  "rand 0.10.1",
  "regex",

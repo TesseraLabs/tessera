@@ -57,6 +57,13 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 mockall = { workspace = true, optional = true }
 libloading = { workspace = true }
+# PKCS#12 container structure, read without the password: the login screen's
+# "wrong drive against wrong password" diagnostic walks the container's safes
+# itself because `PKCS12_parse` gives up at the encrypted key. Only the ASN.1
+# layout is used; every cryptographic step on this path is absent by design.
+der = { workspace = true }
+pkcs12 = { workspace = true }
+cms = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

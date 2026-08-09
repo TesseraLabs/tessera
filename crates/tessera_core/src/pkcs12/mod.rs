@@ -10,6 +10,7 @@
 //! layer can drive a bounded retry loop without leaking the PIN.
 
 pub mod error;
+mod unencrypted;
 
 pub use error::{AcquireError, P12EnvelopeError, Pkcs12Error};
 
@@ -162,23 +163,77 @@ pub fn validate_p12_envelope(bytes: &[u8]) -> Result<(), P12EnvelopeError> {
 /// Attempt to extract the end-entity certificate from a PKCS#12 buffer
 /// **without** a password.
 ///
-/// Newer issuance tooling (`issue-service-cert.sh` v2 and later)
-/// places the leaf certificate in an unencrypted `SafeBag` so an admin
-/// can inspect host/user bindings without the PIN. When that layout is
-/// present this returns `Some(Certificate)`; when the cert is encrypted
-/// (legacy bundles) or the bundle is malformed it returns `None`.
+/// Issuance places the leaf certificate and its chain in an unencrypted safe so
+/// that a reader without the PIN can still see who the container was issued
+/// for. This walks that safe directly — the container's `AuthenticatedSafe`,
+/// its `id-data` sections, their certificate bags — because the container's key
+/// is encrypted in every issuance and a reader that goes through
+/// `PKCS12_parse` stops at that key without returning the certificates it
+/// already recovered.
+///
+/// No password is consulted anywhere on this path and no key material is
+/// interpreted. A shrouded key bag is recognised by its bag identifier and its
+/// content dropped; what the ASN.1 decoder copies of it along the way is the
+/// still-encrypted blob, which without the password is no more than opaque
+/// bytes. The `unencrypted` module states exactly what the walk touches.
+///
+/// Returns `None` when the container keeps its certificates encrypted (bundles
+/// of the older layout), when it carries no end-entity certificate, when more
+/// than one of its certificates could be the end-entity, or when the bytes are
+/// malformed. That is a normal outcome — the caller loses the
+/// diagnostic, not the login.
 ///
 /// Used by the PAM flow to enrich the "wrong PIN" diagnostic with the
 /// host/user the cert was issued for — strictly best-effort. The cert
 /// is NOT validated against any trust anchor; it is only parsed enough
-/// to read its extensions for display.
+/// to read its extensions for display, and it does not enter the
+/// authentication decision.
 #[must_use]
 pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
-    let p12 = Pkcs12::from_der(bytes).ok()?;
-    let parsed = p12.parse2("").ok()?;
-    let cert = parsed.cert?;
-    let der = cert.to_der().ok()?;
-    Certificate::from_der(&der).ok()
+    select_end_entity(&unencrypted::certificates_in_clear(bytes))
+}
+
+/// The one non-CA certificate a container carries, if there is exactly one.
+///
+/// A container holds the leaf together with the CAs above it, so "the first
+/// bag" is the wrong answer whenever the writer put the chain first. The rule
+/// applied here is this path's own and deliberately conservative: a certificate
+/// is named only when a single one of the readable certificates is not a CA
+/// (an absent `basicConstraints` means `cA = FALSE`, per RFC 5280). Zero
+/// candidates, or two and more, yield `None` and the caller falls back to its
+/// generic message.
+///
+/// This rule is *not* the one [`LoadedKeyMaterial::from_p12`] applies. OpenSSL
+/// picks the certificate whose `localKeyID` matches the container's key, which
+/// on a container carrying two non-CA certificates — a foreign drive, a
+/// mis-issued bundle, two issuances concatenated — can be a different one.
+/// Matching that would mean reading the key bag's attributes, and the whole
+/// point of this path is not to touch the key bag at all. Naming a certificate
+/// only when the choice is unambiguous keeps the diagnostic from confidently
+/// pointing an engineer at the wrong device, which is the very mistake it
+/// exists to prevent.
+///
+/// Certificates that do not parse, and those whose `basicConstraints` do not
+/// decode, are passed over: a container may carry a bag this Engine cannot
+/// read, and that is no reason to lose the diagnostic carried by the others.
+fn select_end_entity(ders: &[Vec<u8>]) -> Option<Certificate> {
+    let mut candidate = None;
+    for der in ders {
+        let Ok(cert) = Certificate::from_der(der) else {
+            continue;
+        };
+        let Ok(bc) = cert.basic_constraints() else {
+            continue;
+        };
+        if bc.is_some_and(|bc| bc.is_ca) {
+            continue;
+        }
+        if candidate.is_some() {
+            return None;
+        }
+        candidate = Some(cert);
+    }
+    candidate
 }
 
 /// PIN prompt used when the operator did not configure
@@ -229,4 +284,133 @@ where
         }
     }
     Err(AcquireError::MaxTries)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// DER of a committed PEM fixture.
+    fn fixture_der(name: &str) -> Vec<u8> {
+        let pem = std::fs::read(format!(
+            "{}/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("fixture is committed under tests/fixtures");
+        openssl::x509::X509::from_pem(&pem)
+            .expect("fixture is a certificate")
+            .to_der()
+            .expect("a parsed certificate re-encodes")
+    }
+
+    /// A self-signed certificate with no `basicConstraints` extension at all.
+    ///
+    /// Absent means `cA = FALSE` (RFC 5280), and a container written by a
+    /// foreign tool may well leave the extension out — no committed fixture
+    /// does, so this one is minted here.
+    fn without_basic_constraints(cn: &str) -> Vec<u8> {
+        use openssl::asn1::Asn1Time;
+        use openssl::bn::BigNum;
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::hash::MessageDigest;
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+        use openssl::x509::{X509Builder, X509NameBuilder};
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(Nid::COMMONNAME, cn).unwrap();
+        let name = name.build();
+
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        builder.build().to_der().unwrap()
+    }
+
+    fn cn_of(cert: &Certificate) -> String {
+        cert.subject_cn().expect("the fixtures carry a CN")
+    }
+
+    #[test]
+    fn the_single_non_ca_is_the_end_entity() {
+        let certs = vec![fixture_der("leaf_rsa.pem"), fixture_der("int.pem")];
+        let picked = select_end_entity(&certs).expect("one non-CA is unambiguous");
+        assert_eq!(cn_of(&picked), "alice");
+    }
+
+    #[test]
+    fn a_ca_written_before_the_leaf_does_not_take_its_place() {
+        let certs = vec![
+            fixture_der("ca.pem"),
+            fixture_der("int.pem"),
+            fixture_der("leaf_rsa.pem"),
+        ];
+        let picked = select_end_entity(&certs).expect("one non-CA is unambiguous");
+        assert_eq!(cn_of(&picked), "alice");
+    }
+
+    #[test]
+    fn two_non_ca_certificates_name_nobody() {
+        // A foreign drive, a mis-issue or two bundles concatenated: naming
+        // either one would send an engineer to check the wrong device.
+        let certs = vec![
+            fixture_der("leaf_rsa.pem"),
+            fixture_der("int.pem"),
+            fixture_der("leaf_ecdsa.pem"),
+        ];
+        assert!(select_end_entity(&certs).is_none());
+    }
+
+    #[test]
+    fn two_certificates_without_basic_constraints_name_nobody() {
+        let certs = vec![
+            without_basic_constraints("first"),
+            without_basic_constraints("second"),
+        ];
+        assert!(select_end_entity(&certs).is_none());
+    }
+
+    #[test]
+    fn a_certificate_without_basic_constraints_counts_as_the_end_entity() {
+        let certs = vec![without_basic_constraints("alone"), fixture_der("ca.pem")];
+        let picked = select_end_entity(&certs).expect("an absent extension means cA = FALSE");
+        assert_eq!(cn_of(&picked), "alone");
+    }
+
+    #[test]
+    fn a_container_of_cas_only_names_nobody() {
+        let certs = vec![fixture_der("ca.pem"), fixture_der("int.pem")];
+        assert!(select_end_entity(&certs).is_none());
+    }
+
+    #[test]
+    fn nothing_at_all_names_nobody() {
+        assert!(select_end_entity(&[]).is_none());
+    }
+
+    #[test]
+    fn certificates_that_do_not_parse_are_passed_over() {
+        let certs = vec![
+            b"not a certificate".to_vec(),
+            Vec::new(),
+            fixture_der("leaf_rsa.pem"),
+        ];
+        let picked = select_end_entity(&certs).expect("the readable one still decides");
+        assert_eq!(cn_of(&picked), "alice");
+    }
 }
