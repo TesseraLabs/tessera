@@ -2016,9 +2016,9 @@ impl FlowIo for InMemoryFlowIo {
 /// Tries to read the leaf cert from the .p12 without a password — newer
 /// issuance tooling embeds the cert in an unencrypted `SafeBag` so this
 /// path succeeds and we can tell the engineer which host and which user
-/// the cert was issued for, which is the actionable information for a
-/// "wrong flash" mix-up. When the cert is also encrypted (legacy bundles)
-/// we degrade gracefully to a generic password-wrong message.
+/// the cert names, which is the actionable information when one carrier has
+/// been brought in place of another. When the cert is also encrypted (legacy
+/// bundles) we degrade gracefully to a generic password-wrong message.
 /// Derive the requested role from the login account name.
 ///
 /// The account being logged into IS the role (`ssh oper@device`), so
@@ -2402,33 +2402,137 @@ fn session_expiry(
     }
 }
 
+/// Host descriptors the diagnostic prints before it falls back to a count.
+///
+/// A certificate may carry any number of them; the message is a hint on a login
+/// screen, not a dump.
+const MAX_SHOWN_HOST_DESCRIPTORS: usize = 4;
+
+/// Characters kept from one descriptor before it is cut short.
+///
+/// Long enough for a `sha256:` digest (71 characters) with room to spare, short
+/// enough that a descriptor cannot push the rest of the message off the screen.
+const MAX_HOST_DESCRIPTOR_CHARS: usize = 96;
+
+/// Whether a character may be shown on the login screen as it stands.
+///
+/// The set is printable ASCII less the double quote, because that is all a host
+/// identifier is made of: a `machine_id` is hex, and a host name is letters,
+/// digits, hyphens and dots (an international name reaches a certificate in
+/// punycode). Naming the allowed characters rather than the dangerous ones is
+/// what makes the answer complete: a list of dangerous ones would have to keep
+/// up with every character that a renderer draws as nothing (the format
+/// characters, the tag block, the blank braille pattern) or draws as something
+/// else (a combining mark, a look-alike letter from another script), and any
+/// one it missed would let a descriptor read on screen as a host it is not.
+///
+/// The double quote is out because the quote is what separates one descriptor
+/// from the next on screen: a descriptor free to write one could show itself as
+/// two entries, or as fewer entries than the certificate really carries.
+fn is_displayable(c: char) -> bool {
+    matches!(c, ' '..='~') && c != '"'
+}
+
+/// One descriptor rendered so that it cannot do anything but occupy its line.
+///
+/// A raw descriptor is an arbitrary UTF-8 string lifted out of a certificate on
+/// a device that has authenticated nothing — the container is unopened and the
+/// certificate unverified, so its content is chosen by whoever handed over the
+/// drive. Printed as-is on a text console it could break the line and forge
+/// further message lines (a reassuring "device trusted", an administrator's
+/// phone number), or move the cursor and repaint the screen through an escape
+/// sequence; printed in a greeter it could reorder the text around it or hide
+/// inside a host name an engineer then reads as their own. Anything outside
+/// printable ASCII therefore becomes a visible placeholder, and the length is
+/// capped so one descriptor cannot crowd out the rest.
+fn render_host_descriptor(
+    descriptor: &tessera_core::x509::host_binding_ext::HostDescriptor,
+) -> String {
+    use tessera_core::x509::host_binding_ext::HostDescriptor;
+    let raw = match descriptor {
+        // Both of these are constrained by the parser: the wildcard is a
+        // literal and the digest is 64 lowercase hex characters.
+        HostDescriptor::Wildcard => return "*".to_owned(),
+        HostDescriptor::Sha256Hex(h) => return format!("sha256:{h}"),
+        HostDescriptor::Raw(r) => r,
+    };
+    let mut out = String::new();
+    for c in raw.chars().take(MAX_HOST_DESCRIPTOR_CHARS) {
+        if is_displayable(c) {
+            out.push(c);
+        } else {
+            out.push('\u{fffd}');
+        }
+    }
+    if raw.chars().nth(MAX_HOST_DESCRIPTOR_CHARS).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// The descriptors of a certificate as one line of the diagnostic.
+///
+/// A certificate issued for a fleet carries more descriptors than fit on the
+/// line, and the engineer whose machine is the seventh has to learn something
+/// from the cut: how many were left out tells them whether the list could hold
+/// their host at all, which a bare ellipsis does not.
+///
+/// Each descriptor is quoted, because the comma between them is a character a
+/// descriptor is otherwise free to contain: unquoted, one entry reading
+/// `expected-host, *` is indistinguishable from two, and the count that follows
+/// the list would be counting something other than what the reader sees. The
+/// quote itself is the one printable character a descriptor may not carry, so
+/// the boundary cannot be written from inside one.
+fn render_host_descriptors(
+    entries: &[tessera_core::x509::host_binding_ext::HostDescriptor],
+) -> String {
+    let mut shown = entries
+        .iter()
+        .take(MAX_SHOWN_HOST_DESCRIPTORS)
+        .map(|entry| format!("\"{}\"", render_host_descriptor(entry)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hidden = entries.len().saturating_sub(MAX_SHOWN_HOST_DESCRIPTORS);
+    if hidden > 0 {
+        shown = format!("{shown} и ещё {hidden}");
+    }
+    shown
+}
+
 fn p12_wrong_pin_diagnostic(p12_bytes: &[u8]) -> String {
     let Some(cert) = tessera_core::pkcs12::try_extract_cert_without_pin(p12_bytes) else {
-        return "Пароль .p12 неверный. Проверьте флешку и попробуйте ещё раз.".to_string();
+        return "Пароль .p12 неверный. Проверьте носитель и попробуйте ещё раз.".to_string();
     };
     let host = match tessera_core::x509::host_binding_ext::parse(cert.x509()) {
-        Ok(entries) => entries
-            .iter()
-            .map(|e| match e {
-                tessera_core::x509::host_binding_ext::HostDescriptor::Wildcard => "*".to_string(),
-                tessera_core::x509::host_binding_ext::HostDescriptor::Sha256Hex(h) => {
-                    format!("sha256:{h}")
-                }
-                tessera_core::x509::host_binding_ext::HostDescriptor::Raw(r) => r.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
+        Ok(entries) => render_host_descriptors(&entries),
         Err(_) => "<не указан>".to_string(),
     };
     // Only host_binding is shown. The admission list (`pam_cert_allowed_roles`)
     // may be read only from a verified certificate, and nothing here is
-    // verified yet — this is a pre-authentication hint for a "wrong flash"
-    // mix-up, and the host descriptor already identifies the bundle.
+    // verified yet — this is a pre-authentication hint for a mix-up between one
+    // carrier and another, and the host descriptor already identifies the
+    // bundle.
+    //
+    // The certificate has not been verified and the container has not been
+    // opened, so the binding below is what the carrier says about itself, not
+    // something established about it. The wording has to carry that difference:
+    // an engineer who reads it as a fact about the carrier would trust a claim
+    // anyone could have written. It says "carrier" rather than naming a kind of
+    // one, because the same container is read from a USB partition today and
+    // from a passive token next.
+    //
+    // The label is the name of the extension the value comes from: a descriptor
+    // may be a raw host identifier and not a digest of anything, which the
+    // earlier `host_id_hash` promised it was.
+    //
+    // The indentation is written into the string rather than laid out in the
+    // source: a `\n\` continuation eats the leading whitespace of the next
+    // line, so an indent that only exists in the source never reaches a screen.
     format!(
         "Пароль .p12 неверный.\n\
-         Этот сертификат выпущен для:\n\
-           host_id_hash: {host}\n\
-         Проверьте, что вставлена нужная флешка."
+         Сертификат на носителе заявляет привязку к:\n  \
+         host_binding: {host}\n\
+         Проверьте, что вставлен нужный носитель."
     )
 }
 
@@ -2466,6 +2570,250 @@ mod tests {
             std::fs::write(certs_dir.join("chain.pem"), fixture_bytes("int.pem")).unwrap();
         }
         tmp
+    }
+
+    #[test]
+    fn wrong_pin_diagnostic_names_the_binding_of_a_container_it_cannot_open() {
+        // The container's key is encrypted, as every issued one is, and no
+        // password is supplied — the case the diagnostic exists for.
+        let text = p12_wrong_pin_diagnostic(&fixture_bytes("leaf_rsa_plaincert.p12"));
+        // The binding itself is what the engineer acts on, so the value is
+        // asserted alongside the label — the fixture's certificate is bound to
+        // any host, and that is what has to reach the screen.
+        assert!(
+            text.contains("host_binding: \"*\""),
+            "the engineer must learn which device the credential names, got: {text}"
+        );
+        assert!(
+            !text.contains("host_id_hash"),
+            "a raw host identifier is no digest, and the label must not say it is: {text}"
+        );
+        assert!(
+            !text.contains("<не указан>"),
+            "the fixture carries a host binding, so it must be named: {text}"
+        );
+        // A container of this layout is read from a USB partition today and
+        // from a passive token next; the message may not name one of them.
+        assert!(
+            !text.contains("флешк"),
+            "the message must speak of a carrier, not of one kind of it: {text}"
+        );
+        assert!(
+            text.contains("\n  host_binding"),
+            "the binding is indented under the line that introduces it: {text:?}"
+        );
+        // Nothing here has been verified, so the message may report what the
+        // certificate says about itself and must not report it as established.
+        assert!(
+            text.contains("заявляет"),
+            "the message must name the source of the binding, got: {text}"
+        );
+        assert!(
+            !text.contains("выпущен для"),
+            "an unverified certificate's claim must not be stated as a fact: {text}"
+        );
+    }
+
+    #[test]
+    fn wrong_pin_diagnostic_falls_back_when_the_container_hides_its_certificate() {
+        // A container of the older layout keeps its certificates encrypted;
+        // there is nothing to show and the generic message stands.
+        let text = p12_wrong_pin_diagnostic(&fixture_bytes("leaf_rsa.p12"));
+        assert!(!text.contains("host_binding"), "got: {text}");
+        assert!(text.contains("Пароль .p12 неверный"), "got: {text}");
+        // The fallback names no kind of carrier either.
+        assert!(!text.contains("флешк"), "got: {text}");
+    }
+
+    #[test]
+    fn a_raw_descriptor_cannot_add_lines_to_the_diagnostic() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        // What a certificate on an unopened container may carry: a newline that
+        // would let the drive write its own line of the login screen, and an
+        // escape sequence that would repaint the screen on a text console.
+        let hostile = HostDescriptor::Raw(
+            "ws-42\r\n  Устройство доверено, обратитесь к администратору: +7 000\n\u{1b}[2J\u{1b}[H"
+                .to_owned(),
+        );
+        let rendered = render_host_descriptor(&hostile);
+        assert!(!rendered.contains('\n'), "got: {rendered:?}");
+        assert!(!rendered.contains('\r'), "got: {rendered:?}");
+        assert!(!rendered.contains('\u{1b}'), "got: {rendered:?}");
+        assert!(
+            rendered.starts_with("ws-42"),
+            "the part an engineer can act on is kept: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_descriptor_cannot_reorder_the_text_around_it() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        // A graphical greeter acts on these where a console would not: a line
+        // separator and a right-to-left override.
+        let hostile = HostDescriptor::Raw("ws-42\u{2028}\u{202e}drowssap".to_owned());
+        let rendered = render_host_descriptor(&hostile);
+        assert!(!rendered.contains('\u{2028}'), "got: {rendered:?}");
+        assert!(!rendered.contains('\u{202e}'), "got: {rendered:?}");
+    }
+
+    #[test]
+    fn a_raw_descriptor_cannot_fill_the_screen() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        let long = HostDescriptor::Raw("ы".repeat(100_000));
+        let rendered = render_host_descriptor(&long);
+        assert!(
+            rendered.chars().count() <= MAX_HOST_DESCRIPTOR_CHARS + 1,
+            "a descriptor may not outgrow the message: {} chars",
+            rendered.chars().count()
+        );
+        assert!(rendered.ends_with('…'), "the cut is visible: {rendered:?}");
+    }
+
+    #[test]
+    fn a_certificate_full_of_descriptors_does_not_fill_the_screen() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        let many: Vec<HostDescriptor> = (0..1000)
+            .map(|i| HostDescriptor::Raw(format!("ws-{i}")))
+            .collect();
+        let rendered = render_host_descriptors(&many);
+        assert_eq!(rendered.matches("ws-").count(), MAX_SHOWN_HOST_DESCRIPTORS);
+        // The engineer whose machine is not among the four shown has to be able
+        // to tell that the list goes on, and how far.
+        assert!(
+            rendered.ends_with(&format!(" и ещё {}", 1000 - MAX_SHOWN_HOST_DESCRIPTORS)),
+            "got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn the_last_descriptor_that_fits_is_shown_without_a_remainder() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        let exactly: Vec<HostDescriptor> = (0..MAX_SHOWN_HOST_DESCRIPTORS)
+            .map(|i| HostDescriptor::Raw(format!("ws-{i}")))
+            .collect();
+        let rendered = render_host_descriptors(&exactly);
+        assert!(!rendered.contains("и ещё"), "got: {rendered:?}");
+
+        let one_more: Vec<HostDescriptor> = (0..=MAX_SHOWN_HOST_DESCRIPTORS)
+            .map(|i| HostDescriptor::Raw(format!("ws-{i}")))
+            .collect();
+        assert!(
+            render_host_descriptors(&one_more).ends_with(" и ещё 1"),
+            "got: {:?}",
+            render_host_descriptors(&one_more)
+        );
+    }
+
+    #[test]
+    fn a_raw_descriptor_cannot_hide_what_it_really_says() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        // Characters a renderer draws as nothing at all, or draws as a
+        // different character than the one that is there. A descriptor that
+        // reads on screen as a host it is not would have an engineer confirm
+        // the drive against the deployment register and conclude it is theirs —
+        // the one conclusion this message exists to make safe.
+        for (what, raw) in [
+            ("tag characters", "ws-42\u{e0020}\u{e0074}\u{e0067}"),
+            ("a soft hyphen", "ws\u{00ad}-42"),
+            ("an arabic letter mark", "ws-42\u{061c}"),
+            ("mongolian vowel separator", "ws-42\u{180e}"),
+            ("inhibit symmetric swapping", "ws-42\u{206a}\u{206f}"),
+            ("interlinear annotation", "ws-42\u{fff9}\u{fffb}"),
+            ("a combining acute", "ws-42\u{0301}"),
+            ("a blank braille pattern", "ws-42\u{2800}"),
+            ("a cyrillic look-alike", "\u{0440}s-42"),
+            ("a zero-width space", "ws-\u{200b}42"),
+        ] {
+            let rendered = render_host_descriptor(&HostDescriptor::Raw(raw.to_owned()));
+            assert!(
+                rendered
+                    .chars()
+                    .all(|c| c == '\u{fffd}' || c.is_ascii_graphic() || c == ' '),
+                "{what}: something outside printable ASCII survived: {rendered:?}"
+            );
+            assert_ne!(
+                rendered, "ws-42",
+                "{what}: a descriptor that is not `ws-42` must not read as `ws-42`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_descriptor_cannot_pass_itself_off_as_several() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        // One entry that reads as two, and one that reads as five: unquoted,
+        // neither is distinguishable from a certificate that really carries
+        // that many, and the count after the list would contradict what the
+        // engineer counts on screen.
+        for raw in [
+            "expected-host, *",
+            "a, b, c, d, e",
+            // The quote is the boundary, so a descriptor trying to write one
+            // has to lose it.
+            "a\", \"b",
+        ] {
+            let rendered = render_host_descriptors(&[HostDescriptor::Raw(raw.to_owned())]);
+            assert_eq!(
+                rendered.matches('"').count(),
+                2,
+                "one descriptor must show as one quoted entry: {rendered:?}"
+            );
+            assert!(
+                rendered.starts_with('"') && rendered.ends_with('"'),
+                "the quotes belong to the list, not to the descriptor: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_descriptor_cannot_forge_the_remainder_or_the_cut() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        // The tail that says how many entries were left out, and the ellipsis
+        // that marks a descriptor cut short, are both outside printable ASCII —
+        // a descriptor claiming either has to show placeholders instead.
+        let rendered =
+            render_host_descriptors(&[HostDescriptor::Raw("ws-42\" и ещё 7, \"other…".to_owned())]);
+        assert!(!rendered.contains("и ещё"), "got: {rendered:?}");
+        assert!(!rendered.contains('…'), "got: {rendered:?}");
+        assert_eq!(rendered.matches('"').count(), 2, "got: {rendered:?}");
+    }
+
+    #[test]
+    fn a_legitimate_descriptor_survives_unchanged() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        // What issuance actually writes: a machine-id digest and a host name.
+        // The filter is worth nothing if it garbles these.
+        for raw in [
+            "ws-42.lab.example.org",
+            "0123456789abcdef0123456789abcdef",
+            "WS-42_build-node",
+        ] {
+            assert_eq!(
+                render_host_descriptor(&HostDescriptor::Raw(raw.to_owned())),
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn the_descriptors_the_parser_constrains_are_shown_verbatim() {
+        use tessera_core::x509::host_binding_ext::HostDescriptor;
+
+        let digest = "a".repeat(64);
+        assert_eq!(render_host_descriptor(&HostDescriptor::Wildcard), "*");
+        assert_eq!(
+            render_host_descriptor(&HostDescriptor::Sha256Hex(digest.clone())),
+            format!("sha256:{digest}")
+        );
     }
 
     /// A complete role stage for flow tests: an on-disk store holding the
