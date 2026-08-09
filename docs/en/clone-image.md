@@ -278,7 +278,11 @@ The import is atomic and idempotent: repeating the same `bundle_version` is a
 no-op, a smaller one is rejected (anti-rollback), a larger one is applied. After
 a successful import, `tessera check` runs automatically; a failure → rollback,
 exit ≠ 0 (fail-closed). The report prints `host_id` (prefix8), the cert serial,
-`bundle_version`, and the mode; a `device_enrolled` event goes to audit. Without
+`bundle_version`, and the mode; a `device_enrolled` event goes to audit. The
+serial field is currently always empty (`-`): at import time the container is
+vouched for by nothing, and without the password there is no way to tell which
+certificate the workstation will authenticate with — the field stays empty until
+the serial arrives from a source covered by a signature. Without
 tags, group-delegated login is rejected (fail-closed), while per-host login by
 the cert works.
 

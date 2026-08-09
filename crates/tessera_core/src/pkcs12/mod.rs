@@ -171,8 +171,13 @@ pub fn validate_p12_envelope(bytes: &[u8]) -> Result<(), P12EnvelopeError> {
 /// `PKCS12_parse` stops at that key without returning the certificates it
 /// already recovered.
 ///
+/// The walk descends into a `safeContentsBag` (a bag list nested in a bag list,
+/// which RFC 7292 allows and OpenSSL reads), bounded by a depth limit. It did
+/// not until now, so a container whose writer wrapped its bags used to show this
+/// path nothing while opening normally at the login prompt.
+///
 /// No password is consulted anywhere on this path and no key material is
-/// interpreted. A shrouded key bag is recognised by its bag identifier and its
+/// interpreted. A shrouded key bag is passed over by its bag identifier and its
 /// content dropped; what the ASN.1 decoder copies of it along the way is the
 /// still-encrypted blob, which without the password is no more than opaque
 /// bytes. The `unencrypted` module states exactly what the walk touches.
@@ -191,106 +196,6 @@ pub fn validate_p12_envelope(bytes: &[u8]) -> Result<(), P12EnvelopeError> {
 #[must_use]
 pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
     select_end_entity(&unencrypted::certificates_in_clear(bytes))
-}
-
-/// The certificate a container names beyond doubt, or nothing.
-///
-/// For the caller that does not display a certificate but *records* it — the
-/// enrollment report and its `device_enrolled` audit event. There the name has
-/// to be the certificate the device will actually authenticate with, and the
-/// record is written before anything has authenticated: `read_p12_serial` runs
-/// ahead of the manifest signature check, and in standalone mode there is no
-/// signature at all. So the container is hostile input, and the rule below is
-/// built to be silent wherever it cannot prove that what it sees is what the
-/// authentication path will get.
-///
-/// It cannot reproduce that path. `PKCS12_parse` decrypts the private key and
-/// then returns the first recovered certificate whose *public key* matches it
-/// (`X509_check_private_key`); `localKeyId` it merely copies onto the resulting
-/// certificate as metadata. Matching public keys needs the key in the clear,
-/// which needs the password — which this path must not touch. `localKeyId` is
-/// no substitute: it is a free-form label written by whoever assembled the
-/// container, so on a hostile container it is chosen by the attacker.
-///
-/// What is done instead is to demand that two independent rules agree, on a
-/// container with nothing hidden in it. A certificate is named only when all of
-/// this holds:
-///
-/// 1. the container has no section this walk could not see into — no
-///    `id-encryptedData`, nothing that failed to decode, no nesting past the
-///    depth limit. Otherwise there may be candidates it never saw, and no
-///    "exactly one" can be concluded;
-/// 2. exactly one key bag lies in the clear, counting bags nested in a
-///    `safeContentsBag`;
-/// 3. its `localKeyId` is present, is a single non-empty `OCTET STRING` as
-///    PKCS#9 requires, and no bag anywhere in the container carried a
-///    `localKeyId` of another shape (OpenSSL refuses such a container outright);
-/// 4. exactly one certificate bag repeats that label;
-/// 5. that same certificate is the single non-CA among every certificate
-///    visible in the clear — that is, the rule [`try_extract_cert_without_pin`]
-///    applies independently arrives at the same bag;
-/// 6. and its `basicConstraints` are present and say `cA = FALSE`. The login
-///    screen's convention that an absent extension means `cA = FALSE` is right
-///    for naming a certificate to a human and too generous for a record: old
-///    roots are routinely issued without the extension.
-///
-/// Anything else yields `None`, and the report and the audit event carry no
-/// serial. On a container of our own issuance — leaf plus chain in the clear,
-/// the key labelled with the leaf, no `id-encryptedData` — both rules name the
-/// leaf, so the serial is recorded as before.
-///
-/// # What this still cannot promise
-///
-/// If the container's private key does not belong to the single visible non-CA
-/// certificate, this names that certificate and the authentication path finds no
-/// match at all. Checking that would mean comparing public keys, and the public
-/// key of a `pkcs8ShroudedKeyBag` cannot be read without decrypting it. The
-/// enrollment such a container produces fails at the first login rather than
-/// authenticating as somebody else, and no other reading of the container is
-/// available without its password.
-///
-/// The certificates this can see are those in the clear; one kept in an
-/// encrypted safe stays invisible to it, as it does to every part of this
-/// module — and, per point 1, silences the answer entirely. The certificate is
-/// not validated against any trust anchor.
-#[must_use]
-pub fn try_extract_unambiguous_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
-    let bags = unencrypted::bags_in_clear(bytes);
-    if bags.hidden_content || bags.malformed_pairing {
-        return None;
-    }
-    let label = bags.key_local_key_id?;
-
-    let mut labelled = None;
-    for (index, candidate) in bags.certificates.iter().enumerate() {
-        if candidate.local_key_id.as_deref() != Some(label.as_slice()) {
-            continue;
-        }
-        if labelled.is_some() {
-            // Two bags claiming the same key: which of them the authentication
-            // path would settle on is not something to guess at in a record.
-            return None;
-        }
-        labelled = Some(index);
-    }
-    let labelled = labelled?;
-
-    // The second rule, arrived at without the label. Disagreement between the
-    // two is the whole reason this is checked: the label is written by whoever
-    // assembled the container, and on its own it proves nothing about which
-    // certificate the key belongs to.
-    if sole_non_ca(bags.certificates.iter().map(|cert| cert.der.as_slice())) != Some(labelled) {
-        return None;
-    }
-
-    let cert = Certificate::from_der(&bags.certificates.get(labelled)?.der).ok()?;
-    // Present and `cA = FALSE`, not merely "not asserting cA = TRUE": a record
-    // asserting a certificate is an end-entity must not rest on an extension
-    // that is not there.
-    if cert.basic_constraints().ok()?.is_none_or(|bc| bc.is_ca) {
-        return None;
-    }
-    Some(cert)
 }
 
 /// The one non-CA certificate a container carries, if there is exactly one.
@@ -323,10 +228,9 @@ fn select_end_entity(ders: &[Vec<u8>]) -> Option<Certificate> {
 /// The position of the one non-CA certificate among those given, if there is
 /// exactly one.
 ///
-/// Split out from [`select_end_entity`] so that
-/// [`try_extract_unambiguous_cert_without_pin`] can ask the same question and
-/// compare the *bag* it lands on, rather than compare two parsed certificates
-/// and have to decide what makes them the same one.
+/// Kept apart from [`select_end_entity`] so that the counting — which is where
+/// "exactly one" is decided — reads on its own, without the parse that turns the
+/// answer into a [`Certificate`].
 fn sole_non_ca<'a>(ders: impl IntoIterator<Item = &'a [u8]>) -> Option<usize> {
     let mut found = None;
     for (index, der) in ders.into_iter().enumerate() {

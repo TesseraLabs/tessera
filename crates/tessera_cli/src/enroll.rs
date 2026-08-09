@@ -13,7 +13,8 @@
 //!   rollout.
 //!
 //! On success the command prints a report (`host_id` prefix8, per-host cert
-//! serial, applied `bundle_version`, mode) and runs the existing
+//! serial — empty until it comes from a signed source, applied
+//! `bundle_version`, mode) and runs the existing
 //! [`crate::check`] preflight against the device config — a failed post-import
 //! check is surfaced as a non-zero exit (fail-closed). On any import error the
 //! command exits non-zero; the import core guarantees the device is left in its
@@ -29,7 +30,6 @@ use tessera_core::enrollment::{
     EnrollmentPackage, ImportError, ImportMode, ImportOutcome, InstallPaths,
 };
 use tessera_core::host_identity::HostIdentityResolver;
-use tessera_core::pkcs12;
 use tessera_core::role::RoleOs;
 
 /// CLI arguments for `tessera enroll`.
@@ -105,8 +105,11 @@ pub struct EnrollReport {
     pub outcome: ImportOutcome,
     /// `host_id` prefix8 (`""` when it could not be resolved).
     pub host_id_prefix8: String,
-    /// Per-host leaf certificate serial, uppercase hex (`""` when the `.p12`
-    /// leaf could not be read without the PIN — best-effort).
+    /// Per-host leaf certificate serial, uppercase hex.
+    ///
+    /// Empty until the serial arrives from a source the device can verify: it
+    /// cannot be derived from the package `.p12` without the PIN, and a guess
+    /// does not belong in a record that outlives the import.
     pub serial: String,
 }
 
@@ -159,34 +162,6 @@ fn resolve_host_id_prefix8(config: &Path) -> String {
     }
 }
 
-/// Read the per-host leaf certificate serial from the package `.p12` WITHOUT a
-/// PIN (best-effort; modern bundles place the leaf in an unencrypted SafeBag).
-/// Returns `""` when the leaf is encrypted/absent — the serial is a reporting
-/// nicety, never a gate.
-///
-/// The serial goes into the report and into the `device_enrolled` audit event,
-/// so it must be the certificate the device will actually authenticate with —
-/// and it is read here, ahead of the manifest signature check and with no
-/// signature at all in standalone mode, so the container has authenticated
-/// nothing when it is read. The authentication path's own choice cannot be
-/// reproduced without the password (`PKCS12_parse` matches the decrypted key
-/// against each certificate's public key), so the read used here is the
-/// conservative one: it names a certificate only where two independent rules
-/// agree on it and the container hides nothing, and stays silent everywhere
-/// else. An empty serial is a normal outcome; a wrong one would not be.
-fn read_p12_serial(pkg: &EnrollmentPackage, import_root: &Path) -> String {
-    // `EnrollmentPackage::p12_file()` is a bare name validated by the core's
-    // parser; join it under the package root we were given.
-    let p12_path = import_root.join(pkg.p12_file());
-    let Ok(bytes) = std::fs::read(&p12_path) else {
-        return String::new();
-    };
-    match pkcs12::try_extract_unambiguous_cert_without_pin(&bytes) {
-        Some(cert) => cert.serial_hex(),
-        None => String::new(),
-    }
-}
-
 /// Run the post-import `tessera check` preflight against `config`. Returns
 /// `true` when the config passed (no ERROR records), `false` otherwise. Reuses
 /// the exact [`crate::check`] machinery (no duplicate validation).
@@ -219,10 +194,18 @@ pub fn run(opts: EnrollOptions) -> Result<EnrollReport, EnrollError> {
     };
 
     let pkg = EnrollmentPackage::parse(&opts.import, opts.mode)?;
-    // The per-host serial is read from the package `.p12` (best-effort, no PIN)
-    // BEFORE the install consumes anything; it enriches both the audit event
-    // and the printed report.
-    let serial = read_p12_serial(&pkg, &opts.import);
+    // The serial stays empty. Deriving it from the package `.p12` without the
+    // PIN would be a guess about bytes nothing has vouched for: which
+    // certificate the device authenticates with is decided by which one matches
+    // the container's private key, and that key cannot be read without the
+    // password. Whatever a password-free walk picks out instead is a property of
+    // the container's labelling and layout, both of them chosen by whoever
+    // assembled it — and the package is read here before the manifest signature
+    // is checked, with no signature at all in standalone mode. The
+    // `device_enrolled` event is long-lived and gets read when an incident is
+    // reconstructed, so the field carries nothing until there is a source for it
+    // covered by a signature.
+    let serial = String::new();
 
     let ids = EnrollAuditIds {
         host_id_prefix8: &opts.host_id_prefix8,
@@ -448,6 +431,11 @@ mod tests {
         assert!(report.outcome.baseline_established);
         assert!(!report.outcome.no_op);
         assert_eq!(report.host_id_prefix8, "deadbeef");
+        assert!(
+            report.serial.is_empty(),
+            "the serial is not derived from the package: the same field feeds the \
+             device_enrolled event, and nothing here has vouched for the container"
+        );
     }
 
     #[test]
