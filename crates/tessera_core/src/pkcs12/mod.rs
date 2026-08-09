@@ -193,6 +193,34 @@ pub fn try_extract_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
     select_end_entity(&unencrypted::certificates_in_clear(bytes))
 }
 
+/// The certificate of a container that carries exactly one in the clear.
+///
+/// For the caller that does not display a certificate but *records* it — the
+/// enrollment report and its `device_enrolled` audit event. There the name has
+/// to be the certificate the device will authenticate with, and
+/// [`try_extract_cert_without_pin`] cannot promise that: it picks the single
+/// non-CA certificate, while the authentication path lets OpenSSL follow the
+/// key's `localKeyID`, and on a container whose CA precedes its leaf the two
+/// answers differ. An audit record naming a certificate the device never
+/// authenticates with is worse than one naming none.
+///
+/// A container holding a single certificate leaves the two rules nothing to
+/// disagree about, so that is the only shape answered here. Anything else — a
+/// leaf with its chain beside it, a container whose certificates are encrypted,
+/// malformed bytes — yields `None`, and the caller records nothing.
+///
+/// The certificates this can see are those in the clear; one kept in an
+/// encrypted safe stays invisible to it, as it does to every part of this
+/// module. No password is consulted and the certificate is not validated
+/// against any trust anchor.
+#[must_use]
+pub fn try_extract_sole_cert_without_pin(bytes: &[u8]) -> Option<Certificate> {
+    match unencrypted::certificates_in_clear(bytes).as_slice() {
+        [only] => Certificate::from_der(only).ok(),
+        _ => None,
+    }
+}
+
 /// The one non-CA certificate a container carries, if there is exactly one.
 ///
 /// A container holds the leaf together with the CAs above it, so "the first

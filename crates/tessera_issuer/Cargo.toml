@@ -77,7 +77,10 @@ hex = { workspace = true }
 # `hmac` + the `digest` 0.10 SHA-256 back the container MAC and its RFC 7292 key
 # derivation. `zeroize` keeps the generated private key out of freed memory.
 pkcs8 = { workspace = true }
-pkcs12 = { workspace = true }
+# `kdf` is the container MAC's key derivation, needed where a container is
+# written; it is off in the workspace entry so a reader-only build stays without
+# it.
+pkcs12 = { workspace = true, features = ["kdf"] }
 cms = { workspace = true }
 hmac = { workspace = true }
 sha2_pkcs12 = { workspace = true }

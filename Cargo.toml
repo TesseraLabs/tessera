@@ -91,12 +91,16 @@ p384 = "0.13"
 # AES-CBC) used to decrypt operator keys and to generate encrypted fixtures in
 # tests. Native-only, behind the `file` feature.
 pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
-# PKCS#12 container assembly for the issuer: ASN.1 types (`PFX`, `SafeBag`,
-# `CertBag`, `MacData`) plus the RFC 7292 Appendix B key derivation the MAC
-# needs. Only the format lives here; the key is encrypted with PBES2 through
-# `pkcs8`/`pkcs5` and the MAC is `hmac`, so no primitive is written by hand.
-# Matches the workspace's `der` 0.7 / `x509-cert` 0.2 generation.
-pkcs12 = { version = "0.1", features = ["kdf"] }
+# PKCS#12 ASN.1 types (`PFX`, `SafeBag`, `CertBag`, `MacData`). Only the format
+# lives here; the key is encrypted with PBES2 through `pkcs8`/`pkcs5` and the MAC
+# is `hmac`, so no primitive is written by hand. Matches the workspace's `der`
+# 0.7 / `x509-cert` 0.2 generation.
+#
+# The RFC 7292 Appendix B key derivation (`kdf`) is left off here and turned on
+# by the issuer alone: the reader in `tessera_core` walks the container's layout
+# without a password, and a build of that reader has no reason to carry a key
+# derivation it never calls.
+pkcs12 = { version = "0.1" }
 # `ContentInfo`, the envelope PKCS#12 wraps each safe in. Pulled directly
 # because the container assembly builds those envelopes itself; `pkcs12`
 # depends on the same version.

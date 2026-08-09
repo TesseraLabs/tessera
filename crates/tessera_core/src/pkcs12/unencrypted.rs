@@ -74,6 +74,10 @@ pub(super) fn certificates_in_clear(bytes: &[u8]) -> Vec<Vec<u8>> {
     let Ok(pfx) = Pfx::from_der(bytes) else {
         return Vec::new();
     };
+    // A container in public-key privacy mode wraps its authenticated safe in
+    // `signedData` instead of `id-data`. Its content is not octets this path can
+    // read, and refusing it on its declared type says so, rather than leaving it
+    // to whether the octet-string decode happens to fail on the bytes inside.
     let Some(auth_safe) = data_payload(&pfx.auth_safe) else {
         return Vec::new();
     };
@@ -90,10 +94,8 @@ pub(super) fn certificates_in_clear(bytes: &[u8]) -> Vec<Vec<u8>> {
     for safe in &safes {
         // An `id-encryptedData` safe is stepped over: opening it needs the
         // password. A container that hides its certificates that way simply has
-        // none to show here.
-        if safe.content_type != ID_DATA {
-            continue;
-        }
+        // none to show here, and `data_payload` turns it away on its declared
+        // content type.
         let Some(payload) = data_payload(safe) else {
             continue;
         };
@@ -151,8 +153,17 @@ fn bag_content(bag: &SafeBag) -> Option<Vec<u8>> {
     Some(any.value().to_vec())
 }
 
-/// The octets an `id-data` `ContentInfo` carries.
+/// The octets an `id-data` `ContentInfo` carries, or `None` for any other
+/// content type.
+///
+/// The type is checked rather than inferred from whether the octet-string decode
+/// succeeds: an `id-signedData` or `id-encryptedData` content is a structure this
+/// path must not read, and that has to be the stated reason for turning it away,
+/// not a side effect of the decoder's tag mismatch.
 fn data_payload(content_info: &ContentInfo) -> Option<Vec<u8>> {
+    if content_info.content_type != ID_DATA {
+        return None;
+    }
     let der = content_info.content.to_der().ok()?;
     let octets = OctetString::from_der(&der).ok()?;
     Some(octets.as_bytes().to_vec())

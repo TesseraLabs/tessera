@@ -60,7 +60,9 @@ libloading = { workspace = true }
 # PKCS#12 container structure, read without the password: the login screen's
 # "wrong drive against wrong password" diagnostic walks the container's safes
 # itself because `PKCS12_parse` gives up at the encrypted key. Only the ASN.1
-# layout is used; every cryptographic step on this path is absent by design.
+# layout is used; every cryptographic step on this path is absent by design —
+# `pkcs12` is taken as the workspace declares it, which is without the `kdf`
+# feature, so the key derivation is not linked into a build that only reads.
 der = { workspace = true }
 pkcs12 = { workspace = true }
 cms = { workspace = true }

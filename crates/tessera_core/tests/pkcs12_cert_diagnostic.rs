@@ -15,7 +15,9 @@
 #![allow(clippy::panic)]
 
 use secrecy::SecretString;
-use tessera_core::pkcs12::{try_extract_cert_without_pin, LoadedKeyMaterial, Pkcs12Error};
+use tessera_core::pkcs12::{
+    try_extract_cert_without_pin, try_extract_sole_cert_without_pin, LoadedKeyMaterial, Pkcs12Error,
+};
 
 /// Certificates encrypted (`-certpbe AES-256-CBC`): the older layout, which
 /// keeps nothing readable without the password.
@@ -185,6 +187,78 @@ fn the_non_ca_is_chosen_over_a_ca_that_precedes_it() {
         material.end_entity.subject_cn().unwrap(),
         "CertAuth Test Intermediate"
     );
+}
+
+#[test]
+fn a_container_whose_two_readers_could_disagree_yields_no_recorded_certificate() {
+    // The enrollment report and its audit event read the container through the
+    // sole-certificate call, and this fixture is exactly why: the login screen's
+    // rule names the leaf, `PKCS12_parse` names the CA above it, and a record
+    // that picked either would be a record of something that did not happen.
+    assert_eq!(
+        try_extract_cert_without_pin(CA_BEFORE_LEAF)
+            .expect("the diagnostic still names one")
+            .subject_cn()
+            .unwrap(),
+        "alice"
+    );
+    assert_eq!(
+        LoadedKeyMaterial::from_p12(CA_BEFORE_LEAF, &SecretString::from(FIXTURE_PIN.to_owned()))
+            .expect("the fixture opens with its own password")
+            .end_entity
+            .subject_cn()
+            .unwrap(),
+        "CertAuth Test Intermediate"
+    );
+
+    assert!(
+        try_extract_sole_cert_without_pin(CA_BEFORE_LEAF).is_none(),
+        "a container the two readers answer differently about must be recorded without a serial"
+    );
+}
+
+#[test]
+fn a_container_of_one_certificate_yields_it_for_the_record() {
+    // One certificate leaves the two readers nothing to disagree about, so this
+    // is the shape — and the only shape — a serial is recorded from.
+    let bytes = container_with_certificates(&[fixture_der("leaf_rsa.pem")]);
+    let cert = try_extract_sole_cert_without_pin(&bytes)
+        .expect("a container holding one certificate is unambiguous");
+    assert_eq!(cert.subject_cn().unwrap(), "alice");
+    assert_eq!(
+        cert.serial_hex(),
+        "44E056A8B426D4727A82EC2A41EDFFFEA4B3D0E3"
+    );
+}
+
+#[test]
+fn a_certificate_beside_its_chain_yields_nothing_for_the_record() {
+    // The ordinary issued container, leaf and intermediate together: the login
+    // screen names the leaf from it, but the record stays silent rather than
+    // rest on a rule the authentication path does not share.
+    let bytes = container_with_certificates(&[fixture_der("leaf_rsa.pem"), fixture_der("int.pem")]);
+    assert_eq!(
+        try_extract_cert_without_pin(&bytes)
+            .expect("the diagnostic names the non-CA")
+            .subject_cn()
+            .unwrap(),
+        "alice"
+    );
+    assert!(try_extract_sole_cert_without_pin(&bytes).is_none());
+}
+
+#[test]
+fn a_container_with_nothing_readable_yields_nothing_for_the_record() {
+    for (what, bytes) in [
+        ("certificates kept encrypted", ENCRYPTED_CERTS),
+        ("random bytes", &b"not a container at all"[..]),
+        ("an empty buffer", &b""[..]),
+    ] {
+        assert!(
+            try_extract_sole_cert_without_pin(bytes).is_none(),
+            "{what} must yield no certificate rather than panic"
+        );
+    }
 }
 
 #[test]

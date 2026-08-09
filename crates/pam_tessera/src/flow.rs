@@ -2410,8 +2410,12 @@ const MAX_SHOWN_HOST_DESCRIPTORS: usize = 4;
 
 /// Characters kept from one descriptor before it is cut short.
 ///
-/// Long enough for a `sha256:` digest (71 characters) with room to spare, short
-/// enough that a descriptor cannot push the rest of the message off the screen.
+/// Only raw descriptors reach the cut — a wildcard and a `sha256:` digest are
+/// both fixed-length forms the parser has already constrained and are rendered
+/// whole. A raw descriptor is a host name or a `machine_id`, which fit several
+/// times over, so the cut costs nothing an engineer needed to read; what it buys
+/// is that a descriptor of arbitrary length cannot push the rest of the message
+/// off the screen.
 const MAX_HOST_DESCRIPTOR_CHARS: usize = 96;
 
 /// Whether a character may be shown on the login screen as it stands.

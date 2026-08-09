@@ -32,7 +32,8 @@
 // reach — has no caller left. It is kept whole rather than split by feature so
 // the file and the gate stay described in one place; the readers themselves are
 // unconditional, and adding the CLI feature back puts every one of them to work.
-#![cfg_attr(not(feature = "cli"), allow(dead_code))]
+// The exemption is written on each of those items rather than over the module,
+// so an item that becomes unreachable later is still reported.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -44,6 +45,7 @@ use zeroize::Zeroizing;
 /// `false` means [`open`] admits any file the process can open at all. Callers
 /// read this to tell the operator that the check did not run, so "no complaint"
 /// is not mistaken for "the permissions were checked and are fine".
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) const GATE_ENFORCED: bool = cfg!(unix);
 
 /// A file whose permission bits let group or others reach it.
@@ -73,6 +75,7 @@ pub(crate) enum OpenError {
 /// device that never ends — and it is reserved up front, so the buffer holding
 /// the secret is never grown and never leaves a copy of what it held behind in
 /// freed memory.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) const MAX_SECRET_LEN: usize = 4096;
 
 /// The largest buffer reserved from a file's declared size.
@@ -84,6 +87,7 @@ const MAX_RESERVE: usize = 1 << 20;
 
 /// Why one line of a secret could not be read.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) enum ReadLineError {
     /// No line terminator arrived within [`MAX_SECRET_LEN`] bytes.
     TooLong,
@@ -136,6 +140,7 @@ impl SecretFile {
     ///
     /// [`ReadLineError::TooLong`] when no terminator arrives within
     /// [`MAX_SECRET_LEN`] bytes, [`ReadLineError::Io`] on a read failure.
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
     pub(crate) fn read_first_line(mut self) -> Result<Zeroizing<Vec<u8>>, ReadLineError> {
         read_line(&mut self.file)
     }
@@ -184,6 +189,7 @@ impl SecretFile {
     reason = "a buffered read would keep the secret in an allocation that is never wiped; \
               a secret is a line long, so the syscalls it costs are a handful"
 )]
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn read_line(
     source: &mut impl std::io::Read,
 ) -> Result<Zeroizing<Vec<u8>>, ReadLineError> {
