@@ -48,6 +48,7 @@ fn session_with_id_topology(
         target: SessionTarget::logind("c1"),
         usb_serial: Some(serial.into()),
         usb_vid_pid: vid_pid.map(str::to_string),
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_devnode: devnode.map(str::to_string),
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,
@@ -118,6 +119,7 @@ fn setup_with_sessions_and_mode(
         suspend_grace_seconds: 5,
         on_usb_removed: OnUsbRemoved::Lock,
         registry_store: store,
+        monitor_fail_mode: tessera_core::config::validated::MonitorFailMode::Permissive,
     };
     let shutdown = CancellationToken::new();
     let _h = spawn_state_manager(

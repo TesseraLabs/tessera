@@ -399,6 +399,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "cms"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b77c319abfd5219629c45c34c89ba945ed3c5e49fcde9d16b6c3885f118a730"
+dependencies = [
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "spki 0.7.3",
+ "x509-cert",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1797,6 +1809,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkcs12"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "695b3df3d3cc1015f12d70235e35b6b79befc5fa7a9b95b951eab1dd07c9efc2"
+dependencies = [
+ "cms",
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "digest 0.10.7",
+ "spki 0.7.3",
+ "x509-cert",
+ "zeroize",
+]
+
+[[package]]
 name = "pkcs5"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2112,6 +2139,27 @@ checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
 dependencies = [
  "hmac 0.12.1",
  "subtle",
+]
+
+[[package]]
+name = "rpassword"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2635,7 +2683,9 @@ name = "tessera_core"
 version = "0.5.0"
 dependencies = [
  "chrono",
+ "cms",
  "cryptoki",
+ "der 0.7.10",
  "foreign-types",
  "hex",
  "libc",
@@ -2646,6 +2696,7 @@ dependencies = [
  "openssl-sys",
  "p256",
  "parking_lot",
+ "pkcs12",
  "proptest",
  "rand 0.10.1",
  "regex",
@@ -2667,6 +2718,7 @@ dependencies = [
  "udev",
  "uuid",
  "windows-sys 0.61.2",
+ "x509-cert",
  "zeroize",
 ]
 
@@ -2697,19 +2749,24 @@ version = "0.5.0"
 dependencies = [
  "base64",
  "clap",
+ "cms",
  "const-oid 0.9.6",
  "cryptoki",
  "der 0.7.10",
  "getrandom 0.2.17",
  "hex",
+ "hmac 0.12.1",
  "p256",
  "p384",
+ "pkcs12",
  "pkcs8 0.10.2",
  "rand 0.10.1",
+ "rpassword",
  "sad-rsa",
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sha2 0.11.0",
  "spki 0.7.3",
  "tempfile",

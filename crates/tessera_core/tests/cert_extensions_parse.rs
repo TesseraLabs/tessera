@@ -131,6 +131,24 @@ fn host_binding_rejects_non_hex_sha256() {
 }
 
 #[test]
+fn host_binding_reads_multibyte_entries_as_raw_host_ids() {
+    // The parser runs before anything is authenticated, on a certificate that
+    // came off whatever drive was plugged in — a decision on a byte offset
+    // inside these entries would be a decision the drive gets to make.
+    let entries = ["日本語です", "ы", "sha25ф", "шестнадцать"];
+    let cert = build_cert(&[(HOST_BINDING_OID, encode_seq_of_utf8(&entries))]);
+
+    let parsed = host_binding_ext::parse(&cert).unwrap();
+    assert_eq!(
+        parsed,
+        entries
+            .iter()
+            .map(|s| HostDescriptor::Raw((*s).to_owned()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn host_binding_rejects_short_sha256() {
     let value = encode_seq_of_utf8(&[&format!("sha256:{}", "a".repeat(63))]);
     let cert = build_cert(&[(HOST_BINDING_OID, value)]);

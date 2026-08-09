@@ -1295,7 +1295,13 @@ mod journal {
         // annotation variant must not perturb existing lines.
         let mut journal = Journal::load(MemoryStorage::new()).unwrap();
         journal
-            .record_leaf(&[0x2a], b"parent-cert", "CN=Shift", TS)
+            .record_leaf(
+                &[0x2a],
+                b"parent-cert",
+                "CN=Shift",
+                crate::KeyOrigin::Requester,
+                TS,
+            )
             .unwrap();
         let golden = "{\"seq\":0,\"prev_hash\":\"cf9155d836062fbdff126663274d48ba5f2e79e0b6c7723e36c74bdc7a879694\",\"ts\":1600000000,\"op\":\"issue_leaf\",\"serial\":\"2a\",\"parent\":\"f8fd035a13e497ca2b38c0274132f76d17e4c19f5483df61306f4ac3fbdcb5a3\",\"subject\":\"CN=Shift\"}";
         assert_eq!(journal.storage().lines()[0], golden);
@@ -1460,6 +1466,304 @@ mod root {
         assert!(
             !matches!(verify_lines(&lines).status, JournalStatus::Broken { .. }),
             "a journal with an issue_root record verifies"
+        );
+    }
+}
+
+/// Scenarios for the third key source: a leaf over a pair the tool generates,
+/// packaged into a container in the same operation.
+mod generated_key {
+    use super::{envelope, fresh_journal, key, org_ca, root_ca, validity, TS};
+    use crate::keygen::{LeafKeyType, OsEntropy};
+    use crate::sign::MockSigner;
+    use crate::{
+        issue_leaf_generating_key, pkcs12, GeneratedLeafRequest, IntegrityCeiling, IssueError,
+        LeafScope, Serial,
+    };
+    use tessera_ext::ext::{extract_extension_value, parse_seq_of_utf8};
+    use tessera_ext::oids::ALLOWED_ROLES_OID;
+
+    const PASSPHRASE: &str = "delivered-out-of-band";
+
+    fn scope() -> LeafScope {
+        LeafScope {
+            validity: validity(3_600),
+            host_binding: vec!["*".to_owned()],
+            allowed_roles: vec!["oper".to_owned()],
+            max_integrity: Some(IntegrityCeiling {
+                level: 3,
+                categories: 0,
+            }),
+            profile_version: 1,
+        }
+    }
+
+    /// Issue-and-package at the crate's test key-derivation cost.
+    ///
+    /// The shipped cost is exercised by
+    /// [`issues_over_a_generated_pair_with_the_operator_scope`], which goes
+    /// through the public entry point. The tests that only look at what the
+    /// operation *records* would otherwise each spend a minute stretching a
+    /// password they never examine.
+    fn cheap(
+        signer: &MockSigner,
+        parent: &[u8],
+        req: &GeneratedLeafRequest<'_>,
+        journal: &mut crate::Journal<crate::test_support::MemoryStorage>,
+    ) -> crate::GeneratedLeaf {
+        crate::issue_leaf_generating_key_with(
+            signer,
+            &key(),
+            parent,
+            req,
+            PASSPHRASE,
+            &Serial::generate(),
+            journal,
+            &mut OsEntropy,
+            TS,
+            Some(crate::pkcs12::TEST_ITERATIONS),
+        )
+        .expect("the issuance succeeds")
+    }
+
+    fn request(chain: &[Vec<u8>], key_type: LeafKeyType) -> GeneratedLeafRequest<'_> {
+        GeneratedLeafRequest {
+            subject: "CN=ivanov".to_owned(),
+            key_type,
+            scope: scope(),
+            chain_der: chain,
+        }
+    }
+
+    #[test]
+    fn issues_over_a_generated_pair_with_the_operator_scope() {
+        let signer = MockSigner::ecdsa_sha256(key());
+        let ca = org_ca(&signer, &root_ca(&signer));
+        let chain = vec![ca.clone()];
+
+        let generated = issue_leaf_generating_key(
+            &signer,
+            &key(),
+            &ca,
+            &request(&chain, LeafKeyType::EcdsaP256),
+            PASSPHRASE,
+            &Serial::generate(),
+            &mut fresh_journal(),
+            &mut OsEntropy,
+            TS,
+        )
+        .expect("a leaf issues over a generated pair");
+
+        // The scope in the certificate is the operator's, not anything the
+        // (absent) requester could have influenced.
+        let roles = parse_seq_of_utf8(
+            &extract_extension_value(&generated.cert.der, ALLOWED_ROLES_OID)
+                .expect("the extension parses")
+                .expect("the leaf carries allowed_roles"),
+        )
+        .expect("the role list decodes");
+        assert_eq!(roles, vec!["oper".to_owned()]);
+
+        // And the container holds the key for that very certificate.
+        let parsed = pkcs12::parse_container(&generated.container, PASSPHRASE)
+            .expect("the container opens with its password");
+        assert_eq!(parsed.leaf_der, generated.cert.der);
+        assert_eq!(parsed.chain_der, chain);
+    }
+
+    #[test]
+    fn a_widened_scope_is_refused_exactly_as_for_any_other_key_source() {
+        let signer = MockSigner::ecdsa_sha256(key());
+        let ca = org_ca(&signer, &root_ca(&signer));
+        let mut req = request(&[], LeafKeyType::EcdsaP256);
+        // `serv` is outside the org CA's envelope, which allows only `oper`.
+        req.scope.allowed_roles = vec!["serv".to_owned()];
+
+        let err = issue_leaf_generating_key(
+            &signer,
+            &key(),
+            &ca,
+            &req,
+            PASSPHRASE,
+            &Serial::generate(),
+            &mut fresh_journal(),
+            &mut OsEntropy,
+            TS,
+        )
+        .expect_err("a widened scope must be refused");
+        assert!(matches!(err, IssueError::ScopeWidened(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_journal_separates_a_generated_key_from_a_requested_one() {
+        let signer = MockSigner::ecdsa_sha256(key());
+        let ca = org_ca(&signer, &root_ca(&signer));
+        let mut journal = fresh_journal();
+
+        // One issuance over a key the requester brought…
+        crate::issue_leaf(
+            &signer,
+            &key(),
+            &ca,
+            &crate::LeafRequest {
+                subject: "CN=brought-their-own".to_owned(),
+                subject_spki_der: crate::test_support::spki_fixture(),
+                validity: validity(3_600),
+                host_binding: vec!["*".to_owned()],
+                allowed_roles: vec!["oper".to_owned()],
+                max_integrity: None,
+                profile_version: 1,
+            },
+            &Serial::generate(),
+            &mut journal,
+            TS,
+        )
+        .expect("the requester-key issuance succeeds");
+
+        // …and one over a key the tool made.
+        cheap(
+            &signer,
+            &ca,
+            &request(&[], LeafKeyType::EcdsaP256),
+            &mut journal,
+        );
+
+        let lines = journal.storage().lines();
+        let requester = lines
+            .iter()
+            .find(|line| line.contains("brought-their-own"))
+            .expect("the requester-key line is in the chain");
+        let issuer = lines
+            .iter()
+            .find(|line| line.contains("CN=ivanov"))
+            .expect("the generated-key line is in the chain");
+
+        assert!(
+            issuer.contains(r#""key_origin":"issuer""#),
+            "a generated-key issuance must be identifiable in the journal: {issuer}"
+        );
+        assert!(
+            !requester.contains("key_origin"),
+            "a requester-key line stays byte-identical to the ones already in the chain: {requester}"
+        );
+    }
+
+    #[test]
+    fn no_secret_reaches_the_journal() {
+        let signer = MockSigner::ecdsa_sha256(key());
+        let ca = org_ca(&signer, &root_ca(&signer));
+        let mut journal = fresh_journal();
+        let generated = cheap(
+            &signer,
+            &ca,
+            &request(&[], LeafKeyType::EcdsaP256),
+            &mut journal,
+        );
+
+        let parsed = pkcs12::parse_container(&generated.container, PASSPHRASE).expect("it opens");
+        for line in journal.storage().lines() {
+            assert!(
+                !line.contains(PASSPHRASE),
+                "the container password must not reach the journal: {line}"
+            );
+            assert!(
+                !line.contains(&hex::encode(&*parsed.private_key_pkcs8_der)),
+                "the private key must not reach the journal: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_withheld_container_is_marked_in_the_journal() {
+        // The certificate is signed before the container is built, so a
+        // packaging failure leaves an issuance line for a credential nobody
+        // received. Without the annotation an inventory counts it as issued.
+        let signer = MockSigner::ecdsa_sha256(key());
+        let ca = org_ca(&signer, &root_ca(&signer));
+        let mut journal = fresh_journal();
+
+        let mut req = request(&[], LeafKeyType::EcdsaP256);
+        // A chain element that is not a certificate fails the container, and
+        // fails it after the issuance has been journaled.
+        let junk = vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]];
+        req.chain_der = &junk;
+
+        let err = crate::issue_leaf_generating_key_with(
+            &signer,
+            &key(),
+            &ca,
+            &req,
+            PASSPHRASE,
+            &Serial::generate(),
+            &mut journal,
+            &mut OsEntropy,
+            TS,
+            Some(crate::pkcs12::TEST_ITERATIONS),
+        )
+        .expect_err("packaging must fail");
+        assert!(matches!(err, IssueError::Container(_)), "got {err:?}");
+
+        let lines = journal.storage().lines();
+        assert!(
+            lines.iter().any(|line| line.contains("issue_leaf")),
+            "the signed certificate stays recorded"
+        );
+        let note = lines
+            .iter()
+            .find(|line| line.contains(crate::CONTAINER_WITHHELD_ANNOTATION))
+            .expect("the withheld container is recorded");
+        assert!(note.contains("CN=ivanov"), "got {note}");
+        assert!(
+            !note.contains(PASSPHRASE),
+            "the annotation must carry no secret: {note}"
+        );
+    }
+
+    #[test]
+    fn the_envelope_still_bounds_the_generated_leaf() {
+        // The generated-key path must not become a way around the parent's
+        // integrity ceiling, so the same refusal is asserted here as for the
+        // other sources.
+        let signer = MockSigner::ecdsa_sha256(key());
+        let root = root_ca(&signer);
+        let narrow = crate::issue_ca(
+            &signer,
+            &key(),
+            &root,
+            &crate::CaRequest {
+                subject: "CN=Narrow CA".to_owned(),
+                subject_spki_der: crate::test_support::spki_fixture(),
+                validity: validity(5_000_000),
+                constraints: envelope(&["oper"], 2, 3_600),
+                profile_version: 1,
+            },
+            &Serial::generate(),
+            &mut fresh_journal(),
+            TS,
+        )
+        .expect("the narrow CA issues")
+        .der;
+
+        let mut req = request(&[], LeafKeyType::EcdsaP256);
+        req.scope.max_integrity = Some(IntegrityCeiling {
+            level: 4,
+            categories: 0,
+        });
+        let err = issue_leaf_generating_key(
+            &signer,
+            &key(),
+            &narrow,
+            &req,
+            PASSPHRASE,
+            &Serial::generate(),
+            &mut fresh_journal(),
+            &mut OsEntropy,
+            TS,
+        )
+        .expect_err("an integrity ceiling above the parent must be refused");
+        assert!(
+            matches!(err, IssueError::IntegrityExceedsParent { .. }),
+            "got {err:?}"
         );
     }
 }

@@ -351,11 +351,13 @@ impl EnrollmentPackage {
     }
 
     /// Like [`Self::install`], but emits the enrollment audit event enriched
-    /// with the CLI-supplied `host_id` prefix8 and per-host certificate serial
-    /// ([`audit::EnrollAuditIds`]). This is the single emission point for the
-    /// `device_enrolled` / `enrollment_rejected` events, so the CLI gets exactly
-    /// one enriched event per import (no double-emit). A managed re-import of the
-    /// already-applied `bundle_version` is a no-op and emits nothing.
+    /// with the caller-supplied identifiers ([`audit::EnrollAuditIds`]): the
+    /// `host_id` prefix8, plus a `serial` field that every caller leaves empty
+    /// until a source under signature carries it. This is the single emission
+    /// point for the `device_enrolled` / `enrollment_rejected` events, so the
+    /// CLI gets exactly one enriched event per import (no double-emit). A
+    /// managed re-import of the already-applied `bundle_version` is a no-op and
+    /// emits nothing.
     ///
     /// # Errors
     ///

@@ -18,9 +18,11 @@
 //!
 //! Help text and subcommand names are English (the usual CLI convention); the
 //! *result* messages an operator reads are localized through [`crate::l10n`].
-//! The token PIN is never a command-line argument: the PKCS#11 backend prompts
-//! for it (pinentry, falling back to `TESSERA_ISSUER_PIN`) only for the duration
-//! of a signing operation.
+//! The token PIN is never a command-line argument: no flag takes a secret by
+//! value. It is obtained for the duration of a signing operation through the
+//! ladder in [`secret`] — a source named by a flag, else a pinentry program on
+//! `PATH`, else a console prompt with the echo off, else `TESSERA_ISSUER_PIN`
+//! with a warning — and the file backend's key passphrase the same way.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -78,6 +80,8 @@ enum Command {
     IssueLeaf(IssueLeafArgs),
     /// Issue a CRL for a CA.
     IssueCrl(IssueCrlArgs),
+    /// Lay an issued credential out on a carrier.
+    PrepareCarrier(PrepareCarrierArgs),
     /// Verify an issuance journal's hash chain.
     VerifyJournal(VerifyJournalArgs),
     /// Build a certificate request signed by the engineer's token key.
@@ -96,6 +100,18 @@ enum BackendKind {
     /// A deterministic in-crate signer for tests (no real cryptography).
     #[value(hide = true)]
     Mock,
+}
+
+impl BackendKind {
+    /// The value `--backend` takes for this backend, for error messages.
+    fn flag_value(self) -> &'static str {
+        match self {
+            BackendKind::Pkcs11 => "pkcs11",
+            BackendKind::Vault => "vault",
+            BackendKind::File => "file",
+            BackendKind::Mock => "mock",
+        }
+    }
 }
 
 /// Backend selection and its per-backend connection flags, shared by every
@@ -125,9 +141,26 @@ struct BackendArgs {
     #[arg(long)]
     key_file: Option<PathBuf>,
     /// pinentry program for the PIN prompt (pkcs11 backend) or the key
-    /// passphrase prompt (file backend).
-    #[arg(long)]
+    /// passphrase prompt (file backend). Naming one pins the secret source: no
+    /// other source is consulted.
+    #[arg(long, conflicts_with_all = ["pin_stdin", "pin_file", "key_passphrase_stdin", "key_passphrase_file"])]
     pinentry: Option<PathBuf>,
+    /// Read the token PIN as one line from standard input (pkcs11 backend).
+    #[arg(long, conflicts_with_all = ["pin_file", "key_passphrase_stdin"])]
+    pin_stdin: bool,
+    /// Read the token PIN as one line from a file readable only by its owner
+    /// (pkcs11 backend). The flag takes the file's path, never the PIN itself.
+    #[arg(long)]
+    pin_file: Option<PathBuf>,
+    /// Read the CA key passphrase as one line from standard input (file
+    /// backend).
+    #[arg(long, conflicts_with_all = ["key_passphrase_file"])]
+    key_passphrase_stdin: bool,
+    /// Read the CA key passphrase as one line from a file readable only by its
+    /// owner (file backend). The flag takes the file's path, never the
+    /// passphrase itself.
+    #[arg(long)]
+    key_passphrase_file: Option<PathBuf>,
     /// Vault base address, e.g. `https://vault.example:8200` (vault backend).
     #[arg(long)]
     vault_addr: Option<String>,
@@ -143,6 +176,38 @@ struct BackendArgs {
     /// Send a locally computed digest with `prehashed=true` (vault backend).
     #[arg(long)]
     prehashed: bool,
+}
+
+#[cfg(any(feature = "pkcs11", feature = "file"))]
+impl BackendArgs {
+    /// The PIN source the operator named, if any.
+    ///
+    /// Only one can be present: the flags are mutually exclusive at parsing, so
+    /// the order the arms are tried here never decides anything.
+    #[cfg(feature = "pkcs11")]
+    fn pin_source(&self) -> Option<secret::FlagSource> {
+        if let Some(program) = self.pinentry.clone() {
+            return Some(secret::FlagSource::Pinentry(program));
+        }
+        if self.pin_stdin {
+            return Some(secret::FlagSource::Stdin);
+        }
+        self.pin_file.clone().map(secret::FlagSource::File)
+    }
+
+    /// The key-passphrase source the operator named, if any.
+    #[cfg(feature = "file")]
+    fn key_passphrase_source(&self) -> Option<secret::FlagSource> {
+        if let Some(program) = self.pinentry.clone() {
+            return Some(secret::FlagSource::Pinentry(program));
+        }
+        if self.key_passphrase_stdin {
+            return Some(secret::FlagSource::Stdin);
+        }
+        self.key_passphrase_file
+            .clone()
+            .map(secret::FlagSource::File)
+    }
 }
 
 /// Flags for `issuer issue-root`.
@@ -264,6 +329,11 @@ struct IssueCaArgs {
 
 /// Flags for `issuer issue-leaf`.
 #[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the struct is the command line: each flag is one boolean and \
+              folding them into enums would change the operator-facing syntax"
+)]
 struct IssueLeafArgs {
     #[command(flatten)]
     backend: BackendArgs,
@@ -276,7 +346,36 @@ struct IssueLeafArgs {
     /// Leaf key source: a PKCS#10 CSR (PEM or DER). Its subject and key are used.
     #[arg(long)]
     csr: Option<PathBuf>,
-    /// Subject distinguished name (RFC 4514); required with `--spki`.
+    /// Generate the leaf key pair here instead of taking one in. The private key
+    /// exists only in memory and in the container written to `--out-p12`.
+    #[arg(long, conflicts_with_all = ["spki", "csr"])]
+    generate_key: bool,
+    /// Type of key to generate: `ecdsa-p256` (the default), `ecdsa-p384`,
+    /// `rsa-2048`, `rsa-3072` or `rsa-4096`. Only with `--generate-key`.
+    #[arg(long)]
+    key_type: Option<String>,
+    /// Output path for the PKCS#12 container. Required with, and only valid
+    /// with, `--generate-key`.
+    #[arg(long)]
+    out_p12: Option<PathBuf>,
+    /// Chain certificates to package beside the leaf (PEM, may hold several);
+    /// defaults to the parent certificate alone. Only with `--generate-key`.
+    #[arg(long)]
+    chain: Option<PathBuf>,
+    /// Read the container password as one line from standard input. Without any
+    /// `--p12-passphrase-*` flag the tool generates one and shows it once.
+    #[arg(long, conflicts_with_all = ["p12_passphrase_file", "p12_passphrase_prompt"])]
+    p12_passphrase_stdin: bool,
+    /// Read the container password as one line from a file readable only by its
+    /// owner. The flag takes the file's path, never the password itself.
+    #[arg(long, conflicts_with = "p12_passphrase_prompt")]
+    p12_passphrase_file: Option<PathBuf>,
+    /// Ask for the container password interactively (a pinentry dialog, else a
+    /// console prompt with the echo off).
+    #[arg(long)]
+    p12_passphrase_prompt: bool,
+    /// Subject distinguished name (RFC 4514); required with `--spki` and with
+    /// `--generate-key`.
     #[arg(long)]
     subject: Option<String>,
     /// A host descriptor the leaf binds (repeat for several).
@@ -306,12 +405,73 @@ struct IssueLeafArgs {
     /// NDJSON issuance journal file.
     #[arg(long)]
     journal: PathBuf,
-    /// Output path for the issued certificate.
+    /// Output path for the issued certificate. Optional with `--generate-key`,
+    /// where the certificate also travels inside the container.
     #[arg(long)]
-    out: PathBuf,
+    out: Option<PathBuf>,
     /// Write DER instead of PEM.
     #[arg(long)]
     der: bool,
+}
+
+/// Flags for `issuer prepare-carrier`.
+///
+/// The command has no signing backend: it moves already-issued artifacts onto a
+/// carrier and signs nothing.
+#[derive(Debug, Args)]
+struct PrepareCarrierArgs {
+    /// The PKCS#12 container to place.
+    #[arg(long)]
+    p12: PathBuf,
+    /// The trust chain to place beside it (PEM).
+    #[arg(long)]
+    chain: Option<PathBuf>,
+    /// The mounted carrier to lay the artifacts out on.
+    #[arg(long)]
+    media: Option<PathBuf>,
+    /// Container path relative to the carrier, for a fleet whose devices
+    /// configure `pkcs12_path_pattern` away from the default.
+    #[arg(long)]
+    container_path: Option<String>,
+    /// PKCS#11 module of a passive token to write the container to.
+    #[arg(long)]
+    module: Option<PathBuf>,
+    /// Label of the token data object holding the container.
+    #[arg(long)]
+    object_label: Option<String>,
+    /// Token label to select. Worth naming whenever more than one token is
+    /// plugged in: without it the first slot with a token wins, which is as
+    /// likely to be the CA token as the carrier.
+    #[arg(long)]
+    token_label: Option<String>,
+    /// pinentry program for the token PIN prompt. Naming one pins the secret
+    /// source: no other source is consulted.
+    #[arg(long, conflicts_with_all = ["pin_stdin", "pin_file"])]
+    pinentry: Option<PathBuf>,
+    /// Read the token PIN as one line from standard input.
+    #[arg(long, conflicts_with_all = ["pin_file"])]
+    pin_stdin: bool,
+    /// Read the token PIN as one line from a file readable only by its owner.
+    /// The flag takes the file's path, never the PIN itself.
+    #[arg(long)]
+    pin_file: Option<PathBuf>,
+    /// Replace an existing container without asking.
+    #[arg(long)]
+    force: bool,
+}
+
+#[cfg(feature = "pkcs11")]
+impl PrepareCarrierArgs {
+    /// The PIN source the operator named, if any.
+    fn pin_source(&self) -> Option<secret::FlagSource> {
+        if let Some(program) = self.pinentry.clone() {
+            return Some(secret::FlagSource::Pinentry(program));
+        }
+        if self.pin_stdin {
+            return Some(secret::FlagSource::Stdin);
+        }
+        self.pin_file.clone().map(secret::FlagSource::File)
+    }
 }
 
 /// Flags for `issuer issue-crl`.
@@ -410,6 +570,7 @@ fn run(command: Command, locale: Locale) -> Result<(), CliError> {
             dispatch_with_backend(&args.backend, locale, IssueCrlJob { args: &args })
         }
         Command::Csr(args) => dispatch_with_backend(&args.backend, locale, CsrJob { args: &args }),
+        Command::PrepareCarrier(args) => prepare_carrier(&args, locale),
         Command::VerifyJournal(args) => verify_journal(&args, locale),
     }
 }
@@ -477,11 +638,56 @@ fn dispatch_with_backend(
     locale: Locale,
     job: impl BackendJob,
 ) -> Result<(), CliError> {
+    reject_foreign_secret_flags(args, locale)?;
     match args.backend {
         BackendKind::Mock => run_mock(args, locale, job),
         BackendKind::Pkcs11 => run_pkcs11(args, locale, job),
         BackendKind::Vault => run_vault(args, locale, job),
         BackendKind::File => run_file(args, locale, job),
+    }
+}
+
+/// Refuse a secret-source flag that belongs to a backend other than the one
+/// selected.
+///
+/// The sources are per-backend: `--pin-*` feeds the PKCS#11 token PIN,
+/// `--key-passphrase-*` the file backend's key, and neither Vault nor the mock
+/// signer asks for a secret at all. A flag for another backend is read by
+/// nobody, so accepting it would silently run the operation from a source the
+/// operator did not name — a dialog, or the environment variable — while their
+/// command line says otherwise.
+fn reject_foreign_secret_flags(args: &BackendArgs, locale: Locale) -> Result<(), CliError> {
+    let asks_for_a_pin = args.backend == BackendKind::Pkcs11;
+    let asks_for_a_passphrase = args.backend == BackendKind::File;
+    let foreign = [
+        (
+            "--pinentry",
+            args.pinentry.is_some(),
+            asks_for_a_pin || asks_for_a_passphrase,
+        ),
+        ("--pin-stdin", args.pin_stdin, asks_for_a_pin),
+        ("--pin-file", args.pin_file.is_some(), asks_for_a_pin),
+        (
+            "--key-passphrase-stdin",
+            args.key_passphrase_stdin,
+            asks_for_a_passphrase,
+        ),
+        (
+            "--key-passphrase-file",
+            args.key_passphrase_file.is_some(),
+            asks_for_a_passphrase,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(flag, given, applies)| (given && !applies).then_some(flag));
+
+    match foreign {
+        None => Ok(()),
+        Some(flag) => Err(CliError::Usage(format!(
+            "{} {flag} (--backend {})",
+            Msg::CliSecretFlagForeignBackend.text(locale),
+            args.backend.flag_value(),
+        ))),
     }
 }
 
@@ -549,7 +755,7 @@ fn run_pkcs11(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Resul
         // registry key is configured by external signing frontends, not here.
         registry_key: None,
     };
-    let signer = Pkcs11Signer::open(config, pin::CliPinSource::new(args.pinentry.clone()))
+    let signer = Pkcs11Signer::open(config, pin::CliPinSource::new(args.pin_source(), locale))
         .map_err(|e| CliError::Backend(e.to_string()))?;
     job.run(&signer, locale)
 }
@@ -610,16 +816,26 @@ fn run_file(args: &BackendArgs, locale: Locale, job: impl BackendJob) -> Result<
     // "no cross-check") rather than substituting a default.
     let requested_algorithm = args.algorithm.as_deref().map(parse_algorithm).transpose()?;
     let key_id = effective_key_id(args)?;
-    let passphrase = keypass::FilePassphraseSource::new(args.pinentry.clone());
+    let passphrase = keypass::FilePassphraseSource::new(args.key_passphrase_source(), locale);
     let signer = FileSigner::open(
         FileConfig {
-            path,
+            path: path.clone(),
             key_id,
             requested_algorithm,
         },
         &passphrase,
     )
     .map_err(|e| CliError::Backend(e.to_string()))?;
+    // The CA key passes the same owner-only gate as a secret file. Where the
+    // platform has no such check, say so: silence would read as a permission
+    // check that ran and found nothing wrong. It is said only once the key is
+    // actually open — a warning about a file the run never got to read would
+    // point the operator at the wrong thing.
+    if let Some(notice) =
+        secret::unchecked_gate_notice(crate::secret_file::GATE_ENFORCED, locale, &path)
+    {
+        secret::warn(&mut std::io::stderr(), &notice);
+    }
     // A plaintext CA key is accepted but flagged on every start.
     if !signer.key_is_encrypted() {
         eprintln!("{}", Msg::FilePlaintextKeyWarning.text(locale));
@@ -721,10 +937,20 @@ struct IssueLeafJob<'a> {
 impl BackendJob for IssueLeafJob<'_> {
     fn run<B: SignatureBackend>(self, backend: &B, locale: Locale) -> Result<(), CliError> {
         let a = self.args;
+        // Before anything is read from disk: a flag that will be ignored is a
+        // usage error, and saying so costs nothing here.
+        if !a.generate_key {
+            reject_generation_flags(a)?;
+        }
         let key = effective_key_id(&a.backend)?;
         let parent = decode_pem_or_der(&read_file(&a.parent)?)?;
-        let source = build_key_source(a.spki.as_deref(), a.csr.as_deref())?;
         let scope = leaf_scope(a);
+
+        if a.generate_key {
+            return self.run_generating(backend, &key, &parent, &scope, locale);
+        }
+
+        let source = build_key_source(a.spki.as_deref(), a.csr.as_deref())?;
 
         // With a CSR, surface the request's subject and self-signature status
         // before issuing (the core re-checks proof of possession authoritatively).
@@ -752,8 +978,84 @@ impl BackendJob for IssueLeafJob<'_> {
             &mut journal,
             now_unix()?,
         )?;
-        write_artifact(&a.out, &issued.der, "CERTIFICATE", a.der)?;
-        println!("{} {}", Msg::CliCertWritten.text(locale), a.out.display());
+        let out = a.out.as_deref().ok_or_else(|| {
+            CliError::Usage("--out is required without --generate-key".to_owned())
+        })?;
+        write_artifact(out, &issued.der, "CERTIFICATE", a.der)?;
+        println!("{} {}", Msg::CliCertWritten.text(locale), out.display());
+        Ok(())
+    }
+}
+
+impl IssueLeafJob<'_> {
+    /// The `--generate-key` path: mint the key, issue, package, write.
+    ///
+    /// Everything the operator gets out of this is written here, in one place,
+    /// because the private key exists only for the length of the call — there is
+    /// no later step that could pick it up.
+    fn run_generating<B: SignatureBackend>(
+        self,
+        backend: &B,
+        key: &KeyId,
+        parent: &[u8],
+        scope: &LeafScope,
+        locale: Locale,
+    ) -> Result<(), CliError> {
+        let a = self.args;
+        let subject = a.subject.as_deref().ok_or_else(|| {
+            CliError::Usage("--subject is required with --generate-key".to_owned())
+        })?;
+        let out_p12 = a.out_p12.as_deref().ok_or_else(|| {
+            CliError::Usage("--out-p12 is required with --generate-key".to_owned())
+        })?;
+        let key_type = crate::keygen::LeafKeyType::parse(
+            a.key_type.as_deref().unwrap_or(DEFAULT_LEAF_KEY_TYPE),
+        )?;
+
+        // Without a chain file the parent CA is the chain: it is the one
+        // certificate the leaf provably needs, and it is already in hand.
+        let chain = match a.chain.as_deref() {
+            Some(path) => decode_pem_chain(&read_file(path)?)?,
+            None => vec![parent.to_vec()],
+        };
+
+        let passphrase = p12pass::resolve(a, locale)?;
+        let mut entropy = crate::keygen::OsEntropy;
+        let mut journal = open_journal(&a.journal)?;
+        let serial = Serial::generate();
+        let generated = crate::issue_leaf_generating_key(
+            backend,
+            key,
+            parent,
+            &crate::GeneratedLeafRequest {
+                subject: subject.to_owned(),
+                key_type,
+                scope: scope.clone(),
+                chain_der: &chain,
+            },
+            passphrase.expose(),
+            &serial,
+            &mut journal,
+            &mut entropy,
+            now_unix()?,
+        )?;
+
+        write_container(out_p12, &generated.container)?;
+        println!(
+            "{} {}",
+            Msg::CliContainerWritten.text(locale),
+            out_p12.display()
+        );
+        if let Some(out) = a.out.as_deref() {
+            write_artifact(out, &generated.cert.der, "CERTIFICATE", a.der)?;
+            println!("{} {}", Msg::CliCertWritten.text(locale), out.display());
+        }
+        // The generated password is shown last so it is the final thing on the
+        // operator's screen, and only when the tool made it up: one the operator
+        // supplied is already theirs to keep.
+        if let Some(shown) = passphrase.shown_once() {
+            show_generated_passphrase(shown, locale)?;
+        }
         Ok(())
     }
 }
@@ -982,6 +1284,39 @@ fn build_key_source(spki: Option<&Path>, csr: Option<&Path>) -> Result<KeySource
     }
 }
 
+/// The key type generated when the operator names none.
+///
+/// P-256 rather than RSA: every supported device verifies it, and it is the one
+/// choice whose generation does not make the operator wait.
+const DEFAULT_LEAF_KEY_TYPE: &str = "ecdsa-p256";
+
+/// Refuse a `--generate-key` flag on a run that is not generating a key.
+///
+/// `clap` cannot express this: a flag with a default value counts as present, so
+/// `requires` never fires. Left unchecked, an operator who forgot
+/// `--generate-key` would get a normal issuance and no container, with their
+/// `--out-p12` silently ignored — the shape of mistake that is only noticed when
+/// the engineer has nothing to log in with.
+fn reject_generation_flags(args: &IssueLeafArgs) -> Result<(), CliError> {
+    let stray = [
+        ("--key-type", args.key_type.is_some()),
+        ("--out-p12", args.out_p12.is_some()),
+        ("--chain", args.chain.is_some()),
+        ("--p12-passphrase-stdin", args.p12_passphrase_stdin),
+        ("--p12-passphrase-file", args.p12_passphrase_file.is_some()),
+        ("--p12-passphrase-prompt", args.p12_passphrase_prompt),
+    ]
+    .into_iter()
+    .find_map(|(flag, given)| given.then_some(flag));
+
+    match stray {
+        None => Ok(()),
+        Some(flag) => Err(CliError::Usage(format!(
+            "{flag} applies only to --generate-key"
+        ))),
+    }
+}
+
 /// Assemble the operator-set leaf scope from the parsed flags.
 fn leaf_scope(args: &IssueLeafArgs) -> LeafScope {
     LeafScope {
@@ -1078,6 +1413,407 @@ fn write_artifact(path: &Path, der: &[u8], pem_label: &str, as_der: bool) -> Res
     std::fs::write(path, bytes).map_err(|e| CliError::Io(format!("{}: {e}", path.display())))
 }
 
+/// Write a PKCS#12 container, readable by its owner alone.
+///
+/// The certificates the tool writes are public; this file is not — it carries a
+/// private key, and the password protecting that key travels separately and may
+/// not have reached the engineer yet.
+///
+/// The bytes go into a fresh file beside the target and are renamed over it.
+/// `create_new` is what makes the mode hold: setting a mode on `open` affects
+/// only a file being created, so writing straight to the target would inherit
+/// whatever mode it already had — and would follow a symlink sitting there,
+/// putting the key wherever it points. The rename also means a reader never
+/// sees a half-written container.
+///
+/// Windows has no equivalent one-call restriction here; the file inherits the
+/// directory's ACL, which is the platform's own answer to the same question.
+fn write_container(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    use std::io::Write as _;
+
+    let io = |p: &Path, e: std::io::Error| CliError::Io(format!("{}: {e}", p.display()));
+
+    let mut staged_name = std::ffi::OsString::from(".tessera-staging-");
+    staged_name.push(path.file_name().unwrap_or_else(|| "container".as_ref()));
+    let staged = path.with_file_name(staged_name);
+    drop(std::fs::remove_file(&staged));
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&staged).map_err(|e| io(&staged, e))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| io(&staged, e));
+    drop(file);
+    if let Err(e) = written {
+        drop(std::fs::remove_file(&staged));
+        return Err(e);
+    }
+    std::fs::rename(&staged, path).map_err(|e| io(path, e))
+}
+
+/// Decode every PEM block of a chain file into DER, in file order.
+///
+/// A chain file holds one certificate or several; the single-block decoder
+/// would silently take only the first, which is exactly the kind of quiet loss
+/// that surfaces later as an unverifiable chain on a device.
+fn decode_pem_chain(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CliError> {
+    let chain = decode_pem_blocks(bytes)?;
+    // Decoding base64 says nothing about what was inside it. The container's
+    // certificate safe is unencrypted by design, so a file that is not a
+    // certificate — the CA key file sits under an adjacent flag — would be
+    // published in the clear. Each block is reported as the chain element it
+    // is: an operator told "the leaf certificate" would go and check the wrong
+    // file.
+    for (index, der) in chain.iter().enumerate() {
+        crate::pkcs12::check_certificate(der, &format!("chain element {index}"))
+            .map_err(|e| CliError::Usage(format!("--chain: {e}")))?;
+    }
+    Ok(chain)
+}
+
+/// Split a PEM file into the DER of each block, in file order.
+fn decode_pem_blocks(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CliError> {
+    let looks_pem = bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|&b| b == b'-');
+    if !looks_pem {
+        return Ok(vec![bytes.to_vec()]);
+    }
+    let text =
+        core::str::from_utf8(bytes).map_err(|_| CliError::Io("PEM is not UTF-8".to_owned()))?;
+    let mut out = Vec::new();
+    let mut body = String::new();
+    let mut in_body = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("-----BEGIN") {
+            in_body = true;
+            body.clear();
+        } else if trimmed.starts_with("-----END") {
+            in_body = false;
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(body.as_bytes())
+                .map_err(|e| CliError::Io(format!("PEM base64: {e}")))?;
+            out.push(der);
+        } else if in_body {
+            body.push_str(trimmed);
+        }
+    }
+    if out.is_empty() {
+        return Err(CliError::Io("no PEM certificate found".to_owned()));
+    }
+    Ok(out)
+}
+
+/// Refuse to generate a password there is nobody to show.
+///
+/// A generated password is shown once and nowhere else, so a run that cannot
+/// show it produces a container no one can ever open. Writing it into a
+/// captured stream instead — a CI log, a `tee` file — would mean treating it as
+/// compromised from the moment it is issued.
+///
+/// This runs before the key is generated and before anything is journaled, so
+/// the refusal costs nothing and leaves nothing behind.
+fn require_terminal_for_generated_passphrase(locale: Locale) -> Result<(), CliError> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stderr().is_terminal() {
+        return Ok(());
+    }
+    Err(CliError::Usage(
+        Msg::CliContainerPassphraseNoTerminal
+            .text(locale)
+            .to_owned(),
+    ))
+}
+
+/// Show a generated container password, once, to a person.
+///
+/// Standard error, not standard output: the password is not part of the
+/// artifact stream an operator pipes into a file or a log, and the same crate
+/// already sends its environment-variable warning there. That the stream is a
+/// terminal was settled before the issuance ran.
+fn show_generated_passphrase(passphrase: &str, locale: Locale) -> Result<(), CliError> {
+    use std::io::Write as _;
+
+    let mut stderr = std::io::stderr();
+    writeln!(
+        stderr,
+        "{}",
+        Msg::CliContainerPassphraseHeading.text(locale)
+    )
+    .and_then(|()| writeln!(stderr, "{passphrase}"))
+    .map_err(|e| CliError::Io(format!("stderr: {e}")))
+}
+
+/// Check that a chain about to be laid out belongs to the container beside it.
+///
+/// The container's certificate safe is unencrypted, so the leaf is readable
+/// here without the password — and when it is, the chain can be checked against
+/// it rather than taken on trust. A container this tool did not build may hide
+/// its leaf; then there is nothing to check against and the chain's own
+/// well-formedness, already established, is all that can be said.
+fn check_chain_against_container(container: &[u8], chain: &[Vec<u8>]) -> Result<(), CliError> {
+    let Ok(certs) = crate::pkcs12::certificates_without_passphrase(container) else {
+        return Ok(());
+    };
+    let Some(leaf) = certs.first() else {
+        return Ok(());
+    };
+    crate::pkcs12::check_chain(leaf, chain)
+        .map_err(|e| CliError::Usage(format!("--chain does not match --p12: {e}")))
+}
+
+/// `prepare-carrier`: lay an already-issued credential out where the device's
+/// check looks for it.
+///
+/// Nothing is signed and no secret is read: the command moves files. The one
+/// judgement it makes is about replacing a container that is already there,
+/// which it never does without a yes.
+fn prepare_carrier(args: &PrepareCarrierArgs, locale: Locale) -> Result<(), CliError> {
+    if args.module.is_some() || args.object_label.is_some() {
+        return prepare_token_carrier(args, locale);
+    }
+    let media = args
+        .media
+        .as_deref()
+        .ok_or_else(|| CliError::Usage("--media is required".to_owned()))?;
+
+    // A mounted carrier reads no PIN and selects no token, so the flags that
+    // supply those are refused rather than dropped. Every other incompatible
+    // combination this command can be given is refused out loud; a `--pin-file`
+    // accepted and ignored would let an operator believe a PIN was involved in
+    // protecting what was just written to a plain directory.
+    if let Some(flag) = token_only_flag(args) {
+        return Err(CliError::Usage(format!(
+            "{flag} describes a token carrier; a run with --media takes neither a PIN nor a \
+             token label"
+        )));
+    }
+
+    if let Some(relative) = args.container_path.as_deref() {
+        crate::carrier::check_container_path(relative)
+            .map_err(|e| CliError::Usage(e.to_string()))?;
+    }
+
+    let container = read_file(&args.p12)?;
+    // The chain is validated before it is copied: `certs/chain.pem` is read by
+    // the device, and a file that is not a chain fails there, not here.
+    let chain = match args.chain.as_deref() {
+        Some(path) => {
+            let bytes = read_file(path)?;
+            let certs = decode_pem_chain(&bytes)?;
+            check_chain_against_container(&container, &certs)?;
+            Some(bytes)
+        }
+        None => None,
+    };
+
+    let overwrite = resolve_overwrite(media, args, locale)?;
+    let written = crate::carrier::lay_out_media(
+        media,
+        &crate::carrier::CarrierPayload {
+            container: &container,
+            chain_pem: chain.as_deref(),
+        },
+        args.container_path.as_deref(),
+        overwrite,
+    )
+    .map_err(|e| CliError::Io(e.to_string()))?;
+
+    println!("{}", Msg::CliCarrierWritten.text(locale));
+    println!("  {}", written.container.display());
+    if let Some(path) = written.chain {
+        println!("  {}", path.display());
+    }
+    Ok(())
+}
+
+/// The first flag given that only a token carrier can act on, if any.
+///
+/// Named separately from the check that uses it so the list is one place: these
+/// are declared unconditionally on the command (a build without the `pkcs11`
+/// feature has them too, and can act on none of them).
+fn token_only_flag(args: &PrepareCarrierArgs) -> Option<&'static str> {
+    [
+        ("--pinentry", args.pinentry.is_some()),
+        ("--pin-stdin", args.pin_stdin),
+        ("--pin-file", args.pin_file.is_some()),
+        ("--token-label", args.token_label.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(flag, given)| given.then_some(flag))
+}
+
+/// `prepare-carrier` against a passive token: write the container into a
+/// private data object.
+///
+/// Only the container travels this way. The trust chain stays on the device
+/// side, and a run that asks for both is refused rather than half-served: an
+/// operator told the carrier was prepared would not go looking for the chain.
+#[cfg(feature = "pkcs11")]
+fn prepare_token_carrier(args: &PrepareCarrierArgs, locale: Locale) -> Result<(), CliError> {
+    use crate::carrier::{Overwrite, TokenTarget};
+    use crate::pkcs11::PinSource as _;
+
+    let module = args
+        .module
+        .as_deref()
+        .ok_or_else(|| CliError::Usage("--object-label needs --module".to_owned()))?;
+    let object_label = args
+        .object_label
+        .as_deref()
+        .ok_or_else(|| CliError::Usage("--module needs --object-label".to_owned()))?;
+    if args.media.is_some() || args.container_path.is_some() {
+        return Err(CliError::Usage(
+            "--media and --container-path describe a mounted carrier; a token takes \
+             --module and --object-label"
+                .to_owned(),
+        ));
+    }
+    if args.chain.is_some() {
+        return Err(CliError::Usage(
+            "a token carries the container only; place the chain on the device or on a \
+             mounted carrier"
+                .to_owned(),
+        ));
+    }
+    crate::carrier::check_object_label(object_label).map_err(|e| CliError::Usage(e.to_string()))?;
+
+    // The size is judged from the directory entry first, so a file far too big
+    // to be a container is refused without a copy of it in memory. It is not
+    // the check that decides — a length read separately from the bytes can be
+    // stale — only the one that keeps the obvious case cheap.
+    if let Ok(metadata) = std::fs::metadata(&args.p12) {
+        let claimed = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        crate::carrier::check_container_fits(claimed)
+            .map_err(|e| CliError::Usage(e.to_string()))?;
+    }
+    let container = read_file(&args.p12)?;
+    // Before the PIN is asked for: a container that cannot be written is not
+    // worth interrupting the operator over.
+    crate::carrier::check_container_fits(container.len())
+        .map_err(|e| CliError::Usage(e.to_string()))?;
+
+    let pin =
+        pin::CliPinSource::for_carrier(args.pin_source(), args.token_label.as_deref(), locale)
+            .pin()
+            .map_err(|e| CliError::Usage(e.to_string()))?;
+    let overwrite = if args.force {
+        Overwrite::Allow
+    } else {
+        Overwrite::Refuse
+    };
+
+    let written = crate::carrier::lay_out_token(
+        &TokenTarget {
+            module_path: module,
+            token_label: args.token_label.as_deref(),
+            object_label,
+        },
+        &container,
+        &pin,
+        overwrite,
+    )
+    .map_err(|e| match e {
+        // The replacement is a second decision, and it is taken with the token
+        // in hand rather than in an answer typed after a PIN prompt.
+        crate::carrier::CarrierError::TokenObjectExists(_) => {
+            CliError::Usage(format!("{e}; re-run with --force"))
+        }
+        other => CliError::Io(other.to_string()),
+    })?;
+
+    println!("{}", Msg::CliCarrierWritten.text(locale));
+    println!(
+        "  {} ({} bytes) -> {} {}",
+        written.object_label, written.bytes, written.token_label, written.token_serial
+    );
+    Ok(())
+}
+
+/// The refusal a build without the PKCS#11 feature gives for a token carrier.
+#[cfg(not(feature = "pkcs11"))]
+fn prepare_token_carrier(_args: &PrepareCarrierArgs, _locale: Locale) -> Result<(), CliError> {
+    Err(CliError::Usage(
+        crate::carrier::lay_out_token()
+            .err()
+            .map_or_else(String::new, |e| e.to_string()),
+    ))
+}
+
+/// Decide whether an existing container may be replaced.
+///
+/// `--force` is the operator's yes given up front. Otherwise they are asked, and
+/// a run with nobody to ask stops rather than guessing: the container in place
+/// may be another engineer's working credential.
+fn resolve_overwrite(
+    media: &Path,
+    args: &PrepareCarrierArgs,
+    locale: Locale,
+) -> Result<crate::carrier::Overwrite, CliError> {
+    use crate::carrier::Overwrite;
+
+    if args.force {
+        return Ok(Overwrite::Allow);
+    }
+    let at_risk = crate::carrier::artifact_at_risk(
+        media,
+        args.container_path.as_deref(),
+        args.chain.is_some(),
+    )
+    .map_err(|e| CliError::Usage(e.to_string()))?;
+    let Some(target) = at_risk else {
+        return Ok(Overwrite::Refuse);
+    };
+    match ask_yes_no(&format!(
+        "{} {}",
+        Msg::CliCarrierOverwriteAsk.text(locale),
+        target.display()
+    )) {
+        Some(true) => Ok(Overwrite::Allow),
+        Some(false) => Err(CliError::Usage(
+            Msg::CliCarrierOverwriteDeclined.text(locale).to_owned(),
+        )),
+        None => Err(CliError::Usage(format!(
+            "{} {}",
+            Msg::CliCarrierOverwriteNeedsConfirmation.text(locale),
+            target.display()
+        ))),
+    }
+}
+
+/// Ask a yes/no question on the terminal.
+///
+/// `None` means there was no terminal to ask on — distinct from a "no", because
+/// the caller treats an unanswerable question and a refusal differently.
+fn ask_yes_no(question: &str) -> Option<bool> {
+    use std::io::{BufRead as _, IsTerminal as _, Write as _};
+
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    // Asked on standard error, where the answer is read from: printing to
+    // standard output would leave an operator whose output is redirected
+    // staring at a blank screen while the tool waits for an answer to a
+    // question they never saw.
+    let mut stderr = std::io::stderr();
+    write!(stderr, "{question} ").ok()?;
+    stderr.flush().ok()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer).ok()?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Some(answer == "y" || answer == "yes")
+}
+
 /// Decode PEM (any label) if the input begins with `-`, else pass the DER
 /// through unchanged. Keying on the first non-whitespace byte avoids misreading
 /// DER that merely contains a dash as PEM.
@@ -1131,14 +1867,14 @@ fn encode_pem(label: &str, der: &[u8]) -> String {
 
 // --- Secret prompting (pinentry) --------------------------------------------
 
-/// Shared pinentry prompting for the interactive backend secrets: the PKCS#11
-/// token PIN and the file-backend key passphrase. The Assuan exchange is the
-/// same; only the prompt caption and the environment fallback differ, so the
-/// exchange lives here and each backend's secret source wraps it.
-#[cfg(any(feature = "pkcs11", feature = "file"))]
+/// Shared pinentry prompting for the interactive secrets: the PKCS#11 token
+/// PIN, the file-backend key passphrase, and an operator-chosen container
+/// password. The Assuan exchange is the same; only the prompt caption differs,
+/// so the exchange lives here and the [`secret`] ladder wraps it as one of its
+/// sources.
 mod prompt {
     use std::io::{BufRead, BufReader, Write};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
 
     use secrecy::SecretString;
@@ -1152,24 +1888,17 @@ mod prompt {
         "pinentry-curses",
     ];
 
-    /// Prompt for a secret via pinentry, or `None` if none is available or the
-    /// prompt is cancelled (the caller then falls back to the environment).
+    /// Prompt for a secret with `program`, or `None` if the dialog produced
+    /// none (it is missing, it failed, or the operator cancelled).
     ///
     /// `prompt` is the caption shown in the dialog (e.g. the token PIN or the
     /// key passphrase).
-    pub(super) fn prompt_secret(explicit: Option<PathBuf>, prompt: &str) -> Option<SecretString> {
-        let program = discover(explicit)?;
-        pinentry_get_secret(&program, prompt)
+    pub(super) fn ask(program: &Path, prompt: &str) -> Option<SecretString> {
+        pinentry_get_secret(program, prompt)
     }
 
-    /// Locate a pinentry program: an explicit path if present, else the first
-    /// known name on `PATH`.
-    fn discover(explicit: Option<PathBuf>) -> Option<PathBuf> {
-        if let Some(path) = explicit {
-            if path.exists() {
-                return Some(path);
-            }
-        }
+    /// The first known pinentry program on `PATH`, if any.
+    pub(super) fn discover_on_path() -> Option<PathBuf> {
         let paths = std::env::var_os("PATH")?;
         for dir in std::env::split_paths(&paths) {
             for name in PINENTRY_NAMES {
@@ -1186,7 +1915,7 @@ mod prompt {
     ///
     /// Returns `None` on any channel or protocol failure so the caller can fall
     /// back; a cancelled prompt is also `None`.
-    fn pinentry_get_secret(program: &PathBuf, prompt: &str) -> Option<SecretString> {
+    fn pinentry_get_secret(program: &Path, prompt: &str) -> Option<SecretString> {
         let mut child = Command::new(program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1401,91 +2130,1138 @@ mod prompt {
     }
 }
 
-/// The PIN provider for the CLI's PKCS#11 backend: an interactive pinentry
-/// prompt, falling back to the `TESSERA_ISSUER_PIN` environment variable.
-#[cfg(feature = "pkcs11")]
-mod pin {
-    use std::path::PathBuf;
+/// The ladder of secret sources shared by the backends that need one: the
+/// PKCS#11 token PIN and the file backend's CA key passphrase.
+///
+/// The order is fixed — a source named by a flag, else a pinentry program found
+/// on `PATH`, else a console prompt with the echo off, else an environment
+/// variable — and it exists to keep the environment variable last. A pinentry
+/// program ships with `GnuPG`, which is not present on a stock macOS or Windows
+/// workstation; without the console step those two platforms would have the
+/// variable as their only source, and a token PIN in the environment is visible
+/// to every child process and lands in memory dumps.
+///
+/// A source named by a flag is used *alone*: an unattended run that named one
+/// must fail rather than block on a dialog nobody is there to answer.
+///
+/// Whatever the source, the secret is held in a [`SecretString`] (zeroized when
+/// dropped), never logged, never journaled, and never accepted as a flag value —
+/// the file and stdin sources take a path or a stream, so no secret can appear
+/// in `argv`.
+mod secret {
+    use std::io::IsTerminal as _;
+    use std::path::{Path, PathBuf};
 
     use secrecy::SecretString;
+    use zeroize::Zeroizing;
 
+    use crate::l10n::{Locale, Msg};
+
+    /// A secret source named on the command line.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum FlagSource {
+        /// An operator-supplied Assuan-compatible dialog (`--pinentry`).
+        Pinentry(PathBuf),
+        /// One line on standard input (`--pin-stdin` / `--key-passphrase-stdin`).
+        Stdin,
+        /// One line of an owner-only file (`--pin-file` / `--key-passphrase-file`).
+        File(PathBuf),
+    }
+
+    /// One rung of the ladder: a source to try, in the order [`rungs`] returns.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Rung {
+        /// Ask an Assuan-compatible dialog at this path.
+        Pinentry(PathBuf),
+        /// Read one line from standard input.
+        Stdin,
+        /// Read one line from this file.
+        File(PathBuf),
+        /// Prompt on the attached terminal with the echo off.
+        Console,
+        /// Take the value of the environment variable.
+        Env,
+    }
+
+    /// The process facts the ladder's non-flag rungs depend on.
+    ///
+    /// Kept as data so the precedence can be tested without a terminal, a
+    /// pinentry program, or a mutated environment.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    struct Facts {
+        /// A pinentry program found on `PATH`, if any.
+        discovered_pinentry: Option<PathBuf>,
+        /// Whether a terminal is attached for a console prompt.
+        console: bool,
+        /// Whether the environment variable holds a non-empty value.
+        env_present: bool,
+    }
+
+    impl Facts {
+        /// Probe the running process for the non-flag rungs, given whether the
+        /// environment variable was found to hold a value.
+        fn probe(env_present: bool) -> Self {
+            Self {
+                discovered_pinentry: super::prompt::discover_on_path(),
+                console: console_attached(),
+                env_present,
+            }
+        }
+    }
+
+    /// The outside world the ladder reaches for: the environment variable's
+    /// value and the stream warnings go to.
+    ///
+    /// Both are passed in rather than read and written where they are needed, so
+    /// the rungs can be exercised without mutating the process environment
+    /// (which `edition 2024` makes `unsafe`) and without capturing a process-wide
+    /// stderr shared with every other test.
+    ///
+    /// The environment value is read once, into a buffer that is wiped when it
+    /// is dropped: probing the variable with a throwaway `String` would leave a
+    /// copy of the secret in freed memory even on the runs that never use it.
+    struct Ports<'a> {
+        /// The environment variable's value, an empty one treated as unset.
+        env: Option<Zeroizing<String>>,
+        /// Where operator warnings are written.
+        warn: &'a mut dyn std::io::Write,
+    }
+
+    /// One backend secret: what to call it, and where its non-flag sources are.
+    pub(super) struct Request<'a> {
+        /// The source named on the command line, if the operator named one.
+        pub(super) explicit: Option<&'a FlagSource>,
+        /// The prompt caption shown to the operator.
+        pub(super) caption: Msg,
+        /// Which device the caption is about, when the tool can be more
+        /// specific than the caption alone — the token label of a carrier, say.
+        /// An operator with two tokens plugged in has to be able to tell from
+        /// the prompt which one the PIN is going to.
+        pub(super) subject: Option<&'a str>,
+        /// The environment variable of last resort.
+        pub(super) env_var: &'static str,
+        /// The flags that can name a source, for the message shown when none of
+        /// the sources produced a secret.
+        pub(super) flags: &'static str,
+        /// The operator-message locale.
+        pub(super) locale: Locale,
+    }
+
+    /// A localized failure of the secret ladder.
+    ///
+    /// Carries a message already rendered in the operator's locale and nothing
+    /// else — in particular never a secret, and never a partially read buffer.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct SecretError {
+        /// The localized text shown to the operator.
+        message: String,
+    }
+
+    impl core::fmt::Display for SecretError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for SecretError {}
+
+    /// Obtain the secret described by `request`, walking the ladder.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretError`] when a source was reached and failed (an unreadable or
+    /// over-permissive file, a broken console), or when no source produced a
+    /// secret at all — the latter message names every source that could.
+    pub(super) fn resolve(request: &Request<'_>) -> Result<SecretString, SecretError> {
+        // A named source short-circuits the probe: with one given, the ladder
+        // must not touch `PATH`, the terminal, or the environment at all.
+        let mut stderr = std::io::stderr();
+        let mut ports = Ports {
+            env: if request.explicit.is_some() {
+                None
+            } else {
+                env_value(request.env_var)
+            },
+            warn: &mut stderr,
+        };
+        resolve_with(request, &mut ports)
+    }
+
+    /// Walk the ladder over the given ports — the body of [`resolve`], with the
+    /// process services it supplies made explicit.
+    fn resolve_with(
+        request: &Request<'_>,
+        ports: &mut Ports<'_>,
+    ) -> Result<SecretString, SecretError> {
+        let facts = if request.explicit.is_some() {
+            Facts::default()
+        } else {
+            Facts::probe(ports.env.is_some())
+        };
+        for rung in rungs(request.explicit, &facts) {
+            if let Some(secret) = climb(&rung, request, ports)? {
+                return Ok(secret);
+            }
+        }
+        Err(unavailable(request))
+    }
+
+    /// The sources to try, most preferred first.
+    ///
+    /// A named source is the whole ladder. Otherwise the rungs are those the
+    /// process actually has, in the fixed order the module documents.
+    fn rungs(explicit: Option<&FlagSource>, facts: &Facts) -> Vec<Rung> {
+        if let Some(source) = explicit {
+            return vec![match source {
+                FlagSource::Pinentry(program) => Rung::Pinentry(program.clone()),
+                FlagSource::Stdin => Rung::Stdin,
+                FlagSource::File(path) => Rung::File(path.clone()),
+            }];
+        }
+        let mut ladder = Vec::new();
+        if let Some(program) = &facts.discovered_pinentry {
+            ladder.push(Rung::Pinentry(program.clone()));
+        }
+        if facts.console {
+            ladder.push(Rung::Console);
+        }
+        if facts.env_present {
+            ladder.push(Rung::Env);
+        }
+        ladder
+    }
+
+    /// Try one rung: `Ok(Some)` on a secret, `Ok(None)` when the rung produced
+    /// none and the next may be tried, `Err` when the rung failed outright.
+    ///
+    /// A rung the operator *named* never falls through: the pinning must not be
+    /// undone by continuing to a source they did not ask for, so a named file,
+    /// stream or dialog that yields nothing is an error. A rung the ladder chose
+    /// on its own is different — it was chosen from a guess about the process,
+    /// and a guess that proves wrong (no dialog answers, the terminal cannot be
+    /// opened) is exactly what the rungs below it are for.
+    fn climb(
+        rung: &Rung,
+        request: &Request<'_>,
+        ports: &mut Ports<'_>,
+    ) -> Result<Option<SecretString>, SecretError> {
+        let caption = prompt_caption(request);
+        let caption = caption.as_str();
+        match rung {
+            Rung::Pinentry(program) => match super::prompt::ask(program, caption) {
+                Some(secret) => Ok(Some(secret)),
+                None if request.explicit.is_some() => Err(error(
+                    request,
+                    Msg::SecretPinentryFailed,
+                    &program.display().to_string(),
+                )),
+                None => Ok(None),
+            },
+            Rung::Stdin => {
+                let line = read_stdin_line()
+                    .map_err(|e| line_error(request, &e, Msg::SecretStdinUnreadable, "stdin"))?;
+                let text = as_text(&line)
+                    .map_err(|e| error(request, Msg::SecretStdinUnreadable, &e.to_string()))?;
+                accept(request, text, "stdin")
+            }
+            Rung::File(path) => read_secret_file(path, request, ports),
+            Rung::Console => match rpassword::prompt_password(format!("{caption}: ")) {
+                Ok(entered) => accept(request, &Zeroizing::new(entered), "console"),
+                // The console rung is chosen by looking at standard input and
+                // standard error, while the prompt reads the terminal device
+                // itself (`/dev/tty`, `CONIN$`). When the two disagree the rung
+                // simply cannot start, and the ladder continues; an entry the
+                // operator ended — interrupted, or closed with no input — is an
+                // answer, and stops it.
+                Err(e) if console_failure_is_fatal(e.kind()) => {
+                    Err(error(request, Msg::SecretConsoleFailed, &e.to_string()))
+                }
+                Err(_) => Ok(None),
+            },
+            Rung::Env => {
+                let value = ports.env.as_ref().ok_or_else(|| unavailable(request))?;
+                let warning = env_warning(request.locale, request.env_var);
+                warn(&mut *ports.warn, &warning);
+                accept(request, value, request.env_var)
+            }
+        }
+    }
+
+    /// The caption a prompt carries: the request's own, with the device it is
+    /// about appended when there is one.
+    ///
+    /// The subject is what stops a PIN going to the wrong device. Two tokens on
+    /// one workstation is the ordinary case for an operator preparing a
+    /// credential, and each has its own attempt counter — a PIN presented to
+    /// the other one is not a typo to retry, it is one attempt spent.
+    fn prompt_caption(request: &Request<'_>) -> String {
+        let caption = request.caption.text(request.locale);
+        match request.subject {
+            Some(subject) => format!("{caption} ({subject})"),
+            None => caption.to_owned(),
+        }
+    }
+
+    /// Write one warning line to the warning stream.
+    ///
+    /// A warning that cannot be written is dropped: the secret is in hand and
+    /// the operation is sound, so failing it over an unwritable stderr would
+    /// trade a real issuance for a note about one.
+    pub(super) fn warn(sink: &mut dyn std::io::Write, line: &str) {
+        let written = writeln!(sink, "{line}");
+        drop(written);
+    }
+
+    /// Whether a failed console prompt ends the ladder.
+    ///
+    /// Two failures mean the operator was at the prompt and declined: an
+    /// interrupt (`Ctrl-C`) and an end of input with nothing entered (`Ctrl-D`,
+    /// `Ctrl-Z` on Windows), which `rpassword` reports as an unexpected
+    /// end-of-file. Reaching past either for the environment variable would
+    /// answer a question they refused to answer, and the variable is the last
+    /// resort for a process with no terminal — not for one whose operator said
+    /// no. Every other failure says the prompt never got to ask, and the ladder
+    /// goes on.
+    fn console_failure_is_fatal(kind: std::io::ErrorKind) -> bool {
+        matches!(
+            kind,
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::UnexpectedEof
+        )
+    }
+
+    /// Read a secret file: the owner-only gate first, its first line second.
+    ///
+    /// The gate runs on the open handle before any byte is read, so a file
+    /// reachable beyond its owner never puts its content in memory and the file
+    /// read is the file checked. It is the same gate the file backend applies to
+    /// the CA key. On a platform without that check the operator is told so —
+    /// silence here would read as "the permissions were checked and are fine".
+    fn read_secret_file(
+        path: &Path,
+        request: &Request<'_>,
+        ports: &mut Ports<'_>,
+    ) -> Result<Option<SecretString>, SecretError> {
+        let unreadable = |e: &dyn core::fmt::Display| {
+            error(
+                request,
+                Msg::SecretFileUnreadable,
+                &format!("{}: {e}", path.display()),
+            )
+        };
+        let opened = crate::secret_file::open(path).map_err(|e| match e {
+            crate::secret_file::OpenError::Io(e) => unreadable(&e),
+            crate::secret_file::OpenError::BeyondOwner(refusal) => error(
+                request,
+                Msg::SecretFileBeyondOwner,
+                &format!("{} (mode {:04o})", path.display(), refusal.mode),
+            ),
+        })?;
+        let origin = path.display().to_string();
+        if let Some(notice) =
+            unchecked_gate_notice(crate::secret_file::GATE_ENFORCED, request.locale, path)
+        {
+            warn(&mut *ports.warn, &notice);
+        }
+        let line = opened
+            .read_first_line()
+            .map_err(|e| line_error(request, &e, Msg::SecretFileUnreadable, &origin))?;
+        let text = as_text(&line).map_err(|e| unreadable(&e))?;
+        accept(request, text, &origin)
+    }
+
+    /// Read one line of the secret from standard input.
+    ///
+    /// On Unix the descriptor is reopened through `/dev/stdin` and read
+    /// directly: [`std::io::Stdin`] reads through a buffer that lives in a
+    /// process-wide static for the life of the process and is never wiped, so a
+    /// secret read through it stays in memory long after the
+    /// [`secrecy::SecretString`] built from it is gone. Where that reopening is
+    /// not available — any non-Unix target, or a Unix one without `/dev` — the
+    /// read falls back to that buffer and the residue is real; the file and
+    /// dialog sources have no such caveat.
+    ///
+    /// What `/dev/stdin` *is* differs between Unixes, and so does the reopened
+    /// handle's file offset. On Linux it resolves through `/proc/self/fd/0`, and
+    /// reopening a regular file there yields a fresh file description starting
+    /// at offset zero; on macOS it is a devfs node that duplicates descriptor 0
+    /// and shares its offset. So a run that redirects standard input from a file
+    /// *already partly consumed* — `exec 0<secrets.txt`, a line read away, then
+    /// `issuer --pin-stdin` — takes the file's first line on Linux and the next
+    /// unread one on macOS. This source is meant for a pipe or a terminal, where
+    /// the two agree; a partly consumed file redirection is not a supported way
+    /// to name a secret, and `--pin-file` is the source that reads a file
+    /// predictably.
+    fn read_stdin_line() -> Result<Zeroizing<Vec<u8>>, crate::secret_file::ReadLineError> {
+        #[cfg(unix)]
+        if let Ok(mut reopened) = std::fs::File::open("/dev/stdin") {
+            return crate::secret_file::read_line(&mut reopened);
+        }
+        crate::secret_file::read_line(&mut std::io::stdin())
+    }
+
+    /// Borrow a read buffer as text, without copying it out of its wiped
+    /// allocation.
+    fn as_text(raw: &[u8]) -> std::io::Result<&str> {
+        core::str::from_utf8(raw).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not UTF-8: {e}"))
+        })
+    }
+
+    /// Wrap a read value as the secret, refusing an empty one.
+    ///
+    /// An empty secret is never what the operator meant — an empty file, an
+    /// empty line, a variable set to nothing — and passing it on would surface
+    /// as a failed login or, on a token, as a consumed PIN attempt.
+    fn accept(
+        request: &Request<'_>,
+        value: &str,
+        origin: &str,
+    ) -> Result<Option<SecretString>, SecretError> {
+        if value.is_empty() {
+            return Err(error(request, Msg::SecretEmpty, origin));
+        }
+        Ok(Some(SecretString::from(value.to_owned())))
+    }
+
+    /// Whether a terminal is attached for an interactive console prompt.
+    ///
+    /// Either end counts. A run whose standard input is a pipe but whose
+    /// standard error is the terminal still has an operator in front of it (the
+    /// shape `ssh` and `sudo` prompt in), and the console prompt reads from the
+    /// terminal device rather than from standard input.
+    ///
+    /// That makes this an estimate: the answer is read off standard input and
+    /// standard error, while the prompt opens the terminal device itself. The
+    /// rung is written to survive the estimate being wrong — a prompt that
+    /// cannot start hands the ladder to the next source instead of ending it.
+    fn console_attached() -> bool {
+        std::io::stdin().is_terminal() || std::io::stderr().is_terminal()
+    }
+
+    /// The environment variable's value, treating an empty one as unset.
+    ///
+    /// The value lands straight in a buffer that is wiped when it is dropped —
+    /// including on the runs that only wanted to know whether the variable is
+    /// set at all.
+    fn env_value(name: &str) -> Option<Zeroizing<String>> {
+        let value = Zeroizing::new(std::env::var(name).ok()?);
+        (!value.is_empty()).then_some(value)
+    }
+
+    /// The stderr warning printed whenever the environment variable is used.
+    pub(super) fn env_warning(locale: Locale, env_var: &str) -> String {
+        format!("{} {env_var}", Msg::SecretEnvWarning.text(locale))
+    }
+
+    /// The warning owed to the operator when a secret-bearing file was accepted
+    /// without the owner-only gate, or `None` where the gate ran.
+    ///
+    /// The gate's reach is a parameter rather than read here so both callers —
+    /// this ladder and the file backend's key — say the same thing, and so both
+    /// answers can be seen on either platform.
+    pub(super) fn unchecked_gate_notice(
+        gate_enforced: bool,
+        locale: Locale,
+        path: &Path,
+    ) -> Option<String> {
+        (!gate_enforced).then(|| {
+            format!(
+                "{} {}",
+                Msg::SecretFileUncheckedPlatform.text(locale),
+                path.display()
+            )
+        })
+    }
+
+    /// A localized error for a line that could not be read from `origin`.
+    ///
+    /// A secret longer than the bound is called out as its own case: read as a
+    /// generic I/O failure it would send the operator looking at permissions,
+    /// when what happened is that the source held no line terminator.
+    fn line_error(
+        request: &Request<'_>,
+        failure: &crate::secret_file::ReadLineError,
+        unreadable: Msg,
+        origin: &str,
+    ) -> SecretError {
+        match failure {
+            crate::secret_file::ReadLineError::TooLong => error(
+                request,
+                Msg::SecretTooLong,
+                &format!("{origin} ({} bytes)", crate::secret_file::MAX_SECRET_LEN),
+            ),
+            crate::secret_file::ReadLineError::Io(e) => {
+                error(request, unreadable, &format!("{origin}: {e}"))
+            }
+        }
+    }
+
+    /// The error shown when no source produced a secret, naming every source
+    /// that could have.
+    fn unavailable(request: &Request<'_>) -> SecretError {
+        SecretError {
+            message: format!(
+                "{} {}; {} {}",
+                Msg::SecretUnavailableFlags.text(request.locale),
+                request.flags,
+                Msg::SecretUnavailableFallbacks.text(request.locale),
+                request.env_var,
+            ),
+        }
+    }
+
+    /// A localized ladder error: a caption from the table, then the technical
+    /// detail (a path, a variable name, an OS error) that is not translated.
+    fn error(request: &Request<'_>, caption: Msg, detail: &str) -> SecretError {
+        SecretError {
+            message: format!("{} {detail}", caption.text(request.locale)),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+        use super::{
+            accept, climb, console_failure_is_fatal, env_warning, error, line_error,
+            prompt_caption, read_secret_file, resolve_with, rungs, unchecked_gate_notice, Facts,
+            FlagSource, Msg, PathBuf, Ports, Request, Rung, SecretError,
+        };
+        use crate::l10n::Locale;
+        use secrecy::ExposeSecret as _;
+        use zeroize::Zeroizing;
+
+        /// The flag list the PIN request advertises, mirrored from `pin`.
+        const FLAGS: &str = "--pinentry <path>, --pin-file <path>, --pin-stdin";
+
+        /// A warning sink and an environment holding `value`.
+        fn ports<'a>(value: Option<&str>, warn: &'a mut Vec<u8>) -> Ports<'a> {
+            Ports {
+                env: value.map(|v| Zeroizing::new(v.to_owned())),
+                warn,
+            }
+        }
+
+        /// Assert that reading a secret file left nothing on the warning stream
+        /// beyond what the platform owes the operator.
+        ///
+        /// Where the owner-only gate runs the read is silent; where the platform
+        /// has no permission model to check, every accepted secret file is
+        /// announced as unchecked, so exactly that one line is expected.
+        fn assert_gate_warning_only(warnings: &[u8]) {
+            let printed = String::from_utf8(warnings.to_owned()).unwrap();
+            if crate::secret_file::GATE_ENFORCED {
+                assert!(printed.is_empty(), "unexpected warning: {printed:?}");
+            } else {
+                assert_eq!(
+                    printed.lines().count(),
+                    1,
+                    "the unchecked-permissions notice must be the only warning: {printed:?}"
+                );
+                assert!(
+                    printed.contains(Msg::SecretFileUncheckedPlatform.text(Locale::En)),
+                    "{printed:?} must announce that the permission gate did not run"
+                );
+            }
+        }
+
+        /// A PIN-shaped request over `explicit`.
+        fn request(explicit: Option<&FlagSource>) -> Request<'_> {
+            Request {
+                explicit,
+                caption: Msg::SecretPromptTokenPin,
+                subject: None,
+                env_var: "TESSERA_ISSUER_PIN",
+                flags: FLAGS,
+                locale: Locale::En,
+            }
+        }
+
+        /// The prompt has to name the device when the request knows it: an
+        /// operator with the CA token plugged in beside the carrier decides
+        /// which PIN to type from this line alone.
+        #[test]
+        fn a_prompt_names_the_device_it_is_asking_about() {
+            let named = Request {
+                caption: Msg::SecretPromptCarrierPin,
+                subject: Some("Rutoken Lite 483d4e1a"),
+                ..request(None)
+            };
+            let shown = prompt_caption(&named);
+            assert!(shown.contains("Rutoken Lite 483d4e1a"), "{shown}");
+            assert!(shown.contains("carrier"), "{shown}");
+            // With nothing to name, the caption stands alone rather than
+            // growing an empty pair of brackets.
+            assert_eq!(
+                prompt_caption(&request(None)),
+                Msg::SecretPromptTokenPin.text(Locale::En)
+            );
+        }
+
+        /// A process that has every non-flag source available.
+        fn everything() -> Facts {
+            Facts {
+                discovered_pinentry: Some(PathBuf::from("/usr/bin/pinentry")),
+                console: true,
+                env_present: true,
+            }
+        }
+
+        /// A named dialog is the whole ladder: with `--pinentry` given, no other
+        /// source is consulted even though every one of them is available.
+        #[test]
+        fn a_named_pinentry_is_the_only_rung() {
+            let explicit = FlagSource::Pinentry(PathBuf::from("/opt/corp/pinentry"));
+            assert_eq!(
+                rungs(Some(&explicit), &everything()),
+                vec![Rung::Pinentry(PathBuf::from("/opt/corp/pinentry"))]
+            );
+        }
+
+        /// A named file wins over a pinentry on `PATH`: an unattended run must
+        /// not be diverted into a dialog nobody can answer.
+        #[test]
+        fn a_named_file_outranks_a_discovered_pinentry() {
+            let explicit = FlagSource::File(PathBuf::from("/run/secrets/pin"));
+            assert_eq!(
+                rungs(Some(&explicit), &everything()),
+                vec![Rung::File(PathBuf::from("/run/secrets/pin"))]
+            );
+            let explicit = FlagSource::Stdin;
+            assert_eq!(rungs(Some(&explicit), &everything()), vec![Rung::Stdin]);
+        }
+
+        /// With no flag, a pinentry on `PATH` leads and the rest follow it.
+        #[test]
+        fn a_discovered_pinentry_leads_the_unnamed_ladder() {
+            assert_eq!(
+                rungs(None, &everything()),
+                vec![
+                    Rung::Pinentry(PathBuf::from("/usr/bin/pinentry")),
+                    Rung::Console,
+                    Rung::Env,
+                ]
+            );
+        }
+
+        /// No pinentry but a terminal: the console prompt is used, and the
+        /// environment variable is not needed to reach a secret.
+        #[test]
+        fn without_a_pinentry_a_terminal_makes_the_console_the_source() {
+            let facts = Facts {
+                discovered_pinentry: None,
+                console: true,
+                env_present: true,
+            };
+            let ladder = rungs(None, &facts);
+            assert_eq!(ladder.first(), Some(&Rung::Console));
+
+            // And with no variable set at all the console still answers.
+            let facts = Facts {
+                console: true,
+                ..Facts::default()
+            };
+            assert_eq!(rungs(None, &facts), vec![Rung::Console]);
+        }
+
+        /// No pinentry and no terminal: the environment variable is the last
+        /// resort, and it is announced.
+        #[test]
+        fn without_a_terminal_the_environment_is_the_last_resort() {
+            let facts = Facts {
+                discovered_pinentry: None,
+                console: false,
+                env_present: true,
+            };
+            assert_eq!(rungs(None, &facts), vec![Rung::Env]);
+
+            let warning = env_warning(Locale::En, "TESSERA_ISSUER_PIN");
+            assert!(warning.contains("TESSERA_ISSUER_PIN"));
+            assert!(warning.contains("child processes"));
+            assert!(env_warning(Locale::Ru, "TESSERA_ISSUER_PIN").contains("дочерним процессам"));
+        }
+
+        /// With nothing available the ladder is empty and the error names every
+        /// source the operator could have offered.
+        #[test]
+        fn an_empty_ladder_reports_every_source() {
+            assert!(rungs(None, &Facts::default()).is_empty());
+            let message = super::unavailable(&request(None)).to_string();
+            for source in [
+                "--pinentry",
+                "--pin-file",
+                "--pin-stdin",
+                "pinentry program on PATH",
+                "interactive terminal",
+                "TESSERA_ISSUER_PIN",
+            ] {
+                assert!(message.contains(source), "{message:?} must name {source}");
+            }
+        }
+
+        /// A file reachable by group or others is refused on its metadata — the
+        /// error names the mode and the content is never read.
+        #[cfg(unix)]
+        #[test]
+        fn a_group_readable_file_is_refused_before_its_content_is_read() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pin");
+            std::fs::write(&path, "s3cret\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+            let mut warnings = Vec::new();
+            let err = read_secret_file(&path, &request(None), &mut ports(None, &mut warnings))
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("0640"), "{message:?} must name the mode");
+            assert!(
+                !message.contains("s3cret"),
+                "the error must not carry content"
+            );
+
+            // Tightened to owner-only, the same file is read.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let secret = read_secret_file(&path, &request(None), &mut ports(None, &mut warnings))
+                .unwrap()
+                .unwrap();
+            assert_eq!(secret.expose_secret(), "s3cret");
+            // Where the gate runs, nothing is said about it.
+            assert!(warnings.is_empty(), "unexpected warning: {warnings:?}");
+        }
+
+        /// A missing file is an error, not a fall-through to another source.
+        #[test]
+        fn a_missing_secret_file_is_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut warnings = Vec::new();
+            let err = read_secret_file(
+                &dir.path().join("absent"),
+                &request(None),
+                &mut ports(None, &mut warnings),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("absent"));
+        }
+
+        /// A secret file is read to its first line and no further: the rest of
+        /// the file is neither consumed nor required to arrive.
+        #[test]
+        fn a_secret_file_is_read_to_its_first_line_only() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pin");
+            std::fs::write(&path, "s3cret\nnot-the-secret\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+
+            let mut warnings = Vec::new();
+            let secret = read_secret_file(&path, &request(None), &mut ports(None, &mut warnings))
+                .unwrap()
+                .unwrap();
+            assert_eq!(secret.expose_secret(), "s3cret");
+        }
+
+        /// A source with no line break within the bound is refused by name, not
+        /// as a generic read failure — and the bound is in the message.
+        #[test]
+        fn a_source_without_a_line_break_is_refused_by_name() {
+            let failure = crate::secret_file::ReadLineError::TooLong;
+            let message = line_error(
+                &request(None),
+                &failure,
+                Msg::SecretFileUnreadable,
+                "/run/secrets/pin",
+            )
+            .to_string();
+            assert!(message.contains("no line break"), "{message:?}");
+            assert!(message.contains("/run/secrets/pin"), "{message:?}");
+            assert!(
+                message.contains(&crate::secret_file::MAX_SECRET_LEN.to_string()),
+                "{message:?} must name the bound"
+            );
+
+            let ru = Request {
+                locale: Locale::Ru,
+                ..request(None)
+            };
+            let ru_message =
+                line_error(&ru, &failure, Msg::SecretFileUnreadable, "pin").to_string();
+            assert!(ru_message.contains("перевода строки"), "{ru_message:?}");
+        }
+
+        /// The environment rung answers from the injected environment and says
+        /// so on the warning stream, naming the variable.
+        #[test]
+        fn the_environment_rung_warns_and_names_the_variable() {
+            let mut warnings = Vec::new();
+            let secret = climb(
+                &Rung::Env,
+                &request(None),
+                &mut ports(Some("s3cret"), &mut warnings),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(secret.expose_secret(), "s3cret");
+
+            let printed = String::from_utf8(warnings).unwrap();
+            assert!(
+                printed.contains("TESSERA_ISSUER_PIN"),
+                "{printed:?} must name the variable"
+            );
+            assert!(
+                printed.contains("child processes"),
+                "{printed:?} must say why the variable is a last resort"
+            );
+            assert!(
+                !printed.contains("s3cret"),
+                "the warning must not carry the secret"
+            );
+        }
+
+        /// With the variable unset the rung reports the ladder exhausted rather
+        /// than reaching for the process environment behind the ports.
+        #[test]
+        fn the_environment_rung_without_a_value_reports_the_ladder_exhausted() {
+            let mut warnings = Vec::new();
+            let err =
+                climb(&Rung::Env, &request(None), &mut ports(None, &mut warnings)).unwrap_err();
+            assert!(err.to_string().contains("TESSERA_ISSUER_PIN"));
+            assert!(warnings.is_empty(), "nothing was used, so nothing to warn");
+        }
+
+        /// A named file is read by the whole ladder, and neither the terminal
+        /// nor the environment is consulted on the way.
+        #[test]
+        fn a_named_file_is_served_by_the_ladder_without_the_environment() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pin");
+            std::fs::write(&path, "s3cret\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+
+            let explicit = FlagSource::File(path);
+            let mut warnings = Vec::new();
+            let secret = resolve_with(
+                &request(Some(&explicit)),
+                &mut ports(Some("from-the-environment"), &mut warnings),
+            )
+            .unwrap();
+            assert_eq!(secret.expose_secret(), "s3cret");
+            // The environment held a different secret and was never reached, so
+            // its warning is absent; the platform's own notice may be there.
+            assert_gate_warning_only(&warnings);
+        }
+
+        /// A console prompt that could not start hands the ladder on; one the
+        /// operator ended stops it.
+        ///
+        /// Both ways of ending it count. `rpassword` reports `Ctrl-C` as an
+        /// interrupt and `Ctrl-D` (`Ctrl-Z` on Windows) with nothing typed as an
+        /// unexpected end of input; treating the latter as "the rung could not
+        /// start" would walk past a refusal straight into the environment
+        /// variable.
+        #[test]
+        fn an_interrupted_or_ended_console_entry_stops_the_ladder() {
+            assert!(console_failure_is_fatal(std::io::ErrorKind::Interrupted));
+            assert!(console_failure_is_fatal(std::io::ErrorKind::UnexpectedEof));
+            for kind in [
+                std::io::ErrorKind::NotFound,
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::BrokenPipe,
+                std::io::ErrorKind::Unsupported,
+            ] {
+                assert!(
+                    !console_failure_is_fatal(kind),
+                    "{kind:?} must not be fatal"
+                );
+            }
+        }
+
+        /// A platform without the permission gate says so, in the operator's
+        /// locale, naming the file it did not check; a platform with one says
+        /// nothing.
+        #[test]
+        fn an_unchecked_platform_is_announced() {
+            let path = PathBuf::from("/run/secrets/pin");
+            let en = unchecked_gate_notice(false, Locale::En, &path).unwrap();
+            assert!(en.contains("/run/secrets/pin"));
+            assert!(en.contains("does not check file permissions"));
+            assert!(unchecked_gate_notice(false, Locale::Ru, &path)
+                .unwrap()
+                .contains("права файла"));
+            assert!(
+                unchecked_gate_notice(true, Locale::En, &path).is_none(),
+                "a gate that ran has nothing to announce"
+            );
+        }
+
+        /// An empty value is refused rather than passed on as a secret.
+        #[test]
+        fn an_empty_value_is_refused() {
+            let err = accept(&request(None), "", "stdin").unwrap_err();
+            assert!(err.to_string().contains("stdin"));
+        }
+
+        /// Errors are localized and carry only the technical detail beside the
+        /// caption.
+        #[test]
+        fn errors_are_localized() {
+            let explicit = FlagSource::Stdin;
+            let ru = Request {
+                locale: Locale::Ru,
+                ..request(Some(&explicit))
+            };
+            let err: SecretError = error(&ru, Msg::SecretFileUnreadable, "/run/secrets/pin");
+            assert!(err.to_string().starts_with("не удалось"));
+            assert!(err.to_string().ends_with("/run/secrets/pin"));
+        }
+    }
+}
+
+/// The PIN providers for the CLI's PKCS#11 paths: the shared secret ladder,
+/// captioned and sourced per device.
+///
+/// The ladder is the same for both. What must not be shared is its last rung.
+/// The signing backend's PIN belongs to the CA token, and a scripted issuance
+/// keeps it in [`CA_PIN_ENV`] for the whole run; adding a `prepare-carrier`
+/// step to that script would, with no flag and no terminal, walk the same
+/// ladder down to the same variable and present the CA token's PIN to the
+/// engineer's carrier. That is not a prompt to retry — it is one attempt spent
+/// on a counter that locks the carrier after a few, and the token then reports
+/// a login failure rather than "that PIN belongs to the other device". So the
+/// carrier reads its own variable, and its prompt names the token it is for.
+#[cfg(feature = "pkcs11")]
+mod pin {
+    use secrecy::SecretString;
+
+    use crate::l10n::{Locale, Msg};
     use crate::pkcs11::{PinSource, Pkcs11SignError};
 
-    /// A [`PinSource`] that prompts via pinentry, then falls back to the
-    /// `TESSERA_ISSUER_PIN` environment variable for non-interactive use.
+    use super::secret::{self, FlagSource, Request};
+
+    /// The flags that name a PIN source, for the message shown when none did.
+    const PIN_FLAGS: &str = "--pinentry <path>, --pin-file <path>, --pin-stdin";
+    /// The environment variable of last resort for the signing backend's token.
+    const CA_PIN_ENV: &str = "TESSERA_ISSUER_PIN";
+    /// The environment variable of last resort for a carrier token.
+    const CARRIER_PIN_ENV: &str = "TESSERA_CARRIER_PIN";
+
+    /// A [`PinSource`] backed by the ladder in [`super::secret`].
     pub(super) struct CliPinSource {
-        explicit_pinentry: Option<PathBuf>,
+        /// The source the operator named, if any.
+        explicit: Option<FlagSource>,
+        /// The prompt caption: which device the PIN is for.
+        caption: Msg,
+        /// The token the PIN is going to, when one was named.
+        subject: Option<String>,
+        /// The environment variable of last resort.
+        env_var: &'static str,
+        /// The operator-message locale.
+        locale: Locale,
     }
 
     impl CliPinSource {
-        /// A PIN source preferring `explicit_pinentry`, then a discovered one.
-        pub(super) fn new(explicit_pinentry: Option<PathBuf>) -> Self {
-            Self { explicit_pinentry }
+        /// A PIN source for the signing backend's token.
+        pub(super) fn new(explicit: Option<FlagSource>, locale: Locale) -> Self {
+            Self {
+                explicit,
+                caption: Msg::SecretPromptTokenPin,
+                subject: None,
+                env_var: CA_PIN_ENV,
+                locale,
+            }
+        }
+
+        /// A PIN source for the token a credential is being written to.
+        ///
+        /// `token_label` is the label the operator selected the carrier by, and
+        /// it goes into the prompt: with the CA token plugged in beside the
+        /// carrier, "token PIN" alone does not say which one is being asked
+        /// about.
+        pub(super) fn for_carrier(
+            explicit: Option<FlagSource>,
+            token_label: Option<&str>,
+            locale: Locale,
+        ) -> Self {
+            Self {
+                explicit,
+                caption: Msg::SecretPromptCarrierPin,
+                subject: token_label.map(str::to_owned),
+                env_var: CARRIER_PIN_ENV,
+                locale,
+            }
         }
     }
 
     impl PinSource for CliPinSource {
         fn pin(&self) -> Result<SecretString, Pkcs11SignError> {
-            if let Some(secret) =
-                super::prompt::prompt_secret(self.explicit_pinentry.clone(), "Tessera token PIN")
-            {
-                return Ok(secret);
-            }
-            std::env::var("TESSERA_ISSUER_PIN")
-                .ok()
-                .filter(|p| !p.is_empty())
-                .map(SecretString::from)
-                .ok_or_else(|| {
-                    Pkcs11SignError::PinUnavailable(
-                        "no pinentry available; set TESSERA_ISSUER_PIN".to_owned(),
-                    )
-                })
+            secret::resolve(&Request {
+                explicit: self.explicit.as_ref(),
+                caption: self.caption,
+                subject: self.subject.as_deref(),
+                env_var: self.env_var,
+                flags: PIN_FLAGS,
+                locale: self.locale,
+            })
+            .map_err(|e| Pkcs11SignError::PinUnavailable(e.to_string()))
         }
     }
 }
 
-/// The passphrase provider for the CLI's file backend: an interactive pinentry
-/// prompt, falling back to the `TESSERA_ISSUER_KEY_PASSPHRASE` environment
-/// variable.
+/// The container password: generated by default, taken from the shared secret
+/// ladder when the operator names a source.
+///
+/// The default is *generation*, not a prompt, and that asymmetry with the
+/// backend secrets is deliberate. A backend secret already exists and the tool
+/// can only ask for it; a container password is being created here, and one a
+/// person invents under the pressure of routine is the weakest part of an
+/// artifact that carries an extractable private key. So the tool makes it up
+/// unless told otherwise — and when told, it still refuses one that is too
+/// short.
+///
+/// No flag takes the password by value: `argv` is readable by every process on
+/// the machine.
+mod p12pass {
+    use zeroize::Zeroizing;
+
+    use crate::l10n::{Locale, Msg};
+    use crate::pkcs12;
+
+    use super::secret::{self, FlagSource, Request};
+    use super::{CliError, IssueLeafArgs};
+
+    /// The flags that name a password source, for the message shown when none
+    /// did.
+    const P12_FLAGS: &str =
+        "--p12-passphrase-file <path>, --p12-passphrase-stdin, --p12-passphrase-prompt";
+    /// The environment variable of last resort, reachable only through
+    /// `--p12-passphrase-prompt` (the ladder's non-flag rungs).
+    const P12_ENV: &str = "TESSERA_ISSUER_P12_PASSPHRASE";
+
+    /// A container password, and whether the tool made it up.
+    pub(super) struct ContainerPassphrase {
+        /// The password itself, wiped when dropped.
+        value: Zeroizing<String>,
+        /// Whether the tool generated it, and so owes the operator a one-time
+        /// display.
+        generated: bool,
+    }
+
+    impl ContainerPassphrase {
+        /// The password, for the length of the packaging call.
+        pub(super) fn expose(&self) -> &str {
+            &self.value
+        }
+
+        /// The password to show once, or `None` when the operator supplied it
+        /// and already has it.
+        pub(super) fn shown_once(&self) -> Option<&str> {
+            self.generated.then(|| self.value.as_str())
+        }
+    }
+
+    /// Resolves the container password for one `issue-leaf --generate-key` run.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::Usage`] when a named source fails or yields nothing, and
+    /// [`CliError::Issue`] when an operator-supplied password is below the
+    /// length floor.
+    pub(super) fn resolve(
+        args: &IssueLeafArgs,
+        locale: Locale,
+    ) -> Result<ContainerPassphrase, CliError> {
+        let explicit = if args.p12_passphrase_stdin {
+            Some(FlagSource::Stdin)
+        } else {
+            args.p12_passphrase_file.clone().map(FlagSource::File)
+        };
+
+        if explicit.is_none() && !args.p12_passphrase_prompt {
+            // Asked before anything is issued: a password that cannot be shown
+            // is a container nobody can open, and finding that out after the
+            // certificate is signed and journaled leaves an artifact whose only
+            // possible fate is to be thrown away.
+            super::require_terminal_for_generated_passphrase(locale)?;
+            return Ok(ContainerPassphrase {
+                value: pkcs12::generate_passphrase(&mut crate::keygen::OsEntropy),
+                generated: true,
+            });
+        }
+
+        let secret = secret::resolve(&Request {
+            explicit: explicit.as_ref(),
+            caption: Msg::SecretPromptContainerPassphrase,
+            subject: None,
+            env_var: P12_ENV,
+            flags: P12_FLAGS,
+            locale,
+        })
+        .map_err(|e| CliError::Usage(e.to_string()))?;
+        let value = {
+            use secrecy::ExposeSecret as _;
+            Zeroizing::new(secret.expose_secret().to_owned())
+        };
+        pkcs12::check_passphrase(&value)?;
+        Ok(ContainerPassphrase {
+            value,
+            generated: false,
+        })
+    }
+}
+
+/// The passphrase provider for the CLI's file backend: the shared secret ladder,
+/// captioned as the CA key passphrase.
 #[cfg(feature = "file")]
 mod keypass {
-    use std::path::PathBuf;
-
     use secrecy::SecretString;
 
     use crate::file::{FileSignError, PassphraseSource};
+    use crate::l10n::{Locale, Msg};
 
-    /// A [`PassphraseSource`] that prompts via pinentry, then falls back to the
-    /// `TESSERA_ISSUER_KEY_PASSPHRASE` environment variable.
+    use super::secret::{self, FlagSource, Request};
+
+    /// The flags that name a passphrase source, for the message shown when none
+    /// did.
+    const KEY_FLAGS: &str =
+        "--pinentry <path>, --key-passphrase-file <path>, --key-passphrase-stdin";
+    /// The environment variable of last resort.
+    const KEY_ENV: &str = "TESSERA_ISSUER_KEY_PASSPHRASE";
+
+    /// A [`PassphraseSource`] backed by the ladder in [`super::secret`].
     pub(super) struct FilePassphraseSource {
-        explicit_pinentry: Option<PathBuf>,
+        /// The source the operator named, if any.
+        explicit: Option<FlagSource>,
+        /// The operator-message locale.
+        locale: Locale,
     }
 
     impl FilePassphraseSource {
-        /// A passphrase source preferring `explicit_pinentry`, then a discovered
-        /// pinentry program.
-        pub(super) fn new(explicit_pinentry: Option<PathBuf>) -> Self {
-            Self { explicit_pinentry }
+        /// A passphrase source over the source `explicit` names, else the full
+        /// ladder.
+        pub(super) fn new(explicit: Option<FlagSource>, locale: Locale) -> Self {
+            Self { explicit, locale }
         }
     }
 
     impl PassphraseSource for FilePassphraseSource {
         fn passphrase(&self) -> Result<SecretString, FileSignError> {
-            if let Some(secret) = super::prompt::prompt_secret(
-                self.explicit_pinentry.clone(),
-                "Tessera CA key passphrase",
-            ) {
-                return Ok(secret);
-            }
-            std::env::var("TESSERA_ISSUER_KEY_PASSPHRASE")
-                .ok()
-                .filter(|p| !p.is_empty())
-                .map(SecretString::from)
-                .ok_or_else(|| {
-                    FileSignError::PassphraseUnavailable(
-                        "no pinentry available; set TESSERA_ISSUER_KEY_PASSPHRASE".to_owned(),
-                    )
-                })
+            secret::resolve(&Request {
+                explicit: self.explicit.as_ref(),
+                caption: Msg::SecretPromptKeyPassphrase,
+                subject: None,
+                env_var: KEY_ENV,
+                flags: KEY_FLAGS,
+                locale: self.locale,
+            })
+            .map_err(|e| FileSignError::PassphraseUnavailable(e.to_string()))
         }
     }
 }
@@ -1922,6 +3698,256 @@ mod tests {
         );
     }
 
+    /// An `issue-root` argv that parses, ready to be extended with the secret
+    /// flags under test.
+    fn root_argv_with_role() -> Vec<&'static str> {
+        let mut argv = root_argv();
+        argv.extend(["--allow-role", "oper"]);
+        argv
+    }
+
+    /// Two named secret sources are a contradiction, not a precedence question:
+    /// a run that names both has no single answer to "where does the PIN come
+    /// from", so it is refused before anything is opened.
+    #[test]
+    fn two_named_secret_sources_are_refused_at_parsing() {
+        for extra in [
+            vec!["--pinentry", "/usr/bin/pinentry", "--pin-file", "pin.txt"],
+            vec!["--pinentry", "/usr/bin/pinentry", "--pin-stdin"],
+            vec![
+                "--pinentry",
+                "/usr/bin/pinentry",
+                "--key-passphrase-file",
+                "pass.txt",
+            ],
+            vec!["--pin-file", "pin.txt", "--pin-stdin"],
+            vec![
+                "--key-passphrase-file",
+                "pass.txt",
+                "--key-passphrase-stdin",
+            ],
+            // Both streams would consume the same standard input.
+            vec!["--pin-stdin", "--key-passphrase-stdin"],
+        ] {
+            let mut argv = root_argv_with_role();
+            argv.extend(extra.iter().copied());
+            let err = Cli::try_parse_from(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{extra:?} must not parse"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{extra:?} must be refused as a conflict"
+            );
+        }
+    }
+
+    /// Each secret flag on its own parses, so the conflict above is about the
+    /// combination and not about a flag being rejected outright.
+    #[test]
+    fn a_single_named_secret_source_parses() {
+        for extra in [
+            vec!["--pinentry", "/usr/bin/pinentry"],
+            vec!["--pin-file", "pin.txt"],
+            vec!["--pin-stdin"],
+            vec!["--key-passphrase-file", "pass.txt"],
+            vec!["--key-passphrase-stdin"],
+        ] {
+            let mut argv = root_argv_with_role();
+            argv.extend(extra.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "{extra:?} must parse on its own"
+            );
+        }
+    }
+
+    /// No flag accepts a secret by value. The sources that take an argument take
+    /// a *path*, the stream sources take none, and there is no `--pin` at all —
+    /// so a PIN or passphrase can never appear in the process's `argv`, which
+    /// every other user of the host can read.
+    #[test]
+    fn no_flag_accepts_a_secret_by_value() {
+        use clap::CommandFactory as _;
+
+        /// The secret-related flags that take an argument; every one of them
+        /// takes a filesystem path.
+        const PATH_VALUED: &[&str] = &["pinentry", "pin_file", "key_passphrase_file"];
+        /// The secret-related flags that take no argument at all.
+        const VALUELESS: &[&str] = &["pin_stdin", "key_passphrase_stdin"];
+
+        let command = Cli::command();
+        let subcommand = command
+            .get_subcommands()
+            .find(|s| s.get_name() == "issue-root")
+            .expect("issue-root");
+        let mut seen: Vec<String> = Vec::new();
+        for arg in subcommand.get_arguments() {
+            let id = arg.get_id().as_str();
+            if !(id.contains("pin") || id.contains("passphrase")) {
+                continue;
+            }
+            seen.push(id.to_owned());
+            let takes_value = matches!(
+                arg.get_action(),
+                clap::ArgAction::Set | clap::ArgAction::Append
+            );
+            assert_eq!(
+                takes_value,
+                PATH_VALUED.contains(&id),
+                "{id} takes a value it should not, or lost the one it needs"
+            );
+        }
+        seen.sort();
+        let mut expected: Vec<String> = PATH_VALUED
+            .iter()
+            .chain(VALUELESS)
+            .map(|s| (*s).to_owned())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "a secret-related flag appeared that this test has not vetted"
+        );
+
+        // And the flag that would take a secret directly does not exist.
+        for named in [
+            vec!["--pin", "1234"],
+            vec!["--key-passphrase", "hunter2"],
+            vec!["--passphrase", "hunter2"],
+        ] {
+            let mut argv = root_argv_with_role();
+            argv.extend(named.iter().copied());
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{named:?} must not be a flag"
+            );
+        }
+    }
+
+    /// The parsed flags map onto the ladder's named source, one flag each.
+    #[cfg(all(feature = "pkcs11", feature = "file"))]
+    #[test]
+    fn named_flags_map_onto_the_ladder_source() {
+        let backend_of = |extra: Vec<&str>| {
+            let mut argv = root_argv_with_role();
+            argv.extend(extra);
+            let Command::IssueRoot(root) = Cli::parse_from(argv).command else {
+                panic!("expected issue-root");
+            };
+            root.backend
+        };
+
+        assert_eq!(backend_of(vec![]).pin_source(), None);
+        assert_eq!(
+            backend_of(vec!["--pin-file", "pin.txt"]).pin_source(),
+            Some(secret::FlagSource::File(PathBuf::from("pin.txt")))
+        );
+        assert_eq!(
+            backend_of(vec!["--pin-stdin"]).pin_source(),
+            Some(secret::FlagSource::Stdin)
+        );
+        assert_eq!(
+            backend_of(vec!["--pinentry", "/opt/corp/pinentry"]).pin_source(),
+            Some(secret::FlagSource::Pinentry(PathBuf::from(
+                "/opt/corp/pinentry"
+            )))
+        );
+        // The same dialog flag serves the file backend's passphrase.
+        assert_eq!(
+            backend_of(vec!["--pinentry", "/opt/corp/pinentry"]).key_passphrase_source(),
+            Some(secret::FlagSource::Pinentry(PathBuf::from(
+                "/opt/corp/pinentry"
+            )))
+        );
+        assert_eq!(
+            backend_of(vec!["--key-passphrase-file", "pass.txt"]).key_passphrase_source(),
+            Some(secret::FlagSource::File(PathBuf::from("pass.txt")))
+        );
+        assert_eq!(
+            backend_of(vec!["--key-passphrase-stdin"]).key_passphrase_source(),
+            Some(secret::FlagSource::Stdin)
+        );
+    }
+
+    /// A secret-source flag naming another backend's source is refused, so the
+    /// operation never runs from a source the operator did not name.
+    #[test]
+    fn a_secret_flag_of_another_backend_is_refused() {
+        let backend_of = |extra: Vec<&str>| {
+            let mut argv = root_argv_with_role();
+            argv.extend(extra);
+            let Command::IssueRoot(root) = Cli::parse_from(argv).command else {
+                panic!("expected issue-root");
+            };
+            root.backend
+        };
+        let refusal = |extra: Vec<&str>| {
+            let args = backend_of(extra);
+            super::reject_foreign_secret_flags(&args, Locale::En)
+        };
+
+        // Each backend accepts only its own source flags.
+        assert!(refusal(vec!["--backend", "pkcs11", "--pin-stdin"]).is_ok());
+        assert!(refusal(vec!["--backend", "pkcs11", "--pin-file", "pin.txt"]).is_ok());
+        assert!(refusal(vec!["--backend", "pkcs11", "--pinentry", "/bin/pe"]).is_ok());
+        assert!(refusal(vec!["--backend", "file", "--key-passphrase-stdin"]).is_ok());
+        assert!(refusal(vec!["--backend", "file", "--pinentry", "/bin/pe"]).is_ok());
+        assert!(refusal(vec![]).is_ok());
+
+        for (extra, flag) in [
+            (
+                vec!["--backend", "file", "--pin-file", "pin.txt"],
+                "--pin-file",
+            ),
+            (vec!["--backend", "file", "--pin-stdin"], "--pin-stdin"),
+            (
+                vec!["--backend", "pkcs11", "--key-passphrase-file", "pass.txt"],
+                "--key-passphrase-file",
+            ),
+            (
+                vec!["--backend", "pkcs11", "--key-passphrase-stdin"],
+                "--key-passphrase-stdin",
+            ),
+            (vec!["--backend", "vault", "--pin-stdin"], "--pin-stdin"),
+            (
+                vec!["--backend", "vault", "--pinentry", "/bin/pe"],
+                "--pinentry",
+            ),
+        ] {
+            let err = refusal(extra.clone()).unwrap_err();
+            assert!(matches!(err, CliError::Usage(_)), "{extra:?}: {err:?}");
+            let message = err.render(Locale::En);
+            assert!(message.contains(flag), "{message:?} must name {flag}");
+        }
+
+        // A pair of flags that clap lets through, one from each backend's set,
+        // is unreachable once the backend is known: whichever backend is
+        // selected, one of the two belongs to the other one.
+        for backend in ["pkcs11", "file", "vault"] {
+            assert!(
+                refusal(vec![
+                    "--backend",
+                    backend,
+                    "--pin-file",
+                    "pin.txt",
+                    "--key-passphrase-stdin",
+                ])
+                .is_err(),
+                "a cross-backend pair must not survive --backend {backend}"
+            );
+        }
+
+        // And the refusal is localized.
+        let ru = super::reject_foreign_secret_flags(
+            &backend_of(vec!["--backend", "file", "--pin-stdin"]),
+            Locale::Ru,
+        )
+        .unwrap_err()
+        .render(Locale::Ru);
+        assert!(ru.contains("другого бэкенда"), "{ru:?}");
+    }
+
     /// PEM and DER cert inputs decode to the same bytes.
     #[test]
     fn pem_and_der_inputs_decode_equally() {
@@ -1929,5 +3955,731 @@ mod tests {
         let pem = encode_pem("CERTIFICATE", &der);
         assert_eq!(decode_pem_or_der(&der).unwrap(), der);
         assert_eq!(decode_pem_or_der(pem.as_bytes()).unwrap(), der);
+    }
+}
+
+/// The `--generate-key` surface: the flags, the container it produces, and what
+/// it must never leave behind.
+#[cfg(test)]
+mod generate_key_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use crate::sign::MockSigner;
+    use crate::test_support::{self_signed_ca, spki_fixture, MemoryStorage};
+    use crate::{CaRequest, Journal};
+    use tessera_ext::delegation::DelegationConstraints;
+
+    const TS: u64 = 1_600_000_000;
+
+    fn key() -> KeyId {
+        KeyId::new("ca-key")
+    }
+
+    /// An org CA the generated leaf can be issued under.
+    fn parent(signer: &MockSigner) -> Vec<u8> {
+        parent_named(signer, "Org CA")
+    }
+
+    /// As [`parent`], with a common name of the caller's choosing — a second CA
+    /// needs its own subject, since that is what the chain check compares.
+    pub(super) fn parent_named(signer: &MockSigner, common_name: &str) -> Vec<u8> {
+        let req = CaRequest {
+            subject: format!("CN={common_name}"),
+            subject_spki_der: spki_fixture(),
+            validity: Validity {
+                not_before: TS,
+                not_after: TS + 9_000_000,
+            },
+            constraints: DelegationConstraints {
+                require_tags: vec![],
+                allow_roles: vec!["oper".to_owned()],
+                max_level: 5,
+                max_ttl: 86_400,
+            },
+            profile_version: 0,
+        };
+        let mut journal = Journal::load(MemoryStorage::new()).unwrap();
+        self_signed_ca(signer, &key(), &req, &Serial::generate(), &mut journal, TS)
+            .unwrap()
+            .der
+    }
+
+    /// The argv of a `--generate-key` issuance into `dir`.
+    fn argv(dir: &Path, extra: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = [
+            "issuer",
+            "issue-leaf",
+            "--backend",
+            "mock",
+            "--key",
+            "ca-key",
+            "--parent",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        out.push(dir.join("parent.der").display().to_string());
+        for arg in [
+            "--generate-key",
+            "--subject",
+            "CN=ivanov",
+            "--host",
+            "*",
+            "--role",
+            "oper",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1600003600",
+        ] {
+            out.push(arg.to_owned());
+        }
+        out.push("--journal".to_owned());
+        out.push(dir.join("journal.ndjson").display().to_string());
+        out.push("--out-p12".to_owned());
+        out.push(dir.join("ivanov.p12").display().to_string());
+        out.extend(extra.iter().map(|s| (*s).to_owned()));
+        out
+    }
+
+    /// Lay down the parent certificate and run the parsed command.
+    ///
+    /// A password source is supplied by default: a test process has no terminal
+    /// to show a generated password on, and the tool refuses to print one into
+    /// output that is being captured.
+    fn run_in(dir: &Path, extra: &[&str]) -> Result<(), CliError> {
+        let secret = dir.join("p12-password.txt");
+        write_owner_only(&secret, "delivered-out-of-band\n");
+        let mut with_source: Vec<&str> = extra.to_vec();
+        let path = secret.display().to_string();
+        with_source.extend(["--p12-passphrase-file", &path]);
+        run_in_raw(dir, &with_source)
+    }
+
+    /// As [`run_in`], naming no password source — the tool then generates one.
+    fn run_in_raw(dir: &Path, extra: &[&str]) -> Result<(), CliError> {
+        let signer = MockSigner::ecdsa_sha256(key());
+        std::fs::write(dir.join("parent.der"), parent(&signer)).unwrap();
+        run(Cli::parse_from(argv(dir, extra)).command, Locale::En)
+    }
+
+    /// Write a secret file the owner-only gate accepts.
+    fn write_owner_only(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn writes_a_container_and_leaves_no_key_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        run_in(dir.path(), &[]).expect("the issuance succeeds");
+
+        let container = std::fs::read(dir.path().join("ivanov.p12")).unwrap();
+        let certs = crate::pkcs12::certificates_without_passphrase(&container)
+            .expect("the container's certificates are readable without the password");
+        assert!(!certs.is_empty());
+
+        // Nothing but the artifacts the operator asked for: in particular no
+        // key file, no temporary, and no password beside the container.
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "ivanov.p12".to_owned(),
+                "journal.ndjson".to_owned(),
+                // The password source the test supplied, not something the run
+                // produced.
+                "p12-password.txt".to_owned(),
+                "parent.der".to_owned(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_container_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        run_in(dir.path(), &[]).expect("the issuance succeeds");
+        let mode = std::fs::metadata(dir.path().join("ivanov.p12"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file carrying a private key must not be readable beyond its owner"
+        );
+    }
+
+    #[test]
+    fn refuses_a_generated_password_it_cannot_show_to_a_person() {
+        // A test process has no terminal on standard error. Printing the
+        // password anyway would put it in whatever captured the run, after
+        // which it would have to be treated as compromised.
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_in_raw(dir.path(), &[]).expect_err("there is nobody to show the password to");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("--p12-passphrase-file"),
+            "the refusal must name the sources that would work: {message}"
+        );
+        // And it happens before any work: a container written but unopenable,
+        // or a journal line for a credential nobody received, would both be
+        // worse than the refusal.
+        assert!(!dir.path().join("ivanov.p12").exists());
+        assert!(!dir.path().join("journal.ndjson").exists());
+    }
+
+    #[test]
+    fn refuses_a_chain_file_that_is_not_a_certificate() {
+        // The slip: `--chain ca.pk8.pem` where `--key-file ca.pk8.pem` was
+        // meant. The certificate safe is unencrypted, so the CA key would ride
+        // out in the clear.
+        let dir = tempfile::tempdir().unwrap();
+        let key_pem = crate::keygen::generate_key_pair(
+            crate::keygen::LeafKeyType::EcdsaP256,
+            &mut crate::keygen::OsEntropy,
+        )
+        .unwrap();
+        let chain = dir.path().join("ca.pk8.pem");
+        std::fs::write(
+            &chain,
+            encode_pem("PRIVATE KEY", &key_pem.private_key_pkcs8_der),
+        )
+        .unwrap();
+
+        let err = run_in(dir.path(), &["--chain", &chain.display().to_string()])
+            .expect_err("a private key must never be packaged as a chain");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("chain element 0 is not an X.509 certificate"),
+            "the message must name the element that was checked: {message}"
+        );
+        assert!(
+            !message.contains("leaf"),
+            "a chain element must not be reported as the leaf: {message}"
+        );
+        assert!(
+            !message.contains("pkcs12 container"),
+            "the container module must not leak into a chain diagnostic: {message}"
+        );
+        assert!(
+            message.contains("expected tag"),
+            "the underlying cause is worth keeping: {message}"
+        );
+        assert!(
+            !dir.path().join("ivanov.p12").exists(),
+            "nothing may be written when the chain is refused"
+        );
+    }
+
+    #[test]
+    fn refuses_a_chain_from_a_different_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        // A well-formed CA that did not issue this leaf.
+        let signer = MockSigner::ecdsa_sha256(key());
+        let foreign = dir.path().join("foreign-chain.pem");
+        std::fs::write(
+            &foreign,
+            encode_pem("CERTIFICATE", &parent_named(&signer, "Some Other CA")),
+        )
+        .unwrap();
+
+        // The mismatch is caught by the core when the container is assembled,
+        // so it surfaces as the issuance refusal, not as a usage error.
+        let err = run_in(dir.path(), &["--chain", &foreign.display().to_string()])
+            .expect_err("a chain that did not issue the leaf must be refused");
+        let CliError::Issue(IssueError::Container(message)) = err else {
+            panic!("expected a container refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("does not lead to the leaf"),
+            "got {message}"
+        );
+        assert!(
+            !dir.path().join("ivanov.p12").exists(),
+            "nothing may be written when the chain is refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_wider_container_file_does_not_inherit_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ivanov.p12");
+        std::fs::write(&target, b"stale").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        run_in(dir.path(), &[]).expect("the issuance succeeds");
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file carrying a private key must not keep a mode it had before"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_container_path_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere.txt");
+        std::fs::write(&elsewhere, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("ivanov.p12")).unwrap();
+
+        run_in(dir.path(), &[]).expect("the issuance succeeds");
+
+        assert_eq!(
+            std::fs::read(&elsewhere).unwrap(),
+            b"untouched",
+            "the private key must not travel down a planted symlink"
+        );
+        assert!(!dir.path().join("ivanov.p12").is_symlink());
+    }
+
+    #[test]
+    fn refuses_a_key_type_the_device_cannot_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_in(dir.path(), &["--key-type", "gost-2012-256"])
+            .expect_err("an unverifiable key type must be refused");
+        let CliError::Issue(IssueError::UnsupportedKeyType { supported, .. }) = err else {
+            panic!("expected UnsupportedKeyType, got {err:?}");
+        };
+        assert!(supported.contains("ecdsa-p384"), "got {supported}");
+        assert!(
+            !dir.path().join("ivanov.p12").exists(),
+            "a refused request must not leave an artifact"
+        );
+        assert!(
+            !dir.path().join("journal.ndjson").exists(),
+            "a request refused before generation must not reach the journal"
+        );
+    }
+
+    #[test]
+    fn refuses_a_short_operator_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        write_owner_only(&secret, "short\n");
+
+        let err = run_in_raw(
+            dir.path(),
+            &["--p12-passphrase-file", &secret.display().to_string()],
+        )
+        .expect_err("a short password must be refused");
+        assert!(
+            matches!(err, CliError::Issue(IssueError::PassphraseTooShort { .. })),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn no_flag_takes_the_password_by_value() {
+        // `argv` is world-readable, so a flag that accepted the password
+        // directly would publish it to every process on the machine.
+        for flag in [
+            "--p12-passphrase",
+            "--p12-password",
+            "--passphrase",
+            "--password",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut with_value = argv(dir.path(), &[]);
+            with_value.push(flag.to_owned());
+            with_value.push("hunter2hunter2".to_owned());
+            assert!(
+                Cli::try_parse_from(&with_value).is_err(),
+                "{flag} must not exist"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_is_mutually_exclusive_with_the_other_key_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        for conflicting in [["--spki", "spki.pem"], ["--csr", "req.pem"]] {
+            let mut argv = argv(dir.path(), &[]);
+            argv.extend(conflicting.iter().map(|s| (*s).to_owned()));
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "--generate-key must conflict with {}",
+                conflicting[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_generation_flags_are_refused_without_the_generation_flag() {
+        // Silently ignoring them would issue a plain certificate and no
+        // container, which is only discovered when the engineer has nothing to
+        // log in with.
+        let base = [
+            "issuer",
+            "issue-leaf",
+            "--backend",
+            "mock",
+            "--key",
+            "ca-key",
+            "--parent",
+            "ca.pem",
+            "--spki",
+            "spki.pem",
+            "--subject",
+            "CN=ivanov",
+            "--not-before",
+            "1600000000",
+            "--not-after",
+            "1600003600",
+            "--journal",
+            "journal.ndjson",
+            "--out",
+            "leaf.pem",
+        ];
+        for stray in [
+            vec!["--p12-passphrase-stdin"],
+            vec!["--p12-passphrase-prompt"],
+            vec!["--out-p12", "ivanov.p12"],
+            vec!["--key-type", "ecdsa-p384"],
+            vec!["--chain", "chain.pem"],
+        ] {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend(&stray);
+            let err = run(Cli::parse_from(&argv).command, Locale::En)
+                .expect_err("a stray generation flag must be refused");
+            let CliError::Usage(message) = err else {
+                panic!("expected a usage refusal for {stray:?}, got {err:?}");
+            };
+            let flag = stray.first().copied().unwrap_or_default();
+            assert!(message.contains(flag), "got {message}");
+        }
+    }
+}
+
+/// `prepare-carrier`: where the artifacts land and what it refuses to do.
+#[cfg(test)]
+mod prepare_carrier_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Parse and run a `prepare-carrier` argv.
+    fn run_argv(flags: &[String]) -> Result<(), CliError> {
+        let mut argv = vec!["issuer".to_owned(), "prepare-carrier".to_owned()];
+        argv.extend_from_slice(flags);
+        run(Cli::parse_from(argv).command, Locale::En)
+    }
+
+    fn arg(flag: &str, value: &Path) -> Vec<String> {
+        vec![flag.to_owned(), value.display().to_string()]
+    }
+
+    /// A CA certificate in PEM, for the chain files these tests hand around.
+    fn ca_pem() -> String {
+        use crate::sign::MockSigner;
+        let signer = MockSigner::ecdsa_sha256(KeyId::new("ca-key"));
+        encode_pem(
+            "CERTIFICATE",
+            &super::generate_key_tests::parent_named(&signer, "Carrier Test CA"),
+        )
+    }
+
+    #[test]
+    fn lays_artifacts_where_the_device_looks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let chain = dir.path().join("chain.pem");
+        let media = dir.path().join("media");
+        // Minted once: every call produces a fresh serial, so the file and the
+        // expectation have to come from the same certificate.
+        let pem = ca_pem();
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(&chain, &pem).unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend(arg("--chain", &chain));
+        argv.extend(arg("--media", &media));
+        run_argv(&argv).expect("the layout succeeds");
+
+        assert_eq!(
+            std::fs::read(media.join("certs/user.p12")).unwrap(),
+            b"container"
+        );
+        assert_eq!(
+            std::fs::read_to_string(media.join("certs/chain.pem")).unwrap(),
+            pem
+        );
+    }
+
+    #[test]
+    fn refuses_to_replace_a_container_without_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let media = dir.path().join("media");
+        std::fs::write(&p12, b"mine").unwrap();
+        std::fs::create_dir_all(media.join("certs")).unwrap();
+        std::fs::write(media.join("certs/user.p12"), b"someone-else").unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend(arg("--media", &media));
+        // The test process has no terminal, so the question cannot be asked and
+        // the operation must stop rather than guess.
+        let err = run_argv(&argv).expect_err("an unconfirmed overwrite must be refused");
+        assert!(matches!(err, CliError::Usage(_)), "got {err:?}");
+        assert_eq!(
+            std::fs::read(media.join("certs/user.p12")).unwrap(),
+            b"someone-else"
+        );
+
+        argv.push("--force".to_owned());
+        run_argv(&argv).expect("--force is the confirmation");
+        assert_eq!(
+            std::fs::read(media.join("certs/user.p12")).unwrap(),
+            b"mine"
+        );
+    }
+
+    /// A PIN flag on a mounted-carrier run is refused, not dropped. The command
+    /// refuses every other incompatible combination out loud, and an operator
+    /// who passed `--pin-file` and saw a success would have every reason to
+    /// think a PIN was protecting what landed in a plain directory. Holds in a
+    /// build without the token backend too: the flags are declared there as
+    /// well, and mean even less.
+    #[test]
+    fn a_mounted_carrier_refuses_the_flags_that_belong_to_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let pin_file = dir.path().join("pin.txt");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(&pin_file, b"12345678\n").unwrap();
+
+        for extra in [
+            arg("--pin-file", &pin_file),
+            vec!["--pin-stdin".to_owned()],
+            vec!["--token-label".to_owned(), "Rutoken Lite".to_owned()],
+            arg("--pinentry", Path::new("/usr/bin/pinentry")),
+        ] {
+            let media = dir.path().join(extra.join("-").replace(['/', '-'], "_"));
+            let mut argv = arg("--p12", &p12);
+            argv.extend(arg("--media", &media));
+            argv.extend(extra.clone());
+            match run_argv(&argv) {
+                Err(CliError::Usage(message)) => assert!(
+                    message.contains(extra.first().map_or("", String::as_str)),
+                    "the refusal must name the flag: {message}"
+                ),
+                other => panic!("{extra:?} must be refused, got {other:?}"),
+            }
+            assert!(
+                !media.exists(),
+                "{extra:?}: a refused run must lay nothing out"
+            );
+        }
+    }
+
+    /// A build that cannot reach a token says so instead of writing nothing
+    /// and reporting success.
+    #[cfg(not(feature = "pkcs11"))]
+    #[test]
+    fn a_build_without_the_token_backend_refuses_rather_than_pretending() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        std::fs::write(&p12, b"container").unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend([
+            "--module".to_owned(),
+            "/usr/lib/librtpkcs11ecp.so".to_owned(),
+        ]);
+        argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
+
+        let err = run_argv(&argv).expect_err("this build cannot reach a token");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("pkcs11"),
+            "the refusal must name what is missing: {message}"
+        );
+    }
+
+    /// The two carriers are not mixed in one run. Half-serving the request
+    /// would leave an operator told the carrier was prepared and no chain
+    /// anywhere.
+    #[cfg(feature = "pkcs11")]
+    #[test]
+    fn a_token_run_refuses_the_flags_that_belong_to_a_mounted_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let chain = dir.path().join("chain.pem");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(&chain, b"chain").unwrap();
+
+        let token = |extra: Vec<String>| {
+            let mut argv = arg("--p12", &p12);
+            argv.extend([
+                "--module".to_owned(),
+                "/nonexistent/__tessera_no_module__.so".to_owned(),
+            ]);
+            argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
+            argv.extend(extra);
+            run_argv(&argv)
+        };
+
+        for extra in [
+            arg("--media", dir.path()),
+            arg("--chain", &chain),
+            vec!["--container-path".to_owned(), "certs/x.p12".to_owned()],
+        ] {
+            let err = token(extra.clone()).expect_err("mixed carriers must be refused");
+            assert!(matches!(err, CliError::Usage(_)), "{extra:?}: got {err:?}");
+        }
+    }
+
+    /// Half a token target is a typo, not a request: `--module` without a label
+    /// would write where nothing looks for it.
+    #[cfg(feature = "pkcs11")]
+    #[test]
+    fn a_token_run_needs_both_the_module_and_the_object_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        std::fs::write(&p12, b"container").unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend([
+            "--module".to_owned(),
+            "/nonexistent/__tessera_no_module__.so".to_owned(),
+        ]);
+        let err = run_argv(&argv).expect_err("--module alone is not a target");
+        assert!(matches!(err, CliError::Usage(_)), "got {err:?}");
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
+        let err = run_argv(&argv).expect_err("--object-label alone is not a target");
+        assert!(matches!(err, CliError::Usage(_)), "got {err:?}");
+    }
+
+    /// The size is judged before the PIN is asked for. The test process has no
+    /// PIN source at all, so a check made in the wrong order would fail on the
+    /// missing PIN — and on a real token it would not fail at all, it would
+    /// truncate.
+    #[cfg(feature = "pkcs11")]
+    #[test]
+    fn an_oversized_container_is_refused_before_the_operator_is_asked_for_a_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        std::fs::write(&p12, vec![0xAB; 48 * 1024]).unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend([
+            "--module".to_owned(),
+            "/nonexistent/__tessera_no_module__.so".to_owned(),
+        ]);
+        argv.extend(["--object-label".to_owned(), "tessera-credential".to_owned()]);
+
+        let err = run_argv(&argv).expect_err("48 KiB must be refused");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        assert!(
+            message.contains("49152") && message.contains("32768"),
+            "the refusal must name both sizes: {message}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_container_path_that_leaves_the_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let media = dir.path().join("media");
+        let victim = dir.path().join("keep.txt");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(&victim, b"not yours").unwrap();
+
+        for escape in [
+            "../escaped.p12".to_owned(),
+            victim.display().to_string(),
+            "certs/../../escaped.p12".to_owned(),
+        ] {
+            let mut argv = arg("--p12", &p12);
+            argv.extend(arg("--media", &media));
+            argv.extend(["--container-path".to_owned(), escape.clone()]);
+            argv.push("--force".to_owned());
+
+            let err = run_argv(&argv).expect_err("'{escape}' must be refused");
+            assert!(matches!(err, CliError::Usage(_)), "{escape}: got {err:?}");
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"not yours",
+            "a refused path must not have written anything"
+        );
+    }
+
+    #[test]
+    fn refuses_a_chain_file_that_is_not_a_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        let chain = dir.path().join("not-a-chain.pem");
+        let media = dir.path().join("media");
+        std::fs::write(&p12, b"container").unwrap();
+        std::fs::write(
+            &chain,
+            "-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+
+        let mut argv = arg("--p12", &p12);
+        argv.extend(arg("--chain", &chain));
+        argv.extend(arg("--media", &media));
+        let err = run_argv(&argv).expect_err("a chain file must hold certificates");
+        let CliError::Usage(message) = err else {
+            panic!("expected a usage refusal, got {err:?}");
+        };
+        // Preparing a carrier assembles no container, so nothing here may speak
+        // of one; and the element checked is a chain element, not a leaf.
+        assert!(
+            message.contains("chain element 0 is not an X.509 certificate"),
+            "got {message}"
+        );
+        assert!(!message.contains("leaf"), "got {message}");
+        assert!(!message.contains("pkcs12 container"), "got {message}");
+        assert!(
+            !media.join("certs/chain.pem").exists(),
+            "nothing may reach the carrier when the chain is refused"
+        );
+    }
+
+    #[test]
+    fn takes_no_password_at_all() {
+        // Container and password travel by separate channels; a flag here would
+        // invite writing the password onto the carrier beside the container.
+        let dir = tempfile::tempdir().unwrap();
+        let p12 = dir.path().join("ivanov.p12");
+        std::fs::write(&p12, b"container").unwrap();
+        for flag in ["--p12-passphrase-file", "--passphrase-file", "--password"] {
+            let mut argv = arg("--p12", &p12);
+            argv.extend(arg("--media", dir.path()));
+            argv.extend([flag.to_owned(), "whatever".to_owned()]);
+            let mut full = vec!["issuer".to_owned(), "prepare-carrier".to_owned()];
+            full.extend(argv);
+            assert!(Cli::try_parse_from(&full).is_err(), "{flag} must not exist");
+        }
     }
 }

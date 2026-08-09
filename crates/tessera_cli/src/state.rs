@@ -5,13 +5,14 @@
 //! stimulus through a single `mpsc::UnboundedReceiver<Event>`. Emits action
 //! requests for the action-runner task.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use tessera_core::config::validated::MonitorFailMode;
 use tessera_core::mac::audit as mac_audit;
 use tessera_core::mac::backend::MacBackend;
 use tessera_core::mac::IntegrityLabel;
@@ -31,8 +32,8 @@ use crate::udev_query::{UdevDeviceIdentity, UdevQuery};
 ///
 /// PKCS#12 credentials are observable as USB block devices and therefore use
 /// udev presence/removal enforcement. PKCS#11 token serials live in a
-/// different namespace; the PAM authentication flow rejects strict
-/// continuous-presence mode until a native token-event monitor exists.
+/// different namespace and are established by polling the provider — see
+/// [`Event::TokenPoll`] and `daemon::token_presence`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialMode {
     /// PKCS#12 bundle discovered on a USB block device.
@@ -73,12 +74,26 @@ pub enum SuspendState {
 
 impl SuspendState {
     /// Are we currently inside the suspend grace window?
+    ///
+    /// The pre-suspend announcement is bounded by the same window as a
+    /// resume, rather than held open until logind says the machine woke.
+    /// A `PrepareForSleep(true)` whose matching `false` never arrives — a
+    /// suspend that failed, a D-Bus connection dropped across the
+    /// transition — would otherwise suppress every removal for the rest of
+    /// the daemon's life, which under strict monitoring means promising
+    /// continuous presence while enforcing none of it.
+    ///
+    /// The bound is safe because the clock behind [`Instant`] does not
+    /// advance while the machine is suspended: a genuine suspend consumes
+    /// almost none of the window, and what it does consume is the awake part
+    /// of the transition, which is what the window is for.
     #[must_use]
     pub fn is_in_grace_window(&self, secs: u64) -> bool {
         match self {
             SuspendState::Awake => false,
-            SuspendState::SuspendingAt(_) => true,
-            SuspendState::ResumedAt(t) => t.elapsed() < Duration::from_secs(secs),
+            SuspendState::SuspendingAt(t) | SuspendState::ResumedAt(t) => {
+                t.elapsed() < Duration::from_secs(secs)
+            }
         }
     }
 }
@@ -97,6 +112,12 @@ pub struct StateConfig {
     pub on_usb_removed: OnUsbRemoved,
     /// Persistence backend.
     pub registry_store: RegistryStore,
+    /// What a persistent loss of token observation means for live sessions.
+    ///
+    /// `Strict` promises continuous carrier presence, which cannot be kept
+    /// without observing the carrier, so lost observation counts as removal.
+    /// `Permissive` makes no such promise and only logs.
+    pub monitor_fail_mode: MonitorFailMode,
 }
 
 impl StateConfig {
@@ -109,8 +130,44 @@ impl StateConfig {
             suspend_grace_seconds: 30,
             on_usb_removed: OnUsbRemoved::Lock,
             registry_store: store,
+            monitor_fail_mode: MonitorFailMode::Permissive,
         }
     }
+}
+
+/// Consecutive polls that must agree before the daemon acts on them.
+///
+/// Applies to both things a poll can say, because a single poll is weak
+/// evidence for either:
+///
+/// - *no answer* — a reader busy with another process's APDU, a `pcscd`
+///   restart, a transient provider error;
+/// - *an answer without this carrier* — the same transients seen from the
+///   other side. `C_GetSlotList` reports an empty list when the smart-card
+///   service is briefly blind, and on an integrated token (the reader is the
+///   device) that is byte for byte what a genuine removal looks like. The
+///   provider cannot tell the two apart, so neither can this code; what it
+///   can do is refuse to act on the first one.
+///
+/// Acting on a single poll would end the session of an engineer whose token
+/// never left the reader. Three consecutive polls span two full intervals —
+/// beyond any transient observed on the bench — and the removal grace is
+/// spent on top of that before anything happens.
+///
+/// The cost is detection latency: with the default two-second interval a real
+/// removal is acted on after about six seconds plus the grace, not two. That
+/// is the price of not gashing sessions on provider noise, and it is what the
+/// documented contract states.
+const POLLS_BEFORE_CONFIRMED: u32 = 3;
+
+/// What recent polls have said about one session's carrier.
+#[derive(Debug, Default, Clone, Copy)]
+struct CarrierAbsence {
+    /// Consecutive polls that did not confirm the carrier present.
+    consecutive: u32,
+    /// Whether the removal grace has already been armed for this absence, so
+    /// one absence produces one action rather than one per poll.
+    actioned: bool,
 }
 
 /// IPC requests fed into the state manager.
@@ -166,6 +223,21 @@ pub enum IpcRequest {
     },
 }
 
+/// Outcome of one presence poll of the PKCS#11 provider.
+///
+/// The poller reports what it saw and counts nothing: how many failures in a
+/// row amount to lost observation, and what lost observation costs, are
+/// policy — and policy lives with the sessions it applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenPoll {
+    /// The provider answered. These token serial numbers are present.
+    Observed(BTreeSet<String>),
+    /// The poll did not produce an answer — the provider errored, or the call
+    /// did not return within its timeout. A hung call is a failure and not
+    /// presence: a carrier nobody can see is not a carrier that is there.
+    Failed(String),
+}
+
 /// Top-level event accepted by the state manager.
 #[derive(Debug)]
 pub enum Event {
@@ -175,6 +247,8 @@ pub enum Event {
     Udev(UdevEvent),
     /// Logind signal.
     Logind(LogindSignal),
+    /// Result of one token-presence poll.
+    TokenPoll(TokenPoll),
 }
 
 /// Action requests dispatched to the action-runner task.
@@ -233,6 +307,16 @@ pub fn spawn_state_manager(
         // growing memory without limit.
         let (ttl_expired_tx, mut ttl_expired_rx) = mpsc::channel::<TtlExpired>(64);
         let mut suspend_state = SuspendState::Awake;
+        // Consecutive failed presence polls; reset by any poll that answers.
+        let mut poll_failures: u32 = 0;
+        // What recent polls have said about each live session's carrier.
+        // Polling is level-triggered by design — that is what makes a removal
+        // during a daemon restart impossible to miss — but the *action* is not
+        // something to repeat every interval for as long as the token stays
+        // out, and a single unconfirmed poll is not evidence enough to act on
+        // at all. Entries are dropped when the carrier is confirmed present
+        // again and when the session leaves the registry.
+        let mut carrier_absence: HashMap<Uuid, CarrierAbsence> = HashMap::new();
 
         // Re-arm TTL timers for sessions restored from the persisted registry.
         // Without this a daemon restart would forget every deadline and a
@@ -256,6 +340,7 @@ pub fn spawn_state_manager(
                         &ttl_expired_tx,
                         &mut grace_tokens,
                         &mut ttl_tokens,
+                        &mut carrier_absence,
                         expired,
                     ).await;
                 }
@@ -269,10 +354,21 @@ pub fn spawn_state_manager(
                             &ttl_expired_tx,
                             &mut grace_tokens,
                             &mut ttl_tokens,
+                            &mut carrier_absence,
                             req,
                         ).await,
                         Event::Udev(u) => handle_udev(&cfg, &registry, &mut grace_tokens, &suspend_state, &action_tx, u),
-                        Event::Logind(s) => handle_logind(&cfg, &mut suspend_state, &registry, &mut grace_tokens, &mut ttl_tokens, s).await,
+                        Event::Logind(s) => handle_logind(&cfg, &mut suspend_state, &registry, &mut grace_tokens, &mut ttl_tokens, &mut carrier_absence, s).await,
+                        Event::TokenPoll(poll) => handle_token_poll(
+                            &cfg,
+                            &registry,
+                            &mut grace_tokens,
+                            &suspend_state,
+                            &action_tx,
+                            &mut poll_failures,
+                            &mut carrier_absence,
+                            poll,
+                        ),
                     }
                 }
             }
@@ -359,8 +455,8 @@ async fn handle_session_open(
     // SessionOpen vs Remove race (T19): PKCS#12 is observable through the
     // block-device udev namespace, so require the exact captured device to
     // still be present. PKCS#11 token serials are deliberately never compared
-    // to block-device serials; permissive PKCS#11 is best-effort and strict
-    // PKCS#11 is rejected by the PAM authentication flow.
+    // to block-device serials; a token carrier's presence is established by
+    // the poll instead, whose first cycle covers the same race.
     if cfg.credential_mode == CredentialMode::Pkcs12 {
         if let Some(serial) = session.usb_serial.as_deref() {
             if !udev_query.is_device_present(UdevDeviceIdentity {
@@ -426,6 +522,7 @@ async fn handle_ipc(
     ttl_expired_tx: &mpsc::Sender<TtlExpired>,
     grace_tokens: &mut HashMap<Uuid, CancellationToken>,
     ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
+    carrier_absence: &mut HashMap<Uuid, CarrierAbsence>,
     req: IpcRequest,
 ) {
     match req {
@@ -482,6 +579,7 @@ async fn handle_ipc(
             if let Some(tok) = grace_tokens.remove(&session_id) {
                 tok.cancel();
             }
+            carrier_absence.remove(&session_id);
             let _removed = registry.remove(session_id);
             persist_best_effort(&cfg.registry_store, registry.snapshot(), "session_close").await;
             // Best-effort: клиент мог отключиться, ответ можно потерять.
@@ -585,10 +683,6 @@ fn remove_event_may_match_session(
     vid_pid_ok && devnode_ok
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "remove and add branches share one destructured udev event and per-session timer map"
-)]
 fn handle_udev(
     cfg: &StateConfig,
     registry: &SessionRegistry,
@@ -598,8 +692,8 @@ fn handle_udev(
     event: UdevEvent,
 ) {
     // PKCS#11 token serials and USB block-device serials are unrelated
-    // namespaces. Permissive PKCS#11 deliberately has no continuous-presence
-    // enforcement until a native token-event source exists; reacting to an
+    // namespaces. A token carrier's removal reaches the state manager through
+    // `Event::TokenPoll`, never through here; reacting to an
     // attacker-controlled block device with a colliding serial would only
     // create a spurious session-ending action.
     if cfg.credential_mode == CredentialMode::Pkcs11 {
@@ -638,52 +732,9 @@ fn handle_udev(
             if sessions.is_empty() {
                 return;
             }
-            let grace = Duration::from_secs(cfg.grace_seconds);
             for session in sessions {
-                let session_id = session.session_id;
-                if grace_tokens
-                    .get(&session_id)
-                    .is_some_and(|token| !token.is_cancelled())
-                {
-                    // Duplicate remove/hub event for this exact session.
-                    continue;
-                }
-                grace_tokens.remove(&session_id);
-                let token = CancellationToken::new();
-                grace_tokens.insert(session_id, token.clone());
-                let completed = token.clone();
-                let action_tx = action_tx.clone();
-                let action = cfg.on_usb_removed.clone();
-                let serial_for_log = serial.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = tokio::time::sleep(grace) => {
-                            tracing::info!(
-                                target: "tessera.monitord",
-                                serial = serial_for_log,
-                                %session_id,
-                                "grace window expired, dispatching action"
-                            );
-                            // Best-effort: если приёмник действий уже закрыт,
-                            // демон всё равно завершается — терять нечего.
-                            drop(action_tx.send(ActionRequest::HandleUsbRemoved {
-                                session,
-                                action,
-                            }));
-                            // Mark the map entry reusable without retaining a
-                            // permanently "pending" timer after dispatch.
-                            completed.cancel();
-                        }
-                        _ = token.cancelled() => {
-                            tracing::info!(
-                                target: "tessera.monitord",
-                                serial = serial_for_log,
-                                %session_id,
-                                "grace cancelled"
-                            );
-                        }
-                    }
-                });
+                let carrier = serial.clone();
+                arm_removal_grace(cfg, grace_tokens, action_tx, session, carrier);
             }
         }
         (UdevAction::Add, Some(serial)) => {
@@ -726,6 +777,271 @@ fn handle_udev(
         }
         _ => {}
     }
+}
+
+/// Start the removal grace window for `session`, dispatching the configured
+/// action when it elapses without being cancelled.
+///
+/// Returns `false` and does nothing when a grace timer for this exact session
+/// is already pending — a duplicate udev hub event and a repeated poll that
+/// still does not see the carrier are both "the same removal, said twice".
+///
+/// `carrier` is the identifier the removal was observed against (a USB
+/// descriptor serial or a token serial); it only reaches the log.
+fn arm_removal_grace(
+    cfg: &StateConfig,
+    grace_tokens: &mut HashMap<Uuid, CancellationToken>,
+    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    session: ActiveSession,
+    carrier: String,
+) -> bool {
+    let session_id = session.session_id;
+    if grace_tokens
+        .get(&session_id)
+        .is_some_and(|token| !token.is_cancelled())
+    {
+        return false;
+    }
+    grace_tokens.remove(&session_id);
+    let token = CancellationToken::new();
+    grace_tokens.insert(session_id, token.clone());
+    let completed = token.clone();
+    let action_tx = action_tx.clone();
+    let action = cfg.on_usb_removed.clone();
+    let grace = Duration::from_secs(cfg.grace_seconds);
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tokio::time::sleep(grace) => {
+                tracing::info!(
+                    target: "tessera.monitord",
+                    serial = carrier,
+                    %session_id,
+                    "grace window expired, dispatching action"
+                );
+                // Best-effort: если приёмник действий уже закрыт,
+                // демон всё равно завершается — терять нечего.
+                drop(action_tx.send(ActionRequest::HandleUsbRemoved {
+                    session,
+                    action,
+                }));
+                // Mark the map entry reusable without retaining a
+                // permanently "pending" timer after dispatch.
+                completed.cancel();
+            }
+            () = token.cancelled() => {
+                tracing::info!(
+                    target: "tessera.monitord",
+                    serial = carrier,
+                    %session_id,
+                    "grace cancelled"
+                );
+            }
+        }
+    });
+    true
+}
+
+/// Apply one presence poll of the PKCS#11 provider to the live sessions.
+///
+/// Presence is decided per session by comparing the session's recorded carrier
+/// serial against the set the provider reported. Some other token being
+/// connected is not this token being connected: the serial is the only key
+/// that ties a carrier to the session it authenticated, so a poll that returns
+/// a non-empty set without the session's own serial is an absence.
+///
+/// Detection is level-triggered — every poll re-decides — which is what makes
+/// a removal that happened while the daemon was down impossible to miss. The
+/// action is not: `token_absent` records the sessions already accounted for,
+/// so a token left out does not re-trigger the action every interval.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the state-manager task's borrows plus its two poll-scoped counters"
+)]
+fn handle_token_poll(
+    cfg: &StateConfig,
+    registry: &SessionRegistry,
+    grace_tokens: &mut HashMap<Uuid, CancellationToken>,
+    suspend_state: &SuspendState,
+    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    poll_failures: &mut u32,
+    carrier_absence: &mut HashMap<Uuid, CarrierAbsence>,
+    poll: TokenPoll,
+) {
+    // A USB-carrier host runs no poller, so this is unreachable there. Kept
+    // as a guard rather than an assumption: reading a block-device serial as
+    // a token serial would end sessions over an identifier collision.
+    if cfg.credential_mode != CredentialMode::Pkcs11 {
+        return;
+    }
+
+    // Only sessions whose serial is known to be a token serial. A session
+    // opened under a different carrier is not judged here at all — see
+    // `ActiveSession::watched_by_token_poll`.
+    let sessions: Vec<ActiveSession> = registry
+        .all()
+        .into_iter()
+        .filter(ActiveSession::watched_by_token_poll)
+        .collect();
+
+    // Entries describe live sessions only, so a closed session cannot leave
+    // one behind for the rest of the daemon's uptime.
+    let live: HashSet<Uuid> = sessions.iter().map(|s| s.session_id).collect();
+    carrier_absence.retain(|id, _| live.contains(id));
+
+    match poll {
+        TokenPoll::Observed(present) => {
+            *poll_failures = 0;
+            for session in sessions {
+                let Some(serial) = session.usb_serial.clone() else {
+                    continue;
+                };
+                let session_id = session.session_id;
+                if present.contains(&serial) {
+                    if carrier_absence.remove(&session_id).is_some() {
+                        tracing::info!(
+                            target: "tessera.monitord",
+                            serial,
+                            %session_id,
+                            "token carrier confirmed present again"
+                        );
+                    }
+                    if let Some(token) = grace_tokens.remove(&session_id) {
+                        token.cancel();
+                    }
+                } else {
+                    // The provider answered and this carrier was not among
+                    // what it confirmed. That is the removal case — and also
+                    // what a briefly blind smart-card service looks like, so
+                    // it has to repeat before it counts.
+                    note_carrier_unconfirmed(
+                        cfg,
+                        grace_tokens,
+                        suspend_state,
+                        action_tx,
+                        carrier_absence,
+                        session,
+                        serial,
+                        "carrier not among the tokens the provider confirmed",
+                    );
+                }
+            }
+        }
+        TokenPoll::Failed(reason) => {
+            *poll_failures = poll_failures.saturating_add(1);
+            if *poll_failures < POLLS_BEFORE_CONFIRMED {
+                tracing::warn!(
+                    target: "tessera.monitord",
+                    reason,
+                    consecutive = *poll_failures,
+                    threshold = POLLS_BEFORE_CONFIRMED,
+                    "token presence poll failed; not yet treated as lost observation"
+                );
+                return;
+            }
+            match cfg.monitor_fail_mode {
+                MonitorFailMode::Permissive => {
+                    tracing::error!(
+                        target: "tessera.monitord",
+                        reason,
+                        consecutive = *poll_failures,
+                        "token presence observation lost; sessions continue (permissive monitoring \
+                         promises no continuous presence)"
+                    );
+                }
+                MonitorFailMode::Strict => {
+                    tracing::error!(
+                        target: "tessera.monitord",
+                        reason,
+                        consecutive = *poll_failures,
+                        "token presence observation lost; strict monitoring treats it as removal"
+                    );
+                    // The failure streak has already served as the repetition
+                    // this needs, so each session is taken straight to the
+                    // confirmed state rather than starting its own count.
+                    for session in sessions {
+                        let Some(serial) = session.usb_serial.clone() else {
+                            continue;
+                        };
+                        let session_id = session.session_id;
+                        carrier_absence.entry(session_id).or_default().consecutive =
+                            POLLS_BEFORE_CONFIRMED;
+                        note_carrier_unconfirmed(
+                            cfg,
+                            grace_tokens,
+                            suspend_state,
+                            action_tx,
+                            carrier_absence,
+                            session,
+                            serial,
+                            "token presence unobservable under strict monitoring",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Account for one poll that did not confirm `session`'s carrier present.
+///
+/// Arms the removal grace once the count reaches [`POLLS_BEFORE_CONFIRMED`],
+/// and stays quiet on every later poll that says the same — one absence
+/// produces one action, not one per poll.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared by the absence and lost-observation branches of one poll"
+)]
+fn note_carrier_unconfirmed(
+    cfg: &StateConfig,
+    grace_tokens: &mut HashMap<Uuid, CancellationToken>,
+    suspend_state: &SuspendState,
+    action_tx: &mpsc::UnboundedSender<ActionRequest>,
+    carrier_absence: &mut HashMap<Uuid, CarrierAbsence>,
+    session: ActiveSession,
+    serial: String,
+    reason: &'static str,
+) {
+    let session_id = session.session_id;
+    // A reader that goes quiet across a suspend is the machine sleeping, not
+    // an engineer walking off with the token — the same judgement the udev
+    // path makes about a removal seen in that window.
+    if suspend_state.is_in_grace_window(cfg.suspend_grace_seconds) {
+        tracing::info!(
+            target: "tessera.monitord",
+            serial,
+            %session_id,
+            "token absence suppressed by suspend grace"
+        );
+        return;
+    }
+    let entry = carrier_absence.entry(session_id).or_default();
+    entry.consecutive = entry.consecutive.saturating_add(1);
+    if entry.actioned {
+        // The grace timer armed for this same absence already owns it.
+        return;
+    }
+    if entry.consecutive < POLLS_BEFORE_CONFIRMED {
+        tracing::warn!(
+            target: "tessera.monitord",
+            serial,
+            %session_id,
+            reason,
+            consecutive = entry.consecutive,
+            threshold = POLLS_BEFORE_CONFIRMED,
+            "token carrier not confirmed present; not yet treated as removed"
+        );
+        return;
+    }
+    entry.actioned = true;
+    tracing::warn!(
+        target: "tessera.monitord",
+        serial,
+        %session_id,
+        reason,
+        consecutive = entry.consecutive,
+        "token carrier absent across consecutive polls; starting removal grace"
+    );
+    arm_removal_grace(cfg, grace_tokens, action_tx, session, serial);
 }
 
 /// Arm a bounded-TTL termination timer for `session`.
@@ -824,6 +1140,7 @@ async fn handle_session_expired(
     ttl_expired_tx: &mpsc::Sender<TtlExpired>,
     grace_tokens: &mut HashMap<Uuid, CancellationToken>,
     ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
+    carrier_absence: &mut HashMap<Uuid, CarrierAbsence>,
     expired: TtlExpired,
 ) {
     let Some(session) = registry.find_by_session_id(expired.session_id) else {
@@ -852,6 +1169,7 @@ async fn handle_session_expired(
     if let Some(token) = grace_tokens.remove(&expired.session_id) {
         token.cancel();
     }
+    carrier_absence.remove(&expired.session_id);
     let Some(session) = registry.remove(expired.session_id) else {
         return;
     };
@@ -865,12 +1183,17 @@ async fn handle_session_expired(
     persist_best_effort(&cfg.registry_store, registry.snapshot(), "session_expired").await;
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "logind teardown reaches every per-session map the state manager owns"
+)]
 async fn handle_logind(
     cfg: &StateConfig,
     suspend_state: &mut SuspendState,
     registry: &SessionRegistry,
     grace_tokens: &mut HashMap<Uuid, CancellationToken>,
     ttl_tokens: &mut HashMap<Uuid, CancellationToken>,
+    carrier_absence: &mut HashMap<Uuid, CarrierAbsence>,
     sig: LogindSignal,
 ) {
     match sig {
@@ -881,6 +1204,12 @@ async fn handle_logind(
             for (_session_id, tok) in grace_tokens.drain() {
                 tok.cancel();
             }
+            // Forget what recent polls said about every carrier. The records
+            // exist to keep one absence from re-arming every poll; kept
+            // across a suspend whose grace timers were just dropped, they
+            // would instead stop a carrier that really is gone after the
+            // resume from ever arming one.
+            carrier_absence.clear();
         }
         LogindSignal::PrepareForSleep(false) => {
             *suspend_state = SuspendState::ResumedAt(Instant::now());
@@ -905,6 +1234,7 @@ async fn handle_logind(
                 if let Some(tok) = grace_tokens.remove(&uuid) {
                     tok.cancel();
                 }
+                carrier_absence.remove(&uuid);
                 let _ = registry.remove(uuid);
             }
             // Persist after removals so a daemon restart does not

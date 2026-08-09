@@ -151,6 +151,9 @@ enum Payload {
         parent: String,
         /// The issued certificate's subject (RFC 4514).
         subject: String,
+        /// Where the certified key pair came from.
+        #[serde(default, skip_serializing_if = "KeyOrigin::is_requester")]
+        key_origin: KeyOrigin,
     },
     /// An organisation-CA issuance.
     #[serde(rename = "issue_ca")]
@@ -188,6 +191,43 @@ enum Payload {
         /// core, which neither reads nor validates its contents.
         data: serde_json::Value,
     },
+}
+
+/// Where the key pair a leaf certifies came from.
+///
+/// The distinction is not bookkeeping: when the issuer generated the pair, the
+/// private key is known to two parties and nothing signed with it can be
+/// attributed to the holder alone. An inventory that cannot separate the two
+/// cannot answer which issued credentials have that property — the first
+/// question an assessor or an incident review asks.
+///
+/// `Requester` is the default so the many lines written before this field
+/// existed read back as what they were: issuances where the key came from the
+/// engineer. For the same reason a `Requester` line does not carry the field at
+/// all, leaving those lines byte-identical to the ones already in the chain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum KeyOrigin {
+    /// The key came from the requester: an explicit public key, or a
+    /// certificate request they signed.
+    #[default]
+    Requester,
+    /// The issuing tool generated the key pair.
+    Issuer,
+}
+
+impl KeyOrigin {
+    /// Whether this is the default origin (used to keep it off the wire).
+    ///
+    /// Takes a reference because that is the shape `skip_serializing_if` calls.
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if is handed a reference to the field"
+    )]
+    fn is_requester(&self) -> bool {
+        matches!(self, KeyOrigin::Requester)
+    }
 }
 
 /// SHA-256 of `bytes` as a 32-byte array.
@@ -268,7 +308,7 @@ impl<S: JournalStorage> Journal<S> {
         &self.storage
     }
 
-    /// Records a shift-leaf issuance.
+    /// Records a shift-leaf issuance, noting where the certified key came from.
     ///
     /// # Errors
     ///
@@ -278,6 +318,7 @@ impl<S: JournalStorage> Journal<S> {
         serial: &[u8],
         parent_cert_der: &[u8],
         subject: &str,
+        key_origin: KeyOrigin,
         now_unix: u64,
     ) -> Result<(), JournalError> {
         self.append(
@@ -285,6 +326,7 @@ impl<S: JournalStorage> Journal<S> {
                 serial: hex::encode(serial),
                 parent: fingerprint(parent_cert_der),
                 subject: subject.to_owned(),
+                key_origin,
             },
             now_unix,
         )

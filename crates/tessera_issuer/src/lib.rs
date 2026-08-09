@@ -76,10 +76,18 @@ pub mod crl;
 pub mod csr;
 mod error;
 pub mod journal;
+pub mod keygen;
 pub mod l10n;
 pub mod monotonicity;
+pub mod pkcs12;
 mod profile;
 pub mod serial;
+// The owner-only gate shared by the file backend's key file and the CLI's
+// `--pin-file` / `--key-passphrase-file` / `--p12-passphrase-file` sources.
+// Compiled only where one of those readers exists, so no other build carries an
+// unused check.
+#[cfg(any(feature = "file", feature = "cli"))]
+mod secret_file;
 pub mod sign;
 pub mod summary;
 mod tbs;
@@ -90,6 +98,13 @@ mod verify;
 // the library where it can be unit-tested without spawning a process.
 #[cfg(feature = "cli")]
 pub mod cli;
+
+// Laying issued artifacts out on a carrier: filesystem paths the device's check
+// looks at. Native-only (it touches the filesystem), so the wasm core, which
+// hands its container to the browser rather than to a mount point, pulls none of
+// it.
+#[cfg(feature = "native")]
+pub mod carrier;
 
 // The operator-confirmation channel: a generic surface a signing frontend uses
 // to show a parsed TBS and gate the operation on an explicit yes. Native-only
@@ -116,8 +131,9 @@ pub use csr::{
 };
 pub use error::IssueError;
 pub use journal::{
-    verify_lines, Journal, JournalError, JournalReport, JournalStatus, JournalStorage,
+    verify_lines, Journal, JournalError, JournalReport, JournalStatus, JournalStorage, KeyOrigin,
 };
+pub use keygen::{generate_key_pair, Entropy, GeneratedKeyPair, LeafKeyType};
 pub use l10n::Locale;
 pub use profile::{CaRequest, IntegrityCeiling, LeafRequest, RootRequest, Validity};
 pub use serial::Serial;
@@ -254,6 +270,39 @@ pub fn issue_leaf<B: SignatureBackend, S: JournalStorage>(
     journal: &mut Journal<S>,
     now_unix: u64,
 ) -> Result<IssuedCert, IssueError> {
+    issue_leaf_recording_origin(
+        backend,
+        key_id,
+        parent_der,
+        req,
+        serial,
+        journal,
+        KeyOrigin::Requester,
+        now_unix,
+    )
+}
+
+/// [`issue_leaf`], with the journal's record of where the key came from made
+/// explicit.
+///
+/// The checks, the signing and the self-check are identical for every key
+/// source — only the journal line differs — so all three entry points share this
+/// body rather than each running its own copy of the issuance path.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared issuance body threads every input of the public entry \
+              points plus the journal's key-origin marker"
+)]
+pub(crate) fn issue_leaf_recording_origin<B: SignatureBackend, S: JournalStorage>(
+    backend: &B,
+    key_id: &KeyId,
+    parent_der: &[u8],
+    req: &LeafRequest,
+    serial: &Serial,
+    journal: &mut Journal<S>,
+    key_origin: KeyOrigin,
+    now_unix: u64,
+) -> Result<IssuedCert, IssueError> {
     if req.host_binding.is_empty() {
         return Err(IssueError::MissingHostBinding);
     }
@@ -283,11 +332,198 @@ pub fn issue_leaf<B: SignatureBackend, S: JournalStorage>(
 
     verify::self_check_leaf(&cert, req, &parent)?;
     // Journal before releasing the artifact; a failed write withholds it.
-    journal.record_leaf(serial.as_bytes(), parent_der, &req.subject, now_unix)?;
+    journal.record_leaf(
+        serial.as_bytes(),
+        parent_der,
+        &req.subject,
+        key_origin,
+        now_unix,
+    )?;
     Ok(IssuedCert {
         der: cert,
         serial: serial.as_bytes().to_vec(),
     })
+}
+
+/// Annotation `kind` recording that a leaf was issued but its container never
+/// reached the operator.
+///
+/// The journal exists for inventory, and an issuance line on its own says a
+/// credential is in circulation. When packaging fails the certificate was
+/// signed but nothing was handed over, and only this line separates the two
+/// cases afterwards.
+pub const CONTAINER_WITHHELD_ANNOTATION: &str = "tessera.issuer.container_withheld";
+
+/// A leaf issuance in which the tool generates the key pair.
+///
+/// The scope is the operator's, exactly as for every other key source; what the
+/// requester contributes here is nothing at all, which is the point of the
+/// process this supports.
+#[derive(Debug, Clone)]
+pub struct GeneratedLeafRequest<'a> {
+    /// Subject distinguished name (RFC 4514).
+    pub subject: String,
+    /// The key type to generate.
+    pub key_type: keygen::LeafKeyType,
+    /// Operator-set scope, identical in meaning to the CSR path's.
+    pub scope: LeafScope,
+    /// Chain certificates to package beside the leaf (typically the issuing
+    /// CA), DER, in order.
+    pub chain_der: &'a [Vec<u8>],
+}
+
+/// The result of a leaf issuance with a generated key: the certificate, and the
+/// container that carries the key.
+///
+/// The private key is deliberately *not* a field: it exists only inside
+/// `container`, and returning it separately would invite a caller to write it
+/// somewhere.
+pub struct GeneratedLeaf {
+    /// The issued certificate.
+    pub cert: IssuedCert,
+    /// The PKCS#12 container holding the key, the certificate and the chain.
+    pub container: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl core::fmt::Debug for GeneratedLeaf {
+    /// The container holds the private key, so its bytes stay out of any
+    /// formatted output.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GeneratedLeaf")
+            .field("cert", &self.cert)
+            .field("container", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Issues a shift-leaf over a key pair this call generates, and packages it.
+///
+/// Generation, issuance and packaging are one operation on purpose. Split into
+/// two commands, the private key would have to survive between them — that is,
+/// on disk — which is exactly what the process is meant to avoid. Here it never
+/// leaves memory: it is generated, certified, packaged, and dropped into wiped
+/// memory before the call returns.
+///
+/// The issuance itself runs the same path as every other key source: the same
+/// scope checks against the parent envelope, the same signing, the same
+/// self-check of the finished certificate. Only the journal line differs — it
+/// records that the issuer, not the requester, holds the key.
+///
+/// `passphrase` protects the container. Callers are responsible for its
+/// strength ([`pkcs12::check_passphrase`] enforces the floor on an
+/// operator-supplied one) and for holding it in wiped memory.
+///
+/// # Errors
+///
+/// Everything [`issue_leaf`] can return, plus [`IssueError::KeyGeneration`]
+/// when the key cannot be generated and [`IssueError::Container`] when the
+/// container cannot be assembled or does not read back as what went into it.
+///
+/// A container failure comes *after* the issuance has been journaled: the
+/// certificate is genuinely issued at that point, and a journal that omitted it
+/// would under-report. No artifact is returned.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the operation spans issuance and packaging: signer, key, parent, \
+              request, container password, serial, journal, entropy and clock \
+              are each a distinct required input"
+)]
+pub fn issue_leaf_generating_key<B: SignatureBackend, S: JournalStorage, E: keygen::Entropy>(
+    backend: &B,
+    key_id: &KeyId,
+    parent_der: &[u8],
+    req: &GeneratedLeafRequest<'_>,
+    passphrase: &str,
+    serial: &Serial,
+    journal: &mut Journal<S>,
+    entropy: &mut E,
+    now_unix: u64,
+) -> Result<GeneratedLeaf, IssueError> {
+    issue_leaf_generating_key_with(
+        backend, key_id, parent_der, req, passphrase, serial, journal, entropy, now_unix, None,
+    )
+}
+
+/// [`issue_leaf_generating_key`] with the container's key-derivation cost
+/// overridable.
+///
+/// `pbkdf2_iterations` is `None` everywhere but in the crate's own tests, which
+/// build containers in bulk and cannot each afford the shipped cost; one test
+/// goes through the public entry point and pays it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared body threads every input of the public entry point plus \
+              the test-only derivation cost"
+)]
+fn issue_leaf_generating_key_with<B: SignatureBackend, S: JournalStorage, E: keygen::Entropy>(
+    backend: &B,
+    key_id: &KeyId,
+    parent_der: &[u8],
+    req: &GeneratedLeafRequest<'_>,
+    passphrase: &str,
+    serial: &Serial,
+    journal: &mut Journal<S>,
+    entropy: &mut E,
+    now_unix: u64,
+    pbkdf2_iterations: Option<u32>,
+) -> Result<GeneratedLeaf, IssueError> {
+    let pair = keygen::generate_key_pair(req.key_type, entropy)?;
+
+    let leaf_req = LeafRequest {
+        subject: req.subject.clone(),
+        subject_spki_der: pair.spki_der.clone(),
+        validity: req.scope.validity,
+        host_binding: req.scope.host_binding.clone(),
+        allowed_roles: req.scope.allowed_roles.clone(),
+        max_integrity: req.scope.max_integrity,
+        profile_version: req.scope.profile_version,
+    };
+    let cert = issue_leaf_recording_origin(
+        backend,
+        key_id,
+        parent_der,
+        &leaf_req,
+        serial,
+        journal,
+        KeyOrigin::Issuer,
+        now_unix,
+    )?;
+
+    let contents = pkcs12::ContainerContents {
+        private_key_pkcs8_der: &pair.private_key_pkcs8_der,
+        leaf_der: &cert.der,
+        chain_der: req.chain_der,
+    };
+    let built = match pbkdf2_iterations {
+        Some(iterations) => {
+            pkcs12::build_with_iterations(&contents, passphrase, entropy, iterations)
+        }
+        None => pkcs12::build_container(&contents, passphrase, entropy),
+    };
+    let container = match built {
+        Ok(container) => container,
+        Err(error) => {
+            // The issuance is already in the chain and stays there — the
+            // certificate was genuinely signed. But nothing reached the
+            // engineer, and a journal that showed only the issuance would count
+            // this as a credential in circulation. The annotation is what tells
+            // the two apart later; failing to write it does not change the
+            // outcome, which is the packaging failure the caller is about to
+            // see.
+            let noted = journal.append_annotation(
+                CONTAINER_WITHHELD_ANNOTATION,
+                serde_json::json!({
+                    "serial": hex::encode(serial.as_bytes()),
+                    "subject": req.subject,
+                    "reason": error.to_string(),
+                }),
+                now_unix,
+            );
+            drop(noted);
+            return Err(error);
+        }
+    };
+    Ok(GeneratedLeaf { cert, container })
 }
 
 /// Issues an organisation CA under the parent in `parent_der`.

@@ -83,6 +83,7 @@ fn sample_logind_session(id: &str) -> ActiveSession {
         target: SessionTarget::logind(id),
         usb_serial: Some("AB".into()),
         usb_vid_pid: None,
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_devnode: None,
         host_id_hash: "h".into(),
         opened_at: SystemTime::UNIX_EPOCH,

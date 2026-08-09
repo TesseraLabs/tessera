@@ -55,6 +55,18 @@ pub struct RawConfig {
     pub pkcs12_path_pattern: Option<String>,
     /// PIN prompt.
     pub pkcs12_pin_prompt: Option<String>,
+    /// Where the PKCS#12 envelope is read from.  Absent means the USB
+    /// partition every installation used before a token could carry one.
+    #[serde(default)]
+    pub pkcs12_source: RawPkcs12Source,
+    /// `CKA_LABEL` of the data object holding the envelope on the token.
+    ///
+    /// Required by `pkcs12_source = "token_object"` and refused otherwise:
+    /// the token finds the envelope by label and by nothing else, so a
+    /// default guessed here would send the login looking for an object the
+    /// issuing tool never wrote.
+    #[serde(default)]
+    pub pkcs12_token_object_label: Option<String>,
     /// Optional path to the gost-engine `.so` file.
     ///
     /// Configuration validation requires this to be set whenever the OpenSSL
@@ -349,6 +361,23 @@ pub enum RawMode {
     Pkcs11,
 }
 
+/// Where `mode = "pkcs12"` reads the envelope from.
+///
+/// This is a choice of carrier, not a third authentication mode: everything
+/// that happens once the envelope is in hand — the PIN loop, the challenge,
+/// the chain, the host binding — is the same code either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RawPkcs12Source {
+    /// A partition on a USB medium: the default, and what an installation
+    /// that says nothing about the source keeps doing.
+    #[default]
+    UsbPartition,
+    /// A `CKO_DATA` object on a PKCS#11 token.  No mass storage is involved,
+    /// so nothing is mounted.
+    TokenObject,
+}
+
 /// Raw removal action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -423,6 +452,15 @@ pub struct RawMonitor {
     /// monitord IPC server. Default 64.
     #[serde(default)]
     pub max_concurrent_connections: Option<u32>,
+    /// Interval between presence polls of a PKCS#11 token carrier, in
+    /// seconds. Default 2.
+    ///
+    /// A token is not a block device and raises no udev event, so its
+    /// presence is established by asking the provider. The interval is the
+    /// floor on detection latency: removal is noticed no later than one
+    /// interval plus [`Self::usb_removed_grace_seconds`].
+    #[serde(default)]
+    pub token_poll_interval_seconds: Option<u64>,
 }
 
 /// Trust section.

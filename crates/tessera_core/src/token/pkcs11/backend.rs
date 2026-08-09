@@ -467,17 +467,40 @@ impl Pkcs11Backend {
     /// - [`Pkcs11Error::Cryptoki`] for any FFI error from
     ///   `C_GetSlotList` / `C_GetTokenInfo`.
     pub fn find_slot(&self, token_label: Option<&str>) -> Result<Slot, Pkcs11Error> {
+        let matching = self.find_slots(token_label)?;
+        matching.into_iter().next().ok_or_else(|| {
+            // `find_slots` already answered `NoTokenAvailable` when no slot
+            // holds a token at all, so an empty set here means a label was
+            // asked for and nothing carried it.
+            Pkcs11Error::TokenNotFound {
+                label: token_label.unwrap_or_default().to_owned(),
+            }
+        })
+    }
+
+    /// Every slot whose token satisfies `token_label`, in provider order.
+    ///
+    /// `None` matches every present token; `Some(label)` matches those whose
+    /// `CK_TOKEN_INFO.label` (trailing-space trimmed) equals it.
+    ///
+    /// Callers that must not pick a token on the operator's behalf use the
+    /// length: more than one match means the configuration does not say which
+    /// device is meant, and choosing the first would decide it silently.
+    ///
+    /// # Errors
+    ///
+    /// - [`Pkcs11Error::NoTokenAvailable`] when no slot reports a token.
+    /// - [`Pkcs11Error::Cryptoki`] for any FFI error from
+    ///   `C_GetSlotList` / `C_GetTokenInfo`.
+    pub fn find_slots(&self, token_label: Option<&str>) -> Result<Vec<Slot>, Pkcs11Error> {
         let slots = self.list_slots_with_token()?;
         if slots.is_empty() {
             return Err(Pkcs11Error::NoTokenAvailable);
         }
         let Some(want) = token_label else {
-            // Safe: we just verified slots is non-empty.
-            return slots
-                .into_iter()
-                .next()
-                .ok_or(Pkcs11Error::NoTokenAvailable);
+            return Ok(slots);
         };
+        let mut matching = Vec::new();
         for slot in slots {
             // Read afresh per slot: another thread's `load` can raise the
             // context to `Mutex` while this scan runs, and a scan that
@@ -489,12 +512,10 @@ impl Pkcs11Backend {
             let mode = self.locking_mode();
             let info = with_global_lock(mode, || self.ctx().get_token_info(slot))?;
             if info.label().trim_end() == want {
-                return Ok(slot);
+                matching.push(slot);
             }
         }
-        Err(Pkcs11Error::TokenNotFound {
-            label: want.to_owned(),
-        })
+        Ok(matching)
     }
 
     /// Block until a matching token is present, polling every 200 ms.

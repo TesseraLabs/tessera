@@ -19,6 +19,7 @@ fn sample_open() -> ClientMessage {
         target: SessionTarget::tty("/dev/pts/0"),
         usb_serial: Some("AB12CD".into()),
         usb_vid_pid: Some("1234:5678".into()),
+        carrier: Some(tessera_proto::CarrierKind::UsbPartition),
         usb_devnode: Some("/dev/sdb1".into()),
         host_id_hash: "deadbeef".into(),
         opened_at: UNIX_EPOCH + Duration::from_secs(1_700_000_000),

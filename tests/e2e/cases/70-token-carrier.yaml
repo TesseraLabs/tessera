@@ -1,0 +1,117 @@
+suite: token-carrier
+description: Удостоверение на пассивном токене — запись, вход, наблюдение за извлечением
+setup: [install-package, deploy-fixtures]
+
+cases:
+  - id: TOK-001
+    title: Конверт, записанный на токен, читается обратно побайтово
+    requirement: openspec/specs/token-data-carrier/spec.md
+    requires: [hardware-token]
+    steps:
+      # Запись на токен не диагностирует превышение размера объекта: устройство
+      # принимает её и молча усекает. Поэтому единственная проверка, которой
+      # можно верить, — обратное чтение, и делает его сторонний инструмент,
+      # а не тот же код, что писал.
+      - pause: |
+          Подключите пассивный токен (Рутокен Lite) и убедитесь, что он один в
+          системе — либо запомните его метку для --token-label.
+          Запишите метку токена и его серийный номер: они понадобятся ниже.
+        capture: token-label-and-serial
+      - run: |
+          issuer prepare-carrier --p12 {{fixtures}}/leaf_ecdsa.p12 \
+            --module /usr/lib/librtpkcs11ecp.so \
+            --object-label tessera-e2e-carrier \
+            --pinentry
+        expect: { exit_code: 0, stdout_matches: 'носитель подготовлен' }
+        timeout: 120
+      - run: |
+          pkcs11-tool --module /usr/lib/librtpkcs11ecp.so --login \
+            --read-object --type data --label tessera-e2e-carrier \
+            -o /tmp/tok-readback.bin
+          cmp {{fixtures}}/leaf_ecdsa.p12 /tmp/tok-readback.bin
+        expect: { exit_code: 0 }
+        timeout: 120
+      # Объект обязан быть приватным: публичный читается без PIN, и проверка
+      # на устройстве такие объекты отвергает.
+      - run: |
+          pkcs11-tool --module /usr/lib/librtpkcs11ecp.so --list-objects \
+            | grep -c tessera-e2e-carrier
+        expect: { exit_code: 1 }
+    teardown:
+      - run: |
+          rm -f /tmp/tok-readback.bin
+          pkcs11-tool --module /usr/lib/librtpkcs11ecp.so --login \
+            --delete-object --type data --label tessera-e2e-carrier || true
+
+  - id: TOK-002
+    title: Слишком большой конверт отвергается до обращения к токену
+    requirement: openspec/specs/token-data-carrier/spec.md
+    requires: [hardware-token]
+    steps:
+      # Потолок объекта данных измерен на одном экземпляре и превышение
+      # устройством не сообщается: 48 КБ принимаются «успешно», читается
+      # усечённое. Отказ обязан наступать раньше записи.
+      - run: head -c 49152 /dev/urandom > /tmp/tok-oversized.p12
+      - run: |
+          issuer prepare-carrier --p12 /tmp/tok-oversized.p12 \
+            --module /usr/lib/librtpkcs11ecp.so \
+            --object-label tessera-e2e-oversized \
+            --pinentry
+        expect: { exit_code: 1, stderr_matches: '49152' }
+        timeout: 120
+      - run: |
+          pkcs11-tool --module /usr/lib/librtpkcs11ecp.so --login \
+            --list-objects | grep -c tessera-e2e-oversized
+        expect: { exit_code: 1 }
+    teardown:
+      - run: rm -f /tmp/tok-oversized.p12
+
+  - id: TOK-003
+    title: Вход с удостоверения на токене открывает сессию
+    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requires: [hardware-token, service-manager]
+    steps:
+      # Ручной кейс: раздел съёмного носителя при этом источнике не
+      # используется вовсе, поэтому проверяется именно то, что устройство
+      # берёт конверт с токена и не ждёт флешку.
+      - pause: |
+          Приведите /etc/tessera/config.toml к источнику «токен»:
+            pkcs12_source = "token_object"
+            pkcs12_token_object_label = "tessera-e2e-carrier"
+            pkcs11_module = "/usr/lib/librtpkcs11ecp.so"
+            pkcs11_token_label = "<метка токена>"
+          Убедитесь, что раздел съёмного носителя НЕ подключён.
+        capture: config-applied
+      - pause: |
+          Войдите в систему по удостоверению с токена.
+          Проверьте: PIN токена спрашивается, пароль контейнера спрашивается,
+          сессия открывается. Приложите вывод `journalctl -t pam_tessera -n 40`.
+        capture: login-journal
+
+  - id: TOK-004
+    title: Извлечение токена во время сессии применяет настроенное действие
+    requirement: openspec/specs/carrier-presence/spec.md
+    requires: [hardware-token, service-manager]
+    steps:
+      # Присутствие токена наблюдается опросом, а не событием, поэтому реакция
+      # приходит с задержкой: интервал опроса плюс ожидание ответа устройства
+      # плюс выдержка. Кейс проверяет и факт реакции, и что она укладывается
+      # в обещанное документацией окно.
+      - pause: |
+          Убедитесь, что в конфигурации задано on_usb_removed = "lock",
+          usb_removed_grace_seconds = 0 и token_poll_interval_seconds = 2.
+          Войдите по удостоверению с токена.
+        capture: session-open
+      - pause: |
+          Выньте токен и засеките время до блокировки экрана.
+          Ожидание: экран блокируется в пределах ~7 секунд.
+          Приложите замеренное время и `journalctl -u tessera -n 40`.
+        capture: removal-latency
+      - pause: |
+          Войдите заново, затем выньте токен и верните его обратно быстрее,
+          чем истечёт выдержка.
+          Ожидание: при нулевой выдержке отмена невозможна — это проверка того,
+          что документация не обещает отмену там, где её нет.
+        capture: reinsert-behaviour
+    teardown:
+      - run: helpers/usb-loop.sh detach

@@ -225,6 +225,31 @@ openssl pkcs12 -export \
     -passout pass:correct-pin \
     -out leaf_ecdsa.p12
 
+# The same bundle with its certificates left in the clear (`-certpbe NONE`),
+# the layout issuance writes: the key stays encrypted, so this is what proves
+# the password-free certificate read does not depend on our own writer.
+openssl pkcs12 -export \
+    -inkey leaf_rsa.key \
+    -in leaf_rsa.pem \
+    -certfile int.pem \
+    -name "alice" \
+    -keypbe AES-256-CBC -certpbe NONE -macalg sha256 \
+    -passout pass:correct-pin \
+    -out leaf_rsa_plaincert.p12
+
+# A bundle whose first certificate is the CA and whose second is the leaf: the
+# password-free diagnostic has to name the person the credential was issued to,
+# so it must pick the end-entity rather than whatever bag comes first. Our own
+# writer refuses this ordering, which is why the fixture comes from `openssl`.
+openssl pkcs12 -export \
+    -inkey int.key \
+    -in int.pem \
+    -certfile leaf_rsa.pem \
+    -name "intermediate" \
+    -keypbe AES-256-CBC -certpbe NONE -macalg sha256 \
+    -passout pass:correct-pin \
+    -out ca_before_leaf.p12
+
 # PKCS#12 bundle for the revoked leaf (CN=mallory, serial 0x99).
 # The matching CRL `crl_valid.pem` lists this serial as revoked.
 openssl pkcs12 -export \

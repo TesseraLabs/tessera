@@ -58,7 +58,7 @@ the example really validates through `ValidatedConfig::try_from`.
 | `on_usb_removed`           | string             | `"lock"`    | `"lock"`, `"logout"`, `"hook"`, `"shutdown"`                   | Action on confirmed USB removal.                             | `"shutdown"` fits terminals; `"lock"` fits workstations.                             |
 | `usb_removed_grace_seconds`| integer            | `0`         | `0..=300`                                                      | Cancellation window: reinserting the same serial cancels the action. | Protects against false triggers; set to `0` on terminals.                    |
 | `suspend_grace_seconds`    | integer            | `0`         | `0..=600`                                                      | Window after resume during which USB removal is ignored.     | Hubs often make noise during suspend; `30` seconds is a typical value.               |
-| `monitor_fail_mode`        | string             | `"strict"`  | `"strict"`, `"permissive"`                                     | Whether to propagate non-fatal `monitord` IPC errors to the calling code (`strict`) or swallow them with a WARN (`permissive`). | `DeviceGone`/`Unauthorized` are always fatal. Strict mode currently rejects PKCS#11 authentication because native token-removal observation is not implemented. |
+| `monitor_fail_mode`        | string             | `"strict"`  | `"strict"`, `"permissive"`                                     | Whether to propagate non-fatal `monitord` IPC errors to the calling code (`strict`) or swallow them with a WARN (`permissive`). | `DeviceGone`/`Unauthorized` are always fatal. Under strict mode, losing sight of the token counts as the carrier having been removed. |
 
 > **Authorization (device + role) is described in the credential itself
 > via X.509 v3 extensions** `pam_cert_host_binding` and
@@ -131,6 +131,32 @@ minimal environment with a fixed system `PATH`.
 | `on_usb_removed`             | string | —       | same as top-level    | Per-section override of `on_usb_removed`.                           | See the top-level key.                                          |
 | `usb_removed_grace_seconds`  | integer| —       | same as top-level    | Per-section override of the cancellation window.                    | See the top-level key.                                          |
 | `suspend_grace_seconds`      | integer| —       | seconds              | Window after resume during which removal events are ignored (default 30). | Too large a window weakens the response to removal.       |
+| `token_poll_interval_seconds` | integer | `2`    | `1..=600`            | How often the daemon polls for the presence of a PKCS#11 token. Applies when the credential lives on a token (`pkcs12_source = "token_object"` or `mode = "pkcs11"`); the removable-media partition uses udev events instead. | Sets how long removal goes unnoticed. A longer interval means the session outlives the carrier for longer. |
+
+**Detecting token removal.** A removable drive announces its departure with an
+event; a token does not, so the daemon polls, and that adds a delay. A carrier
+is not declared gone on the first poll: **three consecutive polls** must agree,
+so that one hiccup in the smart-card service does not lock out an engineer whose
+token is sitting in the reader. While polling is healthy, the carrier is
+considered gone no later than `3 × token_poll_interval_seconds` plus
+`usb_removed_grace_seconds` — about 6 seconds with the defaults and no grace.
+That is the bound on *detection*; carrying the action out (locking the session
+through `logind`) takes its own time on top. A call that hangs is waited on for
+no more than 5 seconds and then counts as a failed poll.
+
+**Losing sight of the token.** Polling itself can stop answering — the reader is
+gone, the vendor library is wedged. Three consecutive failures count as lost
+observation, and `monitor_fail_mode` decides what that means: `strict` promises
+continuous carrier presence and therefore treats lost observation as removal;
+`permissive` makes no such promise and only logs the failure. A call that hangs
+counts as a failed poll, not as presence.
+
+**After a daemon restart.** Presence is established by the first poll rather
+than by waiting for an event, so a removal that happened during the gap is not
+lost. The widest blind window is the time the daemon takes to call a poll wedged
+(two cycles), plus `WatchdogSec` from the unit, plus the restart delay, plus the
+first poll — **66 seconds with the defaults**. Every second added to
+`WatchdogSec` widens that window one for one.
 
 ### The `[trust]` section
 
@@ -457,13 +483,14 @@ Details and ready-made `openssl.cnf` recipes are in
 
 ## Typical scenarios
 
-### 3.1 Terminal — offline, CRL with TTL, PKCS#11 without continuous presence
+### 3.1 Terminal — offline, CRL with TTL, key on a token
 
 Properties: the machine is in a metal enclosure, no Internet, and the key is
-on a token. Native PKCS#11 removal observation is not implemented yet, so this
-profile is suitable only where bounded role/session TTL is an acceptable
-compensating control. Do not deploy it where token removal must immediately
-end the session.
+on a token. Token presence is observed by polling, so removing the token ends
+the session the same way removing a flash drive does — not instantly, but
+within the poll interval (see "Detecting token removal" above). Where seconds
+of delay are unacceptable, a bounded role TTL remains an additional control
+rather than a replacement.
 
 ```toml
 crypto_backend = "pkcs11_native"
@@ -509,10 +536,10 @@ level = "warn"
 Rationale for the choices:
 
 - `mode = "pkcs11"` + `librtpkcs11ecp.so`: a non-extractable key.
-- `monitor_fail_mode = "permissive"`: PKCS#11 token serials are not USB
-  block-device serials. Strict authentication is refused until monitord has a
-  native token-event source; `on_usb_removed` is therefore not an enforcement
-  boundary for this profile.
+- `monitor_fail_mode`: PKCS#11 token serials are not USB block-device serials,
+  so the daemon reads them in their own namespace and observes them by polling.
+  Under `strict`, losing sight of the token counts as removal; under
+  `permissive`, the session survives and the failure is logged.
 - `usb_removed_grace_seconds = 0`: on a terminal there can be no "pulled
   it out and changed my mind".
 - `mode = "crl"` with `crl_max_age_hours = 72`: three days is a
