@@ -1,6 +1,6 @@
 suite: auth
 description: Аутентификация по удостоверению через PAM-стек certauth (pam_tessera.so)
-setup: [install-package, deploy-fixtures]
+setup: [build-pam-drive, install-package, deploy-fixtures]
 
 cases:
   - id: AUTH-001

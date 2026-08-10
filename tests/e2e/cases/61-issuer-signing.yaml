@@ -1,0 +1,143 @@
+suite: issuer-signing
+description: Файловый бэкенд подписи — права на ключ, пароль, соответствие алгоритма
+setup: [install-package, deploy-fixtures, deploy-issuer]
+
+# Файловый бэкенд — принятый риск: ключ удостоверяющего центра лежит на диске.
+# Раз риск принят, ограждения вокруг него обязаны работать, и проверяются они
+# здесь: права на файл, отказ на неверном пароле, отказ на несовпадении
+# алгоритма. Каждое ограждение — единственное, что стоит между ключом парка и
+# посторонним, получившим доступ к машине выпуска.
+#
+# Ключи и выпущенное живут в /tmp/issuer-signing и стираются в teardown.
+
+cases:
+  - id: SIGN-001
+    title: Ключ, доступный не только владельцу, отвергается до чтения содержимого
+    requirement: openspec/specs/issuer-signing/spec.md
+    requires: []
+    # Отказ обязан наступить раньше чтения: ключ, который прочитали и лишь
+    # потом забраковали, уже побывал в памяти процесса.
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-signing && install -d -m 0700 /tmp/issuer-signing
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-signing/ca.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-signing/ca.key.pem -pubout \
+            -out /tmp/issuer-signing/ca.spki.pem 2>/dev/null
+          chmod 0644 /tmp/issuer-signing/ca.key.pem
+      - run: |
+          N=$(date -u +%s)
+          issuer issue-root --backend file --key-file /tmp/issuer-signing/ca.key.pem \
+            --spki /tmp/issuer-signing/ca.spki.pem --subject "CN=E2E Signing" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 3600 \
+            --journal /tmp/issuer-signing/journal.ndjson \
+            --out /tmp/issuer-signing/ca.crt.pem
+        expect:
+          exit_code: 1
+          stderr_matches: 'key file .* is group/other-accessible \(mode 0644\); require 0600 or stricter'
+      - expect_file:
+          path: /tmp/issuer-signing/ca.crt.pem
+          exists: false
+    teardown:
+      - run: rm -rf /tmp/issuer-signing
+
+  - id: SIGN-002
+    title: Незашифрованный ключ работает, но каждый запуск об этом предупреждает
+    requirement: openspec/specs/issuer-signing/spec.md
+    requires: []
+    # Предупреждение не формальность: оно единственное, что отличает временную
+    # схему от постоянной, когда незашифрованный ключ остаётся на машине
+    # выпуска навсегда.
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-signing && install -d -m 0700 /tmp/issuer-signing
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-signing/ca.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-signing/ca.key.pem -pubout \
+            -out /tmp/issuer-signing/ca.spki.pem 2>/dev/null
+          chmod 0600 /tmp/issuer-signing/ca.key.pem
+      - run: |
+          N=$(date -u +%s)
+          issuer issue-root --backend file --key-file /tmp/issuer-signing/ca.key.pem \
+            --spki /tmp/issuer-signing/ca.spki.pem --subject "CN=E2E Signing" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 3600 \
+            --journal /tmp/issuer-signing/journal.ndjson \
+            --out /tmp/issuer-signing/ca.crt.pem
+        expect:
+          exit_code: 0
+          stderr_matches: 'the CA key file is unencrypted'
+      - expect_file:
+          path: /tmp/issuer-signing/ca.crt.pem
+          exists: true
+    teardown:
+      - run: rm -rf /tmp/issuer-signing
+
+  - id: SIGN-003
+    title: Неверный пароль зашифрованного ключа останавливает выпуск до подписи
+    requirement: openspec/specs/issuer-signing/spec.md
+    requires: []
+    # Пароль передаётся переменной окружения — тем самым запасным путём, на
+    # который бэкенд переходит без pinentry. Кейс заодно закрепляет, что о
+    # таком способе продукт предупреждает: значение видно дочерним процессам.
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-signing && install -d -m 0700 /tmp/issuer-signing
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-signing/ca.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-signing/ca.key.pem -pubout \
+            -out /tmp/issuer-signing/ca.spki.pem 2>/dev/null
+          openssl pkcs8 -topk8 -in /tmp/issuer-signing/ca.key.pem \
+            -out /tmp/issuer-signing/ca.enc.p8 -passout pass:e2e-correct \
+            -v2 aes-256-cbc 2>/dev/null
+          chmod 0600 /tmp/issuer-signing/ca.enc.p8
+      - run: |
+          N=$(date -u +%s)
+          TESSERA_ISSUER_KEY_PASSPHRASE=e2e-wrong \
+          issuer issue-root --backend file --key-file /tmp/issuer-signing/ca.enc.p8 \
+            --spki /tmp/issuer-signing/ca.spki.pem --subject "CN=E2E Signing" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 3600 \
+            --journal /tmp/issuer-signing/journal.ndjson \
+            --out /tmp/issuer-signing/ca.crt.pem
+        expect:
+          exit_code: 1
+          stderr_matches: 'wrong passphrase for the encrypted key file'
+      - expect_file:
+          path: /tmp/issuer-signing/ca.crt.pem
+          exists: false
+    teardown:
+      - run: rm -rf /tmp/issuer-signing
+
+  - id: SIGN-004
+    title: Заявленный алгоритм, не совпавший с ключом, отвергается вместо молчаливой замены
+    requirement: openspec/specs/issuer-signing/spec.md
+    requires: []
+    # Алгоритм выводится из самого ключа. Если бы явное значение молча
+    # переопределялось выведенным, оператор считал бы парк выпущенным на P-384,
+    # а он был бы на P-256 — и узнал бы об этом при разборе инцидента.
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-signing && install -d -m 0700 /tmp/issuer-signing
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-signing/ca.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-signing/ca.key.pem -pubout \
+            -out /tmp/issuer-signing/ca.spki.pem 2>/dev/null
+          chmod 0600 /tmp/issuer-signing/ca.key.pem
+      - run: |
+          N=$(date -u +%s)
+          issuer issue-root --backend file --key-file /tmp/issuer-signing/ca.key.pem \
+            --spki /tmp/issuer-signing/ca.spki.pem --subject "CN=E2E Signing" \
+            --not-before $N --not-after $(( N + 86400 )) \
+            --allow-role oper --max-ttl 3600 --algorithm ecdsa-p384 \
+            --journal /tmp/issuer-signing/journal.ndjson \
+            --out /tmp/issuer-signing/ca.crt.pem
+        expect:
+          exit_code: 1
+          stderr_matches: 'key algorithm is EcdsaWithSha256 but --algorithm requested EcdsaWithSha384'
+      - expect_file:
+          path: /tmp/issuer-signing/ca.crt.pem
+          exists: false
+    teardown:
+      - run: rm -rf /tmp/issuer-signing

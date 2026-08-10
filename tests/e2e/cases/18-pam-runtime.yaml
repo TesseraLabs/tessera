@@ -1,0 +1,75 @@
+suite: pam-runtime
+description: Поведение PAM-модуля на границе фаз
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Тестовый сервис certauth содержит строки auth, account и session. Строка
+# session здесь не формальность: без неё PAM завершает фазу сессии успехом
+# сам, и кейсы наблюдали бы собственный стенд, а не продукт.
+#
+# Асимметрия открытия и закрытия сессии намеренная и проверяется обоими
+# кейсами: открытие fail-closed, закрытие fail-open. Ошибка на выходе не имеет
+# права запереть пользователя в системе.
+#
+# Запас по времени здесь больше обычного: на только что созданном контейнере
+# первый вызов PAM попадает на ещё не прогретое окружение и однажды не уложился
+# в минуту. Ложный сбой стенда стоит дороже лишнего ожидания, которого в
+# нормальном прогоне всё равно не бывает.
+
+cases:
+  - id: PMR-001
+    title: Проверка учётной записи без предшествующей аутентификации не выдаёт допуск
+    requirement: openspec/specs/pam-module-runtime/spec.md
+    requires: []
+    # Фаза account вызывается без authenticate, то есть контекста аутентификации
+    # нет. Ответ должен быть «нет данных для решения», а не «разрешено»:
+    # стек, где account-фаза отработала в одиночку, не имеет права пустить.
+    steps:
+      - run: pam-drive certauth {{user}} acct_mgmt
+        expect:
+          exit_code: 9
+          stdout_matches: 'acct: PAM_AUTHINFO_UNAVAIL \(9\)'
+        timeout: 120
+
+  - id: PMR-002
+    title: Сессия не открывается без предшествующей аутентификации
+    requirement: openspec/specs/pam-module-runtime/spec.md
+    requires: []
+    # Открытие сессии — fail-closed: нет контекста аутентификации, значит
+    # применять к сессии нечего, и продолжать нельзя.
+    steps:
+      - run: pam-drive certauth {{user}} open_session
+        expect:
+          exit_code: 9
+          stdout_matches: 'open_session: PAM_AUTHINFO_UNAVAIL \(9\)'
+        timeout: 120
+
+  - id: PMR-003
+    title: Закрытие сессии не блокируется отсутствием контекста
+    requirement: openspec/specs/pam-module-runtime/spec.md
+    requires: []
+    # Закрытие — fail-open, и это не послабление: ошибка на выходе заперла бы
+    # пользователя в системе. Асимметрия с открытием намеренная.
+    steps:
+      - run: pam-drive certauth {{user}} close_session
+        expect:
+          exit_code: 0
+          stdout_matches: 'close_session: PAM_SUCCESS \(0\)'
+        timeout: 120
+
+  - id: PMR-004
+    title: Вход по удостоверению проходит все четыре фазы подряд
+    requirement: openspec/specs/pam-module-runtime/spec.md
+    requires: [usb]
+    # Фазы проверяются одной последовательностью в одном процессе: контекст
+    # аутентификации живёт между ними, и кейс ловит его потерю — по отдельности
+    # каждая фаза этого не покажет.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt open_session close_session
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stdout_matches: 'auth: PAM_SUCCESS \(0\)\nacct: PAM_SUCCESS \(0\)\nopen_session: PAM_SUCCESS \(0\)\nclose_session: PAM_SUCCESS \(0\)'
+        timeout: 120
+    teardown:
+      - run: helpers/usb-loop.sh detach

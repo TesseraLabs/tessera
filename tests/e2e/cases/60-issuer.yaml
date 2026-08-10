@@ -1,6 +1,6 @@
 suite: issuer
 description: Выпуск удостоверений и приём выпущенного модулем аутентификации
-setup: [install-package, deploy-fixtures, deploy-issuer]
+setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
 
 # Выпуск проверяется файловым бэкендом подписи: ключ лежит на диске, HSM и токен
 # не нужны. Это не подмена продуктового пути — тот же код сборки TBS и подписи,

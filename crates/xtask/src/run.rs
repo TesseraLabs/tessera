@@ -9,7 +9,7 @@ use anyhow::Context as _;
 
 use crate::baseline::{self, Divergence};
 use crate::cli::E2eArgs;
-use crate::exec::{Delivery, ExecDeps, ExecOptions, Executor};
+use crate::exec::{Delivery, ExecDeps, ExecOptions, Executor, HELPERS_VAR};
 use crate::interact::{ConsoleOperator, Operator, OperatorError, Verdict};
 use crate::profile::{FixturesEntry, Profile};
 use crate::provenance::{ArtifactProvenance, Provenance};
@@ -18,7 +18,7 @@ use crate::registry::{self, Registry};
 use crate::report::{self, CaseResult, RunReport};
 use crate::stand::{OpCli, StandConfig, StandError};
 use crate::vars::Vars;
-use crate::{artifacts, driver};
+use crate::{artifacts, driver, repo_root};
 
 /// Код возврата, когда прогон не состоялся: стенд не описан.
 pub const EXIT_NO_STAND: i32 = 2;
@@ -73,14 +73,7 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
     }
     vars.insert_plain("package", REMOTE_PACKAGE);
     let vars = vars;
-    let secret_vars: Vec<String> = vars.secret_names().into_iter().map(str::to_owned).collect();
-    let redactor = Redactor::new(vars.secret_values());
-    if !redactor.is_empty() {
-        eprintln!(
-            "значения переменных {} получены по ссылкам на хранилище и вычищаются из отчёта",
-            secret_vars.join(", ")
-        );
-    }
+    let (secret_vars, redactor) = announce_redaction(&vars);
 
     let cases_dirs = if args.cases_dir.is_empty() {
         vec![e2e_root.join("cases")]
@@ -88,6 +81,9 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
         args.cases_dir.clone()
     };
     let registry = Registry::load(&cases_dirs)?;
+    for warning in registry.warnings() {
+        eprintln!("ВНИМАНИЕ: {warning}");
+    }
 
     let package = Provenance::of_package(
         &stand.package.deb,
@@ -125,10 +121,7 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
     let runs_root = e2e_root.join("runs");
     warn_if_suspect(&runs_root);
 
-    let driver = driver::build(&profile, &stand, &repo_root(), Arc::clone(&interrupt))?;
-    if args.recreate {
-        driver.recreate().context("пересоздание окружения")?;
-    }
+    let driver = prepare_driver(&profile, &stand, &vars, args.recreate, &interrupt)?;
 
     let started_at = now();
     let run_dir = report::run_dir(&runs_root, &today(), &profile.name, &package);
@@ -162,6 +155,37 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
     update_suspect_marker(&runs_root, &report);
 
     compare_with_baseline(args, &report, &package)
+}
+
+/// Собирает драйвер окружения и, если просили, пересоздаёт его.
+fn prepare_driver(
+    profile: &Profile,
+    stand: &StandConfig,
+    vars: &Vars,
+    recreate: bool,
+    interrupt: &Arc<AtomicBool>,
+) -> anyhow::Result<Box<dyn driver::CommandDriver>> {
+    let driver = driver::build(
+        profile,
+        stand,
+        &repo_root(),
+        stand_root(vars),
+        Arc::clone(interrupt),
+    )?;
+    if recreate {
+        driver.recreate().context("пересоздание окружения")?;
+    }
+    Ok(driver)
+}
+
+/// Корень стенда в целевом окружении: откуда исполняются команды кейсов.
+///
+/// Считается от каталога хелперов, а не задаётся отдельным полем: исполнитель
+/// ищет скрипты подготовки по той же переменной, и разъедься эти два места,
+/// кейс запускался бы не оттуда, где лежит его материал. Контейнерный профиль
+/// величину не берёт — там рабочий каталог задаёт `WORKDIR` образа.
+fn stand_root(vars: &Vars) -> Option<&str> {
+    vars.plain(HELPERS_VAR).map(driver::remote_parent)
 }
 
 /// Что раннер везёт в окружение перед первым действием подготовки.
@@ -403,11 +427,18 @@ impl Operator for SilentOperator {
     }
 }
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+/// Собирает вычистку секретов и называет переменные, чьи значения из отчёта
+/// вырезаются: оператор должен знать, почему в отчёте стоит заглушка.
+fn announce_redaction(vars: &Vars) -> (Vec<String>, Redactor) {
+    let secret_vars: Vec<String> = vars.secret_names().into_iter().map(str::to_owned).collect();
+    let redactor = Redactor::new(vars.secret_values());
+    if !redactor.is_empty() {
+        eprintln!(
+            "значения переменных {} получены по ссылкам на хранилище и вычищаются из отчёта",
+            secret_vars.join(", ")
+        );
+    }
+    (secret_vars, redactor)
 }
 
 fn now() -> String {

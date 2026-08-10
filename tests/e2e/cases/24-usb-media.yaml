@@ -1,0 +1,64 @@
+suite: usb-media
+description: Носитель с удостоверением — обнаружение, фильтр устройств, отсутствие носителя
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Эмулятор носителя объявляет себя как устройство 0951:1666 на шине USB —
+# те же VID:PID, что печатает lsusb для настоящей флешки.
+#
+# Фильтр по VID:PID — гигиена против случайно воткнутого устройства, а не
+# граница доверия: идентификаторы подделываются. Доверие остаётся за
+# расшифровкой контейнера и цепочкой, и кейсы это разделение сохраняют:
+# ни один из них не выводит допуск из одного лишь совпадения VID:PID.
+
+cases:
+  - id: USB-001
+    title: Отсутствие носителя закрывает вход по истечении ожидания
+    requirement: openspec/specs/usb-media-pkcs12/spec.md
+    requires: []
+    # Ожидание носителя в стенде равно нулю, поэтому кейс проверяет исход, а не
+    # длительность: ждать нечего, устройств нет, вход закрыт.
+    steps:
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 9
+          stdout_matches: 'auth: PAM_AUTHINFO_UNAVAIL \(9\)'
+        timeout: 60
+
+  - id: USB-002
+    title: Носитель вне списка разрешённых устройств не рассматривается
+    requirement: openspec/specs/usb-media-pkcs12/spec.md
+    requires: [usb]
+    # Носитель подключён и удостоверение на нём валидно — отказ вызван ровно
+    # фильтром устройств.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh usb-allow-foreign
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 9
+          stdout_matches: 'auth: PAM_AUTHINFO_UNAVAIL \(9\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+
+  - id: USB-003
+    title: Носитель из списка разрешённых устройств проходит
+    requirement: openspec/specs/usb-media-pkcs12/spec.md
+    requires: [usb]
+    # Парный к USB-002: без него отказ выше объяснялся бы самим фактом
+    # включения фильтра, а не его содержимым.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh usb-allow-actual
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stdout_matches: 'auth: PAM_SUCCESS \(0\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach

@@ -1,0 +1,206 @@
+suite: configuration
+description: Отказ продукта принимать неверную конфигурацию и назвать причину
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Конфигурация проверяется раньше аутентификации: продукт, принявший неверный
+# конфиг, дальше делает не то, что администратор думает. Поэтому suite стоит
+# между установкой и входом.
+#
+# Диагностика `tessera check` идёт в stderr, сводка прогона — в stdout.
+# Каждая порча вносится именованной операцией `helpers/config-mutate.sh`:
+# место вставки ключа определяет, что именно проверяет кейс.
+
+cases:
+  - id: CONF-001
+    title: Неизвестное поле конфигурации отвергается с указанием имени поля
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    steps:
+      - run: helpers/config-mutate.sh unknown-field
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'unknown field `foo_bar`'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-002
+    title: Неразбираемый конфиг отвергается, а не читается частично
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    steps:
+      - run: helpers/config-mutate.sh broken-toml
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'TOML parse error'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-003
+    title: Удалённая секция user_mapping отвергается с объяснением, а не как опечатка
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    # Общей ошибки «неизвестное поле» здесь недостаточно: администратор,
+    # обновляющий парк, должен отличить намеренное изменение поведения от
+    # собственной опечатки.
+    steps:
+      - run: helpers/config-mutate.sh user-mapping
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: '\[\[user_mapping\]\] has been removed'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-004
+    title: Удалённый ключ roles.enforce отвергается с объяснением безусловности проверки ролей
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    steps:
+      - run: helpers/config-mutate.sh roles-enforce
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: '\[roles\]\.enforce has been removed'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-005
+    title: Пустой список якорей доверия отвергается
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    steps:
+      - run: helpers/config-mutate.sh empty-anchors
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'trust\.anchors must not be empty'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-006
+    title: Отсутствие режима отзыва отвергается, отказ от проверки требует явного mode
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    # Молчаливого отката к «отзыв не проверяется» нет: иначе потерянная при
+    # правке строка тихо отключила бы проверку отзыва на всём парке.
+    steps:
+      - run: helpers/config-mutate.sh no-revocation-mode
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'trust\.revocation\.mode is required'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-007
+    title: Режим OCSP без адреса ответчика отвергается
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    steps:
+      - run: helpers/config-mutate.sh ocsp-without-url
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'ocsp_responder_url is required when mode'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-008
+    title: Ключ OCSP в режиме, где он не работает, отвергается, а не игнорируется
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    # Мёртвых ключей в конфиге нет: молча проигнорированный ocsp_responder_url
+    # выглядел бы как настроенная проверка отзыва, которой на деле нет.
+    steps:
+      - run: helpers/config-mutate.sh ocsp-key-unused
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'ocsp_responder_url only valid when mode'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-009
+    title: Путь хука вне hook-режима отвергается
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    steps:
+      - run: helpers/config-mutate.sh hook-path-unused
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'on_usb_removed_hook_path is only valid when'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-010
+    title: Hook-режим без пути к хуку отвергается
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    steps:
+      - run: helpers/config-mutate.sh hook-without-path
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'requires monitor\.on_usb_removed_hook_path'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-011
+    title: Значение вне допустимого диапазона отвергается с указанием границы
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    steps:
+      - run: helpers/config-mutate.sh partitions-100
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'max_usb_partitions must be <= 64'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CONF-012
+    title: Неверная конфигурация закрывает вход, а не открывает его
+    requirement: openspec/specs/configuration/spec.md
+    requires: [usb]
+    # Главный кейс suite: остальные проверяют диагностику, этот — что отказ
+    # конфигурации доходит до PAM. Носитель подключён и удостоверение валидно,
+    # то есть отказ вызван ровно конфигурацией. Без носителя кейс был бы пуст:
+    # PAM_AUTHINFO_UNAVAIL приходит и просто от отсутствия носителя.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh empty-anchors
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 9
+          stdout_matches: 'auth: PAM_AUTHINFO_UNAVAIL \(9\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+
+  - id: CONF-013
+    title: Устаревший ключ логирования принимается, но продукт предупреждает о том, что он игнорируется
+    requirement: openspec/specs/configuration/spec.md
+    requires: []
+    # Ожидание взято из спеки, а не из наблюдения: спека требует WARN
+    # «deprecated and ignored» при валидации. Продукт принимает ключ молча —
+    # администратор, поставивший syslog_facility, считает журналирование
+    # настроенным, а оно не настроено. Кейс красный намеренно.
+    #
+    # Поток выбран по тому, как `tessera check` печатает предупреждения
+    # сегодня: строки `[WARN ]` идут в stdout. Если предупреждение реализуют
+    # через `tracing::warn!(target: "tessera.config")`, оно уйдёт в stderr, и
+    # кейс останется красным уже по другой причине — тогда ожидание надо
+    # перевести на stderr_matches, а не считать гарантию невыполненной.
+    steps:
+      - run: helpers/config-mutate.sh deprecated-syslog
+      - run: tessera check
+        expect:
+          exit_code: 0
+          stdout_matches: 'syslog_facility.*deprecated and ignored'
+    teardown:
+      - run: helpers/config-mutate.sh restore

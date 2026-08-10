@@ -1,6 +1,6 @@
 suite: roles
 description: Допуск к роли при входе в ролевую учётную запись
-setup: [install-package, deploy-fixtures]
+setup: [build-pam-drive, install-package, deploy-fixtures]
 
 # Кейсы написаны от ЦЕЛЕВОЙ модели «роль = ролевая учётная запись» (решение
 # 2026-06-19, зафиксировано в openspec/specs/role-selection/spec.md): инженер

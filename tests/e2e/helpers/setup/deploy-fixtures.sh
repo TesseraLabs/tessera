@@ -167,6 +167,10 @@ deploy_pam_service() {
 # Системные стеки (sudo, login, common-*) прогоном не затрагиваются.
 auth       [success=done default=die] pam_tessera.so
 account    required                   pam_tessera.so
+# Фаза сессии нужна, чтобы кейсы вообще доходили до модуля: пустой session-стек
+# PAM завершает успехом сам, и проверка открытия/закрытия сессии наблюдала бы
+# собственный стенд, а не продукт.
+session    required                   pam_tessera.so
 EOF
     chmod 0644 "$PAM_SERVICE"
 }

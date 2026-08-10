@@ -18,6 +18,16 @@ pub struct Cli {
 pub enum Command {
     /// Прогон реестра e2e-кейсов.
     E2e(E2eArgs),
+    /// Пересборка матрицы покрытия спек кейсами реестра.
+    E2eCoverage(CoverageArgs),
+}
+
+/// Аргументы сборки матрицы покрытия.
+#[derive(Debug, Clone, clap::Args)]
+pub struct CoverageArgs {
+    /// Ничего не писать: сверить файл со сгенерированным и упасть при расхождении.
+    #[arg(long)]
+    pub check: bool,
 }
 
 /// Аргументы прогона.

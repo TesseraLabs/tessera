@@ -46,6 +46,10 @@ address = "127.0.0.1"
 port = 2222
 user = "bfs_admin"
 identity_file = "~/.ssh/id_ed25519"
+# Команды пойдут через `sudo -n`: кейсы ставят пакет и дёргают systemctl, а
+# вход root'ом по SSH на такой машине закрыт. Учётной записи нужно право
+# повышения без пароля.
+sudo = true
 "#;
 
 /// Ошибки чтения параметров стенда.
@@ -238,6 +242,14 @@ pub struct HostConfig {
     /// Дополнительные опции `-o` для `ssh`.
     #[serde(default)]
     pub ssh_options: Vec<String>,
+    /// Выполнять ли удалённые команды через `sudo`.
+    ///
+    /// На живой машине кейсы ставят пакет, правят `/etc/tessera` и дёргают
+    /// `systemctl`, а вход root'ом по SSH там обычно закрыт. Признак стенда, а
+    /// не профиля: одни и те же кейсы гоняются и в контейнере от root, и на
+    /// машине из-под учётной записи с правом повышения.
+    #[serde(default)]
+    pub sudo: bool,
 }
 
 impl StandConfig {
@@ -487,6 +499,31 @@ mode = "rwxr-xr-x"
         .unwrap_err()
         .to_string();
         assert!(err.contains("восьмеричные"), "{err}");
+    }
+
+    #[test]
+    fn a_host_asks_for_privilege_escalation_explicitly() {
+        let config: StandConfig = toml::from_str(
+            r#"
+[package]
+deb = "/art/tessera.deb"
+
+[hosts.astra-vm]
+address = "127.0.0.1"
+user = "bfs_admin"
+sudo = true
+
+[hosts.container-host]
+address = "10.0.0.2"
+user = "root"
+"#,
+        )
+        .unwrap();
+        assert!(config.hosts["astra-vm"].sudo);
+        // Умолчание — без повышения: машину, где команды и так идут от root,
+        // молча заворачивать в sudo нельзя.
+        assert!(!config.hosts["container-host"].sudo);
+        assert!(toml::from_str::<StandConfig>(SAMPLE).unwrap().hosts["astra-vm"].sudo);
     }
 
     #[test]

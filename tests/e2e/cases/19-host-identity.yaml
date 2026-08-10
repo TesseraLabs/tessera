@@ -1,0 +1,83 @@
+suite: host-identity
+description: Определение идентичности узла — порядок источников, нормализация, отказ
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Идентичность узла модуль печатает при аутентификации строкой
+# «Это устройство: host_id=<префикс> (source=<источник>)» — по ней и наблюдаются
+# все гарантии этого suite.
+#
+# Удостоверение фикстуры не привязано к узлу, поэтому смена идентичности сама
+# по себе входа не закрывает. Кейсы и не утверждают обратного: они проверяют,
+# КАКАЯ идентичность получена и что бывает, когда её получить неоткуда.
+
+cases:
+  - id: HOST-001
+    title: Первый сработавший источник определяет идентичность
+    requirement: openspec/specs/host-identity/spec.md
+    requires: [usb]
+    # Перебора источников нет намеренно: правило «совпал хоть один» позволило бы
+    # подделать самый слабый из них. Здесь первым стоит внешняя команда, и
+    # идентичность обязана прийти от неё, хотя следом объявлен machine_id.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh host-first-wins
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stderr_matches: 'host_id=[0-9a-f]{8} \(source=CustomCommand\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+
+  - id: HOST-002
+    title: Сырое значение источника нормализуется до сравнения
+    requirement: openspec/specs/host-identity/spec.md
+    requires: [usb]
+    # Значения «AA:BB CC» и «aabbcc» — одна и та же идентичность: нормализация
+    # убирает двоеточия и пробелы и приводит к нижнему регистру. Префикс
+    # a5b432ee посчитан от нормализованной формы и не зависит от окружения,
+    # поэтому его можно закрепить: разойдётся он только при смене правил
+    # нормализации, что и должно быть замечено.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh host-override-raw
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stderr_matches: 'host_id=a5b432ee \(source=Override\)'
+        timeout: 60
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/config-mutate.sh host-override-clean
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stderr_matches: 'host_id=a5b432ee \(source=Override\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+
+  - id: HOST-003
+    title: Неопределимая идентичность узла закрывает вход
+    requirement: openspec/specs/host-identity/spec.md
+    requires: [usb]
+    # Единственный источник возвращает пустоту. Политика по умолчанию —
+    # отказывать: узел, который не смог себя назвать, не получает доступ.
+    # Обратное поведение означало бы, что достаточно сломать источник
+    # идентичности, чтобы обойти привязку удостоверения к устройству.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh host-all-fail
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 9
+          stdout_matches: 'auth: PAM_AUTHINFO_UNAVAIL \(9\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach

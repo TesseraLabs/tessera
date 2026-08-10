@@ -57,7 +57,8 @@ RUN mkdir -p /etc/systemd/system/systemd-udevd.service.d \
         | tee /etc/systemd/system/systemd-udevd.service.d/e2e-emulation.conf \
               /etc/systemd/system/systemd-journald.service.d/e2e-emulation.conf >/dev/null
 
-COPY helpers/usb-loop.sh helpers/ocsp-responder.sh helpers/udevd-start.sh /opt/tessera-e2e/helpers/
+COPY helpers/usb-loop.sh helpers/ocsp-responder.sh helpers/udevd-start.sh \
+     helpers/config-mutate.sh /opt/tessera-e2e/helpers/
 COPY helpers/setup/ /opt/tessera-e2e/helpers/setup/
 RUN chmod 0755 /opt/tessera-e2e/helpers/*.sh /opt/tessera-e2e/helpers/setup/*.sh \
     && mkdir -p /opt/tessera-e2e/fixtures /opt/tessera-e2e/pkg
