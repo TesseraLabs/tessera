@@ -1,0 +1,70 @@
+suite: device-tags
+description: Теги устройства — строгий разбор источника и отсутствие тегов по умолчанию
+setup: [install-package, deploy-fixtures]
+
+# Теги устройства решают, попадает ли машина под групповое делегирование.
+# Поэтому источник разбирается строго: сомнительный набор отвергается целиком,
+# а ненастроенный источник означает «тегов нет», а не «подходят любые».
+
+cases:
+  - id: TAG-001
+    title: Корректный набор тегов принимается
+    requirement: openspec/specs/device-tags/spec.md
+    requires: []
+    # Опорный кейс: без него все отказы ниже объяснялись бы тем, что проверка
+    # отвергает вообще всё.
+    steps:
+      - run: |
+          printf '[tags]\nregion = "north"\nclass = "terminal"\n' > /tmp/tessera-e2e-tags.toml
+      - run: tessera tags lint /tmp/tessera-e2e-tags.toml
+        expect:
+          exit_code: 0
+    teardown:
+      - run: rm -f /tmp/tessera-e2e-tags.toml
+
+  - id: TAG-002
+    title: Повторяющийся ключ отвергает набор целиком
+    requirement: openspec/specs/device-tags/spec.md
+    requires: []
+    # Правило «последний выигрывает» здесь недопустимо: от того, какое из двух
+    # значений возьмёт продукт, зависит попадание устройства в группу, и
+    # угадывать это нельзя.
+    steps:
+      - run: |
+          printf '[tags]\nregion = "north"\nregion = "south"\n' > /tmp/tessera-e2e-tags.toml
+      - run: tessera tags lint /tmp/tessera-e2e-tags.toml
+        expect:
+          exit_code: 1
+          stdout_matches: 'device-tags TOML is invalid'
+    teardown:
+      - run: rm -f /tmp/tessera-e2e-tags.toml
+
+  - id: TAG-003
+    title: Посторонняя секция в файле тегов отвергается
+    requirement: openspec/specs/device-tags/spec.md
+    requires: []
+    # Файл тегов описывает ровно одну таблицу. Лишняя секция означает, что файл
+    # не тот или собран не тем инструментом, и молча читать из него часть
+    # данных нельзя.
+    steps:
+      - run: |
+          printf '[tags]\nregion = "north"\n[other]\nx = "y"\n' > /tmp/tessera-e2e-tags.toml
+      - run: tessera tags lint /tmp/tessera-e2e-tags.toml
+        expect:
+          exit_code: 1
+          stdout_matches: 'device-tags TOML is invalid'
+    teardown:
+      - run: rm -f /tmp/tessera-e2e-tags.toml
+
+  - id: TAG-004
+    title: Без настроенного источника у устройства нет тегов
+    requirement: openspec/specs/device-tags/spec.md
+    requires: []
+    # «Тегов нет» — безопасное значение по умолчанию: групповые рамки при нём
+    # неудовлетворимы. Обратное («тегов нет, значит подходят любые») открывало
+    # бы групповой вход любому устройству без источника тегов.
+    steps:
+      - run: tessera tags show
+        expect:
+          exit_code: 0
+          stdout_matches: 'summary: 0 tags'

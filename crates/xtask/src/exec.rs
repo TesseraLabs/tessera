@@ -25,7 +25,7 @@ const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_mins(2);
 const DELIVERY_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Переменная, из которой берётся каталог хелперов в окружении.
-const HELPERS_VAR: &str = "helpers";
+pub const HELPERS_VAR: &str = "helpers";
 
 /// Что доставить в окружение перед первым действием подготовки.
 #[derive(Debug, Clone)]

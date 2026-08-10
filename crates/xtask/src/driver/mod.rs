@@ -93,6 +93,10 @@ pub trait CommandDriver {
 
 /// Собирает драйвер по профилю и параметрам стенда.
 ///
+/// `workdir` — корень стенда в целевом окружении, откуда исполняются команды
+/// кейсов. Контейнерный профиль его не берёт: там рабочий каталог задаёт
+/// `WORKDIR` образа, и второй источник той же величины разъехался бы с первым.
+///
 /// # Ошибки
 ///
 /// Несогласованность профиля и стенда: объявленный транспорт без своей секции
@@ -101,6 +105,7 @@ pub fn build(
     profile: &Profile,
     stand: &StandConfig,
     repo_root: &Path,
+    workdir: Option<&str>,
     interrupt: Arc<AtomicBool>,
 ) -> Result<Box<dyn CommandDriver>, DriverError> {
     match profile.driver {
@@ -123,7 +128,11 @@ pub fn build(
             // `ssh` получает аргументы напрямую, без шелла, поэтому `~` в пути
             // к ключу никто не раскроет — сделаем это сами.
             host.identity_file = host.identity_file.map(|path| expand_tilde(&path));
-            Ok(Box::new(ssh::SshDriver::new(host, interrupt)))
+            Ok(Box::new(ssh::SshDriver::new(
+                host,
+                workdir.map(str::to_owned),
+                interrupt,
+            )))
         }
     }
 }

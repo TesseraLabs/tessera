@@ -1,6 +1,6 @@
 suite: revocation
 description: Проверка отзыва удостоверений по CRL
-setup: [install-package, deploy-fixtures]
+setup: [build-pam-drive, install-package, deploy-fixtures]
 
 # Каждый кейс переводит [trust.revocation] в нужный режим правкой конфигурации,
 # а teardown возвращает окружение в известное состояние повторным запуском

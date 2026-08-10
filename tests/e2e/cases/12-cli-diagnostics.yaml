@@ -1,0 +1,68 @@
+suite: cli-diagnostics
+description: Диагностические команды — префлайт, выгрузка идентичностей узла, снятые подкоманды
+setup: [install-package, deploy-fixtures]
+
+# `tessera check` служит hard-gate'ом перед запуском службы, а вывод
+# `dump-host-id` — тем, из чего администратор берёт отпечаток при выпуске
+# удостоверения. Ошибка здесь не ломает вход, но приводит к выпуску
+# удостоверения на неверный узел.
+
+cases:
+  - id: CLI-001
+    title: Префлайт на исправной системе завершается успехом и печатает сводку
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # Предупреждения на исход не влияют: в контейнере всегда есть WARN об
+    # отсутствии мандатного контроля, и гейт не должен на нём спотыкаться.
+    steps:
+      - run: tessera check
+        expect:
+          exit_code: 0
+          stdout_matches: 'summary: \d+ info, \d+ warn, 0 error'
+
+  - id: CLI-002
+    title: Выгрузка идентичностей пробивает все источники и отмечает действующий
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # Команда намеренно игнорирует список источников из конфигурации: оператор
+    # должен видеть всё железо целиком, включая источники, которые сейчас не
+    # выбраны. Отметка действующего источника — то место, откуда берётся
+    # отпечаток для выпуска, и перепутать его нельзя.
+    steps:
+      - run: tessera dump-host-id
+        expect:
+          exit_code: 0
+          stdout_matches: 'source\tstatus\thash_hex\thash_prefix\traw\tnormalized\tactive_under_current_config\treason'
+      - run: tessera dump-host-id
+        expect:
+          exit_code: 0
+          stdout_matches: 'machine_id\tok\t[0-9a-f]{64}\t[0-9a-f]{8}\t.*\tyes\t-'
+      - run: tessera dump-host-id --output /tmp/tessera-e2e-hostid.tsv
+        expect:
+          exit_code: 0
+      - expect_file:
+          path: /tmp/tessera-e2e-hostid.tsv
+          mode: "0644"
+    teardown:
+      - run: rm -f /tmp/tessera-e2e-hostid.tsv
+
+  - id: CLI-003
+    title: Снятые подкоманды не воскресают
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # Подкоманды версии 0.2.x удалены. Возврат любой из них означал бы, что
+    # чужой сценарий автоматизации снова начнёт «работать», делая не то, что
+    # делал раньше.
+    steps:
+      - run: tessera execute
+        expect:
+          exit_code: 2
+          stderr_matches: "unrecognized subcommand 'execute'"
+      - run: tessera policy
+        expect:
+          exit_code: 2
+          stderr_matches: "unrecognized subcommand 'policy'"
+      - run: tessera gc
+        expect:
+          exit_code: 2
+          stderr_matches: "unrecognized subcommand 'gc'"

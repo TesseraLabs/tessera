@@ -9,7 +9,9 @@
 # до первого кейса. Скрипт пакет только ставит; отсутствие файла — сбой стенда,
 # а не провал продукта, и отдаётся кодом 70.
 #
-# Идемпотентность: повторный запуск на уже установленной той же версии — успех.
+# Идемпотентность: повторный запуск с тем же файлом пакета — успех без
+# переустановки. Сравнивается отпечаток файла, а не номер версии: сборки разных
+# коммитов одного релиза номер не различает.
 
 set -euo pipefail
 
@@ -20,6 +22,9 @@ export DEBIAN_FRONTEND=noninteractive
 # Куда раннер кладёт пакет. Переопределяется на случай ручного прогона.
 DEB_PATH="${TESSERA_E2E_DEB:-/opt/tessera-e2e/pkg/tessera.deb}"
 PKG_NAME="${TESSERA_E2E_PKG_NAME:-tessera}"
+# Отпечаток установленного пакета: по нему подготовка отличает «тот же пакет
+# уже стоит» от «версия совпала, а содержимое другое».
+DIGEST_FILE="${TESSERA_E2E_DIGEST_FILE:-/var/lib/tessera-e2e-package.sha256}"
 
 # Коды, отличающие сбой стенда от вердикта продукта: раннер трактует их
 # как ERROR по списку error_exit_codes профиля.
@@ -72,14 +77,19 @@ main() {
         die_stand "архитектура пакета ($deb_arch) не совпадает с окружением ($host_arch)"
     fi
 
-    local deb_version installed_version
-    deb_version="$(dpkg-deb -f "$deb" Version 2>/dev/null || true)"
-    installed_version="$(dpkg-query -W -f='${Version}' "$PKG_NAME" 2>/dev/null || true)"
+    # Повторную установку пропускает не совпадение версии, а совпадение самого
+    # пакета побайтово. Номер версии между сборками одного релиза не меняется:
+    # сборка вчерашней ветки и сборка сегодняшнего main обе называются 0.5.0-1.
+    # Пропуск по версии означал бы, что прогон проверяет код, оставшийся от
+    # прошлого раза, и молча выдаёт его результаты за проверку текущего —
+    # ровно то, ради чего контур и существует, только наоборот.
+    local deb_digest installed_digest
+    deb_digest="$(sha256sum "$deb" 2>/dev/null | cut -d' ' -f1)"
+    installed_digest="$(cat "$DIGEST_FILE" 2>/dev/null || true)"
 
-    if [ -n "$installed_version" ] && [ "$installed_version" = "$deb_version" ]; then
-        # Та же версия уже стоит: подготовка выполняется один раз за прогон,
-        # но окружение может быть переиспользовано между прогонами без --recreate.
-        echo "already installed: $PKG_NAME $installed_version"
+    if [ -n "$deb_digest" ] && [ "$deb_digest" = "$installed_digest" ] \
+        && dpkg-query -W -f='${Status}' "$PKG_NAME" 2>/dev/null | grep -q "install ok installed"; then
+        echo "already installed: $PKG_NAME из того же пакета (sha256 ${deb_digest:0:12}…)"
         return 0
     fi
 
@@ -96,10 +106,15 @@ main() {
         fi
     fi
 
+    local installed_version
     installed_version="$(dpkg-query -W -f='${Version}' "$PKG_NAME" 2>/dev/null || true)"
     [ -n "$installed_version" ] || die_stand "после установки пакет $PKG_NAME не зарегистрирован в dpkg"
 
-    echo "installed: $PKG_NAME $installed_version"
+    # Отпечаток пишется только после успешной установки: прерванная установка
+    # не должна выглядеть как «этот пакет уже стоит».
+    [ -n "$deb_digest" ] && printf '%s\n' "$deb_digest" > "$DIGEST_FILE"
+
+    echo "installed: $PKG_NAME $installed_version (sha256 ${deb_digest:0:12}…)"
 }
 
 main "$@"

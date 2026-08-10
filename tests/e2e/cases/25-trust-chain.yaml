@@ -1,0 +1,108 @@
+suite: trust-chain
+description: Построение и проверка цепочки доверия — рамки, задаваемые конфигурацией
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Все кейсы предъявляют валидное удостоверение с носителя и меняют ровно один
+# параметр доверия. Так отказ нельзя объяснить ничем, кроме проверяемой рамки:
+# кейс, отказывающий «вообще», не отличает работающую проверку от сломанного
+# стенда.
+#
+# Отказ проверки цепочки приходит как PAM_PERM_DENIED (6), а не как
+# PAM_AUTHINFO_UNAVAIL (9): удостоверение прочитано и отвергнуто по существу.
+
+cases:
+  - id: TRUST-001
+    title: Якорь вне списка закреплённых отпечатков не пускает
+    requirement: openspec/specs/trust-chain-validation/spec.md
+    requires: [usb]
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh pinning-foreign
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 6
+          stdout_matches: 'auth: PAM_PERM_DENIED \(6\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+
+  - id: TRUST-002
+    title: Закрепление отпечатка своего якоря вход не ломает
+    requirement: openspec/specs/trust-chain-validation/spec.md
+    requires: [usb]
+    # Парный к TRUST-001. Без него «чужой отпечаток не пускает» ничего не
+    # доказывает: отказывать могло бы и само включение закрепления.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh pinning-anchor
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stdout_matches: 'auth: PAM_SUCCESS \(0\)\nacct: PAM_SUCCESS \(0\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+
+  - id: TRUST-003
+    title: Цепочка длиннее разрешённой глубины не пускает
+    requirement: openspec/specs/trust-chain-validation/spec.md
+    requires: [usb]
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh depth-1
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 6
+          stdout_matches: 'auth: PAM_PERM_DENIED \(6\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+
+  - id: TRUST-004
+    title: Разрешённый алгоритм подписи не совпадает по подстроке
+    requirement: openspec/specs/trust-chain-validation/spec.md
+    requires: [usb]
+    # Сравнение строгое: подстрочное сравнение когда-то пропускало
+    # sha1WithRSAEncryption под элементом whitelist "sha". Здесь whitelist
+    # состоит ровно из "sha", и настоящий алгоритм подписи не должен под него
+    # подойти.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh algorithms-substring
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 6
+          stdout_matches: 'auth: PAM_PERM_DENIED \(6\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+
+  - id: TRUST-005
+    title: Промежуточный из самого удостоверения достраивает цепочку
+    requirement: openspec/specs/trust-chain-validation/spec.md
+    requires: [usb]
+    # Issuer ищется в якорях, затем среди предъявленного, затем в пуле.
+    # Удостоверение фикстуры несёт промежуточный внутри, поэтому вход проходит
+    # и тогда, когда промежуточные не объявлены в конфигурации. Кейс закрепляет
+    # это как обещание: иначе выпуск, полагающийся на предъявленную цепочку,
+    # сломался бы незаметно.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh no-intermediates
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stdout_matches: 'auth: PAM_SUCCESS \(0\)\nacct: PAM_SUCCESS \(0\)'
+        timeout: 60
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach

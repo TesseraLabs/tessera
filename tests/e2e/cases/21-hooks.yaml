@@ -1,0 +1,47 @@
+suite: hooks
+description: Внешние хуки стадий — запуск, отчёт в журнале, отказ на неверном пути
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Хук — единственная точка, где продукт исполняет чужой код. Поэтому проверок
+# две: что объявленный хук действительно запускается и что путь к нему берётся
+# буквально, без поиска по PATH.
+
+cases:
+  - id: HOOK-001
+    title: Хук стадии открытия сессии запускается и его исход виден в журнале
+    requirement: openspec/specs/hooks/spec.md
+    requires: [usb]
+    steps:
+      - run: rm -f /tmp/tessera-e2e-hook-ran
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: helpers/config-mutate.sh hook-session-open
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt open_session
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+        timeout: 60
+      - expect_file:
+          path: /tmp/tessera-e2e-hook-ran
+          exists: true
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'tessera\.hook\.finish: hook finished stage=session_open .* exit_code=0'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/usb-loop.sh detach
+      - run: rm -f /tmp/tessera-e2e-hook-ran
+
+  - id: HOOK-002
+    title: Хук с неабсолютным путём отвергается при загрузке конфигурации
+    requirement: openspec/specs/hooks/spec.md
+    requires: []
+    # Путь берётся буквально и не ищется по PATH: иначе подсунутый в PATH
+    # исполняемый файл выполнялся бы с правами продукта в момент входа.
+    steps:
+      - run: helpers/config-mutate.sh hook-relative-command
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'hook command path is invalid'
+    teardown:
+      - run: helpers/config-mutate.sh restore

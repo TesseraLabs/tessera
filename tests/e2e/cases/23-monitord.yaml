@@ -1,0 +1,69 @@
+suite: monitord
+description: Демон наблюдения — сокет, регистрация сессии, реакция на извлечение носителя
+setup: [build-pam-drive, install-package, deploy-fixtures, start-monitord]
+
+# Регистрация сессии в демоне отдельным кейсом не проверяется: снаружи она
+# ненаблюдаема — модуль сообщает о ней в журнал только когда демон НЕдоступен,
+# а записи самого демона в этот момент неотличимы от фоновых. Кейс, матчивший
+# их, оказался плавающим и удалён: проверка, зеленеющая от постороннего шума,
+# хуже её отсутствия. Косвенно регистрация подтверждается MON-003: демон не
+# отследил бы извлечение носителя для незарегистрированной сессии.
+#
+# Демон в контейнере поднимается с `--no-dbus` (см. helpers/setup/start-monitord.sh):
+# без системной шины он отказывается стартовать, потому что действия над
+# сессией идут через logind. Поэтому здесь проверяется всё, что до logind:
+# приём соединений, регистрация сессии, обнаружение извлечения носителя.
+# Само применение действия к сессии проверяется на профиле с настоящей системой.
+
+cases:
+  - id: MON-001
+    title: Сокет демона не доступен на запись посторонним
+    requirement: openspec/specs/ipc-protocol/spec.md
+    requires: [service-manager]
+    # Через этот сокет сообщают об открытии и закрытии сессий. Доступный на
+    # запись кому угодно, он позволил бы закрыть чужую сессию или скрыть свою.
+    #
+    # Одного режима 0660 мало: он ограничивает доступ владельцем и группой, но
+    # ничего не говорит о том, кто они. Сокет, созданный с широкой группой,
+    # прошёл бы проверку режима и остался бы открытым посторонним, поэтому
+    # владелец проверяется отдельным шагом.
+    steps:
+      - expect_file:
+          path: /run/tessera/monitord.sock
+          exists: true
+          mode: "0660"
+      - run: stat -c '%U:%G' /run/tessera/monitord.sock
+        expect:
+          exit_code: 0
+          stdout_matches: '^tessera:tessera$'
+
+  - id: MON-003
+    title: Извлечение носителя при активной сессии замечается демоном
+    requirement: openspec/specs/session-monitoring/spec.md
+    requires: [service-manager, usb]
+    # Носитель извлекается прямо в кейсе, после открытой сессии. Демон обязан
+    # это заметить и начать отсчёт отсрочки — иначе сессия переживёт носитель,
+    # ради контроля которого всё и делается.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt open_session
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+        timeout: 60
+      - run: helpers/usb-loop.sh detach
+      - run: sleep 8
+      - expect_journal:
+          unit: tessera
+          matches: 'grace window expired, dispatching action'
+    # Последний кейс suite возвращает стенд в исходное состояние: подготовка
+    # запустила службу, а кейс установки в следующем прогоне того же контейнера
+    # проверяет ровно то, что установка службу НЕ активирует. Оставленная
+    # запущенной служба валила бы его — прогон видел бы дефект установки там,
+    # где наследил сам контур.
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: systemctl stop tessera || true
+      - run: rm -f /etc/systemd/system/tessera.service.d/e2e-no-dbus.conf
+      - run: systemctl daemon-reload
+      - run: rm -f /run/tessera/sessions.json

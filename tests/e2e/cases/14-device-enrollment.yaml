@@ -1,0 +1,41 @@
+suite: device-enrollment
+description: Импорт пакета первичной настройки — отказ на неполном и отсутствующем пакете
+setup: [install-package, deploy-fixtures]
+
+# Импорт раскладывает на устройство удостоверение узла, теги и первые роли.
+# Проверяются здесь только отказные пути: успешный импорт требует собранного
+# пакета с удостоверением узла и подписанным манифестом, а его сборка — это
+# сторона выпуска, отдельная от проверяемого устройства. Пока такого пакета в
+# стенде нет, успешный путь и повторный импорт как no-op остаются непокрытыми,
+# и это записано в задачах контура, а не забыто.
+
+cases:
+  - id: ENR-001
+    title: Пакет без удостоверения узла отвергается целиком
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # Импорт неполного пакета обязан быть отказом, а не частичной раскладкой:
+    # устройство с половиной привезённого состояния хуже нетронутого — оно
+    # выглядит настроенным.
+    steps:
+      - run: rm -rf /tmp/tessera-e2e-enroll && mkdir -p /tmp/tessera-e2e-enroll
+      - run: tessera enroll --standalone --import /tmp/tessera-e2e-enroll
+        expect:
+          exit_code: 1
+          stderr_matches: 'enrollment package has no per-host \.p12'
+    teardown:
+      - run: rm -rf /tmp/tessera-e2e-enroll
+
+  - id: ENR-002
+    title: Отсутствующий пакет не считается пустым
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # Опечатка в пути обязана останавливать первичную настройку, а не проходить
+    # как «импортировать нечего»: иначе устройство уедет в парк ненастроенным,
+    # а оператор будет считать шаг выполненным.
+    steps:
+      - run: rm -rf /tmp/tessera-e2e-enroll-missing
+      - run: tessera enroll --standalone --import /tmp/tessera-e2e-enroll-missing
+        expect:
+          exit_code: 1
+          stderr_matches: 'enrollment package not found'

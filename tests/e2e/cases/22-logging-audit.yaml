@@ -1,0 +1,70 @@
+suite: logging-audit
+description: Что продукт оставляет в журнале о входе, отказе и опасной конфигурации
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Записи ищутся по идентификатору syslog `pam_tessera`: модуль службой не
+# является, и по имени юнита его строк в журнале нет вовсе.
+#
+# Имена целей (`tessera.flow`, `tessera.auth`, `tessera.config`) — это API для
+# операторских grep'ов, а не деталь реализации: смена имени ломает чужие
+# правила разбора журнала так же, как смена формата вывода.
+
+cases:
+  - id: LOG-001
+    title: Успешный вход оставляет в журнале результат и идентификатор удостоверения
+    requirement: openspec/specs/logging-audit/spec.md
+    requires: [usb]
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+        timeout: 60
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'tessera\.flow: auth result: success \(pkcs12\) pam_user=serv'
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'tessera\.flow: cert chain validated'
+    teardown:
+      - run: helpers/usb-loop.sh detach
+
+  - id: LOG-002
+    title: Отказ во входе объясняется в журнале причиной, а не одним кодом
+    requirement: openspec/specs/logging-audit/spec.md
+    requires: [usb]
+    # Разбор инцидента начинается с журнала: код возврата PAM говорит вызвавшей
+    # службе «нет», но не говорит администратору, почему.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "заведомо-неверный-PIN"
+        expect:
+          exit_code: 11
+        timeout: 60
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'tessera\.auth: authentication failed'
+    teardown:
+      - run: helpers/usb-loop.sh detach
+
+  - id: LOG-003
+    title: Вход при отключённой проверке отзыва сопровождается предупреждением
+    requirement: openspec/specs/logging-audit/spec.md
+    requires: [usb]
+    # Режим «отзыв не проверяется» выбирается явно, но молчать о нём нельзя:
+    # отозванное удостоверение в этом режиме пускает, и запись в журнале —
+    # единственный след, по которому это заметят до инцидента.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
+      - run: pam-drive certauth {{user}} authenticate
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+        timeout: 60
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'tessera\.config: trust\.revocation\.mode is "none": certificate revocation is NOT checked'
+    teardown:
+      - run: helpers/usb-loop.sh detach

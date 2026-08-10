@@ -37,7 +37,8 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* /usr/local/src/pam-drive.c
 
-COPY helpers/usb-loop.sh helpers/ocsp-responder.sh helpers/udevd-start.sh /opt/tessera-e2e/helpers/
+COPY helpers/usb-loop.sh helpers/ocsp-responder.sh helpers/udevd-start.sh \
+     helpers/config-mutate.sh /opt/tessera-e2e/helpers/
 COPY helpers/setup/ /opt/tessera-e2e/helpers/setup/
 RUN chmod 0755 /opt/tessera-e2e/helpers/*.sh /opt/tessera-e2e/helpers/setup/*.sh \
     && mkdir -p /opt/tessera-e2e/fixtures /opt/tessera-e2e/pkg

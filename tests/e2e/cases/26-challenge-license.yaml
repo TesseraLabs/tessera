@@ -1,0 +1,44 @@
+suite: challenge-license
+description: Подпись вызова разными типами ключей и лицензионные условия поставки
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Два независимых сюжета, каждому из которых мало на отдельный suite: выбор
+# алгоритма подписи по типу ключа удостоверения и лицензия, с которой пакет
+# уезжает пользователю.
+
+cases:
+  - id: CHAL-001
+    title: Удостоверение с ключом на эллиптической кривой проходит наравне с RSA
+    requirement: openspec/specs/challenge-response/spec.md
+    requires: [usb]
+    # Алгоритм подписи вызова выбирается по типу ключа из сертификата.
+    # Ошибка выбора не даёт «неверную подпись» на глаз — она даёт отказ входа
+    # владельцу исправного удостоверения, и без кейса на второй тип ключа
+    # такой отказ обнаружился бы только у пользователя.
+    steps:
+      - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_ecdsa.p12
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stdout_matches: 'auth: PAM_SUCCESS \(0\)\nacct: PAM_SUCCESS \(0\)'
+        timeout: 60
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'tessera\.flow: auth result: success \(pkcs12\)'
+    teardown:
+      - run: helpers/usb-loop.sh detach
+
+  - id: LIC-001
+    title: Пакет заявляет двойное лицензирование
+    requirement: openspec/specs/licensing-distribution/spec.md
+    requires: []
+    # Условия распространения едут вместе с пакетом, а не только лежат в
+    # репозитории: получатель .deb видит их из установленной системы.
+    steps:
+      - expect_file:
+          path: /usr/share/doc/tessera/copyright
+          matches: 'License: AGPL-3\.0-only or Commercial'
+      - expect_file:
+          path: /usr/share/doc/tessera/copyright
+          matches: 'commercial license \(see LICENSE\.commercial\)'

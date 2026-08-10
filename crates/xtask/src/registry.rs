@@ -5,7 +5,7 @@
 //! кейсу нужны условие или цикл, логика уезжает в хелпер, иначе реестр
 //! выродится в недо-язык, который придётся сопровождать наравне с продуктом.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,35 @@ pub enum RegistryError {
     /// Реестр внутренне противоречив.
     #[error("реестр некорректен: {0}")]
     Invalid(String),
+    /// Кейс ссылается на спеку, которой нет ни среди принятых, ни в предложениях.
+    #[error(
+        "{path}: кейс {case}: спека {requirement} не найдена — \
+         ни файла в корне репозитория, ни каталога openspec/changes/*/specs/{name}/spec.md"
+    )]
+    MissingRequirement {
+        /// Файл suite, в котором лежит кейс.
+        path: PathBuf,
+        /// Идентификатор кейса.
+        case: String,
+        /// Значение поля `requirement`, как оно записано в кейсе.
+        requirement: String,
+        /// Имя спеки, выведенное из пути; по нему шёл поиск в предложениях.
+        name: String,
+    },
+    /// Из значения `requirement` не выводится имя спеки.
+    #[error(
+        "{path}: кейс {case}: ссылка {requirement} не ведёт на спеку; \
+         ожидается путь от корня репозитория ровно вида openspec/specs/<имя>/spec.md \
+         (допустим якорь #<раздел>), иначе кейс выпадает из матрицы покрытия"
+    )]
+    MalformedRequirement {
+        /// Файл suite, в котором лежит кейс.
+        path: PathBuf,
+        /// Идентификатор кейса.
+        case: String,
+        /// Значение поля `requirement`, как оно записано в кейсе.
+        requirement: String,
+    },
 }
 
 /// Suite — группа кейсов, живущая в одном файле реестра.
@@ -389,26 +418,53 @@ struct FileWrapper {
     expect_file: FileStep,
 }
 
+/// Спека, на которую ссылается кейс, но которая ещё не синкнута из
+/// предложения в `openspec/specs/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSpec {
+    /// Имя спеки — оно же имя будущего каталога в `openspec/specs/`.
+    pub name: String,
+    /// Предложение, внутри которого спека живёт сейчас.
+    pub change: String,
+}
+
 /// Загруженный реестр — склейка одного или нескольких каталогов кейсов.
 #[derive(Debug, Default)]
 pub struct Registry {
     /// Suite'ы в порядке загрузки.
     pub suites: Vec<Suite>,
+    /// Спеки, которые ещё не синкнуты из предложений, в порядке имени.
+    pub pending_specs: Vec<PendingSpec>,
 }
 
 impl Registry {
     /// Загружает и проверяет реестр из перечисленных каталогов.
+    ///
+    /// Ссылки `requirement` разрешаются относительно корня репозитория, в
+    /// котором собран сам раннер.
     ///
     /// # Ошибки
     ///
     /// Возвращает ошибку, если каталог недоступен, файл не разбирается или
     /// реестр не проходит проверку целостности.
     pub fn load(dirs: &[PathBuf]) -> Result<Self, RegistryError> {
+        Self::load_from(dirs, &crate::repo_root())
+    }
+
+    /// То же, но с явным корнем репозитория, относительно которого
+    /// разрешаются ссылки `requirement`.
+    ///
+    /// # Ошибки
+    ///
+    /// См. [`Registry::load`].
+    pub fn load_from(dirs: &[PathBuf], repo_root: &Path) -> Result<Self, RegistryError> {
         let mut registry = Self::default();
         for dir in dirs {
             registry.load_dir(dir)?;
         }
         registry.validate()?;
+        let pending = registry.check_requirements(repo_root)?;
+        registry.pending_specs = pending;
         Ok(registry)
     }
 
@@ -482,6 +538,65 @@ impl Registry {
         Ok(())
     }
 
+    /// Проверяет, что каждая ссылка `requirement` куда-то ведёт.
+    ///
+    /// Сначала проверяется форма пути, и только потом существование файла.
+    /// Наоборот нельзя: любой существующий файл репозитория прошёл бы проверку,
+    /// но в матрицу покрытия такой кейс всё равно не попадает — имя спеки из
+    /// него не выводится. Гейт зеленел бы на кейсе без ссылки на спеку, то есть
+    /// ровно на том, что обязан ловить.
+    ///
+    /// Спека либо уже принята и лежит по указанному пути, либо ещё живёт внутри
+    /// предложения. Второе законно и правится само: кейс уже несёт канонический
+    /// путь, а синк спеки создаёт ровно этот файл.
+    fn check_requirements(&self, repo_root: &Path) -> Result<Vec<PendingSpec>, RegistryError> {
+        let changes_root = repo_root.join("openspec").join("changes");
+        let mut pending: BTreeMap<String, String> = BTreeMap::new();
+        for suite in &self.suites {
+            for case in &suite.cases {
+                let name = spec_name(&case.requirement).ok_or_else(|| {
+                    RegistryError::MalformedRequirement {
+                        path: suite.path.clone(),
+                        case: case.id.clone(),
+                        requirement: case.requirement.clone(),
+                    }
+                })?;
+                if repo_root.join(spec_path(case.requirement.trim())).is_file() {
+                    continue;
+                }
+                let Some(change) = find_change_with_spec(&changes_root, name) else {
+                    return Err(RegistryError::MissingRequirement {
+                        path: suite.path.clone(),
+                        case: case.id.clone(),
+                        requirement: case.requirement.clone(),
+                        name: name.to_owned(),
+                    });
+                };
+                pending.insert(name.to_owned(), change);
+            }
+        }
+        Ok(pending
+            .into_iter()
+            .map(|(name, change)| PendingSpec { name, change })
+            .collect())
+    }
+
+    /// Замечания, не мешающие прогону: их печатают до первого кейса.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        self.pending_specs
+            .iter()
+            .map(|spec| {
+                format!(
+                    "спека `{}` ещё не синкнута: сейчас она живёт в предложении `{}`. \
+                     Ссылка в кейсе уже каноническая и заработает сама, как только спека \
+                     переедет в openspec/specs/ — менять её не надо",
+                    spec.name, spec.change
+                )
+            })
+            .collect()
+    }
+
     /// Перебирает кейсы вместе с их suite в порядке прогона.
     pub fn cases(&self) -> impl Iterator<Item = (&Suite, &Case)> {
         self.suites
@@ -510,6 +625,59 @@ impl Registry {
 /// Шаблон не компилируется.
 pub fn compile_pattern(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::RegexBuilder::new(pattern).multi_line(true).build()
+}
+
+/// Путь к файлу спеки из значения `requirement`: якорь на заголовок внутри
+/// файла к пути не относится.
+fn spec_path(requirement: &str) -> &str {
+    requirement.split('#').next().unwrap_or(requirement)
+}
+
+/// Имя спеки из ссылки канонического вида `openspec/specs/<имя>/spec.md`.
+///
+/// Форма проверяется целиком, а не «есть ли предпоследний сегмент»: из ссылки
+/// произвольного вида имя спеки не выводится, а значит, кейс с такой ссылкой
+/// не попадёт в матрицу покрытия. Сегменты сравниваются как текст, а не через
+/// [`Path`]: в реестре путь всегда пишется через прямой слэш, каким бы ни была
+/// система, где раннер собран.
+#[must_use]
+pub fn spec_name(requirement: &str) -> Option<&str> {
+    let mut segments = spec_path(requirement.trim()).split('/');
+    if segments.next()? != "openspec" || segments.next()? != "specs" {
+        return None;
+    }
+    let name = segments.next()?;
+    if segments.next()? != "spec.md" || segments.next().is_some() {
+        return None;
+    }
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name)
+}
+
+/// Ищет спеку с таким именем среди незаархивированных предложений и
+/// возвращает имя change'а.
+fn find_change_with_spec(changes_root: &Path, name: &str) -> Option<String> {
+    let mut changes: Vec<PathBuf> = std::fs::read_dir(changes_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    // Один и тот же реестр должен давать одно и то же сообщение независимо от
+    // порядка обхода каталога.
+    changes.sort();
+    changes.into_iter().find_map(|change| {
+        let spec = change.join("specs").join(name).join("spec.md");
+        if spec.is_file() {
+            change
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::to_owned)
+        } else {
+            None
+        }
+    })
 }
 
 fn validate_patterns(case_id: &str, step: &Step) -> Result<(), RegistryError> {
@@ -795,6 +963,147 @@ cases:
 ",
         ));
         assert!(registry.validate().is_err());
+    }
+
+    /// Готовит дерево с одним кейсом, ссылающимся на указанную спеку, и
+    /// возвращает корень «репозитория» вместе с каталогом кейсов.
+    fn tree_with_requirement(requirement: &str) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let cases = root.path().join("tests/e2e/cases");
+        std::fs::create_dir_all(&cases).unwrap();
+        std::fs::write(
+            cases.join("auth.yaml"),
+            format!(
+                r"
+suite: s
+cases:
+  - id: A-1
+    title: t
+    requirement: {requirement}
+    steps:
+      - run: /bin/true
+"
+            ),
+        )
+        .unwrap();
+        (root, cases)
+    }
+
+    fn write_spec(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#### Scenario: что-то\n").unwrap();
+    }
+
+    #[test]
+    fn a_requirement_pointing_at_an_accepted_spec_loads_without_a_word() {
+        let (root, cases) = tree_with_requirement("openspec/specs/revocation/spec.md");
+        write_spec(&root.path().join("openspec/specs/revocation/spec.md"));
+        let registry = Registry::load_from(std::slice::from_ref(&cases), root.path()).unwrap();
+        assert!(registry.pending_specs.is_empty());
+        assert!(registry.warnings().is_empty());
+    }
+
+    #[test]
+    fn a_spec_still_living_in_a_change_loads_with_a_warning() {
+        let (root, cases) = tree_with_requirement("openspec/specs/carrier-presence/spec.md");
+        write_spec(
+            &root
+                .path()
+                .join("openspec/changes/token-presence-monitor/specs/carrier-presence/spec.md"),
+        );
+        let registry = Registry::load_from(std::slice::from_ref(&cases), root.path()).unwrap();
+        assert_eq!(
+            registry.pending_specs,
+            vec![PendingSpec {
+                name: "carrier-presence".to_owned(),
+                change: "token-presence-monitor".to_owned(),
+            }]
+        );
+        let warnings = registry.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = &warnings[0];
+        assert!(warning.contains("carrier-presence"), "{warning}");
+        assert!(warning.contains("token-presence-monitor"), "{warning}");
+        // Ссылка в кейсе уже каноническая: синк спеки создаёт ровно тот файл,
+        // на который она указывает. Совет её править увёл бы на путь внутри
+        // предложения, то есть на неканонический.
+        assert!(
+            !warning.contains("обнов") && !warning.contains("замен"),
+            "предупреждение не должно звать править ссылку: {warning}"
+        );
+    }
+
+    /// Форма пути проверяется раньше существования файла: иначе кейс со
+    /// ссылкой на любой существующий файл репозитория прошёл бы загрузку, но в
+    /// матрицу покрытия не попал — имя спеки из такой ссылки не выводится.
+    #[test]
+    fn an_existing_file_that_is_not_a_spec_is_still_rejected() {
+        let (root, cases) = tree_with_requirement("Cargo.toml");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let err = Registry::load_from(std::slice::from_ref(&cases), root.path())
+            .expect_err("существование файла не делает ссылку ссылкой на спеку");
+        assert!(
+            matches!(err, RegistryError::MalformedRequirement { .. }),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("openspec/specs/"), "{text}");
+    }
+
+    #[test]
+    fn only_the_canonical_shape_of_a_requirement_is_accepted() {
+        for requirement in [
+            "openspec/specs/revocation/spec.md",
+            "openspec/specs/revocation/spec.md#раздел",
+        ] {
+            assert_eq!(spec_name(requirement), Some("revocation"), "{requirement}");
+        }
+        for requirement in [
+            "Cargo.toml",
+            "r",
+            "specs/revocation/spec.md",
+            "/openspec/specs/revocation/spec.md",
+            "../openspec/specs/revocation/spec.md",
+            "openspec/changes/token-presence-monitor/specs/carrier-presence/spec.md",
+            "openspec/specs/revocation/README.md",
+            "openspec/specs/revocation",
+            "openspec/specs//spec.md",
+        ] {
+            assert_eq!(spec_name(requirement), None, "{requirement}");
+        }
+    }
+
+    #[test]
+    fn a_requirement_pointing_nowhere_stops_the_run() {
+        let (root, cases) = tree_with_requirement("openspec/specs/выдумка/spec.md");
+        std::fs::create_dir_all(root.path().join("openspec/changes")).unwrap();
+        let err = Registry::load_from(std::slice::from_ref(&cases), root.path())
+            .expect_err("ссылка в никуда выключает кейс из матрицы покрытия молча");
+        assert!(
+            matches!(err, RegistryError::MissingRequirement { .. }),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("A-1") && text.contains("выдумка"), "{text}");
+    }
+
+    #[test]
+    fn a_requirement_without_a_spec_directory_is_rejected() {
+        let (root, cases) = tree_with_requirement("r");
+        let err = Registry::load_from(std::slice::from_ref(&cases), root.path())
+            .expect_err("из такой ссылки не выводится имя спеки");
+        assert!(
+            matches!(err, RegistryError::MalformedRequirement { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_anchor_does_not_break_the_lookup() {
+        let (root, cases) = tree_with_requirement("openspec/specs/revocation/spec.md#отзыв");
+        write_spec(&root.path().join("openspec/specs/revocation/spec.md"));
+        let registry = Registry::load_from(std::slice::from_ref(&cases), root.path()).unwrap();
+        assert!(registry.pending_specs.is_empty());
     }
 
     /// Реестр в репозитории — контракт между раннером и автором кейсов:

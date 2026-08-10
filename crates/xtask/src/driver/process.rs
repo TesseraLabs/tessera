@@ -27,6 +27,39 @@ pub struct ProcessOutcome {
     pub interrupted: bool,
 }
 
+/// Результат запуска процесса без предположений о кодировке потоков.
+///
+/// Нужен там, где по потокам едут не тексты: архив доставки проходит через
+/// stdout и stdin процессов целиком, а приведение к `String` заменило бы
+/// каждый неюникодный байт на заполнитель и испортило бы его молча.
+#[derive(Debug, Clone)]
+pub struct RawOutcome {
+    /// Код возврата; `None`, если процесс убит сигналом.
+    pub exit_code: Option<i32>,
+    /// Стандартный вывод как есть.
+    pub stdout: Vec<u8>,
+    /// Стандартный поток ошибок как есть.
+    pub stderr: Vec<u8>,
+    /// Процесс убит по таймауту.
+    pub timed_out: bool,
+    /// Процесс убит из-за прерывания прогона.
+    pub interrupted: bool,
+}
+
+impl RawOutcome {
+    /// Читает потоки как текст, заменяя неюникодные байты заполнителем.
+    #[must_use]
+    pub fn into_text(self) -> ProcessOutcome {
+        ProcessOutcome {
+            exit_code: self.exit_code,
+            stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&self.stderr).into_owned(),
+            timed_out: self.timed_out,
+            interrupted: self.interrupted,
+        }
+    }
+}
+
 /// Запускает процесс и ждёт его завершения не дольше таймаута.
 ///
 /// # Ошибки
@@ -40,6 +73,22 @@ pub fn run(
     timeout: Duration,
     interrupt: &AtomicBool,
 ) -> std::io::Result<ProcessOutcome> {
+    run_bytes(program, args, stdin.map(str::as_bytes), timeout, interrupt)
+        .map(RawOutcome::into_text)
+}
+
+/// То же, но потоки остаются байтами.
+///
+/// # Ошибки
+///
+/// Ошибки запуска процесса и работы с его потоками.
+pub fn run_bytes(
+    program: &str,
+    args: &[String],
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    interrupt: &AtomicBool,
+) -> std::io::Result<RawOutcome> {
     let started = Instant::now();
     let mut child = Command::new(program)
         .args(args)
@@ -49,12 +98,12 @@ pub fn run(
         .spawn()?;
 
     if let Some(input) = child.stdin.take() {
-        let payload = stdin.unwrap_or("").to_owned();
+        let payload = stdin.unwrap_or_default().to_vec();
         // Пишем в отдельном потоке: команда может не читать stdin вовсе,
         // и тогда синхронная запись заблокировала бы раннер до таймаута.
         std::thread::spawn(move || {
             let mut input = input;
-            let _written = input.write_all(payload.as_bytes());
+            let _written = input.write_all(&payload);
             let _flushed = input.flush();
         });
     }
@@ -81,7 +130,7 @@ pub fn run(
         break None;
     };
 
-    Ok(ProcessOutcome {
+    Ok(RawOutcome {
         exit_code,
         stdout: join_reader(stdout_reader),
         stderr: join_reader(stderr_reader),
@@ -90,18 +139,18 @@ pub fn run(
     })
 }
 
-fn spawn_reader<R>(mut source: R) -> std::thread::JoinHandle<String>
+fn spawn_reader<R>(mut source: R) -> std::thread::JoinHandle<Vec<u8>>
 where
     R: Read + Send + 'static,
 {
     std::thread::spawn(move || {
         let mut buffer = Vec::new();
         let _read = source.read_to_end(&mut buffer);
-        String::from_utf8_lossy(&buffer).into_owned()
+        buffer
     })
 }
 
-fn join_reader(handle: Option<std::thread::JoinHandle<String>>) -> String {
+fn join_reader(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
     // Поток чтения завершается вместе с процессом; паника внутри него не должна
     // валить прогон — потерянный кусок вывода менее ценен, чем отчёт целиком.
     handle

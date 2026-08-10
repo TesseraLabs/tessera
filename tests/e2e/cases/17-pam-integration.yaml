@@ -1,0 +1,71 @@
+suite: pam-integration
+description: Встраивание в PAM-стек — режимы и место вставки в чужом стеке
+setup: [install-package]
+
+# Кейсы работают на отдельных файлах в /tmp, а не на системных стеках: ошибка
+# в проверке места вставки не должна ломать вход в само окружение прогона.
+#
+# Обе проверки места вставки закрывают исправленные дефекты. Регрессия здесь
+# не выглядит как поломка: стек остаётся синтаксически верным, вход работает,
+# и только защита оказывается обойдённой.
+
+cases:
+  - id: PAMI-001
+    title: Три режима различаются control-flag'ом, а не аргументами модуля
+    requirement: openspec/specs/pam-integration/spec.md
+    requires: []
+    steps:
+      - run: grep -E '^auth' /etc/pam.d/tessera
+        expect:
+          stdout_matches: 'auth\s+required\s+pam_tessera\.so'
+      - run: grep -E '^auth' /etc/pam.d/tessera-optional
+        expect:
+          stdout_matches: 'auth\s+sufficient\s+pam_tessera\.so'
+      - run: grep -E '^auth' /etc/pam.d/tessera-only
+        expect:
+          stdout_matches: 'auth\s+\[success=done default=die\]\s+pam_tessera\.so'
+      # Каждый снипет проверяется отдельно: общий grep по трём файлам совпал бы
+      # и тогда, когда строка осталась лишь в одном из них, а два режима молча
+      # перестали бы проверять учётную запись.
+      - run: grep -E '^account' /etc/pam.d/tessera
+        expect:
+          stdout_matches: 'account\s+required\s+pam_tessera\.so'
+      - run: grep -E '^account' /etc/pam.d/tessera-optional
+        expect:
+          stdout_matches: 'account\s+required\s+pam_tessera\.so'
+      - run: grep -E '^account' /etc/pam.d/tessera-only
+        expect:
+          stdout_matches: 'account\s+required\s+pam_tessera\.so'
+
+  - id: PAMI-002
+    title: В стеке с pam_parsec_mac включение ставится после него
+    requirement: openspec/specs/pam-integration/spec.md
+    requires: []
+    # Иначе `success=done` режима cert-only обрывает auth-стек до
+    # pam_parsec_mac, его account- и session-инстансы падают на отсутствии
+    # данных, и вход запрещается целиком.
+    steps:
+      - run: printf 'auth required pam_parsec_mac.so\nauth required pam_unix.so\naccount required pam_unix.so\n' > /tmp/pam-stack-mac
+      - run: /usr/share/tessera/integrate-pam.sh --mode=cert-only /tmp/pam-stack-mac
+      - run: sed -n '1,2p' /tmp/pam-stack-mac
+        expect:
+          stdout_matches: 'auth required pam_parsec_mac\.so\n@include tessera-only'
+    teardown:
+      - run: rm -f /tmp/pam-stack-mac
+
+  - id: PAMI-003
+    title: В стеке без литеральной auth-строки включение ставится перед common-auth
+    requirement: openspec/specs/pam-integration/spec.md
+    requires: []
+    # Стеки sudo и sshd доставляют всю auth-фазу через `@include common-auth`.
+    # Пока якорь искал только литеральную строку `auth`, включение дописывалось
+    # в конец файла: пароль успевал отработать раньше, чем запускалась
+    # проверка удостоверения, и режим cert-only переставал быть cert-only.
+    steps:
+      - run: printf '@include common-auth\n@include common-account\n' > /tmp/pam-stack-include
+      - run: /usr/share/tessera/integrate-pam.sh --mode=cert-only /tmp/pam-stack-include
+      - run: sed -n '1,2p' /tmp/pam-stack-include
+        expect:
+          stdout_matches: '@include tessera-only\n@include common-auth'
+    teardown:
+      - run: rm -f /tmp/pam-stack-include
