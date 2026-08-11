@@ -10,6 +10,10 @@
 //! 4. World-writable bits on `/etc/tessera/ca/`.
 //! 5. `PARSEC_CAP_CHMAC` presence when MAC writes are expected.
 //! 6. `HostIdentityResolver` per-source probe (informational).
+//! 7. GOST-engine configuration: unreachable/dead combinations of
+//!    `mode`, `crypto_backend`, `gost_engine_path` and the GOST entries in
+//!    `allowed_signature_algorithms`, plus an actual load attempt when the
+//!    configuration is otherwise consistent.
 //!
 //! Most checks are advisory (WARN); only invariants whose violation makes
 //! the daemon unsafe to start are wired as fatal — those return
@@ -24,6 +28,7 @@ use std::path::PathBuf;
 use tessera_core::config::ValidatedConfig;
 use tessera_core::mac::{MacBackend, MacError, MacRuntime};
 
+pub mod gost;
 pub mod host_identity;
 pub mod mac_runtime;
 pub mod mrd;
@@ -263,6 +268,8 @@ pub fn run_startup_checks_with_backend(
 
     trust::check_anchors(cfg, &mut report);
     trust::check_ca_dir_permissions(opts.fs_root.as_deref(), &mut report);
+
+    gost::check(cfg, &mut report);
 
     let write_capability = match backend.check_write_capability() {
         Ok(()) => Some(true),

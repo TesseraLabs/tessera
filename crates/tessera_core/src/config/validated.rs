@@ -615,12 +615,35 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             tags: validate_tags(&raw.tags, &raw.roles)?,
         };
         if validated.needs_gost() && validated.gost_engine_path.is_none() {
-            return Err(Error::ConfigInvalid {
-                reason: "gost_engine_path is required when the OpenSSL backend allows GOST \
-                         signatures; implicit engine lookup may honor an inherited \
-                         OPENSSL_ENGINES path"
-                    .into(),
-            });
+            let reason = match validated.crypto_backend {
+                CryptoBackend::Openssl => {
+                    "gost_engine_path is required when the OpenSSL backend allows GOST \
+                     signatures; implicit engine lookup may honor an inherited \
+                     OPENSSL_ENGINES path"
+                        .to_owned()
+                }
+                CryptoBackend::Pkcs11Native => {
+                    // `needs_gost()` is `false` for this backend by construction (see its
+                    // doc comment), so this arm is unreachable today. It is kept — rather
+                    // than `unreachable!()` — as a correct, non-misleading message in case
+                    // that invariant ever changes: adding `gost_engine_path` would not fix
+                    // this configuration, since `validate_gost_engine_path` below rejects
+                    // the field outright when `crypto_backend != "openssl"` (see
+                    // `Error::GostEnginePathRequiresOpenssl`). GOST via PKCS#11 is not
+                    // supported at all: the upstream `cryptoki` crate has no mechanism
+                    // variant for CKM_GOSTR3410 or any 2012-prefixed GOST mechanism (see
+                    // `crate::token::pkcs11::mechanism`, "OPEN QUESTION (cryptoki <= 0.7)").
+                    "a GOST signature algorithm is allowed in \
+                     trust.allowed_signature_algorithms, but crypto_backend is not \
+                     \"openssl\": GOST is not supported outside the OpenSSL backend at all. \
+                     Adding gost_engine_path will not fix this — it is rejected outright \
+                     when crypto_backend != \"openssl\". Either remove the GOST OID(s) from \
+                     allowed_signature_algorithms, or switch to crypto_backend = \"openssl\" \
+                     (with mode = \"pkcs12\" and gost_engine_path set)."
+                        .to_owned()
+                }
+            };
+            return Err(Error::ConfigInvalid { reason });
         }
         Ok(validated)
     }
