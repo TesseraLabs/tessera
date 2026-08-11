@@ -1,0 +1,322 @@
+suite: issuer-request
+description: Сторона запрашивающего — генерация ключа, запрос, приём, раскладка
+setup: [install-package, deploy-fixtures, deploy-issuer]
+
+# Кейсы делятся на три группы по стенду, и подмена одной группы другой
+# обесценивает проверку:
+#   REQ-0xx — программный ключ, идёт где угодно, включая контейнер;
+#   REQ-1xx — живой активный/пассивный токен (requires: hardware-token);
+#   REQ-2xx — подставной модуль-обманщик, который специально врёт об атрибутах.
+# SoftHSM в реестре не участвует: он честен, и кейс на нём зеленел бы независимо
+# от того, проверяем мы атрибуты или нет.
+#
+# Рабочие файлы живут в /tmp/issuer-request и стираются в teardown.
+
+cases:
+  - id: REQ-001
+    title: Запрос с генерацией не требует отдельного файла открытого ключа
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-request && install -d -m 0700 /tmp/issuer-request
+      - run: |
+          issuer request --key-source file --key-out /tmp/issuer-request/eng.key.p8 \
+            --key-type ecdsa-p256 --subject "CN=E2E Engineer" \
+            --key-passphrase-stdin \
+            --out /tmp/issuer-request/eng.csr.pem
+        stdin: "e2e-container-passphrase"
+        expect:
+          exit_code: 0
+          stdout_matches: 'request fingerprint: [0-9a-f]{64}'
+      - expect_file:
+          path: /tmp/issuer-request/eng.key.p8
+          mode: "0600"
+      - expect_file:
+          path: /tmp/issuer-request/eng.csr.pem
+          matches: "BEGIN CERTIFICATE REQUEST"
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: REQ-002
+    title: Незашифрованного закрытого ключа на диске не остаётся
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    # Проверяется не наличие пароля в заголовке, а невозможность прочитать ключ
+    # без него: заголовок можно написать и над открытым ключом.
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-request && install -d -m 0700 /tmp/issuer-request
+          issuer request --key-source file --key-out /tmp/issuer-request/eng.key.p8 \
+            --key-type ecdsa-p256 --subject "CN=E2E Engineer" \
+            --key-passphrase-stdin --out /tmp/issuer-request/eng.csr.pem <<'EOF'
+          e2e-container-passphrase
+          EOF
+      - run: |
+          openssl pkey -in /tmp/issuer-request/eng.key.p8 -inform DER -noout -passin pass:
+        expect:
+          exit_code: 1
+      - run: grep -c "PRIVATE KEY" /tmp/issuer-request/eng.key.p8
+        expect:
+          exit_code: 1
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: REQ-003
+    title: Поданный чужой открытый ключ отвергается до подписи запроса
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-request && install -d -m 0700 /tmp/issuer-request
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-request/other.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-request/other.key.pem -pubout \
+            -out /tmp/issuer-request/other.spki.pem 2>/dev/null
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-request/signing.key.pem 2>/dev/null
+      - run: |
+          issuer request --backend file --key-file /tmp/issuer-request/signing.key.pem \
+            --spki /tmp/issuer-request/other.spki.pem \
+            --subject "CN=E2E Engineer" --out /tmp/issuer-request/eng.csr.pem
+        expect:
+          exit_code: 1
+          stderr_matches: 'supplied public key does not belong to the signing key'
+      - expect_file:
+          path: /tmp/issuer-request/eng.csr.pem
+          exists: false
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: REQ-004
+    title: Имя csr работает и предупреждает об устаревании
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    steps:
+      - run: |
+          rm -rf /tmp/issuer-request && install -d -m 0700 /tmp/issuer-request
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+            -out /tmp/issuer-request/signing.key.pem 2>/dev/null
+          openssl pkey -in /tmp/issuer-request/signing.key.pem -pubout \
+            -out /tmp/issuer-request/signing.spki.pem 2>/dev/null
+      - run: |
+          issuer csr --backend file --key-file /tmp/issuer-request/signing.key.pem \
+            --spki /tmp/issuer-request/signing.spki.pem \
+            --subject "CN=E2E Engineer" --out /tmp/issuer-request/eng.csr.pem
+        expect:
+          exit_code: 0
+          stderr_matches: '`csr` is deprecated; use `issuer request`'
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: ACC-001
+    title: Приём печатает вердикт по каждой проверке отдельной строкой
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    # Шесть строк, а не сводная плашка: когда падает одна из шести, человеку
+    # нужно знать какая.
+    steps:
+      - run: helpers/issuer-request-fixture.sh prepare /tmp/issuer-request
+      - run: |
+          issuer accept --cert /tmp/issuer-request/leaf.crt.pem \
+            --chain /tmp/issuer-request/chain.pem \
+            --roots /tmp/issuer-request/root.crt.pem \
+            --key-file /tmp/issuer-request/eng.key.p8 --key-passphrase-stdin
+        stdin: "e2e-container-passphrase"
+        expect:
+          exit_code: 0
+          stdout_matches: 'key match: pass'
+      - run: |
+          issuer accept --cert /tmp/issuer-request/leaf.crt.pem \
+            --chain /tmp/issuer-request/chain.pem \
+            --roots /tmp/issuer-request/root.crt.pem \
+            --key-file /tmp/issuer-request/eng.key.p8 --key-passphrase-stdin
+        stdin: "e2e-container-passphrase"
+        expect:
+          exit_code: 0
+          stdout_matches: 'host binding: shown, not checked'
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: ACC-002
+    title: Несходящаяся цепочка прерывает приём и ничего не пишет на носитель
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    steps:
+      - run: helpers/issuer-request-fixture.sh prepare-foreign-root /tmp/issuer-request
+      - run: |
+          issuer accept --cert /tmp/issuer-request/leaf.crt.pem \
+            --chain /tmp/issuer-request/chain.pem \
+            --roots /tmp/issuer-request/foreign-root.crt.pem \
+            --key-file /tmp/issuer-request/eng.key.p8 --key-passphrase-stdin \
+            --place-media /tmp/issuer-request/media
+        stdin: "e2e-container-passphrase"
+        expect:
+          exit_code: 1
+          stdout_matches: 'chain: fail'
+      - expect_file:
+          path: /tmp/issuer-request/media/certs/user.p12
+          exists: false
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: ACC-003
+    title: Заданная ожидаемая привязка превращает показ в проверку
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    steps:
+      - run: helpers/issuer-request-fixture.sh prepare /tmp/issuer-request
+      - run: |
+          issuer accept --cert /tmp/issuer-request/leaf.crt.pem \
+            --chain /tmp/issuer-request/chain.pem \
+            --roots /tmp/issuer-request/root.crt.pem \
+            --key-file /tmp/issuer-request/eng.key.p8 --key-passphrase-stdin \
+            --expect-host-binding "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        stdin: "e2e-container-passphrase"
+        expect:
+          exit_code: 1
+          stdout_matches: 'host binding: fail'
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: REQ-101
+    title: Ключ на активном токене неизвлекаем и никогда не был извлекаемым
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: [hardware-token]
+    # Живое железо обязательно: SoftHSM отдаёт NEVER_EXTRACTABLE по своей
+    # внутренней модели, а вопрос стоит о вендорской библиотеке.
+    steps:
+      - run: |
+          issuer request --key-source token --module {{pkcs11_module}} \
+            --token-label {{token_label}} --key-label e2e-request \
+            --key-id 0e2e --key-type ecdsa-p256 \
+            --subject "CN=E2E Engineer" --pin-stdin \
+            --out /tmp/issuer-request/token.csr.pem
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stdout_matches: 'CKA_NEVER_EXTRACTABLE: true'
+      - run: |
+          issuer request --key-source token --module {{pkcs11_module}} \
+            --token-label {{token_label}} --key-label e2e-request \
+            --key-id 0e2e --key-type ecdsa-p256 \
+            --subject "CN=E2E Engineer" --pin-stdin \
+            --out /tmp/issuer-request/token2.csr.pem
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 1
+          stderr_matches: 'a key with this id or label already exists'
+    teardown:
+      - run: helpers/issuer-request-fixture.sh drop-token-key e2e-request
+
+  - id: REQ-102
+    title: Значение закрытого ключа с активного токена не читается
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: [hardware-token]
+    steps:
+      - run: |
+          issuer request --key-source token --module {{pkcs11_module}} \
+            --token-label {{token_label}} --key-label e2e-probe \
+            --key-id 0e2f --key-type ecdsa-p256 \
+            --subject "CN=E2E Engineer" --pin-stdin \
+            --out /tmp/issuer-request/probe.csr.pem
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stdout_matches: 'extraction probe: refused'
+    teardown:
+      - run: helpers/issuer-request-fixture.sh drop-token-key e2e-probe
+
+  - id: REQ-103
+    title: Пассивный токен отвергается как пригодный только под носитель
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: [hardware-token]
+    steps:
+      - run: |
+          issuer request --key-source token --module {{pkcs11_module}} \
+            --token-label {{passive_token_label}} --key-label e2e-passive \
+            --key-id 0e30 --key-type ecdsa-p256 \
+            --subject "CN=E2E Engineer" --pin-stdin \
+            --out /tmp/issuer-request/passive.csr.pem
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 1
+          stderr_matches: 'device cannot generate keys; usable only as a container carrier'
+    teardown: []
+
+  - id: PLC-101
+    title: Сертификат ложится на активный токен с идентификатором ключа
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: [hardware-token]
+    steps:
+      - run: helpers/issuer-request-fixture.sh prepare-token /tmp/issuer-request
+      - run: |
+          issuer accept --cert /tmp/issuer-request/leaf.crt.pem \
+            --chain /tmp/issuer-request/chain.pem \
+            --roots /tmp/issuer-request/root.crt.pem \
+            --key-source token --module {{pkcs11_module}} \
+            --token-label {{token_label}} --key-id 0e2e --pin-stdin \
+            --place-token
+        stdin: "{{pin}}"
+        expect:
+          exit_code: 0
+          stdout_matches: 'certificate written and read back'
+    teardown:
+      - run: helpers/issuer-request-fixture.sh drop-token-key e2e-request
+
+  - id: REQ-201
+    title: Провайдер, проигнорировавший шаблон, отвергается
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    steps:
+      - run: |
+          TESSERA_PKCS11_LIAR_MODE=ignores-template \
+          issuer request --key-source token --module {{liar_module}} \
+            --key-label liar --key-id 0001 --key-type ecdsa-p256 \
+            --subject "CN=E2E Engineer" --pin-stdin \
+            --out /tmp/issuer-request/liar.csr.pem
+        stdin: "0000"
+        expect:
+          exit_code: 1
+          stderr_matches: 'CKA_EXTRACTABLE: requested false, device reports true'
+      - expect_file:
+          path: /tmp/issuer-request/liar.csr.pem
+          exists: false
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: REQ-202
+    title: Провайдер, отдающий закрытый ключ вопреки атрибутам, отвергается
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    steps:
+      - run: |
+          TESSERA_PKCS11_LIAR_MODE=leaks \
+          issuer request --key-source token --module {{liar_module}} \
+            --key-label liar --key-id 0001 --key-type ecdsa-p256 \
+            --subject "CN=E2E Engineer" --pin-stdin \
+            --out /tmp/issuer-request/liar.csr.pem
+        stdin: "0000"
+        expect:
+          exit_code: 1
+          stderr_matches: 'extraction probe succeeded: the device released the private key'
+    teardown:
+      - run: rm -rf /tmp/issuer-request
+
+  - id: REQ-203
+    title: Не возвращённый устройством атрибут — отказ, а не FALSE
+    requirement: openspec/specs/issuance-request/spec.md
+    requires: []
+    steps:
+      - run: |
+          TESSERA_PKCS11_LIAR_MODE=attributes-absent \
+          issuer request --key-source token --module {{liar_module}} \
+            --key-label liar --key-id 0001 --key-type ecdsa-p256 \
+            --subject "CN=E2E Engineer" --pin-stdin \
+            --out /tmp/issuer-request/liar.csr.pem
+        stdin: "0000"
+        expect:
+          exit_code: 1
+          stderr_matches: 'CKA_EXTRACTABLE: device returned no value'
+    teardown:
+      - run: rm -rf /tmp/issuer-request
