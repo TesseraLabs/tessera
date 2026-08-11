@@ -1,30 +1,36 @@
 //! GOST digest helpers.
 //!
-//! Resolves Streebog-256 / Streebog-512 [`MessageDigest`] handles via NIDs
-//! registered by gost-engine after [`super::engine::ensure_loaded`] succeeds.
+//! Resolves Streebog-256 / Streebog-512 [`MessageDigest`] handles by name
+//! (`EVP_get_digestbyname`, via the safe [`MessageDigest::from_name`]),
+//! once [`super::engine::ensure_loaded`] has pinned gost-engine as the
+//! implementation behind them.
 //!
-//! See [`super::engine`] for the current implementation status — while the
-//! engine is stubbed, every helper here returns
-//! [`GostEngineError::NotAvailable`] (engine not loaded) or
-//! [`GostEngineError::DigestUnavailable`] (NID could not be resolved
-//! despite the engine claiming to be loaded — never reached by the stub).
+//! `id-GostR3411-2012-256` / `id-GostR3411-2012-512` (Streebog-256/512)
+//! **are** genuine static entries in libcrypto's built-in object table
+//! (OpenSSL ≥ 1.1.0: `NID_id_GostR3411_2012_256` = 982,
+//! `NID_id_GostR3411_2012_512` = 983, per `obj_mac.h`), each with a stable
+//! NID/SN (`md_gost12_256`/`md_gost12_512`)/LN baked in at compile time —
+//! gost-engine supplies the *implementation* behind these NIDs, it does not
+//! register the OID/name itself. A hardcoded NID literal would therefore
+//! not actually be unstable; this module still resolves by name rather
+//! than NID because that's more robust and self-documenting than
+//! duplicating the same OID as a second, hand-maintained integer that has
+//! to be kept in sync by hand — which is literally how an earlier version
+//! of this module ended up with the wrong NIDs (1177/1178, which are in
+//! fact Kuznyechik-cipher NIDs, unrelated to Streebog).
 
 use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
 
 use crate::x509::SignatureAlg;
 
 use super::engine;
 use super::errors::GostEngineError;
 
-/// NID assigned by gost-engine for `id-tc26-gost3411-12-256` (Streebog-256).
-///
-/// gost-engine registers digests by name (`md_gost12_256`) at load time;
-/// the OBJ table maps that name to the OID `1.2.643.7.1.1.2.2`.  We rely
-/// on `MessageDigest::from_name` (via `EVP_get_digestbyname`) rather than
-/// a hard-coded NID to avoid depending on the engine's internal numbering.
+/// libcrypto's static short name (SN) for `id-GostR3411-2012-256`
+/// (Streebog-256), NID 982; the OID is `1.2.643.7.1.1.2.2`.
 const GOST_2012_256_NAME: &str = "md_gost12_256";
-/// NID name for `id-tc26-gost3411-12-512` (Streebog-512).
+/// libcrypto's static SN for `id-GostR3411-2012-512` (Streebog-512),
+/// NID 983; the OID is `1.2.643.7.1.1.2.3`.
 const GOST_2012_512_NAME: &str = "md_gost12_512";
 
 /// Returns the [`MessageDigest`] for Streebog-256.
@@ -35,7 +41,7 @@ const GOST_2012_512_NAME: &str = "md_gost12_512";
 ///   [`engine::is_available`] is `false`).  This includes the current
 ///   stub-mode where the engine is never loaded.
 /// * [`GostEngineError::DigestUnavailable`] if the engine claims to be
-///   loaded but the NID lookup still fails.
+///   loaded but the name lookup still fails.
 pub fn gost_2012_256_md() -> Result<MessageDigest, GostEngineError> {
     digest_by_name(GOST_2012_256_NAME)
 }
@@ -81,29 +87,12 @@ fn digest_by_name(name: &'static str) -> Result<MessageDigest, GostEngineError> 
             "engine not pinned; cannot resolve digest {name}"
         )));
     }
-    // Even if the engine is "available" by our flag, the NID lookup can
-    // still fail (engine deregistered, build mismatch, etc.).
-    let nid = Nid::from_raw(nid_from_name(name)?);
-    MessageDigest::from_nid(nid).ok_or_else(|| GostEngineError::digest_unavailable(name))
-}
-
-/// Resolves an EVP digest name to a libcrypto NID via the safe surface of
-/// the openssl crate.  We can't call `EVP_get_digestbyname` directly
-/// without unsafe code, so we walk the well-known OIDs registered by
-/// gost-engine.
-fn nid_from_name(name: &'static str) -> Result<i32, GostEngineError> {
-    // These NIDs are stable in libcrypto's `obj_mac.h` for the GOST OIDs
-    // even though the digest registration only becomes active once
-    // gost-engine is loaded.
-    match name {
-        // 1.2.643.7.1.1.2.2 — id-tc26-gost3411-12-256
-        // The libcrypto-builtin NID for the OID; engine-loaded digests
-        // share the same NID.
-        GOST_2012_256_NAME => Ok(1177),
-        // 1.2.643.7.1.1.2.3 — id-tc26-gost3411-12-512
-        GOST_2012_512_NAME => Ok(1178),
-        _ => Err(GostEngineError::digest_unavailable(name)),
-    }
+    // Even if the engine is "available" by our flag, the name lookup can
+    // still fail (engine deregistered, build mismatch, etc.). Resolved by
+    // name (`EVP_get_digestbyname`) rather than by a hardcoded NID literal
+    // purely for maintainability — see the module doc for why a literal
+    // isn't actually unstable but is still worth avoiding.
+    MessageDigest::from_name(name).ok_or_else(|| GostEngineError::digest_unavailable(name))
 }
 
 #[cfg(test)]
