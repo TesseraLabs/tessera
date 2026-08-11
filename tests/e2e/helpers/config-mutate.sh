@@ -15,6 +15,15 @@ set -euo pipefail
 
 CONFIG=/etc/tessera/config.toml
 ORIGINAL=/var/lib/tessera/e2e-config.orig
+# Файл, который существует и читается, но движком не является. Нужен, чтобы
+# отделить отказ ЗАГРУЗКИ движка от отказа ВАЛИДАЦИИ пути: несуществующий путь
+# отвергает `validate_gost_engine_path` ещё при разборе конфига, и startup-check
+# до ГОСТ-шага не доходит вовсе. Лежит рядом с эталоном конфига, чтобы `restore`
+# убирал оба одним местом.
+NOT_AN_ENGINE=/var/lib/tessera/e2e-not-an-engine.so
+# ГОСТ Р 34.10-2012-256. Точечный OID, а не имя: кейс проверяет ГОСТ-шаг
+# startup-check, а не разбор имён allow-list'а.
+GOST_OID='1.2.643.7.1.1.3.2'
 # Живой конфиг не переписывается на месте: перенаправление усекает файл ДО того,
 # как отработает awk, и упавший awk или прерванный прогон оставили бы на
 # неодноразовой машине пустой /etc/tessera/config.toml — состояние, из которого
@@ -65,6 +74,11 @@ config-mutate.sh <операция>
 
   usb-allow-foreign    в списке разрешённых устройств — чужой VID:PID
   usb-allow-actual     в списке разрешённых устройств — VID:PID эмулятора
+
+  gost-engine-unused   путь к движку задан, ГОСТ-подписи не разрешены
+  gost-engine-broken   ГОСТ разрешён, путь ведёт на существующий не-движок
+  gost-engine-real     ГОСТ разрешён, путь ведёт на настоящий gost-engine
+  gost-without-path    ГОСТ разрешён, gost_engine_path отсутствует
 
   restore              вернуть исходный конфиг
 EOF
@@ -120,6 +134,22 @@ replace_host_identity() {
 append_section() {
     save_original
     { cat "$ORIGINAL"; printf '\n%s\n' "$1"; } > "$STAGING"
+    commit_config
+}
+
+# Ключ верхнего уровня И замена значения ключа за ОДИН проход.
+#
+# Последовательные вызовы `insert_top_level` + `replace_key` здесь не работают:
+# каждая из этих функций читает эталон, а не текущий конфиг, поэтому вторая
+# молча отменяет первую. ГОСТ-кейсам нужны обе правки сразу — путь к движку
+# и allow-list задают разные половины одной проверяемой конфигурации.
+insert_top_level_and_replace_key() {
+    save_original
+    awk -v inserted_line="$1" -v key="$2" -v replacement="$3" '
+        /^\[/ && !inserted { print inserted_line; inserted = 1 }
+        $0 ~ key          { print replacement; next }
+        { print }
+    ' "$ORIGINAL" > "$STAGING"
     commit_config
 }
 
@@ -208,6 +238,58 @@ on_failure = "warn"' ;;
     usb-allow-foreign)  insert_top_level 'usb_allowed_devices = ["ffff:ffff"]' ;;
     usb-allow-actual)   insert_top_level 'usb_allowed_devices = ["0951:1666"]' ;;
 
+    # ГОСТ. Базовый конфиг прогона идёт с пустым allow-list и без пути к
+    # движку, поэтому каждая операция добавляет ровно то, что проверяет кейс.
+    gost-engine-unused)
+        # Путь есть, ГОСТ-подписи не разрешены: движок не будет загружен
+        # никогда. Файл обязан существовать — иначе конфиг отвергнет валидатор,
+        # и кейс проверял бы валидацию пути вместо мёртвой конфигурации.
+        install -m 0644 /dev/null "$NOT_AN_ENGINE"
+        insert_top_level "gost_engine_path = \"$NOT_AN_ENGINE\""
+        ;;
+    gost-engine-broken)
+        # ГОСТ разрешён и путь ведёт на существующий не-движок: конфигурация
+        # непротиворечива, отказ приходит с попытки загрузки.
+        printf 'not a shared object\n' > "$NOT_AN_ENGINE"
+        chmod 0644 "$NOT_AN_ENGINE"
+        insert_top_level_and_replace_key \
+            "gost_engine_path = \"$NOT_AN_ENGINE\"" \
+            '^allowed_signature_algorithms = ' \
+            "allowed_signature_algorithms = [\"$GOST_OID\"]"
+        ;;
+    gost-engine-real)
+        # Настоящий движок. Путь не зашивается: каталог движков отличается
+        # между сборками OpenSSL, и зашитый путь превратил бы кейс про загрузку
+        # в кейс про совпадение путей. Кейс объявляет `requires: [gost-engine]`,
+        # поэтому здесь движок обязан найтись — его отсутствие означает
+        # неверно объявленную возможность профиля, то есть сломанный стенд.
+        # `|| true`: под `set -e` присваивание из подстановки роняет скрипт
+        # чужим кодом возврата, а стенд обязан сообщать о своей поломке
+        # кодом 64 — профиль перечисляет его в error_exit_codes и отличает
+        # ERROR (сломан стенд) от FAIL (сломан продукт).
+        engines_dir="$(openssl version -e 2>/dev/null | sed -n 's/^ENGINESDIR: *"\(.*\)"$/\1/p')" || true
+        engine=""
+        for candidate in "${engines_dir:-/nonexistent}/gost.so" \
+                         /usr/lib/*/engines-3/gost.so \
+                         /usr/lib/*/engines-1.1/gost.so; do
+            [ -f "$candidate" ] || continue
+            engine="$candidate"
+            break
+        done
+        if [ -z "$engine" ]; then
+            echo "config-mutate.sh: gost-engine не найден, а профиль объявил его наличие" >&2
+            exit 64
+        fi
+        insert_top_level_and_replace_key \
+            "gost_engine_path = \"$engine\"" \
+            '^allowed_signature_algorithms = ' \
+            "allowed_signature_algorithms = [\"$GOST_OID\"]"
+        ;;
+    gost-without-path)
+        replace_key '^allowed_signature_algorithms = ' \
+            "allowed_signature_algorithms = [\"$GOST_OID\"]"
+        ;;
+
     restore)
         # Идемпотентность: teardown выполняется и там, где порчи не было.
         if [ -f "$ORIGINAL" ]; then
@@ -215,6 +297,7 @@ on_failure = "warn"' ;;
             commit_config
             rm -f "$ORIGINAL"
         fi
+        rm -f "$NOT_AN_ENGINE"
         ;;
     *) usage ;;
 esac
