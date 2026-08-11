@@ -9,8 +9,8 @@ use tracing::warn;
 /// Run structural and crypto-readiness self-checks.
 ///
 /// In addition to the Stage-1 PEM/CRL/hook/ACL checks, this also performs
-/// a fail-closed gost-engine probe when the active configuration whitelists
-/// GOST signature OIDs.  The engine is loaded once per process and the
+/// a fail-closed gost-engine probe when the active configuration has a
+/// `gost_engine_path` configured.  The engine is loaded once per process and the
 /// required digest NIDs are resolved; any failure surfaces as
 /// [`SelfCheckError::GostEngineUnavailable`] so that the caller can refuse
 /// authentication outright rather than silently downgrade to a non-GOST
@@ -51,7 +51,8 @@ pub fn self_check(cfg: &ValidatedConfig) -> Result<(), SelfCheckError> {
     if matches!(cfg.mode, Mode::Pkcs11) {
         self_check_pkcs11(cfg)?;
     }
-    if cfg.needs_gost() {
+    let gost_engine_configured = cfg.gost_engine_path.is_some();
+    if gost_engine_configured {
         gost::engine::ensure_loaded(cfg)?;
         // Probe the digest NIDs as well; a misconfigured engine that
         // claims to load but doesn't register Streebog should fail
