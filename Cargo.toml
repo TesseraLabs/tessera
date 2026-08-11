@@ -10,11 +10,13 @@ members = [
     "crates/tessera_cp",
     "crates/tessera_win_service",
     "crates/tessera_test_plugin",
+    "crates/tessera_pkcs11_liar",
     "crates/xtask",
 ]
-# Раннер e2e — инструмент разработчика: он не собирается и не тестируется
-# обычными `cargo build` / `cargo test` без явного `-p xtask`, поэтому не
-# удлиняет ни сборку пакета, ни прогон unit-тестов продукта.
+# Раннер e2e и подставной PKCS#11-модуль — инструменты разработчика: они не
+# собираются и не тестируются обычными `cargo build` / `cargo test` без явного
+# `-p xtask` / `-p tessera_pkcs11_liar`, поэтому не удлиняют ни сборку пакета,
+# ни прогон unit-тестов продукта.
 default-members = [
     "crates/tessera_core",
     "crates/tessera_ext",

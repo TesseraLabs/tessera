@@ -2777,6 +2777,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera_pkcs11_liar"
+version = "0.5.0"
+dependencies = [
+ "cryptoki-sys",
+ "p256",
+]
+
+[[package]]
 name = "tessera_proto"
 version = "0.5.0"
 dependencies = [

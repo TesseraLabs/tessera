@@ -212,11 +212,25 @@ jobs:
              target/debug/tessera_backend_fixture.so
           echo "TESSERA_TEST_PLUGIN=$GITHUB_WORKSPACE/target/debug/tessera_backend_fixture.so" >> "$GITHUB_ENV"
 
+      - name: Build dishonest PKCS#11 module fixture
+        run: |
+          cargo build -p tessera_pkcs11_liar
+          echo "TESSERA_TEST_PKCS11_LIAR=$GITHUB_WORKSPACE/target/debug/libtessera_pkcs11_liar.so" >> "$GITHUB_ENV"
+
       - name: Run tests (regression guard)
         env:
           RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
         run: ${{ matrix.target.test_cmd }}
+
+      # The dishonest module needs no hardware, so unlike the rest of
+      # `pkcs11-tests` this one really runs here; without it the fixture would
+      # be built by CI and never called.
+      - name: Run tests against the dishonest PKCS#11 module
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: cargo test -p tessera_issuer --features pkcs11-tests --test pkcs11_liar
 
       - name: Build .deb
         env:

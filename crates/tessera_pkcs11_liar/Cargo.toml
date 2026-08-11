@@ -1,0 +1,39 @@
+[package]
+name = "tessera_pkcs11_liar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "A deliberately dishonest PKCS#11 module: accepts a template and reports different attributes. Test fixture for the issuer's attribute read-back and extraction probe."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The raw CK_* types and the CK_FUNCTION_LIST layout. Same version cryptoki 0.12
+# links against, so the two agree on the ABI.
+cryptoki-sys = "0.5"
+# The liar signs honestly: a request built against it must be a real PKCS#10 an
+# issuer can verify. Only the attribute answers are false.
+p256 = { workspace = true, features = ["ecdsa"] }
+
+[lints.rust]
+missing_docs = "deny"
+unused_must_use = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+# A PKCS#11 module is a C ABI surface; unsafe is the point of the crate.
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"
