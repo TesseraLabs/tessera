@@ -253,8 +253,15 @@ sudo systemctl reload tessera
 ### 5.2 Что проверить
 
 ```bash
+sudo tessera check
+# Основная проверка: использует тот же код-путь загрузки движка, что и
+# реальная аутентификация. Ожидание: [INFO] gost_engine_ok. При
+# [ERROR] gost_engine_load_failed — см. troubleshooting.md §10.
 openssl engine gost -t
-# Сразу после обновления должен показывать [ available ].
+# Разовая проверка в отдельном процессе — не воспроизводит гонку с
+# ambient-регистрацией, возможную в долгоживущих процессах (fly-dm);
+# полагаться только на неё недостаточно. Сразу после обновления должен
+# показывать [ available ].
 pamtester sudo alice authenticate
 # Smoke-тест аутентификации после обновления.
 ```

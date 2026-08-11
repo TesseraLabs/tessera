@@ -255,8 +255,15 @@ After `apt upgrade`, when the logs indicate an update of the
 ### 5.2 What to check
 
 ```bash
+sudo tessera check
+# Primary check: exercises the same engine-load code path a real
+# authentication does. Expect [INFO] gost_engine_ok. On
+# [ERROR] gost_engine_load_failed, see troubleshooting.md §10.
 openssl engine gost -t
-# Right after the update it should show [ available ].
+# A one-shot check in a separate process — doesn't reproduce the
+# ambient-registration race possible in long-lived processes (fly-dm);
+# don't rely on it alone. Right after the update it should show
+# [ available ].
 pamtester sudo alice authenticate
 # An authentication smoke test after the update.
 ```

@@ -843,3 +843,55 @@ sudo apt install --reinstall gost-engine
 sudo systemctl restart pcscd
 openssl engine gost -t
 ```
+
+### `gost_engine_load_failed` / `ENGINE_ctrl_cmd_string sequence (...) failed`
+
+**Symptom:** `sudo tessera check` prints `[ERROR] gost_engine_load_failed:
+... ENGINE_ctrl_cmd_string sequence (SO_PATH=1, ID=1, LOAD=0) failed for
+<path>`, while a one-shot `openssl engine gost -t` in a separate process
+shows `[ available ]` with no issue. Most often this is a long-lived
+process — typically `fly-dm`, not `sudo`/`pamtester` (each of those is a
+separate process per login attempt).
+
+**Cause.** Astra auto-registers the `gost` engine at first contact with
+libcrypto in a process by default (`/etc/ssl/openssl.cnf`,
+`[engine_section]` → `default_algorithms = ALL`). `gost-engine` itself
+keeps a process-global guard (`ameth_GostR3410_2001` in its `gost_eng.c`)
+that gets set on first successful initialization and is never cleared by
+its own destructor. If the ambient registration touches libcrypto before
+`tessera` gets to load the engine itself, the engine has already been
+initialized once in that process — reinitializing it in the same process
+is then structurally impossible, and no OpenSSL ENGINE API call can work
+around it.
+
+**What's already fixed.** `self_check` loads the engine purely on the
+fact that `gost_engine_path` is configured (rather than on a GOST OID
+being whitelisted), which makes `tessera`'s own load the first thing to
+touch libcrypto in the process at all — Astra's ambient registration no
+longer gets a chance to run first. If the error still reproduces on a
+current version, that's a signal that something else in the same PAM
+stack is touching libcrypto before `pam_tessera` runs (an unusual stack,
+a third-party PAM module, etc.) — that's what needs investigating, not
+the engine itself.
+
+**Recommendation (not required, but removes one moving part):** disable
+`default_algorithms = ALL` in `[gost_section]` of `/etc/ssl/openssl.cnf`
+— then the ambient registration never happens at all, and the only
+initialization attempt for `gost-engine` in the process is the one
+`tessera` itself makes.
+
+### `tessera check` diagnostics
+
+`sudo tessera check` is the primary GOST-configuration diagnostic tool;
+unlike a one-shot `openssl engine gost -t`, it performs the same engine
+load that a real authentication does. Four possible records:
+
+| Record                          | Level | Meaning                                                                 |
+|----------------------------------|-------|---------------------------------------------------------------------------|
+| `gost_engine_ok`                 | INFO  | `gost_engine_path` is set, a GOST algorithm is whitelisted, the engine loaded successfully. |
+| `gost_pkcs11_unsupported`        | WARN  | `mode = "pkcs11"` with a GOST algorithm allowed: GOST via a PKCS#11 token isn't supported (`cryptoki` <= 0.7 has no mechanism variant for `CKM_GOSTR3410`/2012). |
+| `gost_engine_configured_unused`  | WARN  | `gost_engine_path` is set but no GOST OID is present in `allowed_signature_algorithms` — the engine will never be loaded. Likely a dead configuration left behind after trimming the whitelist. |
+| `gost_engine_load_failed`        | ERROR | Configuration is otherwise correct, but the actual engine load failed — see the race condition above. GOST-certificate authentication will fail closed until this is fixed. |
+
+If `gost_engine_path` isn't set and GOST isn't whitelisted, `tessera
+check` prints nothing for GOST at all: the host simply doesn't use it.

@@ -51,7 +51,7 @@ the example really validates through `ValidatedConfig::try_from`.
 | `pkcs11_allow_unreported_extractable` | boolean | `false`     | `true`, `false`                                                | Whether to accept a key for which the token did not report `CKA_EXTRACTABLE`. | `false` (default) — reject (fail-closed): non-extractability is unproven, and a silent provider is not the same as `FALSE`. `true` — only `pkcs11_extractable_attribute_unavailable` WARN carrying the reason (`sensitive`, `type_invalid`, `unavailable`, `available_but_not_returned` — the provider said the value was readable and still withheld it, `probe_failed` — the follow-up query itself failed); enable when the token vendor confirms the keys are non-extractable and the attribute is withheld by the module's design. Keys that openly report themselves as extractable are NOT covered by this key. |
 | `pkcs12_path_pattern`      | string             | `"certs/user.p12"` | path relative to the USB mountpoint, optional `${user}` | Where to look for the `.p12` on the USB media (supports `${user}`). | Relative path only; `..`/`.` segments and absolute paths are rejected by the validator. |
 | `pkcs12_pin_prompt`        | string             | `"Smart-card PIN: "` | UTF-8, non-empty, `≤ 128` bytes                     | Prompt text for the `.p12` password.                         | UX localization.                                                                    |
-| `gost_engine_path`         | path               | `None`      | absolute path to a `.so`                                       | Explicit path to `gost-engine`; required when OpenSSL allows GOST signatures. | Implicit `OPENSSL_ENGINES` lookup is rejected; the file and every ancestor must be root-controlled. |
+| `gost_engine_path`         | path               | `None`      | absolute path to a `.so`                                       | Explicit path to `gost-engine`; required when OpenSSL allows GOST signatures (its process lifecycle is below). | Implicit `OPENSSL_ENGINES` lookup is rejected; the file and every ancestor must be root-controlled. |
 | `usb_wait_seconds`         | integer            | `10`        | `0..=300`                                                      | How many seconds to wait for the USB media.                  | UX. At `0` — fail-fast.                                                              |
 | `usb_allowed_devices`      | array of strings   | `[]`        | `"vid:pid"` strings, 4 hex digits each (lsusb format), e.g. `["0951:1666"]` | Allow-list of USB devices treated as `.p12` media; empty/absent = any USB block device. | Hygiene against accidental/foreign flash drives, NOT a trust boundary: VID/PID are forgeable, trust comes only from decrypting the `.p12` + chain validation. |
 | `max_usb_partitions`       | integer            | `8`         | `1..=64`                                                       | Maximum number of partitions scanned when searching for the `.p12`. | DoS protection: a physical attacker cannot force a huge number of mount/umount operations. |
@@ -100,6 +100,35 @@ keeping the module resident costs nothing. Under `fly-dm` the display slave
 serves every login attempt for the machine's uptime — there one context per
 process is the goal: a second `C_Initialize` against a live library is at best
 rejected by the provider and at worst kills the process.
+
+#### `gost-engine`'s process lifecycle
+
+`gost-engine` also initializes at most once per process, but more
+strictly than a PKCS#11 module: there's no equivalent of a repeat
+`C_Initialize`. The engine itself keeps a process-global guard
+(`ameth_GostR3410_2001` in its `gost_eng.c`) that gets set on first
+successful initialization and is never cleared by its own destructor. If
+something in the process — for example Astra's own auto-registration via
+`default_algorithms = ALL` in `/etc/ssl/openssl.cnf` — touches libcrypto
+and thereby initializes `gost-engine` before `tessera` does, a second
+initialization in that same process becomes structurally impossible: the
+`ENGINE_ctrl_cmd_string` sequence (`SO_PATH=1, ID=1, LOAD=0`) fails at the
+`LOAD` step, with no way to recover within that process.
+
+That's why the engine load is wired into the earliest self-check and runs
+as soon as `gost_engine_path` is configured — this makes `tessera` the
+first thing to touch libcrypto in the process at all, ahead of any
+ambient registration. In long-lived processes like `fly-dm` (one slave
+for the display's entire uptime — see the PKCS#11 example above) this is
+the only reliable way to guarantee it; the behavior is the same across
+every startup mode regardless.
+
+Disabling `default_algorithms = ALL` in `/etc/ssl/openssl.cnf` is not
+required (`tessera` already wins the race on its own), but it removes one
+moving part if you'd rather have one fewer source of auto-registration —
+see [troubleshooting.md
+§10](troubleshooting.md#10-installation--gost-engine) for the full
+symptom and recommendation.
 
 #### Values of `on_usb_removed`
 
