@@ -289,6 +289,11 @@ fn find_in_path(names: &[&str]) -> Option<PathBuf> {
 /// walk characters, not bytes: a byte of a multi-byte character copied out
 /// through `char::from` becomes a `U+00XX` codepoint that is re-encoded as UTF-8
 /// on the way out, which is what turned Cyrillic summaries into mojibake.
+///
+/// This protects the transport, not the display: the escaping is reversible by
+/// design, and pinentry decodes `%XX` back into the raw byte before rendering
+/// it. What must not reach the operator's eyes in an active form is neutralized
+/// where the summary is rendered, in [`crate::summary`].
 fn assuan_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -296,8 +301,8 @@ fn assuan_escape(text: &str) -> String {
             '%' | '\u{00}'..='\u{1F}' | '\u{7F}' => {
                 let code = u32::from(c);
                 out.push('%');
-                out.push(hex_nibble(code >> 4));
-                out.push(hex_nibble(code & 0x0f));
+                out.push(hex_nibble((code >> 4) & 0xF));
+                out.push(hex_nibble(code & 0xF));
             }
             _ => out.push(c),
         }
@@ -306,8 +311,15 @@ fn assuan_escape(text: &str) -> String {
 }
 
 /// A single uppercase hex digit for a nibble (`0..=15`).
+///
+/// The argument is masked to four bits, so the fallback digit below is
+/// unreachable. It is kept rather than replaced by a panic because this runs on
+/// the path to a signature; what it must never do is fire silently, since a
+/// quiet `'0'` would turn the escape into `%00`, injecting the one byte that
+/// truncates the dialog text at the receiving end.
 fn hex_nibble(nibble: u32) -> char {
-    char::from_digit(nibble, 16).map_or('0', |c| c.to_ascii_uppercase())
+    debug_assert!(nibble < 16, "callers must pass a four-bit nibble");
+    char::from_digit(nibble & 0xF, 16).map_or('0', |c| c.to_ascii_uppercase())
 }
 
 /// Send one Assuan command line.
