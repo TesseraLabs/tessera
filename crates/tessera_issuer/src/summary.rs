@@ -103,8 +103,11 @@ pub struct OperationSummary {
 impl OperationSummary {
     /// Renders the summary as a multi-line block, captioned in `locale`.
     ///
-    /// Only the captions are translated; every value is reproduced verbatim, so
-    /// a Russian and an English rendering carry byte-identical data.
+    /// Only the captions are translated, so a Russian and an English rendering
+    /// carry byte-identical data. Values are reproduced verbatim except for
+    /// bidi controls, C0/C1 controls and the `U+2028`/`U+2029` separators, which
+    /// are shown as `\uXXXX` markers: a value must not be able to hide, truncate
+    /// or forge a line of the summary the operator signs against.
     #[must_use]
     pub fn render(&self, locale: Locale) -> String {
         let mut out = format!(
@@ -119,19 +122,19 @@ impl OperationSummary {
             out.push('\n');
             out.push_str(Caption::Subject.text(locale));
             out.push_str(": ");
-            out.push_str(&neutralize_bidi(&self.subject));
+            out.push_str(&neutralize_for_display(&self.subject));
             out.push('\n');
             out.push_str(Caption::Validity.text(locale));
             out.push_str(": ");
-            out.push_str(&neutralize_bidi(&self.not_before));
+            out.push_str(&neutralize_for_display(&self.not_before));
             out.push_str(" .. ");
-            out.push_str(&neutralize_bidi(&self.not_after));
+            out.push_str(&neutralize_for_display(&self.not_after));
         }
         for line in &self.lines {
             out.push_str("\n  ");
             out.push_str(line.caption.text(locale));
             out.push_str(": ");
-            out.push_str(&neutralize_bidi(&line.value));
+            out.push_str(&neutralize_for_display(&line.value));
         }
         out
     }
@@ -145,23 +148,53 @@ impl OperationSummary {
 /// the bytes that will be signed. None of them belong in a certificate subject
 /// or a scope value, so a summary must not display them raw.
 fn is_bidi_control(c: char) -> bool {
+    // The complete `Bidi_Control=Yes` set: ten codepoints, no more and no less.
+    // `ALM` is the one that hides from a category check — it is `Cf`, not `Cc`,
+    // so a control-character filter walks straight past it while it still gives
+    // neighbouring neutral characters a strong right-to-left direction.
     matches!(c,
-        '\u{200E}' | '\u{200F}'          // LRM, RLM
+        '\u{061C}'                       // ALM
+        | '\u{200E}' | '\u{200F}'        // LRM, RLM
         | '\u{202A}'..='\u{202E}'        // LRE, RLE, PDF, LRO, RLO
         | '\u{2066}'..='\u{2069}') // LRI, RLI, FSI, PDI
 }
 
-/// Replaces every bidi-control codepoint in `value` with a visible `\uXXXX`
-/// marker, so a rendered summary cannot be visually reordered to mislead the
-/// operator. The underlying [`OperationSummary`] value is untouched — this
-/// neutralizes only what is shown, not the data itself.
-fn neutralize_bidi(value: &str) -> String {
-    if !value.contains(is_bidi_control) {
+/// Whether `c` must not reach an operator surface in its active form.
+///
+/// Two ways a value can lie to the operator, one predicate. Bidi controls
+/// reorder what is displayed; the remaining codepoints hide or forge it. `NUL`
+/// terminates the C string a pinentry renderer receives, so everything after it
+/// silently vanishes from the dialog, and a line break lets a value grow a line
+/// the operator reads as another field of the summary. Line breaks in a summary
+/// belong to the renderer.
+///
+/// The set is spelled out rather than delegated to [`char::is_control`], which
+/// covers C0 and C1 but not `U+2028`/`U+2029` — those are `Zl`/`Zp`, yet line
+/// separators for a part of the renderers we feed.
+fn needs_neutralizing(c: char) -> bool {
+    is_bidi_control(c)
+        || matches!(c,
+            '\u{0000}'..='\u{001F}'      // C0 controls, including NUL and LF
+            | '\u{007F}'                 // DEL
+            | '\u{0080}'..='\u{009F}'    // C1 controls, invisible in a terminal
+            | '\u{2028}' | '\u{2029}') // line and paragraph separators
+}
+
+/// Replaces every codepoint that could hide, truncate, forge, or visually
+/// reorder a summary line with a visible `\uXXXX` marker, so what the operator
+/// reads is what the TBS carries. The underlying [`OperationSummary`] value is
+/// untouched — this neutralizes only what is shown, not the data itself.
+///
+/// One pass over one predicate: the marker is built from `\`, `u` and hex
+/// digits, none of which the predicate matches, so a neutralized value never
+/// needs a second pass.
+fn neutralize_for_display(value: &str) -> String {
+    if !value.contains(needs_neutralizing) {
         return value.to_owned();
     }
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
-        if is_bidi_control(c) {
+        if needs_neutralizing(c) {
             // A stable, operator-legible `\uXXXX` marker; the codepoint never
             // reaches the terminal or pinentry as an active control. Every
             // neutralized codepoint fits in four hex digits.
@@ -180,8 +213,15 @@ fn neutralize_bidi(value: &str) -> String {
 }
 
 /// One uppercase hex digit for a nibble (`0..=15`).
+///
+/// The argument is masked to four bits, so the fallback digit below is
+/// unreachable. It is kept rather than replaced by a panic because this runs on
+/// the path to a signature; what it must never do is fire silently, since a
+/// quiet `'0'` would complete the marker into a `\u00XX` shape carrying the very
+/// codepoint the marker exists to expose.
 fn hex_upper_nibble(nibble: u32) -> char {
-    char::from_digit(nibble, 16).map_or('0', |c| c.to_ascii_uppercase())
+    debug_assert!(nibble < 16, "callers must pass a four-bit nibble");
+    char::from_digit(nibble & 0xF, 16).map_or('0', |c| c.to_ascii_uppercase())
 }
 
 /// Why a TBS could not be turned into a summary.
@@ -658,6 +698,166 @@ mod tests {
 
         // The stored value is untouched — neutralization is display-only.
         assert!(summary.subject.contains('\u{202E}'));
+    }
+
+    /// A summary whose lines carry `value` as the single role entry.
+    fn summary_with_role(value: &str) -> OperationSummary {
+        OperationSummary {
+            kind: OperationKind::ShiftLeaf,
+            subject: "CN=ivanov".to_owned(),
+            not_before: "2020-09-13".to_owned(),
+            not_after: "2020-09-14".to_owned(),
+            lines: vec![SummaryLine {
+                caption: Caption::Roles,
+                value: value.to_owned(),
+            }],
+        }
+    }
+
+    /// Every codepoint the renderer must not display raw.
+    fn neutralized_set() -> Vec<char> {
+        let ranges = [
+            0x0000..=0x001F,
+            0x007F..=0x007F,
+            0x0080..=0x009F,
+            0x061C..=0x061C,
+            0x200E..=0x200F,
+            0x202A..=0x202E,
+            0x2028..=0x2029,
+            0x2066..=0x2069,
+        ];
+        ranges
+            .into_iter()
+            .flatten()
+            .filter_map(char::from_u32)
+            .collect()
+    }
+
+    #[test]
+    fn render_neutralizes_nul_and_keeps_the_rest_of_the_summary() {
+        // A NUL reaches pinentry as a real byte (the Assuan escaping is
+        // reversible) and terminates the C string it renders, so everything
+        // after it would silently disappear from the operator's dialog.
+        let summary = summary_with_role("root\u{0000}hidden");
+        let rendered = summary.render(Locale::En);
+
+        assert!(
+            !rendered.contains('\u{0000}'),
+            "raw NUL leaked: {rendered:?}"
+        );
+        assert!(rendered.contains("\\u0000"), "{rendered}");
+        assert!(rendered.contains("hidden"), "{rendered}");
+        // Lines that follow the role in the rendered block survive intact.
+        assert!(rendered.contains("CN=ivanov"), "{rendered}");
+        assert!(rendered.contains("2020-09-14"), "{rendered}");
+        // Display-only: the parsed summary still carries the original bytes.
+        assert!(summary.lines[0].value.contains('\u{0000}'));
+    }
+
+    #[test]
+    fn render_line_count_is_owned_by_the_renderer() {
+        let clean = summary_with_role("root").render(Locale::En);
+        for forged in [
+            "root\nRoles: admin",
+            "root\u{2028}Roles: admin",
+            "root\u{000D}Roles: admin",
+            "root\u{2029}Roles: admin",
+        ] {
+            let rendered = summary_with_role(forged).render(Locale::En);
+            assert_eq!(
+                rendered.lines().count(),
+                clean.lines().count(),
+                "value {forged:?} added a summary line: {rendered}"
+            );
+        }
+    }
+
+    /// This one has no red phase by construction: it guards against the
+    /// neutralized set *growing* — someone reaching for `char::is_control` or
+    /// "escape everything unprintable" and turning ordinary Cyrillic summaries
+    /// into a wall of markers. It never reproduced a defect and never will.
+    #[test]
+    fn render_leaves_ordinary_values_byte_for_byte() {
+        let value = "CN=Иванов И. И., O=ООО «Ромашка»; roles: oper, admin (v1) — 100%";
+        let summary = summary_with_role(value);
+        let rendered = summary.render(Locale::En);
+        assert!(rendered.contains(value), "{rendered}");
+        assert_eq!(neutralize_for_display(value), value);
+    }
+
+    #[test]
+    fn render_keeps_the_characters_bordering_the_neutralized_ranges() {
+        // The characters immediately outside each neutralized range. An
+        // off-by-one in a range bound shows up here and nowhere else: the other
+        // tests all aim at the middle of a range. Two range edges have no free
+        // neighbour and so cannot be listed — `DEL` is followed by the C1 block,
+        // and the bidi run at `U+202A` is preceded by `U+2029`.
+        //
+        // Passing here says only that a character is outside the neutralized
+        // set, not that it is harmless: the invisible `Cf` codepoints (`ZWJ`
+        // among them) and homoglyphs are deliberately out of scope, because no
+        // list of codepoints closes that class.
+        let borders = [
+            '\u{0020}', // SPACE, right after the C0 block
+            '\u{007E}', // TILDE, right before DEL
+            '\u{00A0}', // NBSP, right after the C1 block
+            '\u{061B}', // ARABIC SEMICOLON, right before ALM
+            '\u{061D}', // right after ALM
+            '\u{200D}', // ZWJ, right before LRM
+            '\u{2010}', // HYPHEN, right after RLM
+            '\u{2027}', // HYPHENATION POINT, right before U+2028
+            '\u{202F}', // NARROW NBSP, right after RLO
+            '\u{2065}', // right before LRI
+            '\u{206A}', // right after PDI
+        ];
+        for c in borders {
+            let value = c.to_string();
+            assert_eq!(
+                neutralize_for_display(&value),
+                value,
+                "border character {:#06X} was neutralized",
+                u32::from(c)
+            );
+            let rendered = summary_with_role(&value).render(Locale::En);
+            assert!(
+                rendered.contains(c),
+                "border character {:#06X} did not survive render: {rendered:?}",
+                u32::from(c)
+            );
+        }
+    }
+
+    #[test]
+    fn neutralization_marker_uses_only_hex_digits() {
+        for c in neutralized_set() {
+            let marker = neutralize_for_display(&c.to_string());
+            let digits = marker
+                .strip_prefix("\\u")
+                .unwrap_or_else(|| panic!("no marker for {:#06X}: {marker:?}", u32::from(c)));
+            assert_eq!(digits.len(), 4, "{:#06X} -> {marker:?}", u32::from(c));
+            assert!(
+                digits.chars().all(|d| matches!(d, '0'..='9' | 'A'..='F')),
+                "{:#06X} -> {marker:?}",
+                u32::from(c)
+            );
+            // The marker is built only from characters the predicate lets
+            // through, so a rendered value never needs a second pass.
+            assert!(
+                !marker.contains(needs_neutralizing),
+                "{:#06X} -> {marker:?}",
+                u32::from(c)
+            );
+        }
+    }
+
+    #[test]
+    fn render_neutralizes_c1_controls() {
+        // C1 controls are invisible in a terminal, so a value carrying one
+        // reads as clean while the byte still reaches the renderer.
+        let summary = summary_with_role("root\u{0085}admin");
+        let rendered = summary.render(Locale::En);
+        assert!(!rendered.contains('\u{0085}'), "{rendered:?}");
+        assert!(rendered.contains("\\u0085"), "{rendered}");
     }
 
     #[test]
