@@ -116,16 +116,23 @@ initialization in that same process becomes structurally impossible: the
 `LOAD` step, with no way to recover within that process.
 
 That's why the engine load is wired into the earliest self-check and runs
-as soon as `gost_engine_path` is configured — this makes `tessera` the
-first thing to touch libcrypto in the process at all, ahead of any
-ambient registration. In long-lived processes like `fly-dm` (one slave
-for the display's entire uptime — see the PKCS#11 example above) this is
-the only reliable way to guarantee it; the behavior is the same across
-every startup mode regardless.
+as soon as `gost_engine_path` is configured. This is the earliest point in
+the process `tessera` controls — not the first contact with libcrypto in
+the process, which is out of reach: the module runs inside someone else's
+process, and `sshd` uses libcrypto during key exchange long before the PAM
+stack. It narrows the window for the ambient registration rather than
+closing it. In long-lived processes like `fly-dm` (one slave for the
+display's entire uptime — see the PKCS#11 example above) that window is
+what decides whether GOST works until the service restarts.
+
+The load is also tied to the configured path rather than the whitelist
+because the engine is needed where no GOST OID is whitelisted at all: a
+GOST key inside an RSA-signed certificate, and a container protected with
+GOST-PBE.
 
 Disabling `default_algorithms = ALL` in `/etc/ssl/openssl.cnf` is not
-required (`tessera` already wins the race on its own), but it removes one
-moving part if you'd rather have one fewer source of auto-registration —
+required, but it removes one moving part if you'd rather have one fewer
+source of auto-registration —
 see [troubleshooting.md
 §10](troubleshooting.md#10-installation--gost-engine) for the full
 symptom and recommendation.

@@ -275,6 +275,47 @@ the module is integrated into. There is no alternative auth path.
 
 ## 3. monitord and daemon
 
+### `is not root-controlled` — the daemon or `tessera check` won't start
+
+**Symptom.** `tessera daemon` or `sudo tessera check` exits with a message
+like `config path /etc/tessera/config.toml is not root-controlled` or
+`gost_engine_path /opt/gost/gost.so is not root-controlled`, naming the
+specific reason: owner, mode, or a symbolic link.
+
+**Cause.** The daemon and `tessera check` now read the configuration under
+the same policy as the PAM module: the config file and every path named in it
+must be owned by root and not writable by anyone else. Previously only PAM
+enforced this, while the daemon and the preflight settled for an ordinary
+read.
+
+The reason is that both processes load the native modules named in the
+configuration into their own address space, and gost-engine additionally
+becomes the default implementation for a range of algorithms. A path some
+other user can rewrite is executable code inside a long-lived privileged
+process.
+
+**What is checked:** `config.toml` itself, trust anchors and intermediates,
+CRL files, `gost_engine_path`, and `pkcs11_module` — in every configuration
+where the module is actually loaded: under `mode = "pkcs11"`, and under
+`mode = "pkcs12"` with the `pkcs12_source = "token_object"` carrier.
+
+**What to do.**
+
+```bash
+# Find the path the message names and inspect its permissions.
+sudo ls -la /etc/tessera/config.toml
+sudo namei -l /opt/gost/gost.so   # shows the permissions of every path element
+
+# Restore the expected state: owned by root, not group- or world-writable.
+sudo chown root:root /etc/tessera/config.toml
+sudo chmod 0644 /etc/tessera/config.toml
+```
+
+The check covers the whole path, so a directory writable by someone else will
+reject an otherwise correctly-permissioned file inside it. There is no way to
+relax the check, and no need for one — it separates a sound installation from
+one where an outsider can substitute executable code.
+
 ### monitord not reachable or won't start
 
 **Symptoms (one case, two facets):**
@@ -854,31 +895,47 @@ process — typically `fly-dm`, not `sudo`/`pamtester` (each of those is a
 separate process per login attempt).
 
 **Cause.** Astra auto-registers the `gost` engine at first contact with
-libcrypto in a process by default (`/etc/ssl/openssl.cnf`,
-`[engine_section]` → `default_algorithms = ALL`). `gost-engine` itself
-keeps a process-global guard (`ameth_GostR3410_2001` in its `gost_eng.c`)
-that gets set on first successful initialization and is never cleared by
-its own destructor. If the ambient registration touches libcrypto before
-`tessera` gets to load the engine itself, the engine has already been
-initialized once in that process — reinitializing it in the same process
-is then structurally impossible, and no OpenSSL ENGINE API call can work
-around it.
+libcrypto in a process by default: `/etc/ssl/openssl.cnf` ties
+`[engine_section]` to the engine's own section with the line
+`gost = gost_section`, and the `default_algorithms = ALL` key itself lives
+in `[gost_section]`.
 
-**What's already fixed.** `self_check` loads the engine purely on the
-fact that `gost_engine_path` is configured (rather than on a GOST OID
-being whitelisted), which makes `tessera`'s own load the first thing to
-touch libcrypto in the process at all — Astra's ambient registration no
-longer gets a chance to run first. If the error still reproduces on a
-current version, that's a signal that something else in the same PAM
-stack is touching libcrypto before `pam_tessera` runs (an unusual stack,
-a third-party PAM module, etc.) — that's what needs investigating, not
-the engine itself.
+`gost-engine` keeps a process-global guard of its own — the static
+`ameth_GostR3410_2001` in `gost_eng.c`. Its `check_gost_engine()` tests
+that variable and, when it is non-NULL, prints `GOST engine already
+loaded` and refuses to initialize again. The engine's destructor could
+clear the guard (`gost_engine_destroy` nulls it along with the rest of
+`gost_meth_array`), but as long as the engine stays registered with
+libcrypto the destructor never runs. So in practice: if the ambient
+registration touches libcrypto before `tessera` gets to load the engine
+itself, reinitializing it in that process will not succeed, and no
+OpenSSL ENGINE API call works around it.
+
+Verified against the `gost-engine` v3.0.3 sources — the latest release at
+the time of writing. If your distribution ships a different version, check
+its `gost_eng.c`.
+
+**What changed.** `self_check` loads the engine purely on the fact that
+`gost_engine_path` is configured, rather than on a GOST OID being
+whitelisted. That moves the load to the earliest point in the process
+`tessera` controls — ahead of parsing the container and ahead of touching
+the vendor PKCS#11 module.
+
+It does not make `tessera` the first thing to touch libcrypto in the
+process, and nothing could: `pam_tessera` is a library inside someone
+else's process, and `sshd` uses libcrypto during key exchange, long before
+the PAM stack runs. Loading early narrows the window in which the ambient
+registration can get in first; it does not close it. If the error
+reproduces, the thing to establish is what touched libcrypto before
+`pam_tessera` — that may be a third-party PAM module or the service
+process itself.
 
 **Recommendation (not required, but removes one moving part):** disable
-`default_algorithms = ALL` in `[gost_section]` of `/etc/ssl/openssl.cnf`
-— then the ambient registration never happens at all, and the only
-initialization attempt for `gost-engine` in the process is the one
-`tessera` itself makes.
+`default_algorithms = ALL` in the `[gost_section]` of
+`/etc/ssl/openssl.cnf` — the section `[engine_section]` points at with its
+`gost = gost_section` line. Then the ambient registration never happens at
+all, and the only initialization attempt for `gost-engine` in the process
+is the one `tessera` itself makes.
 
 ### `tessera check` diagnostics
 
@@ -889,9 +946,9 @@ load that a real authentication does. Four possible records:
 | Record                          | Level | Meaning                                                                 |
 |----------------------------------|-------|---------------------------------------------------------------------------|
 | `gost_engine_ok`                 | INFO  | `gost_engine_path` is set, a GOST algorithm is whitelisted, the engine loaded successfully. |
-| `gost_pkcs11_unsupported`        | WARN  | `mode = "pkcs11"` with a GOST algorithm allowed: GOST via a PKCS#11 token isn't supported (`cryptoki` <= 0.7 has no mechanism variant for `CKM_GOSTR3410`/2012). |
-| `gost_engine_configured_unused`  | WARN  | `gost_engine_path` is set but no GOST OID is present in `allowed_signature_algorithms` — the engine will never be loaded. Likely a dead configuration left behind after trimming the whitelist. |
-| `gost_engine_load_failed`        | ERROR | Configuration is otherwise correct, but the actual engine load failed — see the race condition above. GOST-certificate authentication will fail closed until this is fixed. |
+| `pkcs11_openssl_unsupported`     | ERROR | `mode = "pkcs11"` together with `crypto_backend = "openssl"`: this combination rejects every credential, not just GOST ones. On GOST specifically: `CKM_GOSTR3410`/2012 are standard mechanisms (0x1201 and up), `cryptoki` has no variants for them, and the `VendorDefined` escape hatch only accepts values at or above `CKM_VENDOR_DEFINED` (0x8000_0000). |
+| `gost_engine_configured_unused`  | WARN  | `gost_engine_path` is set, no GOST OID is present in `allowed_signature_algorithms`, and the engine loaded anyway. Nothing blocks sign-in — the engine is needed even without a GOST OID — but the setting looks left behind after trimming the whitelist. If the engine fails to load in that configuration, the record is `gost_engine_load_failed` instead. |
+| `gost_engine_load_failed`        | ERROR | `gost_engine_path` is set but the engine is not usable — see the race condition above. **Every** authentication fails, not just GOST ones: the self-check stops at the engine before it ever looks at the credential, so RSA and ECDSA logins on that host fail too. Until the path is removed or the engine is repaired, nobody can log in. |
 
 If `gost_engine_path` isn't set and GOST isn't whitelisted, `tessera
 check` prints nothing for GOST at all: the host simply doesn't use it.
