@@ -15,15 +15,16 @@
 |---|---|
 | Спек в `openspec/specs/` | 32 |
 | Сценариев в них | 338 |
-| Кейсов в реестре | 82 |
-| Спек, к которым привязан хотя бы один кейс | 25 |
-| Спек без единого кейса | 7 |
+| Кейсов в реестре | 89 |
+| Спек, к которым привязан хотя бы один кейс | 26 |
+| Спек без единого кейса | 6 |
 
 ## Спеки, к которым привязаны кейсы
 
 | Спека | Сценариев | Кейсов |
 |---|---:|---:|
 | configuration | 19 | 13 |
+| cli-diagnostics | 3 | 9 |
 | revocation | 19 | 6 |
 | cert-authentication-flow | 15 | 6 |
 | trust-chain-validation | 14 | 5 |
@@ -36,7 +37,6 @@
 | usb-media-pkcs12 | 11 | 3 |
 | pam-integration | 9 | 3 |
 | host-identity | 6 | 3 |
-| cli-diagnostics | 3 | 3 |
 | build-release | 10 | 2 |
 | hooks | 7 | 2 |
 | device-enrollment | 5 | 2 |
@@ -46,6 +46,7 @@
 | daemon-lifecycle | 10 | 1 |
 | ipc-protocol | 10 | 1 |
 | session-monitoring | 9 | 1 |
+| gost-crypto | 7 | 1 |
 | licensing-distribution | 5 | 1 |
 | challenge-response | 4 | 1 |
 
@@ -56,7 +57,6 @@
 | token-pkcs11 | 26 |
 | windows-privileged-path | 10 |
 | windows-removable-media | 8 |
-| gost-crypto | 7 |
 | mac-integrity | 6 |
 | clone-image-bootstrap | 5 |
 | fly-dm-greeter | 4 |

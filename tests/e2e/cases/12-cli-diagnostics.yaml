@@ -66,3 +66,137 @@ cases:
         expect:
           exit_code: 2
           stderr_matches: "unrecognized subcommand 'gc'"
+
+  # ГОСТ-шаг префлайта. Кейсы проверяют, что администратор видит состояние
+  # ГОСТ-конфигурации ДО первого реального входа, а не узнаёт о нём отказом
+  # PAM. Ожидания держатся на идентификаторе записи, а не на тексте сообщения:
+  # идентификатор зафиксирован спекой, формулировка — нет.
+  - id: CLI-004
+    title: Настроенный, но недостижимый ГОСТ-движок останавливает префлайт
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # Путь ведёт на существующий читаемый файл, который движком не является:
+    # это единственный способ дойти до попытки ЗАГРУЗКИ. Несуществующий путь
+    # проверял бы другой барьер — валидатор конфига (см. CLI-007).
+    steps:
+      - run: helpers/config-mutate.sh gost-engine-broken
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stdout_matches: '\[ERROR\] gost_engine_load_failed'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CLI-005
+    title: Неисправный движок останавливает префлайт, даже когда ГОСТ-подписи не разрешены
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # Раньше эта комбинация считалась мёртвой настройкой и давала exit 0.
+    # Мёртвой она не является: аутентификация грузит движок по самому факту
+    # заданного пути, потому что он нужен и там, где ГОСТ-OID в whitelist нет
+    # вовсе — для ГОСТ-ключа в сертификате, подписанном RSA, и для контейнера
+    # под ГОСТ-PBE. Префлайт, отвечающий «всё хорошо» на конфигурации, где
+    # неисправен движок, пропускает машину, на которой не войдёт никто.
+    steps:
+      - run: helpers/config-mutate.sh gost-engine-unused
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stdout_matches: '\[ERROR\] gost_engine_load_failed'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CLI-008
+    title: Исправный движок при неразрешённой ГОСТ-подписи проходит префлайт с пометкой
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: [gost-engine]
+    # Обратная сторона CLI-005: движок исправен, ГОСТ-OID в whitelist нет.
+    # Загрузка удаётся, входу ничто не мешает, и отказывать не за что — но
+    # настройка всё же выглядит забытой после правки allowed_signature_algorithms,
+    # поэтому запись остаётся предупреждением, а код возврата нулевым.
+    steps:
+      - run: helpers/config-mutate.sh gost-engine-unused-real
+      - run: tessera check
+        expect:
+          exit_code: 0
+          stdout_matches: '\[WARN \] gost_engine_configured_unused'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CLI-009
+    title: Связка токена с OpenSSL-бэкендом объявляется отказом, а не предупреждением
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # mode = "pkcs11" вместе с crypto_backend = "openssl" отвергает не только
+    # ГОСТ: аутентификация в этой комбинации возвращает отказ для любого
+    # удостоверения. Префлайт обязан называть это ошибкой — предупреждение с
+    # нулевым кодом пропускает машину, на которой не работает вход как таковой.
+    # Здесь пара сопровождается ГОСТ-настройкой, поэтому в отчёте обязаны быть
+    # ОБЕ записи: про неисправный движок и про саму пару. Аутентификация
+    # проверяет движок раньше режима, и префлайт, умолчавший про движок,
+    # разошёлся бы с ней.
+    steps:
+      - run: helpers/config-mutate.sh gost-pkcs11-openssl
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stdout_matches: '\[ERROR\] gost_engine_load_failed'
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stdout_matches: '\[ERROR\] pkcs11_openssl_unsupported'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CLI-010
+    title: Связка токена с OpenSSL-бэкендом отвергается и без всякого ГОСТа
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # Та же пара режима и бэкенда, но без ГОСТ-OID и без пути к движку —
+    # обычная RSA/ECDSA-конфигурация. Вход не работает ровно так же, поэтому
+    # молчание префлайта здесь опаснее всего: администратор видит exit 0 и
+    # считает машину исправной. Кейс закрывает дефект, найденный независимым
+    # ревью уже после первой правки этого шага: запись выдавалась только когда
+    # ГОСТ разрешён, то есть проверка режима зависела от настройки ГОСТа.
+    steps:
+      - run: helpers/config-mutate.sh pkcs11-openssl-plain
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stdout_matches: '\[ERROR\] pkcs11_openssl_unsupported'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CLI-006
+    title: Исправная ГОСТ-конфигурация подтверждается, а не молчит
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: [gost-engine]
+    # Успех обязан быть виден: администратор, настроивший ГОСТ, должен получить
+    # подтверждение, что движок действительно загрузился, а не отсутствие
+    # жалоб. Проверка выполняет ту же загрузку, что и аутентификация.
+    steps:
+      - run: helpers/config-mutate.sh gost-engine-real
+      - run: tessera check
+        expect:
+          exit_code: 0
+          stdout_matches: '\[INFO \] gost_engine_ok'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: CLI-007
+    title: ГОСТ-подпись без пути к движку отвергается до запуска проверок
+    requirement: openspec/specs/gost-crypto/spec.md
+    requires: []
+    # Отдельный от CLI-004 барьер: конфигурация не доходит до startup-check
+    # вовсе, поэтому диагностика идёт в stderr как ошибка загрузки, а не
+    # записью pipeline в stdout. Кейсы обязаны различать эти два уровня —
+    # иначе регрессия, переносящая проверку с одного на другой, останется
+    # незамеченной.
+    steps:
+      - run: helpers/config-mutate.sh gost-without-path
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'gost_engine_path is required'
+    teardown:
+      - run: helpers/config-mutate.sh restore

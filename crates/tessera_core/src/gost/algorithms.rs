@@ -1,30 +1,39 @@
 //! GOST digest helpers.
 //!
-//! Resolves Streebog-256 / Streebog-512 [`MessageDigest`] handles via NIDs
-//! registered by gost-engine after [`super::engine::ensure_loaded`] succeeds.
+//! Resolves Streebog-256 / Streebog-512 [`MessageDigest`] handles by name
+//! (`EVP_get_digestbyname`, via the safe [`MessageDigest::from_name`]),
+//! once [`super::engine::ensure_loaded`] has pinned gost-engine as the
+//! implementation behind them.
 //!
-//! See [`super::engine`] for the current implementation status — while the
-//! engine is stubbed, every helper here returns
-//! [`GostEngineError::NotAvailable`] (engine not loaded) or
-//! [`GostEngineError::DigestUnavailable`] (NID could not be resolved
-//! despite the engine claiming to be loaded — never reached by the stub).
+//! `id-GostR3411-2012-256` / `id-GostR3411-2012-512` (Streebog-256/512)
+//! **are** genuine static entries in libcrypto's built-in object table
+//! (OpenSSL ≥ 1.1.0: `NID_id_GostR3411_2012_256` = 982,
+//! `NID_id_GostR3411_2012_512` = 983, per `obj_mac.h`), each with a stable
+//! NID/SN (`md_gost12_256`/`md_gost12_512`)/LN baked in at compile time —
+//! gost-engine supplies the *implementation* behind these NIDs, it does not
+//! register the OID/name itself.
+//!
+//! Resolution goes by name because an earlier version of this module
+//! hardcoded 1177/1178 and those numbers are simply wrong: they belong to
+//! `kuznyechik_ctr_acpkm` / `kuznyechik_ctr_acpkm_omac`, a block cipher
+//! unrelated to Streebog. Every digest lookup therefore missed, which is a
+//! likely cause of the GOST authentication failures observed on the Astra
+//! stand. The names are compile-time constants in the same table as the
+//! NIDs, so nothing is lost by using them, and a wrong name fails loudly at
+//! the lookup instead of silently selecting another algorithm.
 
 use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
 
 use crate::x509::SignatureAlg;
 
 use super::engine;
 use super::errors::GostEngineError;
 
-/// NID assigned by gost-engine for `id-tc26-gost3411-12-256` (Streebog-256).
-///
-/// gost-engine registers digests by name (`md_gost12_256`) at load time;
-/// the OBJ table maps that name to the OID `1.2.643.7.1.1.2.2`.  We rely
-/// on `MessageDigest::from_name` (via `EVP_get_digestbyname`) rather than
-/// a hard-coded NID to avoid depending on the engine's internal numbering.
+/// libcrypto's static short name (SN) for `id-GostR3411-2012-256`
+/// (Streebog-256), NID 982; the OID is `1.2.643.7.1.1.2.2`.
 const GOST_2012_256_NAME: &str = "md_gost12_256";
-/// NID name for `id-tc26-gost3411-12-512` (Streebog-512).
+/// libcrypto's static SN for `id-GostR3411-2012-512` (Streebog-512),
+/// NID 983; the OID is `1.2.643.7.1.1.2.3`.
 const GOST_2012_512_NAME: &str = "md_gost12_512";
 
 /// Returns the [`MessageDigest`] for Streebog-256.
@@ -35,7 +44,7 @@ const GOST_2012_512_NAME: &str = "md_gost12_512";
 ///   [`engine::is_available`] is `false`).  This includes the current
 ///   stub-mode where the engine is never loaded.
 /// * [`GostEngineError::DigestUnavailable`] if the engine claims to be
-///   loaded but the NID lookup still fails.
+///   loaded but the name lookup still fails.
 pub fn gost_2012_256_md() -> Result<MessageDigest, GostEngineError> {
     digest_by_name(GOST_2012_256_NAME)
 }
@@ -81,29 +90,12 @@ fn digest_by_name(name: &'static str) -> Result<MessageDigest, GostEngineError> 
             "engine not pinned; cannot resolve digest {name}"
         )));
     }
-    // Even if the engine is "available" by our flag, the NID lookup can
-    // still fail (engine deregistered, build mismatch, etc.).
-    let nid = Nid::from_raw(nid_from_name(name)?);
-    MessageDigest::from_nid(nid).ok_or_else(|| GostEngineError::digest_unavailable(name))
-}
-
-/// Resolves an EVP digest name to a libcrypto NID via the safe surface of
-/// the openssl crate.  We can't call `EVP_get_digestbyname` directly
-/// without unsafe code, so we walk the well-known OIDs registered by
-/// gost-engine.
-fn nid_from_name(name: &'static str) -> Result<i32, GostEngineError> {
-    // These NIDs are stable in libcrypto's `obj_mac.h` for the GOST OIDs
-    // even though the digest registration only becomes active once
-    // gost-engine is loaded.
-    match name {
-        // 1.2.643.7.1.1.2.2 — id-tc26-gost3411-12-256
-        // The libcrypto-builtin NID for the OID; engine-loaded digests
-        // share the same NID.
-        GOST_2012_256_NAME => Ok(1177),
-        // 1.2.643.7.1.1.2.3 — id-tc26-gost3411-12-512
-        GOST_2012_512_NAME => Ok(1178),
-        _ => Err(GostEngineError::digest_unavailable(name)),
-    }
+    // Even if the engine is "available" by our flag, the name lookup can
+    // still fail (engine deregistered, build mismatch, etc.). Resolved by
+    // name (`EVP_get_digestbyname`) rather than by a NID literal — see the
+    // module doc: the literals this module used to carry named a block
+    // cipher, not Streebog, and nothing caught it.
+    MessageDigest::from_name(name).ok_or_else(|| GostEngineError::digest_unavailable(name))
 }
 
 #[cfg(test)]
@@ -138,6 +130,61 @@ mod tests {
             Ok(_) => panic!("digest resolved without engine being available"),
             Err(GostEngineError::NotAvailable(_)) => {}
             Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// libcrypto's static NIDs for Streebog-256/512 — the entries the name
+    /// constants above must resolve to. Present in the built-in object
+    /// table since OpenSSL 1.1.0, with or without gost-engine.
+    const NID_STREEBOG_256: i32 = 982;
+    const NID_STREEBOG_512: i32 = 983;
+
+    /// The NID literals an earlier version of this module used for the two
+    /// digests.
+    const WRONG_LEGACY_NIDS: [i32; 2] = [1177, 1178];
+
+    #[test]
+    fn digest_names_match_the_static_streebog_nids() {
+        // Ties the two name constants to the object-table entries they are
+        // supposed to address. Needs no engine: the names are compiled into
+        // libcrypto, only the implementation behind them comes from the
+        // engine — so this runs everywhere, unlike the four tests below.
+        for (nid, name) in [
+            (NID_STREEBOG_256, GOST_2012_256_NAME),
+            (NID_STREEBOG_512, GOST_2012_512_NAME),
+        ] {
+            let sn = openssl::nid::Nid::from_raw(nid)
+                .short_name()
+                .unwrap_or_else(|e| panic!("nid {nid} has no short name: {e}"));
+            assert_eq!(sn, name, "nid {nid} does not name {name}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_nid_literals_do_not_name_streebog() {
+        // Guards the regression the module doc describes: 1177/1178 name a
+        // Kuznyechik cipher mode, so resolving digests through them yielded
+        // nothing usable while looking plausible in review.
+        for nid in WRONG_LEGACY_NIDS {
+            let nid = openssl::nid::Nid::from_raw(nid);
+            if let Ok(sn) = nid.short_name() {
+                assert_ne!(sn, GOST_2012_256_NAME);
+                assert_ne!(sn, GOST_2012_512_NAME);
+            }
+            if let Some(md) = MessageDigest::from_nid(nid) {
+                assert_ne!(
+                    md.size(),
+                    32,
+                    "nid {} resolves to a 32-byte digest",
+                    nid.as_raw()
+                );
+                assert_ne!(
+                    md.size(),
+                    64,
+                    "nid {} resolves to a 64-byte digest",
+                    nid.as_raw()
+                );
+            }
         }
     }
 

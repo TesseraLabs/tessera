@@ -1,6 +1,9 @@
 //! `tessera check` subcommand.
 //!
-//! Loads + validates the config file, runs the same
+//! Loads + validates the config file the same way the PAM module does — the
+//! config, the trust material, and every native module named in it must be
+//! root-owned and non-writable by anyone else, or the load fails outright —
+//! then runs the same
 //! [`crate::startup_check::run_startup_checks`] pipeline as the daemon, and
 //! prints a coloured/prefixed summary to stdout. Returns exit code 0 iff
 //! no record reached `Error` severity — wrapping it in a systemd
@@ -31,7 +34,7 @@ pub struct CheckArgs {
 /// and keep `main.rs` dispatch symmetric across subcommands.
 #[allow(clippy::needless_pass_by_value)]
 pub fn run(args: CheckArgs) -> ExitCode {
-    let validated = match tessera_core::config::load_validated_config(&args.config) {
+    let validated = match tessera_core::config::load_privileged_validated_config(&args.config) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(

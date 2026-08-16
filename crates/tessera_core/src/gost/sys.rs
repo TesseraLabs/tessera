@@ -527,13 +527,17 @@ mod tests {
         // SAFETY: `id_cmd`/`id_c` are valid NUL-terminated strings from
         // `CString`s outliving the call; `raw` is a valid ENGINE handle
         // we hold a reference to.
-        let r2 =
-            unsafe { ENGINE_ctrl_cmd_string(raw.as_ptr(), id_cmd.as_ptr(), id_c.as_ptr(), 0) };
+        let r2 = unsafe { ENGINE_ctrl_cmd_string(raw.as_ptr(), id_cmd.as_ptr(), id_c.as_ptr(), 0) };
         // SAFETY: `list_add_cmd`/`list_add_val` are valid NUL-terminated
         // strings from `CString`s outliving the call; `raw` is a valid
         // ENGINE handle we hold a reference to.
         let r3 = unsafe {
-            ENGINE_ctrl_cmd_string(raw.as_ptr(), list_add_cmd.as_ptr(), list_add_val.as_ptr(), 0)
+            ENGINE_ctrl_cmd_string(
+                raw.as_ptr(),
+                list_add_cmd.as_ptr(),
+                list_add_val.as_ptr(),
+                0,
+            )
         };
         // SAFETY: `load_cmd` is a valid NUL-terminated string from a
         // `CString` outliving the call; the value argument is NULL as

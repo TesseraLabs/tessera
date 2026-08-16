@@ -15,6 +15,24 @@ set -euo pipefail
 
 CONFIG=/etc/tessera/config.toml
 ORIGINAL=/var/lib/tessera/e2e-config.orig
+# Файл, который существует и читается, но движком не является. Нужен, чтобы
+# отделить отказ ЗАГРУЗКИ движка от отказа ВАЛИДАЦИИ пути: несуществующий путь
+# отвергает `validate_gost_engine_path` ещё при разборе конфига, и startup-check
+# до ГОСТ-шага не доходит вовсе. Лежит рядом с эталоном конфига, чтобы `restore`
+# убирал оба одним местом.
+NOT_AN_ENGINE=/var/lib/tessera/e2e-not-an-engine.so
+# Заглушка для `pkcs11_module` в кейсах, где проверяется связка режима и
+# бэкенда: валидатор требует абсолютный путь, привилегированный загрузчик —
+# существующий файл под root, и он же отвергает символические ссылки в пути.
+# Поэтому заглушка создаётся здесь обычным файлом, а не берётся из системы:
+# `/bin/sh` на Debian и Astra — ссылка на `dash`, и загрузчик отверг бы
+# конфигурацию до того, как кейс увидел бы проверяемую запись. Сам модуль не
+# загружается: связка режима и бэкенда отвергается раньше, чем дело доходит
+# до токена.
+PKCS11_STUB_MODULE=/var/lib/tessera/e2e-pkcs11-stub.so
+# ГОСТ Р 34.10-2012-256. Точечный OID, а не имя: кейс проверяет ГОСТ-шаг
+# startup-check, а не разбор имён allow-list'а.
+GOST_OID='1.2.643.7.1.1.3.2'
 # Живой конфиг не переписывается на месте: перенаправление усекает файл ДО того,
 # как отработает awk, и упавший awk или прерванный прогон оставили бы на
 # неодноразовой машине пустой /etc/tessera/config.toml — состояние, из которого
@@ -65,6 +83,14 @@ config-mutate.sh <операция>
 
   usb-allow-foreign    в списке разрешённых устройств — чужой VID:PID
   usb-allow-actual     в списке разрешённых устройств — VID:PID эмулятора
+
+  gost-engine-unused   путь к неисправному движку задан, ГОСТ-подписи не разрешены
+  gost-engine-unused-real
+                       путь к настоящему движку задан, ГОСТ-подписи не разрешены
+  gost-engine-broken   ГОСТ разрешён, путь ведёт на существующий не-движок
+  gost-engine-real     ГОСТ разрешён, путь ведёт на настоящий gost-engine
+  gost-pkcs11-openssl  mode = "pkcs11" вместе с crypto_backend = "openssl"
+  gost-without-path    ГОСТ разрешён, gost_engine_path отсутствует
 
   restore              вернуть исходный конфиг
 EOF
@@ -121,6 +147,50 @@ append_section() {
     save_original
     { cat "$ORIGINAL"; printf '\n%s\n' "$1"; } > "$STAGING"
     commit_config
+}
+
+# Ключ верхнего уровня И замена значения ключа за ОДИН проход.
+#
+# Последовательные вызовы `insert_top_level` + `replace_key` здесь не работают:
+# каждая из этих функций читает эталон, а не текущий конфиг, поэтому вторая
+# молча отменяет первую. ГОСТ-кейсам нужны обе правки сразу — путь к движку
+# и allow-list задают разные половины одной проверяемой конфигурации.
+insert_top_level_and_replace_key() {
+    save_original
+    awk -v inserted_line="$1" -v key="$2" -v replacement="$3" '
+        /^\[/ && !inserted { print inserted_line; inserted = 1 }
+        $0 ~ key          { print replacement; next }
+        { print }
+    ' "$ORIGINAL" > "$STAGING"
+    commit_config
+}
+
+# Находит установленный gost-engine и кладёт путь в переменную `engine`.
+#
+# Путь не зашивается: каталог движков отличается между сборками OpenSSL, и
+# зашитый путь превратил бы кейс про загрузку в кейс про совпадение путей.
+# Вызывающие кейсы объявляют `requires: [gost-engine]`, поэтому движок обязан
+# найтись — его отсутствие означает неверно объявленную возможность профиля,
+# то есть сломанный стенд, а не дефект продукта. Отсюда код 64: профиль
+# перечисляет его в error_exit_codes и отличает ERROR (сломан стенд) от FAIL.
+#
+# `|| true`: под `set -e` присваивание из подстановки роняет скрипт чужим
+# кодом возврата.
+find_gost_engine() {
+    local engines_dir candidate
+    engines_dir="$(openssl version -e 2>/dev/null | sed -n 's/^ENGINESDIR: *"\(.*\)"$/\1/p')" || true
+    engine=""
+    for candidate in "${engines_dir:-/nonexistent}/gost.so" \
+                     /usr/lib/*/engines-3/gost.so \
+                     /usr/lib/*/engines-1.1/gost.so; do
+        [ -f "$candidate" ] || continue
+        engine="$candidate"
+        break
+    done
+    if [ -z "$engine" ]; then
+        echo "config-mutate.sh: gost-engine не найден, а профиль объявил его наличие" >&2
+        exit 64
+    fi
 }
 
 case "$1" in
@@ -208,6 +278,113 @@ on_failure = "warn"' ;;
     usb-allow-foreign)  insert_top_level 'usb_allowed_devices = ["ffff:ffff"]' ;;
     usb-allow-actual)   insert_top_level 'usb_allowed_devices = ["0951:1666"]' ;;
 
+    # ГОСТ. Базовый конфиг прогона идёт с пустым allow-list и без пути к
+    # движку, поэтому каждая операция добавляет ровно то, что проверяет кейс.
+    gost-engine-unused)
+        # Путь есть, ГОСТ-подписи не разрешены: движок не будет загружен
+        # никогда. Файл обязан существовать — иначе конфиг отвергнет валидатор,
+        # и кейс проверял бы валидацию пути вместо мёртвой конфигурации.
+        install -m 0644 /dev/null "$NOT_AN_ENGINE"
+        insert_top_level "gost_engine_path = \"$NOT_AN_ENGINE\""
+        ;;
+    gost-engine-broken)
+        # ГОСТ разрешён и путь ведёт на существующий не-движок: конфигурация
+        # непротиворечива, отказ приходит с попытки загрузки.
+        printf 'not a shared object\n' > "$NOT_AN_ENGINE"
+        chmod 0644 "$NOT_AN_ENGINE"
+        insert_top_level_and_replace_key \
+            "gost_engine_path = \"$NOT_AN_ENGINE\"" \
+            '^allowed_signature_algorithms = ' \
+            "allowed_signature_algorithms = [\"$GOST_OID\"]"
+        ;;
+    gost-engine-real)
+        find_gost_engine
+        insert_top_level_and_replace_key \
+            "gost_engine_path = \"$engine\"" \
+            '^allowed_signature_algorithms = ' \
+            "allowed_signature_algorithms = [\"$GOST_OID\"]"
+        ;;
+    gost-engine-unused-real)
+        # Обратная сторона gost-engine-unused: движок настоящий, ГОСТ-подписи
+        # по-прежнему не разрешены. Загрузка удаётся, входу ничто не мешает —
+        # проверка обязана дойти до предупреждения, а не до отказа. Отличать
+        # это от gost-engine-unused важно: там неисправный движок, и с ним
+        # аутентификация падает по самому факту заданного пути.
+        find_gost_engine
+        insert_top_level "gost_engine_path = \"$engine\""
+        ;;
+    gost-pkcs11-openssl)
+        # mode = "pkcs11" вместе с crypto_backend = "openssl". Путь к движку
+        # обязателен: без него ГОСТ в allow-list отвергнет валидатор, и кейс
+        # проверял бы валидацию вместо связки режима с бэкендом. Движок здесь
+        # заведомо не настоящий и настоящим быть не должен — эта ветка
+        # диагностики возвращается до всякой попытки загрузки, поэтому кейс и
+        # не объявляет `requires: [gost-engine]`.
+        printf 'not a shared object\n' > "$NOT_AN_ENGINE"
+        chmod 0644 "$NOT_AN_ENGINE"
+        install -m 0644 /dev/null "$PKCS11_STUB_MODULE"
+        save_original
+        # Вставка идёт перед первой секцией, как в insert_top_level: строка,
+        # дописанная в конец файла, попала бы внутрь последней секции и
+        # перестала бы быть ключом верхнего уровня.
+        #
+        # `mode` и `crypto_backend` заменяются ТОЛЬКО до первой секции: ключ с
+        # именем `mode` есть и в [trust.revocation], и правило без этой
+        # оговорки переписывало бы заодно режим отзыва — порча, которую кейс
+        # не заметил бы, потому что проверяет он совсем другое.
+        #
+        # `pkcs11_module` обязателен: при mode = "pkcs11" без него конфиг
+        # отвергает валидатор, и кейс получил бы ошибку загрузки вместо
+        # проверяемой записи. Путь должен существовать и принадлежать root —
+        # `tessera check` читает конфигурацию привилегированным загрузчиком.
+        # Сам модуль не загружается: связка режима и бэкенда отвергается
+        # раньше, чем дело доходит до токена, поэтому годится любой
+        # root-овский файл.
+        awk -v oid="$GOST_OID" -v engine="$NOT_AN_ENGINE" -v module="$PKCS11_STUB_MODULE" '
+            /^\[/ && !inserted {
+                printf "gost_engine_path = \"%s\"\n", engine
+                printf "pkcs11_module = \"%s\"\n", module
+                inserted = 1
+            }
+            !inserted && /^mode = / { print "mode = \"pkcs11\""; next }
+            !inserted && /^crypto_backend = / { print "crypto_backend = \"openssl\""; next }
+            !inserted && /^pkcs11_module = / { next }
+            /^allowed_signature_algorithms = / {
+                printf "allowed_signature_algorithms = [\"%s\"]\n", oid
+                next
+            }
+            { print }
+        ' "$ORIGINAL" > "$STAGING"
+        commit_config
+        ;;
+    pkcs11-openssl-plain)
+        # Та же пара режима и бэкенда, что в gost-pkcs11-openssl, но без
+        # ГОСТ-OID и без пути к движку: обычная RSA/ECDSA-конфигурация, в
+        # которой вход тем не менее не работает. Ключи заменяются только до
+        # первой секции — `mode` есть и в [trust.revocation].
+        #
+        # `pkcs11_module` подставляется по той же причине, что и в
+        # gost-pkcs11-openssl: без него конфиг не проходит валидацию при
+        # mode = "pkcs11", и кейс проверял бы валидатор вместо связки.
+        install -m 0644 /dev/null "$PKCS11_STUB_MODULE"
+        save_original
+        awk -v module="$PKCS11_STUB_MODULE" '
+            !seen_section && /^\[/ {
+                printf "pkcs11_module = \"%s\"\n", module
+                seen_section = 1
+            }
+            !seen_section && /^mode = / { print "mode = \"pkcs11\""; next }
+            !seen_section && /^crypto_backend = / { print "crypto_backend = \"openssl\""; next }
+            !seen_section && /^pkcs11_module = / { next }
+            { print }
+        ' "$ORIGINAL" > "$STAGING"
+        commit_config
+        ;;
+    gost-without-path)
+        replace_key '^allowed_signature_algorithms = ' \
+            "allowed_signature_algorithms = [\"$GOST_OID\"]"
+        ;;
+
     restore)
         # Идемпотентность: teardown выполняется и там, где порчи не было.
         if [ -f "$ORIGINAL" ]; then
@@ -215,6 +392,8 @@ on_failure = "warn"' ;;
             commit_config
             rm -f "$ORIGINAL"
         fi
+        rm -f "$NOT_AN_ENGINE"
+        rm -f "$PKCS11_STUB_MODULE"
         ;;
     *) usage ;;
 esac

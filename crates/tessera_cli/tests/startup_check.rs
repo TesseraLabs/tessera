@@ -20,7 +20,7 @@ use tessera_cli::startup_check::{
     self, run_startup_checks, KernelParsecState, StartupCheckOptions, StartupCheckReport,
     StartupCheckSeverity,
 };
-use tessera_core::config::validated::MacRuntimeMode;
+use tessera_core::config::validated::{CryptoBackend, MacRuntimeMode};
 use tessera_core::config::{load_validated_config, ValidatedConfig};
 use tessera_core::mac::MrdState;
 
@@ -564,7 +564,12 @@ fn run_startup_checks_full_smoke_no_errors_for_healthy_config() {
     let tmp = tempfile::tempdir().expect("tmp");
     let anchor = write_anchor(tmp.path(), "anchor.pem", FAKE_PEM);
     let cfg_path = write_min_config(tmp.path(), anchor.to_str().unwrap(), "auto", "optional");
-    let cfg = load_cfg(&cfg_path);
+    let mut cfg = load_cfg(&cfg_path);
+    // The fixture pairs `mode = "pkcs11"` with `crypto_backend = "openssl"`,
+    // under which no authentication succeeds at all — the sweep is right to
+    // flag it, so the healthy-config smoke has to use the token backend that
+    // pairing is supposed to be switched to.
+    cfg.crypto_backend = CryptoBackend::Pkcs11Native;
 
     // pam_d empty -> no pam_stack records; fs_root tmpdir -> no /etc dir.
     let pam_d = tmp.path().join("pam.d");
@@ -574,10 +579,43 @@ fn run_startup_checks_full_smoke_no_errors_for_healthy_config() {
         fs_root: Some(tmp.path().to_path_buf()),
         kernel_parsec_probe: Some(probe_unavailable),
         mrd_probe: Some(probe_mrd_unknown),
+        gost_probe: None,
     };
 
     let report = run_startup_checks(&cfg, &opts);
     assert!(!report.has_errors(), "expected clean sweep: {report:#?}");
+}
+
+/// `mode = "pkcs11"` with `crypto_backend = "openssl"` rejects every
+/// credential, GOST or not, so the sweep must fail on it even though this
+/// config mentions no GOST at all and configures no engine path.
+#[test]
+fn run_startup_checks_errors_on_pkcs11_mode_with_openssl_backend() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let anchor = write_anchor(tmp.path(), "anchor.pem", FAKE_PEM);
+    let cfg_path = write_min_config(tmp.path(), anchor.to_str().unwrap(), "auto", "optional");
+    let cfg = load_cfg(&cfg_path);
+    assert!(cfg.gost_engine_path.is_none());
+    assert!(!cfg.needs_gost());
+
+    let pam_d = tmp.path().join("pam.d");
+    fs::create_dir_all(&pam_d).expect("mkdir");
+    let opts = StartupCheckOptions {
+        pam_d_root: pam_d,
+        fs_root: Some(tmp.path().to_path_buf()),
+        kernel_parsec_probe: Some(probe_unavailable),
+        mrd_probe: Some(probe_mrd_unknown),
+        gost_probe: None,
+    };
+
+    let report = run_startup_checks(&cfg, &opts);
+    let errors: Vec<_> = report
+        .records
+        .iter()
+        .filter(|r| r.severity == StartupCheckSeverity::Error)
+        .collect();
+    assert_eq!(errors.len(), 1, "{report:#?}");
+    assert_eq!(errors[0].check, "pkcs11_openssl_unsupported");
 }
 
 fn probe_unavailable() -> KernelParsecState {

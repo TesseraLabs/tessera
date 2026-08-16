@@ -9,8 +9,8 @@ use tracing::warn;
 /// Run structural and crypto-readiness self-checks.
 ///
 /// In addition to the Stage-1 PEM/CRL/hook/ACL checks, this also performs
-/// a fail-closed gost-engine probe when the active configuration whitelists
-/// GOST signature OIDs.  The engine is loaded once per process and the
+/// a fail-closed gost-engine probe when the active configuration has a
+/// `gost_engine_path` configured.  The engine is loaded once per process and the
 /// required digest NIDs are resolved; any failure surfaces as
 /// [`SelfCheckError::GostEngineUnavailable`] so that the caller can refuse
 /// authentication outright rather than silently downgrade to a non-GOST
@@ -48,16 +48,22 @@ pub fn self_check(cfg: &ValidatedConfig) -> Result<(), SelfCheckError> {
             });
         }
     }
+    // The engine probe runs before the PKCS#11 one on purpose. Loading a
+    // vendor PKCS#11 module calls `C_Initialize`, and a provider whose
+    // openssl.cnf pulls in an engine of its own leaves libcrypto's engine
+    // table already populated: our own load then becomes a no-op behind
+    // whatever that module registered, and the probe stops describing the
+    // file the operator named. Going first narrows that window to the
+    // engines something else in this process loaded earlier — it does not
+    // close it, since nothing here owns libcrypto's global state.
+    if cfg.gost_engine_path.is_some() {
+        // Both digests are resolved as well as the engine loaded: an engine
+        // that claims to load but doesn't register Streebog must fail
+        // self_check, not the first auth attempt.
+        gost::engine::ensure_ready(cfg)?;
+    }
     if matches!(cfg.mode, Mode::Pkcs11) {
         self_check_pkcs11(cfg)?;
-    }
-    if cfg.needs_gost() {
-        gost::engine::ensure_loaded(cfg)?;
-        // Probe the digest NIDs as well; a misconfigured engine that
-        // claims to load but doesn't register Streebog should fail
-        // self_check, not the first auth attempt.
-        let _ = gost::algorithms::gost_2012_256_md()?;
-        let _ = gost::algorithms::gost_2012_512_md()?;
     }
     Ok(())
 }
