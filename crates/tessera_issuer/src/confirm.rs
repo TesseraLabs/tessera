@@ -274,24 +274,52 @@ fn find_in_path(names: &[&str]) -> Option<PathBuf> {
     None
 }
 
-/// Percent-escape a string for an Assuan command line (control chars and `%`).
+/// Percent-escape a string for an Assuan command line.
+///
+/// Only what the protocol reads as structure is escaped: `%` itself, the C0
+/// controls (a bare LF would end the line and turn the rest of the text into a
+/// forged command), and `DEL`. Everything else — including non-ASCII — travels
+/// as raw UTF-8, which is what the receiving side displays after it
+/// percent-decodes the line.
+///
+/// Two constraints meet here. Escaping too little lets a value break the line;
+/// escaping every non-ASCII byte costs six characters per Cyrillic letter and
+/// pushes the command past the 1000-byte Assuan line limit, on which pinentry
+/// drops the connection and the dialog disappears altogether. Escaping has to
+/// walk characters, not bytes: a byte of a multi-byte character copied out
+/// through `char::from` becomes a `U+00XX` codepoint that is re-encoded as UTF-8
+/// on the way out, which is what turned Cyrillic summaries into mojibake.
+///
+/// This protects the transport, not the display: the escaping is reversible by
+/// design, and pinentry decodes `%XX` back into the raw byte before rendering
+/// it. What must not reach the operator's eyes in an active form is neutralized
+/// where the summary is rendered, in [`crate::summary`].
 fn assuan_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte == b'%' || byte < 0x20 {
-            out.push('%');
-            out.push(hex_nibble(byte >> 4));
-            out.push(hex_nibble(byte & 0x0f));
-        } else {
-            out.push(char::from(byte));
+    for c in text.chars() {
+        match c {
+            '%' | '\u{00}'..='\u{1F}' | '\u{7F}' => {
+                let code = u32::from(c);
+                out.push('%');
+                out.push(hex_nibble((code >> 4) & 0xF));
+                out.push(hex_nibble(code & 0xF));
+            }
+            _ => out.push(c),
         }
     }
     out
 }
 
 /// A single uppercase hex digit for a nibble (`0..=15`).
-fn hex_nibble(nibble: u8) -> char {
-    char::from_digit(u32::from(nibble), 16).map_or('0', |c| c.to_ascii_uppercase())
+///
+/// The argument is masked to four bits, so the fallback digit below is
+/// unreachable. It is kept rather than replaced by a panic because this runs on
+/// the path to a signature; what it must never do is fire silently, since a
+/// quiet `'0'` would turn the escape into `%00`, injecting the one byte that
+/// truncates the dialog text at the receiving end.
+fn hex_nibble(nibble: u32) -> char {
+    debug_assert!(nibble < 16, "callers must pass a four-bit nibble");
+    char::from_digit(nibble & 0xF, 16).map_or('0', |c| c.to_ascii_uppercase())
 }
 
 /// Send one Assuan command line.
@@ -363,13 +391,136 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::unnecessary_wraps)]
 
     use super::*;
-    use crate::summary::OperationKind;
+    use crate::l10n::Caption;
+    use crate::summary::{OperationKind, SummaryLine};
 
     #[test]
     fn assuan_escape_encodes_controls_and_percent() {
         assert_eq!(assuan_escape("a b"), "a b");
         assert_eq!(assuan_escape("line1\nline2"), "line1%0Aline2");
         assert_eq!(assuan_escape("50%"), "50%25");
+    }
+
+    #[test]
+    fn assuan_escape_keeps_non_ascii_intact() {
+        // Non-ASCII carries no protocol meaning and is left as it is: the
+        // receiving side reads the line as UTF-8. Escaping it byte by byte both
+        // triples the length and, done through `char::from`, corrupts the text.
+        assert_eq!(assuan_escape("да"), "да");
+        assert_eq!(assuan_escape("\u{1F512}"), "\u{1F512}");
+        assert_eq!(
+            assuan_escape("CN=Иванов И. И., O=Ромашка"),
+            "CN=Иванов И. И., O=Ромашка"
+        );
+    }
+
+    #[test]
+    fn assuan_escape_covers_the_boundary_bytes() {
+        assert_eq!(assuan_escape(""), "");
+        // The last C0 control is escaped, the first printable byte is not.
+        assert_eq!(assuan_escape("\u{1F}"), "%1F");
+        assert_eq!(assuan_escape(" "), " ");
+        // DEL is the one control above the printable range.
+        assert_eq!(assuan_escape("~\u{7F}"), "~%7F");
+    }
+
+    #[test]
+    fn escaped_summary_fits_the_assuan_line_limit() {
+        // Assuan caps a client request at 1000 bytes including the command and
+        // the line terminator; over that, libassuan answers
+        // `GPG_ERR_ASS_LINE_TOO_LONG` and pinentry drops the connection, so the
+        // dialog disappears instead of being shown. The worst realistic summary
+        // has to fit with room to spare — a Russian rendering of a fully
+        // populated shift-leaf.
+        const ASSUAN_MAX_LINE: usize = 1000;
+
+        let summary = OperationSummary {
+            kind: OperationKind::ShiftLeaf,
+            subject: "CN=Иванов Иван Иванович, OU=Служба эксплуатации, \
+                      O=Акционерное общество «Ромашка», C=RU"
+                .to_owned(),
+            not_before: "2026-08-10T07:00:00Z".to_owned(),
+            not_after: "2026-08-10T19:00:00Z".to_owned(),
+            lines: vec![
+                SummaryLine {
+                    caption: Caption::Roles,
+                    value: "oper, serv, admin".to_owned(),
+                },
+                SummaryLine {
+                    caption: Caption::Hosts,
+                    value: "atm-0431.branch-77.romashka.example, \
+                            atm-0432.branch-77.romashka.example"
+                        .to_owned(),
+                },
+                SummaryLine {
+                    caption: Caption::RequiredTags,
+                    value: "смена, инкассация, обслуживание".to_owned(),
+                },
+                SummaryLine {
+                    caption: Caption::MaxLevel,
+                    value: "2".to_owned(),
+                },
+                SummaryLine {
+                    caption: Caption::MaxTtl,
+                    value: "43200".to_owned(),
+                },
+                SummaryLine {
+                    caption: Caption::Integrity,
+                    value: "2".to_owned(),
+                },
+                SummaryLine {
+                    caption: Caption::Profile,
+                    value: "1".to_owned(),
+                },
+            ],
+        };
+
+        let command = format!("SETDESC {}", assuan_escape(&summary.render(Locale::Ru)));
+        // `send` appends one byte of line terminator to the command.
+        let line = command.len() + 1;
+        assert!(
+            line < ASSUAN_MAX_LINE,
+            "SETDESC line is {line} bytes, over the {ASSUAN_MAX_LINE}-byte Assuan limit"
+        );
+    }
+
+    #[test]
+    fn assuan_escape_round_trips_to_source_bytes() {
+        // The property under test: pinentry percent-decodes the line it
+        // receives and must end up with exactly the source UTF-8 bytes. A
+        // mismatch here is the double encoding that filled the dialog with
+        // mojibake.
+        for source in [
+            "операция: сертификат УЦ организации",
+            "50% ключей\nна складе",
+            "Ünïcødé — dash",
+            "ascii only",
+        ] {
+            assert_eq!(
+                percent_decode(&assuan_escape(source)),
+                source.as_bytes(),
+                "round-trip mismatch for {source:?}"
+            );
+        }
+    }
+
+    /// Decode percent sequences back into bytes, as the receiving Assuan side
+    /// does.
+    fn percent_decode(text: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(text.len());
+        let mut bytes = text.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'%' {
+                let hi = char::from(bytes.next().expect("truncated escape"));
+                let lo = char::from(bytes.next().expect("truncated escape"));
+                let hi = hi.to_digit(16).expect("not a hex digit");
+                let lo = lo.to_digit(16).expect("not a hex digit");
+                out.push(u8::try_from(hi * 16 + lo).expect("byte out of range"));
+            } else {
+                out.push(byte);
+            }
+        }
+        out
     }
 
     #[test]
