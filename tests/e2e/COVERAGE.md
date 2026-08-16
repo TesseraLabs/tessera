@@ -15,7 +15,7 @@
 |---|---|
 | Спек в `openspec/specs/` | 32 |
 | Сценариев в них | 338 |
-| Кейсов в реестре | 86 |
+| Кейсов в реестре | 89 |
 | Спек, к которым привязан хотя бы один кейс | 26 |
 | Спек без единого кейса | 6 |
 
@@ -24,9 +24,9 @@
 | Спека | Сценариев | Кейсов |
 |---|---:|---:|
 | configuration | 19 | 13 |
+| cli-diagnostics | 3 | 9 |
 | revocation | 19 | 6 |
 | cert-authentication-flow | 15 | 6 |
-| cli-diagnostics | 3 | 6 |
 | trust-chain-validation | 14 | 5 |
 | issuer-signing | 15 | 4 |
 | pam-module-runtime | 9 | 4 |
