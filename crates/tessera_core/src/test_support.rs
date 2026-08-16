@@ -64,11 +64,21 @@ pub fn gost_engine_path() -> Option<PathBuf> {
 /// Absolute path to an existing system executable, standing in for a shell,
 /// a PKCS#11 module or a hook command wherever a fixture only needs a path
 /// that exists and is absolute.
+///
+/// Not usable where the path has to survive the privileged root-control walk:
+/// on Debian and Astra `/bin` is a symlink to `/usr/bin`, and the walk rejects
+/// symlink components. Such a test writes its own file into a root-owned
+/// directory instead.
 #[cfg(windows)]
 pub const SHELL_PATH: &str = r"C:\Windows\System32\cmd.exe";
 /// Absolute path to an existing system executable, standing in for a shell,
 /// a PKCS#11 module or a hook command wherever a fixture only needs a path
 /// that exists and is absolute.
+///
+/// Not usable where the path has to survive the privileged root-control walk:
+/// on Debian and Astra `/bin` is a symlink to `/usr/bin`, and the walk rejects
+/// symlink components. Such a test writes its own file into a root-owned
+/// directory instead.
 #[cfg(not(windows))]
 pub const SHELL_PATH: &str = "/bin/sh";
 

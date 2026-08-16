@@ -200,13 +200,19 @@ fn gost_engine_path_loads_while_the_full_config_still_cannot(
     let dir = tempfile::Builder::new().tempdir_in("/root")?;
     let anchor = write_anchor(dir.path());
     let missing_crl = dir.path().join("device.crl");
+    // The engine file has to clear the same root-control walk the loader runs
+    // over it, so it is written here rather than borrowed from the system: on
+    // Debian and Astra `/bin` is a symlink to `/usr/bin`, and the walk refuses
+    // symlink components outright.
+    let engine_path = dir.path().join("gost.so");
+    std::fs::write(&engine_path, b"\x7fELF")?;
     let body = fixture_with_anchor(&anchor).replace(
         "crl_paths = []",
         &format!("crl_paths = [{}]", test_support::toml_path(&missing_crl)),
     );
     let body = format!(
         "gost_engine_path = {}\n{body}",
-        test_support::toml_path(Path::new(test_support::SHELL_PATH))
+        test_support::toml_path(&engine_path)
     );
     let config_path = dir.path().join("config.toml");
     std::fs::write(&config_path, &body)?;
@@ -214,8 +220,10 @@ fn gost_engine_path_loads_while_the_full_config_still_cannot(
     load_privileged_validated_config(&config_path)
         .expect_err("the CRL the enrollment has yet to create must fail the full load");
 
+    // What comes back is the canonical target, not the string from the TOML.
+    let expected = std::fs::canonicalize(&engine_path)?;
     let engine = load_privileged_gost_engine_path(&config_path)?;
-    assert_eq!(engine.as_deref(), Some(Path::new(test_support::SHELL_PATH)));
+    assert_eq!(engine.as_deref(), Some(expected.as_path()));
     Ok(())
 }
 
