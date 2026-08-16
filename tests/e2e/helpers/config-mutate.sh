@@ -21,6 +21,15 @@ ORIGINAL=/var/lib/tessera/e2e-config.orig
 # до ГОСТ-шага не доходит вовсе. Лежит рядом с эталоном конфига, чтобы `restore`
 # убирал оба одним местом.
 NOT_AN_ENGINE=/var/lib/tessera/e2e-not-an-engine.so
+# Заглушка для `pkcs11_module` в кейсах, где проверяется связка режима и
+# бэкенда: валидатор требует абсолютный путь, привилегированный загрузчик —
+# существующий файл под root, и он же отвергает символические ссылки в пути.
+# Поэтому заглушка создаётся здесь обычным файлом, а не берётся из системы:
+# `/bin/sh` на Debian и Astra — ссылка на `dash`, и загрузчик отверг бы
+# конфигурацию до того, как кейс увидел бы проверяемую запись. Сам модуль не
+# загружается: связка режима и бэкенда отвергается раньше, чем дело доходит
+# до токена.
+PKCS11_STUB_MODULE=/var/lib/tessera/e2e-pkcs11-stub.so
 # ГОСТ Р 34.10-2012-256. Точечный OID, а не имя: кейс проверяет ГОСТ-шаг
 # startup-check, а не разбор имён allow-list'а.
 GOST_OID='1.2.643.7.1.1.3.2'
@@ -75,9 +84,12 @@ config-mutate.sh <операция>
   usb-allow-foreign    в списке разрешённых устройств — чужой VID:PID
   usb-allow-actual     в списке разрешённых устройств — VID:PID эмулятора
 
-  gost-engine-unused   путь к движку задан, ГОСТ-подписи не разрешены
+  gost-engine-unused   путь к неисправному движку задан, ГОСТ-подписи не разрешены
+  gost-engine-unused-real
+                       путь к настоящему движку задан, ГОСТ-подписи не разрешены
   gost-engine-broken   ГОСТ разрешён, путь ведёт на существующий не-движок
   gost-engine-real     ГОСТ разрешён, путь ведёт на настоящий gost-engine
+  gost-pkcs11-openssl  mode = "pkcs11" вместе с crypto_backend = "openssl"
   gost-without-path    ГОСТ разрешён, gost_engine_path отсутствует
 
   restore              вернуть исходный конфиг
@@ -151,6 +163,34 @@ insert_top_level_and_replace_key() {
         { print }
     ' "$ORIGINAL" > "$STAGING"
     commit_config
+}
+
+# Находит установленный gost-engine и кладёт путь в переменную `engine`.
+#
+# Путь не зашивается: каталог движков отличается между сборками OpenSSL, и
+# зашитый путь превратил бы кейс про загрузку в кейс про совпадение путей.
+# Вызывающие кейсы объявляют `requires: [gost-engine]`, поэтому движок обязан
+# найтись — его отсутствие означает неверно объявленную возможность профиля,
+# то есть сломанный стенд, а не дефект продукта. Отсюда код 64: профиль
+# перечисляет его в error_exit_codes и отличает ERROR (сломан стенд) от FAIL.
+#
+# `|| true`: под `set -e` присваивание из подстановки роняет скрипт чужим
+# кодом возврата.
+find_gost_engine() {
+    local engines_dir candidate
+    engines_dir="$(openssl version -e 2>/dev/null | sed -n 's/^ENGINESDIR: *"\(.*\)"$/\1/p')" || true
+    engine=""
+    for candidate in "${engines_dir:-/nonexistent}/gost.so" \
+                     /usr/lib/*/engines-3/gost.so \
+                     /usr/lib/*/engines-1.1/gost.so; do
+        [ -f "$candidate" ] || continue
+        engine="$candidate"
+        break
+    done
+    if [ -z "$engine" ]; then
+        echo "config-mutate.sh: gost-engine не найден, а профиль объявил его наличие" >&2
+        exit 64
+    fi
 }
 
 case "$1" in
@@ -258,32 +298,87 @@ on_failure = "warn"' ;;
             "allowed_signature_algorithms = [\"$GOST_OID\"]"
         ;;
     gost-engine-real)
-        # Настоящий движок. Путь не зашивается: каталог движков отличается
-        # между сборками OpenSSL, и зашитый путь превратил бы кейс про загрузку
-        # в кейс про совпадение путей. Кейс объявляет `requires: [gost-engine]`,
-        # поэтому здесь движок обязан найтись — его отсутствие означает
-        # неверно объявленную возможность профиля, то есть сломанный стенд.
-        # `|| true`: под `set -e` присваивание из подстановки роняет скрипт
-        # чужим кодом возврата, а стенд обязан сообщать о своей поломке
-        # кодом 64 — профиль перечисляет его в error_exit_codes и отличает
-        # ERROR (сломан стенд) от FAIL (сломан продукт).
-        engines_dir="$(openssl version -e 2>/dev/null | sed -n 's/^ENGINESDIR: *"\(.*\)"$/\1/p')" || true
-        engine=""
-        for candidate in "${engines_dir:-/nonexistent}/gost.so" \
-                         /usr/lib/*/engines-3/gost.so \
-                         /usr/lib/*/engines-1.1/gost.so; do
-            [ -f "$candidate" ] || continue
-            engine="$candidate"
-            break
-        done
-        if [ -z "$engine" ]; then
-            echo "config-mutate.sh: gost-engine не найден, а профиль объявил его наличие" >&2
-            exit 64
-        fi
+        find_gost_engine
         insert_top_level_and_replace_key \
             "gost_engine_path = \"$engine\"" \
             '^allowed_signature_algorithms = ' \
             "allowed_signature_algorithms = [\"$GOST_OID\"]"
+        ;;
+    gost-engine-unused-real)
+        # Обратная сторона gost-engine-unused: движок настоящий, ГОСТ-подписи
+        # по-прежнему не разрешены. Загрузка удаётся, входу ничто не мешает —
+        # проверка обязана дойти до предупреждения, а не до отказа. Отличать
+        # это от gost-engine-unused важно: там неисправный движок, и с ним
+        # аутентификация падает по самому факту заданного пути.
+        find_gost_engine
+        insert_top_level "gost_engine_path = \"$engine\""
+        ;;
+    gost-pkcs11-openssl)
+        # mode = "pkcs11" вместе с crypto_backend = "openssl". Путь к движку
+        # обязателен: без него ГОСТ в allow-list отвергнет валидатор, и кейс
+        # проверял бы валидацию вместо связки режима с бэкендом. Движок здесь
+        # заведомо не настоящий и настоящим быть не должен — эта ветка
+        # диагностики возвращается до всякой попытки загрузки, поэтому кейс и
+        # не объявляет `requires: [gost-engine]`.
+        printf 'not a shared object\n' > "$NOT_AN_ENGINE"
+        chmod 0644 "$NOT_AN_ENGINE"
+        install -m 0644 /dev/null "$PKCS11_STUB_MODULE"
+        save_original
+        # Вставка идёт перед первой секцией, как в insert_top_level: строка,
+        # дописанная в конец файла, попала бы внутрь последней секции и
+        # перестала бы быть ключом верхнего уровня.
+        #
+        # `mode` и `crypto_backend` заменяются ТОЛЬКО до первой секции: ключ с
+        # именем `mode` есть и в [trust.revocation], и правило без этой
+        # оговорки переписывало бы заодно режим отзыва — порча, которую кейс
+        # не заметил бы, потому что проверяет он совсем другое.
+        #
+        # `pkcs11_module` обязателен: при mode = "pkcs11" без него конфиг
+        # отвергает валидатор, и кейс получил бы ошибку загрузки вместо
+        # проверяемой записи. Путь должен существовать и принадлежать root —
+        # `tessera check` читает конфигурацию привилегированным загрузчиком.
+        # Сам модуль не загружается: связка режима и бэкенда отвергается
+        # раньше, чем дело доходит до токена, поэтому годится любой
+        # root-овский файл.
+        awk -v oid="$GOST_OID" -v engine="$NOT_AN_ENGINE" -v module="$PKCS11_STUB_MODULE" '
+            /^\[/ && !inserted {
+                printf "gost_engine_path = \"%s\"\n", engine
+                printf "pkcs11_module = \"%s\"\n", module
+                inserted = 1
+            }
+            !inserted && /^mode = / { print "mode = \"pkcs11\""; next }
+            !inserted && /^crypto_backend = / { print "crypto_backend = \"openssl\""; next }
+            !inserted && /^pkcs11_module = / { next }
+            /^allowed_signature_algorithms = / {
+                printf "allowed_signature_algorithms = [\"%s\"]\n", oid
+                next
+            }
+            { print }
+        ' "$ORIGINAL" > "$STAGING"
+        commit_config
+        ;;
+    pkcs11-openssl-plain)
+        # Та же пара режима и бэкенда, что в gost-pkcs11-openssl, но без
+        # ГОСТ-OID и без пути к движку: обычная RSA/ECDSA-конфигурация, в
+        # которой вход тем не менее не работает. Ключи заменяются только до
+        # первой секции — `mode` есть и в [trust.revocation].
+        #
+        # `pkcs11_module` подставляется по той же причине, что и в
+        # gost-pkcs11-openssl: без него конфиг не проходит валидацию при
+        # mode = "pkcs11", и кейс проверял бы валидатор вместо связки.
+        install -m 0644 /dev/null "$PKCS11_STUB_MODULE"
+        save_original
+        awk -v module="$PKCS11_STUB_MODULE" '
+            !seen_section && /^\[/ {
+                printf "pkcs11_module = \"%s\"\n", module
+                seen_section = 1
+            }
+            !seen_section && /^mode = / { print "mode = \"pkcs11\""; next }
+            !seen_section && /^crypto_backend = / { print "crypto_backend = \"openssl\""; next }
+            !seen_section && /^pkcs11_module = / { next }
+            { print }
+        ' "$ORIGINAL" > "$STAGING"
+        commit_config
         ;;
     gost-without-path)
         replace_key '^allowed_signature_algorithms = ' \
@@ -298,6 +393,7 @@ on_failure = "warn"' ;;
             rm -f "$ORIGINAL"
         fi
         rm -f "$NOT_AN_ENGINE"
+        rm -f "$PKCS11_STUB_MODULE"
         ;;
     *) usage ;;
 esac
