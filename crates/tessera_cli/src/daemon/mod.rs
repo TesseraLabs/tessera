@@ -116,12 +116,18 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     // Operators previously had to edit the systemd unit's CLI flags AND
     // config.toml in lockstep; with this change the daemon reads the same
     // file as PAM and CLI flags only act as overrides.
-    let validated = tessera_core::config::load_validated_config(&args.config).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to load monitord config from {}: {e}",
-            args.config.display()
-        )
-    })?;
+    //
+    // Loaded through the privileged path check, like PAM: the daemon is
+    // long-lived and root, and the config names native modules it will load
+    // into its own address space, so a config or module that some other user
+    // can rewrite must stop startup rather than be trusted.
+    let validated =
+        tessera_core::config::load_privileged_validated_config(&args.config).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load monitord config from {}: {e}",
+                args.config.display()
+            )
+        })?;
 
     // Logging came up before the config could be read; now that
     // `[logging].level` is known, swap it into the live filter.  The
@@ -132,14 +138,23 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     // its severity level; if any check reported `Error`, refuse to start
     // so misconfigurations surface loudly in `systemctl status` instead of
     // silently degrading every subsequent auth.
+    //
+    // The gost-engine is probed before the plugin is loaded: loading
+    // verifies the plugin's detached signature through OpenSSL, and the
+    // first call into libcrypto registers gost-engine ambiently from
+    // Astra's `openssl.cnf`, after which our own explicit load of the
+    // engine is refused. Probing later would report a broken engine on a
+    // host where authentication works.
+    let gost_readiness = crate::startup_check::gost::probe(&validated);
     let mac_backend: Arc<dyn tessera_core::mac::MacBackend> = Arc::from(
         tessera_core::plugin::load_enforcement_backend(validated.mac.backend.as_deref(), ""),
     );
     let startup_opts = crate::startup_check::StartupCheckOptions::default();
-    let report = crate::startup_check::run_startup_checks_with_backend(
+    let report = crate::startup_check::run_startup_checks_with_backend_and_gost(
         &validated,
         &startup_opts,
         mac_backend.as_ref(),
+        gost_readiness,
     );
     report.log();
     if report.has_errors() {

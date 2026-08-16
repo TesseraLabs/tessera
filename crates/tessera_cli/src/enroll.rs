@@ -25,6 +25,7 @@ use std::process::ExitCode;
 
 use clap::Args;
 
+use tessera_core::config::ValidatedConfig;
 use tessera_core::enrollment::audit::EnrollAuditIds;
 use tessera_core::enrollment::{
     EnrollmentPackage, ImportError, ImportMode, ImportOutcome, InstallPaths,
@@ -132,6 +133,16 @@ pub enum EnrollError {
     /// The post-import `tessera check` preflight reported an ERROR.
     #[error("post-import check failed: the device config did not pass `tessera check`")]
     PostCheckFailed,
+    /// The device config could not be loaded for the post-import check —
+    /// unreadable, unparseable, or not root-controlled.
+    #[error("post-import check could not load config {path}: {reason}")]
+    ConfigLoad {
+        /// Config path that failed to load.
+        path: String,
+        /// Why it failed, including the ownership/mode detail when the path
+        /// failed the root-control policy.
+        reason: String,
+    },
 }
 
 /// Parse an OS string (`astra`/`linux`/`windows`) into a [`RoleOs`].
@@ -149,9 +160,24 @@ fn parse_os(s: &str) -> Result<RoleOs, String> {
 /// Resolve the device `host_id` prefix8 from the validated config, best-effort.
 /// A resolution failure is not fatal to enrollment (the package install does
 /// not depend on it) — it only blanks the `host_id` field in the report/audit.
+///
+/// The config is read under the same root-control policy as PAM and the
+/// daemon, so a config the operator cannot trust never contributes an
+/// identifier to a long-lived audit event. The reason is logged rather than
+/// returned: unless the operator passed `--skip-check`, the same load runs
+/// again in [`load_preflight_config`], which is where it becomes fatal.
 fn resolve_host_id_prefix8(config: &Path) -> String {
-    let Ok(validated) = tessera_core::config::load_validated_config(config) else {
-        return String::new();
+    let validated = match tessera_core::config::load_privileged_validated_config(config) {
+        Ok(validated) => validated,
+        Err(e) => {
+            tracing::warn!(
+                target: "tessera.enroll",
+                config = %config.display(),
+                error = %e,
+                "cannot load config for host_id resolution; reporting an empty host_id"
+            );
+            return String::new();
+        }
     };
     let resolver =
         HostIdentityResolver::from_validated(&validated.host_identity, PathBuf::from("/"));
@@ -161,16 +187,117 @@ fn resolve_host_id_prefix8(config: &Path) -> String {
     }
 }
 
-/// Run the post-import `tessera check` preflight against `config`. Returns
-/// `true` when the config passed (no ERROR records), `false` otherwise. Reuses
-/// the exact [`crate::check`] machinery (no duplicate validation).
-fn post_import_check(config: &Path) -> bool {
-    let Ok(validated) = tessera_core::config::load_validated_config(config) else {
-        return false;
-    };
-    let opts = crate::startup_check::StartupCheckOptions::default();
-    let report = crate::startup_check::run_startup_checks(&validated, &opts);
-    report.count(crate::startup_check::StartupCheckSeverity::Error) == 0
+/// Settle gost-engine readiness from the config's engine path alone, before
+/// anything in this process has reached libcrypto.
+///
+/// The probe belongs here and nowhere later. Verifying the enrollment manifest
+/// calls into libcrypto (`role::verify_signature` on the managed path), and on
+/// Astra the first call into libcrypto registers gost-engine ambiently from
+/// `openssl.cnf`; the engine then refuses our own explicit load. A probe run
+/// after the import would report a broken engine — and fail the enrollment of
+/// a perfectly good package — on a host where authentication works and where
+/// `tessera check` in a fresh process passes.
+///
+/// Only the engine path is read, because the full config is routinely
+/// unloadable at this point: a first managed enrollment runs against a config
+/// naming `/var/lib/tessera/device.crl`, a file this very command creates. The
+/// path still goes through the root-control policy — an engine named by a
+/// config anyone but root can rewrite is loaded into the authentication
+/// process, so a raw TOML value would be no safer here than in the daemon.
+///
+/// A config that cannot be read at all leaves the engine unprobed and silent:
+/// the same file is loaded again after the import, under a strictly stricter
+/// policy, and the operator's error comes from there.
+fn probe_engine_before_import(config: &Path) -> crate::startup_check::gost::EngineReadiness {
+    match tessera_core::config::load_privileged_gost_engine_path(config) {
+        Ok(engine_path) => crate::startup_check::gost::probe_path(engine_path.as_deref()),
+        Err(e) => {
+            tracing::warn!(
+                target: "tessera.enroll",
+                config = %config.display(),
+                error = %e,
+                "cannot read the gost-engine path from the config; leaving the engine unprobed"
+            );
+            crate::startup_check::gost::not_probed()
+        }
+    }
+}
+
+/// Load the device config for the post-import preflight.
+///
+/// # Errors
+///
+/// [`EnrollError::ConfigLoad`] when the config cannot be read, parsed, or does
+/// not pass the root-control policy — the message carries the underlying
+/// reason so the operator knows which path to fix.
+fn load_preflight_config<L>(config: &Path, load_config: L) -> Result<ValidatedConfig, EnrollError>
+where
+    L: FnOnce(&Path) -> Result<ValidatedConfig, tessera_core::Error>,
+{
+    load_config(config).map_err(|e| EnrollError::ConfigLoad {
+        path: config.display().to_string(),
+        reason: e.to_string(),
+    })
+}
+
+/// Run the post-import `tessera check` preflight. Reuses the exact
+/// [`crate::check`] machinery (no duplicate validation), including its
+/// root-control policy on the config and every path it names.
+///
+/// # Errors
+///
+/// [`EnrollError::PostCheckFailed`] when a startup check reported an ERROR.
+fn post_import_check(
+    config: &ValidatedConfig,
+    gost: crate::startup_check::gost::EngineReadiness,
+    check_opts: &crate::startup_check::StartupCheckOptions,
+) -> Result<(), EnrollError> {
+    let report = crate::startup_check::run_startup_checks_with_gost(config, check_opts, gost);
+    if report.has_errors() {
+        Err(EnrollError::PostCheckFailed)
+    } else {
+        Ok(())
+    }
+}
+
+/// Import the package and run the post-import preflight, in the order that
+/// keeps the engine probe ahead of the import's first call into libcrypto.
+///
+/// The install step, the config loader, and the engine probe are parameters so
+/// a test can watch that order directly; production wiring is in [`run`].
+///
+/// # Errors
+///
+/// Whatever `install` returns, or the preflight errors described on
+/// [`load_preflight_config`] and [`post_import_check`].
+fn import_and_check<L, G, I>(
+    opts: &EnrollOptions,
+    check_opts: &crate::startup_check::StartupCheckOptions,
+    load_config: L,
+    probe_engine: G,
+    install: I,
+) -> Result<ImportOutcome, EnrollError>
+where
+    L: FnOnce(&Path) -> Result<ValidatedConfig, tessera_core::Error>,
+    G: FnOnce(&Path) -> crate::startup_check::gost::EngineReadiness,
+    I: FnOnce() -> Result<ImportOutcome, ImportError>,
+{
+    // Once, and ahead of the import: the first load of the engine is the one
+    // the process keeps, so a second attempt after the import would answer
+    // from that same latched result and could only ever contradict a host
+    // where authentication works.
+    let gost = opts.run_check.then(|| probe_engine(&opts.config));
+
+    let outcome = install()?;
+
+    if let Some(gost) = gost {
+        // Now the config loads: this command has just created the artefacts a
+        // freshly enrolled device's config names.
+        let config = load_preflight_config(&opts.config, load_config)?;
+        post_import_check(&config, gost, check_opts)?;
+    }
+
+    Ok(outcome)
 }
 
 /// Execute the enrollment. Imports the package (emitting the enriched
@@ -212,14 +339,16 @@ pub fn run(opts: EnrollOptions) -> Result<EnrollReport, EnrollError> {
     };
     // The core is the single audit-emission point: it emits the enriched
     // `device_enrolled` on success (non-no-op) or `enrollment_rejected` on
-    // failure, fail-closed.
-    let outcome = pkg.install_with_ids(&opts.paths, opts.os, pubkey_bytes.as_deref(), ids)?;
-
-    // Post-import preflight: reuse `tessera check`. A failing config is
-    // fail-closed — the operator must fix it before the device is trusted.
-    if opts.run_check && !post_import_check(&opts.config) {
-        return Err(EnrollError::PostCheckFailed);
-    }
+    // failure, fail-closed. The post-import preflight reuses `tessera check`;
+    // a failing config is fail-closed — the operator must fix it before the
+    // device is trusted.
+    let outcome = import_and_check(
+        &opts,
+        &crate::startup_check::StartupCheckOptions::default(),
+        tessera_core::config::load_privileged_validated_config,
+        probe_engine_before_import,
+        || pkg.install_with_ids(&opts.paths, opts.os, pubkey_bytes.as_deref(), ids),
+    )?;
 
     Ok(EnrollReport {
         outcome,
@@ -320,12 +449,16 @@ mod tests {
     )]
 
     use super::*;
+    use crate::startup_check::test_config::{base_cfg, write_anchor};
+    use crate::startup_check::StartupCheckOptions;
     use openssl::pkey::PKey;
     use openssl::sign::Signer;
     use sha2::{Digest, Sha256};
+    use std::cell::{Cell, RefCell};
     use std::fmt::Write as _;
     use std::fs;
     use tempfile::TempDir;
+    use tessera_core::gost::GostEngineError;
 
     /// Opaque per-host `.p12` bytes the test packages ship (never decrypted).
     const P12_OPAQUE: &[u8] = b"\x30\x82PKCS12-OPAQUE";
@@ -522,9 +655,9 @@ mod tests {
 
     #[test]
     fn post_import_check_failure_is_fail_closed() {
-        // run_check = true with a config path that cannot load → post-import
-        // check returns false → PostCheckFailed (fail-closed). The package
-        // itself imports fine first.
+        // run_check = true with a config path that cannot load → enrollment
+        // fails and the error names the path and the reason (fail-closed).
+        // The package itself imports fine first.
         let pkg = build_standalone_pkg();
         let root = tempfile::tempdir().unwrap();
         let opts = EnrollOptions {
@@ -538,7 +671,11 @@ mod tests {
             config: PathBuf::from("/nonexistent/config.toml"),
         };
         let err = run(opts).expect_err("post-check must fail-closed");
-        assert!(matches!(err, EnrollError::PostCheckFailed));
+        let EnrollError::ConfigLoad { path, reason } = &err else {
+            panic!("expected a config-load failure, got {err:?}");
+        };
+        assert_eq!(path, "/nonexistent/config.toml");
+        assert!(!reason.is_empty(), "the operator needs the reason");
     }
 
     #[test]
@@ -562,6 +699,206 @@ mod tests {
         let second = run(mk_opts()).expect("re-import ok");
         assert!(second.outcome.no_op);
         assert_eq!(second.outcome.bundle_version, 5);
+    }
+
+    thread_local! {
+        /// Call journal shared by the injected engine probe (a plain `fn`
+        /// pointer, so it cannot capture) and the install stub.
+        static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        /// Whether the install stub has run, for the config loader that only
+        /// succeeds once the artefacts it names exist.
+        static INSTALLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn note(what: &'static str) {
+        CALLS.with(|c| c.borrow_mut().push(what));
+    }
+
+    /// Config with GOST configured, so the engine is probed at all.
+    fn gost_cfg(anchor: &Path) -> ValidatedConfig {
+        let mut cfg = base_cfg(anchor, "pkcs12");
+        cfg.gost_engine_path = Some(anchor.with_file_name("gost.so"));
+        cfg.trust
+            .allowed_signature_algorithms
+            .insert("1.2.643.7.1.1.3.2".to_owned());
+        cfg
+    }
+
+    /// Startup-check options confined to `tmp`. `gost_probe` stays unset: the
+    /// enrollment pipeline probes the engine itself, ahead of the import, and
+    /// the check consumes that readiness rather than probing again.
+    fn check_opts(tmp: &Path) -> StartupCheckOptions {
+        StartupCheckOptions {
+            pam_d_root: tmp.join("pam.d"),
+            fs_root: Some(tmp.to_path_buf()),
+            kernel_parsec_probe: None,
+            mrd_probe: None,
+            gost_probe: None,
+        }
+    }
+
+    /// The pre-import engine probe as the tests inject it: it notes the call
+    /// and answers with `outcome`, standing in for a `dlopen` of a real
+    /// engine module.
+    fn engine_probe(
+        outcome: crate::startup_check::gost::EnginePathProbe,
+    ) -> impl FnOnce(&Path) -> crate::startup_check::gost::EngineReadiness {
+        move |_| {
+            crate::startup_check::gost::probe_path_with(Some(Path::new("/gost.so")), |path| {
+                note("gost.probe");
+                outcome(path)
+            })
+        }
+    }
+
+    fn enroll_opts(root: &Path, run_check: bool) -> EnrollOptions {
+        EnrollOptions {
+            import: root.join("package"),
+            mode: ImportMode::Standalone,
+            manifest_pubkey: None,
+            os: RoleOs::Linux,
+            paths: install_paths(root),
+            host_id_prefix8: String::new(),
+            run_check,
+            config: root.join("config.toml"),
+        }
+    }
+
+    fn stub_outcome() -> ImportOutcome {
+        ImportOutcome {
+            mode: ImportMode::Standalone,
+            bundle_version: 0,
+            baseline_established: false,
+            no_op: false,
+        }
+    }
+
+    /// The engine probe has to run before the import — verifying the
+    /// enrollment manifest calls into libcrypto, and on Astra the first such
+    /// call registers gost-engine ambiently from `openssl.cnf`, after which
+    /// our own explicit load is refused. A probe left until after the import
+    /// would fail the enrollment on a host where `tessera check` in a fresh
+    /// process passes.
+    ///
+    /// The single `gost.probe` entry is the other half of the guarantee: the
+    /// check consumes the readiness obtained up front instead of probing
+    /// again once the import has touched OpenSSL.
+    #[test]
+    fn gost_engine_is_probed_before_the_import_runs() {
+        CALLS.with(|c| c.borrow_mut().clear());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let anchor = write_anchor(tmp.path());
+        let opts = enroll_opts(tmp.path(), true);
+        let check_opts = check_opts(tmp.path());
+
+        let err = import_and_check(
+            &opts,
+            &check_opts,
+            |_| Ok(gost_cfg(&anchor)),
+            engine_probe(|_| {
+                Err(GostEngineError::digest_unavailable(
+                    "md_gost12_512 not registered after engine load",
+                ))
+            }),
+            || {
+                note("install");
+                Ok(stub_outcome())
+            },
+        )
+        .expect_err("a broken engine must fail the post-import check");
+
+        assert!(matches!(err, EnrollError::PostCheckFailed), "{err:?}");
+        let calls = CALLS.with(|c| c.borrow().clone());
+        assert_eq!(calls, vec!["gost.probe", "install"], "{calls:?}");
+    }
+
+    /// The regression this ordering exists for: on a first managed enrollment
+    /// the config names artefacts this very command creates
+    /// (`/var/lib/tessera/device.crl`), so it does not load until the import
+    /// is done. The engine probe must not be tied to that load — otherwise it
+    /// lands behind the manifest verification, which is exactly where the
+    /// ambient registration from `openssl.cnf` wins and a healthy host is
+    /// refused with `gost_engine_load_failed` after its package is already
+    /// installed.
+    #[test]
+    fn gost_engine_is_probed_before_the_import_when_the_config_loads_only_after_it() {
+        CALLS.with(|c| c.borrow_mut().clear());
+        INSTALLED.with(|i| i.set(false));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let anchor = write_anchor(tmp.path());
+        let opts = enroll_opts(tmp.path(), true);
+        let check_opts = check_opts(tmp.path());
+
+        let err = import_and_check(
+            &opts,
+            &check_opts,
+            |_| {
+                note("load_config");
+                if INSTALLED.with(Cell::get) {
+                    Ok(gost_cfg(&anchor))
+                } else {
+                    Err(tessera_core::Error::ConfigInvalid {
+                        reason: "trust CRL path /var/lib/tessera/device.crl does not exist"
+                            .to_owned(),
+                    })
+                }
+            },
+            engine_probe(|_| {
+                Err(GostEngineError::digest_unavailable(
+                    "md_gost12_512 not registered after engine load",
+                ))
+            }),
+            || {
+                note("install");
+                INSTALLED.with(|i| i.set(true));
+                Ok(stub_outcome())
+            },
+        )
+        .expect_err("a broken engine must fail the post-import check");
+
+        // The check ran on the config that only became loadable after the
+        // import, and it consumed the readiness obtained before it.
+        assert!(matches!(err, EnrollError::PostCheckFailed), "{err:?}");
+        let calls = CALLS.with(|c| c.borrow().clone());
+        assert_eq!(
+            calls,
+            vec!["gost.probe", "install", "load_config"],
+            "the probe must precede the import even when the config is not \
+             loadable yet, and it must happen exactly once: {calls:?}"
+        );
+    }
+
+    /// `--skip-check` skips the preflight entirely: no config load, no engine
+    /// load, and the import still runs.
+    #[test]
+    fn skipping_the_check_never_probes_the_engine() {
+        CALLS.with(|c| c.borrow_mut().clear());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let anchor = write_anchor(tmp.path());
+        let opts = enroll_opts(tmp.path(), false);
+        let check_opts = check_opts(tmp.path());
+
+        let outcome = import_and_check(
+            &opts,
+            &check_opts,
+            |_| {
+                note("load_config");
+                Ok(gost_cfg(&anchor))
+            },
+            engine_probe(|_| Ok(())),
+            || {
+                note("install");
+                Ok(stub_outcome())
+            },
+        )
+        .expect("no check, no failure");
+
+        assert!(!outcome.no_op);
+        let calls = CALLS.with(|c| c.borrow().clone());
+        assert_eq!(calls, vec!["install"], "{calls:?}");
     }
 
     #[test]

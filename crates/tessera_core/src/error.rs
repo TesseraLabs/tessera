@@ -249,10 +249,12 @@ pub enum SelfCheckError {
     },
     /// GOST engine is required by config but failed to load.
     ///
-    /// Self-check fails closed: the PAM module will return
-    /// `PAM_AUTHINFO_UNAVAIL` for every call, which is the correct
-    /// behaviour when the trust whitelist mandates GOST signatures and
-    /// the engine cannot service them.
+    /// Self-check fails closed: the PAM module returns
+    /// `PAM_AUTHINFO_UNAVAIL` for every call. The probe runs on the mere
+    /// presence of `gost_engine_path`, before the certificate or the mode is
+    /// looked at, so this denies RSA and ECDSA logins as well — a host whose
+    /// engine is broken authenticates nobody until the path is removed or
+    /// the engine is fixed.
     #[error("gost-engine is required but unavailable: {0}")]
     GostEngineUnavailable(#[from] crate::gost::GostEngineError),
     /// Hook command is missing.
