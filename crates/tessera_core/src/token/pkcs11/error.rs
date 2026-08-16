@@ -237,7 +237,7 @@ pub enum Pkcs11Error {
         key_type: String,
     },
     /// A supported key type maps to a PKCS#11 mechanism that the
-    /// binding crate does not expose (e.g. cryptoki 0.7 has no GOST
+    /// binding crate does not expose (e.g. `cryptoki` has no GOST
     /// signing variant).
     #[error("pkcs#11 mechanism not supported: {mechanism}")]
     MechanismNotSupported {

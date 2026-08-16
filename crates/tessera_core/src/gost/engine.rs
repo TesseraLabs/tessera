@@ -141,6 +141,38 @@ pub fn ensure_loaded_with_path(gost_engine_path: Option<&Path>) -> Result<(), Go
     }
 }
 
+/// Load the engine **and** verify it can serve both Streebog digests.
+///
+/// This is the single definition of "GOST is ready on this host", shared by
+/// the fail-closed probe in [`crate::self_check::self_check`] and by the
+/// `tessera check` preflight.  [`ensure_loaded`] alone is a weaker claim: its
+/// post-load sanity check accepts a fork that spells Streebog-256
+/// `streebog256` and never asks about Streebog-512 at all.  Authentication
+/// resolves both digests by their canonical libcrypto names, so a preflight
+/// built on the weaker claim would report success on a host where the first
+/// real login fails.
+///
+/// # Errors
+///
+/// Same set as [`ensure_loaded`], plus
+/// [`GostEngineError::DigestUnavailable`] when the engine loads but either
+/// Streebog digest cannot be resolved by name.
+pub fn ensure_ready(cfg: &ValidatedConfig) -> Result<(), GostEngineError> {
+    ensure_ready_with_path(cfg.gost_engine_path.as_deref())
+}
+
+/// Path-only variant of [`ensure_ready`].
+///
+/// # Errors
+///
+/// Same set as [`ensure_ready`].
+pub fn ensure_ready_with_path(gost_engine_path: Option<&Path>) -> Result<(), GostEngineError> {
+    ensure_loaded_with_path(gost_engine_path)?;
+    super::algorithms::gost_2012_256_md()?;
+    super::algorithms::gost_2012_512_md()?;
+    Ok(())
+}
+
 /// Loads the gost-engine only when at least one certificate in `certs` carries
 /// a GOST signature algorithm.
 ///

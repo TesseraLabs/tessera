@@ -11,13 +11,16 @@
 //! `NID_id_GostR3411_2012_512` = 983, per `obj_mac.h`), each with a stable
 //! NID/SN (`md_gost12_256`/`md_gost12_512`)/LN baked in at compile time —
 //! gost-engine supplies the *implementation* behind these NIDs, it does not
-//! register the OID/name itself. A hardcoded NID literal would therefore
-//! not actually be unstable; this module still resolves by name rather
-//! than NID because that's more robust and self-documenting than
-//! duplicating the same OID as a second, hand-maintained integer that has
-//! to be kept in sync by hand — which is literally how an earlier version
-//! of this module ended up with the wrong NIDs (1177/1178, which are in
-//! fact Kuznyechik-cipher NIDs, unrelated to Streebog).
+//! register the OID/name itself.
+//!
+//! Resolution goes by name because an earlier version of this module
+//! hardcoded 1177/1178 and those numbers are simply wrong: they belong to
+//! `kuznyechik_ctr_acpkm` / `kuznyechik_ctr_acpkm_omac`, a block cipher
+//! unrelated to Streebog. Every digest lookup therefore missed, which is a
+//! likely cause of the GOST authentication failures observed on the Astra
+//! stand. The names are compile-time constants in the same table as the
+//! NIDs, so nothing is lost by using them, and a wrong name fails loudly at
+//! the lookup instead of silently selecting another algorithm.
 
 use openssl::hash::MessageDigest;
 
@@ -89,9 +92,9 @@ fn digest_by_name(name: &'static str) -> Result<MessageDigest, GostEngineError> 
     }
     // Even if the engine is "available" by our flag, the name lookup can
     // still fail (engine deregistered, build mismatch, etc.). Resolved by
-    // name (`EVP_get_digestbyname`) rather than by a hardcoded NID literal
-    // purely for maintainability — see the module doc for why a literal
-    // isn't actually unstable but is still worth avoiding.
+    // name (`EVP_get_digestbyname`) rather than by a NID literal — see the
+    // module doc: the literals this module used to carry named a block
+    // cipher, not Streebog, and nothing caught it.
     MessageDigest::from_name(name).ok_or_else(|| GostEngineError::digest_unavailable(name))
 }
 
@@ -127,6 +130,61 @@ mod tests {
             Ok(_) => panic!("digest resolved without engine being available"),
             Err(GostEngineError::NotAvailable(_)) => {}
             Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// libcrypto's static NIDs for Streebog-256/512 — the entries the name
+    /// constants above must resolve to. Present in the built-in object
+    /// table since OpenSSL 1.1.0, with or without gost-engine.
+    const NID_STREEBOG_256: i32 = 982;
+    const NID_STREEBOG_512: i32 = 983;
+
+    /// The NID literals an earlier version of this module used for the two
+    /// digests.
+    const WRONG_LEGACY_NIDS: [i32; 2] = [1177, 1178];
+
+    #[test]
+    fn digest_names_match_the_static_streebog_nids() {
+        // Ties the two name constants to the object-table entries they are
+        // supposed to address. Needs no engine: the names are compiled into
+        // libcrypto, only the implementation behind them comes from the
+        // engine — so this runs everywhere, unlike the four tests below.
+        for (nid, name) in [
+            (NID_STREEBOG_256, GOST_2012_256_NAME),
+            (NID_STREEBOG_512, GOST_2012_512_NAME),
+        ] {
+            let sn = openssl::nid::Nid::from_raw(nid)
+                .short_name()
+                .unwrap_or_else(|e| panic!("nid {nid} has no short name: {e}"));
+            assert_eq!(sn, name, "nid {nid} does not name {name}");
+        }
+    }
+
+    #[test]
+    fn the_legacy_nid_literals_do_not_name_streebog() {
+        // Guards the regression the module doc describes: 1177/1178 name a
+        // Kuznyechik cipher mode, so resolving digests through them yielded
+        // nothing usable while looking plausible in review.
+        for nid in WRONG_LEGACY_NIDS {
+            let nid = openssl::nid::Nid::from_raw(nid);
+            if let Ok(sn) = nid.short_name() {
+                assert_ne!(sn, GOST_2012_256_NAME);
+                assert_ne!(sn, GOST_2012_512_NAME);
+            }
+            if let Some(md) = MessageDigest::from_nid(nid) {
+                assert_ne!(
+                    md.size(),
+                    32,
+                    "nid {} resolves to a 32-byte digest",
+                    nid.as_raw()
+                );
+                assert_ne!(
+                    md.size(),
+                    64,
+                    "nid {} resolves to a 64-byte digest",
+                    nid.as_raw()
+                );
+            }
         }
     }
 

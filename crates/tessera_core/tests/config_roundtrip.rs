@@ -11,7 +11,9 @@
 mod test_support;
 
 use std::path::{Path, PathBuf};
-use tessera_core::config::{load_privileged_validated_config, RawConfig, ValidatedConfig};
+use tessera_core::config::{
+    load_privileged_gost_engine_path, load_privileged_validated_config, RawConfig, ValidatedConfig,
+};
 use tessera_core::Error;
 
 #[test]
@@ -162,6 +164,61 @@ fn privileged_config_loader_rejects_user_controlled_path() -> Result<(), Box<dyn
     Ok(())
 }
 
+#[test]
+fn gost_engine_path_loader_rejects_user_controlled_config() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, include_str!("fixtures/full_valid.toml"))?;
+
+    let error = load_privileged_gost_engine_path(&config_path)
+        .expect_err("user-controlled config path must be rejected before parsing");
+
+    assert!(matches!(error, Error::PrivilegedPath { .. }));
+    Ok(())
+}
+
+/// The engine path has to be reachable while the rest of the config still
+/// names artefacts that do not exist — a device's first enrollment runs
+/// against a config pointing at the CRL that very import creates. The full
+/// loader fails there; the engine-path loader must not, or the enrollment
+/// probes the engine only after the import has already been through
+/// libcrypto.
+#[cfg(unix)]
+#[test]
+fn gost_engine_path_loads_while_the_full_config_still_cannot(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !running_as_root() {
+        eprintln!(
+            "skip: requires a root-owned config file and trust anchor (run as root to exercise)"
+        );
+        return Ok(());
+    }
+
+    // Same reason as the sibling root-only test: `/tmp` is world-writable and
+    // `ExecTrust::Root` rejects it as an ancestor.
+    let dir = tempfile::Builder::new().tempdir_in("/root")?;
+    let anchor = write_anchor(dir.path());
+    let missing_crl = dir.path().join("device.crl");
+    let body = fixture_with_anchor(&anchor).replace(
+        "crl_paths = []",
+        &format!("crl_paths = [{}]", test_support::toml_path(&missing_crl)),
+    );
+    let body = format!(
+        "gost_engine_path = {}\n{body}",
+        test_support::toml_path(Path::new(test_support::SHELL_PATH))
+    );
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, &body)?;
+
+    load_privileged_validated_config(&config_path)
+        .expect_err("the CRL the enrollment has yet to create must fail the full load");
+
+    let engine = load_privileged_gost_engine_path(&config_path)?;
+    assert_eq!(engine.as_deref(), Some(Path::new(test_support::SHELL_PATH)));
+    Ok(())
+}
+
 /// True when the test process itself runs as root. Only then can a fixture
 /// this test writes to a tempdir come out root-owned, which is what
 /// `load_privileged_validated_config`'s `ExecTrust::Root` walk requires for
@@ -218,11 +275,159 @@ fn privileged_loader_ignores_pkcs11_module_path_when_mode_is_pkcs12(
 
     let validated = load_privileged_validated_config(&config_path)?;
 
-    assert_eq!(validated.mode, tessera_core::config::validated::Mode::Pkcs12);
+    assert_eq!(
+        validated.mode,
+        tessera_core::config::validated::Mode::Pkcs12
+    );
     assert_eq!(
         validated.pkcs11_module.as_deref(),
         Some(Path::new("/nonexistent/rutoken/driver.so"))
     );
+    Ok(())
+}
+
+/// A `mode = "pkcs12"` fixture whose envelope lives in a token object, with
+/// `pkcs11_module` pointed at `module`.
+///
+/// This is the shape that loads the provider without `mode = "pkcs11"`: the
+/// login reads the `CKO_DATA` object through it, and the daemon polls it.
+#[cfg(unix)]
+fn token_carrier_fixture(anchor: &Path, module: &Path) -> String {
+    let body = fixture_with_anchor(anchor).replace(
+        "mode = \"pkcs11\"",
+        "mode = \"pkcs12\"\n\
+         pkcs12_source = \"token_object\"\n\
+         pkcs12_token_object_label = \"tessera-credential\"",
+    );
+    let replaced = body.replace(
+        &format!(
+            "pkcs11_module = {}",
+            test_support::toml_path(test_support::SHELL_PATH)
+        ),
+        &format!("pkcs11_module = {}", test_support::toml_path(module)),
+    );
+    assert!(
+        replaced.contains(&format!(
+            "pkcs11_module = {}",
+            test_support::toml_path(module)
+        )),
+        "fixture must carry the module under test"
+    );
+    replaced
+}
+
+/// The envelope-carrying token loads the very same provider a signing token
+/// does, so a module in a directory the operator can write to must be refused
+/// there too — `mode` alone never decided whether the path reaches `dlopen`.
+#[cfg(unix)]
+#[test]
+fn privileged_loader_rejects_user_controlled_module_for_token_carrier(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !running_as_root() {
+        eprintln!(
+            "skip: requires a root-owned config file and trust anchor (run as root to exercise)"
+        );
+        return Ok(());
+    }
+
+    // As in the sibling root-only tests: the config itself has to sit
+    // somewhere `ExecTrust::Root` accepts, which `/tmp` is not.
+    let dir = tempfile::Builder::new().tempdir_in("/root")?;
+    let anchor = write_anchor(dir.path());
+    // The module, by contrast, deliberately goes where anyone can replace it.
+    let unsafe_dir = tempfile::tempdir()?;
+    let module = unsafe_dir.path().join("driver.so");
+    std::fs::write(&module, b"\x7fELF")?;
+
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, token_carrier_fixture(&anchor, &module))?;
+
+    let err = load_privileged_validated_config(&config_path)
+        .expect_err("a token carrier must not load a module from a writable directory");
+
+    let Error::PrivilegedPath { context, .. } = err else {
+        return Err(format!("expected PrivilegedPath, got {err:?}").into());
+    };
+    assert!(
+        context.contains("pkcs11_module") && context.contains(&module.display().to_string()),
+        "diagnostic must name the field and the path, got: {context}"
+    );
+    Ok(())
+}
+
+/// The counterpart: the same carrier with a root-controlled module loads, and
+/// the canonical path is what the rest of the process gets.
+#[cfg(unix)]
+#[test]
+fn privileged_loader_accepts_root_controlled_module_for_token_carrier(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !running_as_root() {
+        eprintln!(
+            "skip: requires a root-owned config file and trust anchor (run as root to exercise)"
+        );
+        return Ok(());
+    }
+
+    let dir = tempfile::Builder::new().tempdir_in("/root")?;
+    let anchor = write_anchor(dir.path());
+    let module = dir.path().join("driver.so");
+    std::fs::write(&module, b"\x7fELF")?;
+
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, token_carrier_fixture(&anchor, &module))?;
+
+    let validated = load_privileged_validated_config(&config_path)?;
+
+    assert_eq!(
+        validated.pkcs12_source,
+        tessera_core::config::validated::Pkcs12Source::TokenObject {
+            object_label: "tessera-credential".to_owned()
+        }
+    );
+    assert_eq!(validated.pkcs11_module.as_deref(), Some(module.as_path()));
+    Ok(())
+}
+
+/// A USB carrier never opens the module, so a path in a writable directory is
+/// left alone rather than refused: installations upgraded from a token setup
+/// routinely keep a stale value there, and failing them would refuse logins
+/// over a key nothing reads.
+#[cfg(unix)]
+#[test]
+fn privileged_loader_ignores_user_controlled_module_for_usb_carrier(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !running_as_root() {
+        eprintln!(
+            "skip: requires a root-owned config file and trust anchor (run as root to exercise)"
+        );
+        return Ok(());
+    }
+
+    let dir = tempfile::Builder::new().tempdir_in("/root")?;
+    let anchor = write_anchor(dir.path());
+    let unsafe_dir = tempfile::tempdir()?;
+    let module = unsafe_dir.path().join("driver.so");
+    std::fs::write(&module, b"\x7fELF")?;
+
+    let body = fixture_with_anchor(&anchor)
+        .replace("mode = \"pkcs11\"", "mode = \"pkcs12\"")
+        .replace(
+            &format!(
+                "pkcs11_module = {}",
+                test_support::toml_path(test_support::SHELL_PATH)
+            ),
+            &format!("pkcs11_module = {}", test_support::toml_path(&module)),
+        );
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, &body)?;
+
+    let validated = load_privileged_validated_config(&config_path)?;
+
+    assert_eq!(
+        validated.pkcs12_source,
+        tessera_core::config::validated::Pkcs12Source::UsbPartition
+    );
+    assert_eq!(validated.pkcs11_module.as_deref(), Some(module.as_path()));
     Ok(())
 }
 

@@ -13,15 +13,18 @@
 //!   and the caller hashes on the host with Streebog before
 //!   `session.sign`.
 //!
-//! ## OPEN QUESTION (cryptoki ≤ 0.7)
+//! ## Why GOST keys are refused (cryptoki 0.12)
 //!
-//! cryptoki 0.7's [`cryptoki::mechanism::Mechanism`] enum does **not**
-//! include any GOST signing variant — neither `CKM_GOSTR3410` nor any
-//! 2012-prefixed extension.  The version of the spec it tracks
-//! (PKCS#11 v2.40) carries them only as numeric constants in the
-//! vendor-extension range and the upstream Rust crate does not expose
-//! a `Custom`/`Raw` escape hatch.  Until cryptoki gains a variant, we
-//! return [`Pkcs11Error::MechanismNotSupported`] for GOST keys.
+//! [`cryptoki::mechanism::Mechanism`] has no GOST signing variant, and no
+//! escape hatch reaches one.  `MechanismType`'s only open constructor is
+//! `new_vendor_defined`, which refuses anything below `CKM_VENDOR_DEFINED`
+//! (`0x8000_0000`); the GOST mechanisms are standard PKCS#11 v2.40 values
+//! well below it (`CKM_GOSTR3410` = `0x1201`, `CKM_GOSTR3411` = `0x1210`), and
+//! `TryFrom<CK_MECHANISM_TYPE>` maps only the mechanisms the enum already
+//! names.  The raw constants do exist in `cryptoki-sys`, but reaching them
+//! would mean bypassing the safe wrapper entirely.  So a GOST key on a token
+//! yields [`Pkcs11Error::MechanismNotSupported`]; GOST is served by the
+//! OpenSSL/gost-engine path (`mode = "pkcs12"`) instead.
 
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsPssParams};
 use cryptoki::mechanism::{Mechanism, MechanismType};
@@ -136,7 +139,7 @@ fn weak_key_err(err: crate::x509::TrustError) -> Pkcs11Error {
 ///   matrix (currently `RSA`, `EC` on P-256/P-384, `GOSTR3410`).
 /// - [`Pkcs11Error::MechanismNotSupported`] — the key type is in the
 ///   matrix but the binding crate exposes no matching mechanism (today
-///   true for GOST under cryptoki 0.7).
+///   true for GOST — see the module docs).
 /// - [`Pkcs11Error::WeakKey`] — the key is of an accepted family but below the
 ///   minimum strength (e.g. sub-2048-bit RSA).
 pub fn select_mechanism(
@@ -182,11 +185,13 @@ pub fn select_mechanism(
         });
     }
     if key_type == KeyType::GOSTR3410 {
-        // cryptoki 0.7 does not expose CKM_GOSTR3410{,_2012_*}; surface a
-        // typed error so the caller can fall through to the existing
-        // openssl-engine path or return PAM_AUTHINFO_UNAVAIL.
+        // No safe way to name CKM_GOSTR3410 through cryptoki — see the
+        // module docs. Surface a typed error so the caller can fall through
+        // to the openssl-engine path or return PAM_AUTHINFO_UNAVAIL.
         return Err(Pkcs11Error::MechanismNotSupported {
-            mechanism: "CKM_GOSTR3410 (cryptoki 0.7 has no enum variant)".into(),
+            mechanism: "CKM_GOSTR3410 (no cryptoki mechanism variant, and \
+                        new_vendor_defined rejects standard mechanism values)"
+                .into(),
         });
     }
     Err(Pkcs11Error::UnsupportedKeyType {

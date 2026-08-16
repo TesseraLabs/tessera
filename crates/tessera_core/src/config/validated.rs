@@ -630,9 +630,9 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
                     // this configuration, since `validate_gost_engine_path` below rejects
                     // the field outright when `crypto_backend != "openssl"` (see
                     // `Error::GostEnginePathRequiresOpenssl`). GOST via PKCS#11 is not
-                    // supported at all: the upstream `cryptoki` crate has no mechanism
-                    // variant for CKM_GOSTR3410 or any 2012-prefixed GOST mechanism (see
-                    // `crate::token::pkcs11::mechanism`, "OPEN QUESTION (cryptoki <= 0.7)").
+                    // supported at all: the upstream `cryptoki` crate names no GOST signing
+                    // mechanism and its vendor-defined escape hatch refuses the standard
+                    // GOST values (see `crate::token::pkcs11::mechanism` module docs).
                     "a GOST signature algorithm is allowed in \
                      trust.allowed_signature_algorithms, but crypto_backend is not \
                      \"openssl\": GOST is not supported outside the OpenSSL backend at all. \
