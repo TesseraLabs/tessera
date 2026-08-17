@@ -505,6 +505,27 @@ fn drive_with_config(
 /// parsed and validated by production code rather than by the test's idea of
 /// what the section means.
 fn config_with_audit(sections: toml::Table) -> tessera_core::config::ValidatedConfig {
+    // The anchor directory is held until validation is over: the validator
+    // checks that the anchor file is there, so a fixture that dropped its
+    // temporary directory first would fail on a missing file rather than on
+    // whatever the test is about.
+    let (document, _anchor) = fixture_document(sections);
+    let raw: tessera_core::config::RawConfig = toml::Value::Table(document)
+        .try_into()
+        .expect("the test configuration does not parse");
+    tessera_core::config::ValidatedConfig::try_from(&raw)
+        .expect("the test configuration does not validate")
+}
+
+/// The fixture as a TOML document, before it becomes a configuration.
+///
+/// Separate from the call above so a test can look at what the fixture pins
+/// rather than only at what it produces — on Unix the platform-correct monitor
+/// paths and the POSIX defaults are the same strings, so nothing about the
+/// finished configuration distinguishes a fixture that sets them from one that
+/// lets the defaults through. The difference is only visible on Windows, and
+/// structurally here.
+fn fixture_document(sections: toml::Table) -> (toml::Table, tempfile::TempDir) {
     // A trust anchor has to exist for the configuration to validate at all.
     // Nothing here uses it — the code method authenticates without one — so the
     // shortest well-formed PEM does.
@@ -546,15 +567,29 @@ level = "info"
             "anchors".to_owned(),
             toml::Value::Array(vec![path(&anchor)]),
         );
-    for (name, value) in sections {
+
+    // `[monitor]` from the shared fixture rather than from the defaults.
+    //
+    // The defaults are POSIX paths — `/run/tessera/monitord.sock` — and unlike
+    // `[roles].dir` or `[codes].dir`, which are checked only when set
+    // explicitly, the monitor paths are validated whatever their origin. On
+    // Windows a path with no drive letter is not absolute, so the default
+    // itself is refused and the configuration never validates.
+    //
+    // These values satisfy the validator; they are not a statement about what
+    // the product uses on either platform — the Windows transport is a named
+    // pipe. `test_support` says the same at greater length, and is the one home
+    // for both platform traps this fixture kept walking into.
+    let monitor: toml::Table = toml::from_str(&crate::test_support::monitor_section_toml())
+        .expect("the shared [monitor] fixture parses");
+    for (name, value) in monitor {
         document.insert(name, value);
     }
 
-    let raw: tessera_core::config::RawConfig = toml::Value::Table(document)
-        .try_into()
-        .expect("the test configuration does not parse");
-    tessera_core::config::ValidatedConfig::try_from(&raw)
-        .expect("the test configuration does not validate")
+    for (name, value) in sections {
+        document.insert(name, value);
+    }
+    (document, anchors)
 }
 
 /// The defect this harness had, frozen so it cannot come back.
@@ -595,6 +630,39 @@ fn a_windows_style_path_breaks_spliced_toml_and_survives_a_toml_value() {
         windows_path,
         "the path did not survive the encoder unchanged",
     );
+}
+
+/// The fixture must pin the monitor paths, not inherit them.
+///
+/// `[monitor].socket_path` and `state_file_path` are the one pair config
+/// validation checks for absoluteness **whatever their origin** — unlike
+/// `[roles].dir` and `[codes].dir`, which are checked only when set. Their
+/// defaults are POSIX, and a path with no drive letter is not absolute on
+/// Windows, so a fixture that lets them through validates here and is refused
+/// there.
+///
+/// Checked structurally rather than by value on purpose: on Unix the
+/// platform-correct fixture path and the POSIX default are the same string, so
+/// no assertion about the finished configuration can tell the two apart. What
+/// can be told apart is whether the fixture said anything at all.
+#[test]
+fn the_fixture_pins_the_monitor_paths_rather_than_inheriting_posix_defaults() {
+    let (document, _anchor) = fixture_document(toml::Table::new());
+    let monitor = document
+        .get("monitor")
+        .and_then(toml::Value::as_table)
+        .expect("the fixture carries a [monitor] table; without it Windows refuses the defaults");
+
+    for field in ["socket_path", "state_file_path"] {
+        let value = monitor
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("the fixture pins [monitor].{field}"));
+        assert!(
+            std::path::Path::new(value).is_absolute(),
+            "[monitor].{field} is not absolute on this platform: {value}",
+        );
+    }
 }
 
 /// A filesystem path as a TOML value.
