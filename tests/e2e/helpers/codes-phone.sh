@@ -15,6 +15,9 @@
 #   codes-phone.sh expect-issue-refused <user> --level N
 #   codes-phone.sh exhaust-attempts <user>
 #   codes-phone.sh replay-after-restart <user>
+#   codes-phone.sh snapshot-counter
+#   codes-phone.sh restore-counter
+#   codes-phone.sh authenticate-without-code <user>
 #   codes-phone.sh revoke-ticket
 #   codes-phone.sh cleanup
 #
@@ -125,6 +128,12 @@ usage: codes-phone.sh <command> [args]
                         исчерпать бюджет попыток ввода кода в одном прогоне
   replay-after-restart <user>
                         успешный вход, перезапуск устройства, тот же код снова
+  snapshot-counter      снять копию файла счётчика nonce (как копия машины)
+  restore-counter       вернуть снятую копию на место и перезапустить устройство;
+                        0 только если счётчик успел уйти вперёд
+  authenticate-without-code <user>
+                        разговор, в котором код не подаётся вовсе: устройство
+                        обязано отказать раньше, чем его спросит
   issue-storm <user> --level N --count M [--recover-after S]
                         M разговоров, обрываемых на напечатанном challenge, и
                         ещё один сверх того: устройство обязано отказать в
@@ -914,6 +923,101 @@ cmd_replay_after_restart() {
     run_conversation "$user" "$level" "fixed:$code" "$ATTEMPTS_PER_NONCE"
 }
 
+# ----------------------------------------------------------------------------
+# Откат персистированного состояния
+# ----------------------------------------------------------------------------
+#
+# Счётчик выданных значений и состояние с потреблёнными nonce лежат РАЗНЫМИ
+# файлами и пишутся раздельно, счётчик первым. Отсюда и наблюдаемость отката:
+# счётчик, оказавшийся ПОЗАДИ состояния, означает, что вот-вот будут выданы
+# значения, уже произнесённые вслух, — устройство обязано отказать целиком, а
+# парк обязан провести смену эпохи ключа.
+#
+# Согласованный снимок (оба файла из одной копии) не детектируется ничем — так
+# записано в модели угроз, и хелпер такого сценария не изображает: команда,
+# «проверяющая» недетектируемое, зеленела бы по неверной причине.
+COUNTER_FILE="$STATE_DIR/nonce.counter"
+COUNTER_COPY="$RUN_DIR/nonce.counter.copy"
+
+read_counter() {
+    [ -f "$COUNTER_FILE" ] || { printf '0'; return 0; }
+    tr -d '[:space:]' < "$COUNTER_FILE"
+}
+
+cmd_snapshot_counter() {
+    require_root
+    load_prepared
+    [ -f "$COUNTER_FILE" ] || die \
+        "нет $COUNTER_FILE — устройство не выдало ни одного challenge, откатывать будет нечего"
+    install -d -m 0700 "$RUN_DIR"
+    install -m 0600 -o root -g root "$COUNTER_FILE" "$COUNTER_COPY"
+    echo "counter snapshot: $(read_counter)"
+}
+
+cmd_restore_counter() {
+    require_root
+    load_prepared
+    [ -f "$COUNTER_COPY" ] || die "снимок не снят — нужен snapshot-counter"
+
+    local before after
+    before="$(tr -d '[:space:]' < "$COUNTER_COPY")"
+    after="$(read_counter)"
+    # Счётчик, не сдвинувшийся с момента снимка, — это не откат, а тот же файл:
+    # устройство ничего не заметит и пустит, а кейс зазеленеет, ничего не
+    # проверив. Разница между копией и текущим значением и есть предмет кейса.
+    [ "$after" -gt "$before" ] || die \
+        "счётчик не ушёл вперёд с момента снимка ($before → $after) — откатывать нечего"
+
+    # Права те же, что ставит само устройство (0600, root): восстановленная из
+    # копии машина не должна отличаться от настоящей ничем, кроме значения.
+    install -m 0600 -o root -g root "$COUNTER_COPY" "$COUNTER_FILE"
+    # Перезапуск — часть восстановления, а не украшение: владелец парка вернул
+    # копию и поднял машину. Он же снимает вопрос о том, не держится ли отказ на
+    # чём-то, что осталось в памяти процесса.
+    restart_device
+    echo "counter rolled back: $after -> $before"
+}
+
+# Разговор, в котором код не подаётся вовсе. Нужен там, где устройство обязано
+# отказать ДО промпта кода: подавать ответы в разговор, которого не будет,
+# нечем, а `authenticate` в таком прогоне упёрся бы в ненапечатанный challenge и
+# отдал сбой стенда (70) вместо вердикта продукта.
+#
+# Ответы кладутся в FIFO с ограничением по времени и без проверки исхода записи:
+# оборванная труба здесь — ожидаемый ход событий, а не сбой. Кейсу отдаётся код
+# возврата драйвера как есть.
+cmd_authenticate_without_code() {
+    local user="${1:-}"
+    [ -n "$user" ] || usage_error "usage: codes-phone.sh authenticate-without-code <user>"
+    load_prepared
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    pam-drive --answers-per-prompt "$PAM_SERVICE_NAME" "$user" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    local driver=$!
+    DRIVER_PID="$driver"
+
+    # `timeout` не даёт открытию FIFO повиснуть навсегда, если драйвер успел
+    # закончиться до записи: читателя у трубы тогда нет вовсе.
+    timeout 15 sh -c 'printf "%s\n%s\n" "$1" "$2" > "$3"' sh \
+        "$OPERATOR_ID" "$DEVICE_KEY_PIN" "$fifo" 2>/dev/null || true
+
+    local rc=0
+    wait "$driver" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+
+    cat "$out"
+    cat "$err" >&2
+    return "$rc"
+}
+
 # Поток запросов challenge. Каждый разговор обрывается на напечатанном
 # challenge — ровно то, что может сделать всякий, кто дотягивается до PAM-стека
 # с именем ролевой учётной записи, не зная ни кода, ни билета.
@@ -1024,6 +1128,9 @@ main() {
         expect-issue-refused) cmd_expect_issue_refused "$@" ;;
         exhaust-attempts)     cmd_exhaust_attempts "$@" ;;
         replay-after-restart) cmd_replay_after_restart "$@" ;;
+        snapshot-counter)     cmd_snapshot_counter "$@" ;;
+        restore-counter)      cmd_restore_counter "$@" ;;
+        authenticate-without-code) cmd_authenticate_without_code "$@" ;;
         issue-storm)          cmd_issue_storm "$@" ;;
         revoke-ticket)        cmd_revoke_ticket "$@" ;;
         cleanup)              cmd_cleanup "$@" ;;

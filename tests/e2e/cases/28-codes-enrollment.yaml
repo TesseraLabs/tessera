@@ -275,3 +275,69 @@ cases:
         expect: { exit_code: 0 }
     teardown:
       - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-012
+    title: Право снимает только список отзыва — набор без билета его переживает
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: [service-manager]
+    # Владелец парка может снять право оператору двумя движениями, и они не
+    # равны. Внесение билета в список отзыва необратимо: список монотонен, набор
+    # старее применённого отвергается, номер остаётся снятым. Сборка нового
+    # набора БЕЗ билета права не снимает — набор счётчика версий не имеет, и у
+    # standalone-поставки повторная подача прежнего носителя возвращает прежний
+    # набор целиком (модель угроз, §5.15: «Изъятие билета из набора не является
+    # отзывом»).
+    #
+    # Кейс проходит обе ветки подряд, потому что порознь ни одна ничего не
+    # доказывает: «вход закрылся» после сборки без билета выглядит ровно как
+    # отзыв, и отличает их только то, что происходит при повторной подаче
+    # прежнего носителя. Дополняет CODE-007 (`27-codes-phone`), который стережёт
+    # сам отказ по отозванному билету, и ENRC-006, который стережёт его срок —
+    # «в той же попытке входа».
+    steps:
+      # Порядок тот же, что в ENRC-003: подготовка телефонного канала приводит
+      # устройство к чистому состоянию и потому идёт ПЕРЕД первым импортом.
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      # Набор без билета: пока он стоит, оператору нечем открыть устройство.
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1 --without-ticket
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 60
+      # Прежний носитель — прежний набор. Право вернулось, и это обещанное
+      # поведение, а не дефект: именно поэтому набор без билета отзывом не
+      # считается.
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      # Теперь настоящий отзыв — списком.
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1 --revoke-ticket
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 60
+      # Тот же носитель, что вернул билет пять шагов назад. Он несёт набор с
+      # билетом и не несёт списка отзыва вовсе — применённый список остаётся на
+      # месте, и вход остаётся закрытым.
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-enroll.sh cleanup

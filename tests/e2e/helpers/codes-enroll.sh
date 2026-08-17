@@ -8,7 +8,7 @@
 # только формирует пакет и смотрит, что импорт с ним сделал.
 #
 #   codes-enroll.sh package <fixtures>/codes [--epoch N] [--without-codes]
-#                              [--revoke-ticket]
+#                              [--revoke-ticket] [--without-ticket]
 #   codes-enroll.sh import
 #   codes-enroll.sh import-expect-refused <регексп причины>
 #   codes-enroll.sh note-counter
@@ -69,8 +69,12 @@ usage() {
     cat >&2 <<'EOF'
 usage: codes-enroll.sh <command> [args]
   package <fixtures>/codes [--epoch N] [--without-codes] [--revoke-ticket]
+                          [--without-ticket]
                         собрать standalone-пакет первичной настройки; по
-                        умолчанию — с частью Codes на эпохе из device.env
+                        умолчанию — с частью Codes на эпохе из device.env.
+                        --without-ticket собирает набор БЕЗ билета оператора:
+                        это не отзыв, а сборка нового набора, и кейс проверяет
+                        именно разницу между ними
   import                подать собранный пакет `tessera enroll`; 0 только на
                         успешный импорт
   import-expect-refused <регексп>
@@ -138,14 +142,42 @@ restore_device_state() {
     rm -rf "$BACKUP_DIR"
 }
 
+# Собирает набор билетов, из которого вычеркнут билет оператора комплекта.
+#
+# Это НЕ отзыв: набор билетов не монотонен, и повторная подача прежнего носителя
+# вернёт вычеркнутый билет вместе с собой. Разницу между двумя способами снять
+# право и проверяет кейс, ради которого написана функция.
+#
+# Билет опознаётся по номеру из манифеста, а не по номеру строки: комплект
+# фикстур сегодня несёт ровно один билет и набор становится пустым, но появление
+# второго оператора не должно тихо превратить кейс в кейс «привезли набор из
+# одного чужого билета» без правки здесь. Отсутствие удаления — сбой стенда:
+# набор, совпавший с исходным, проверил бы обратное тому, что обещает кейс.
+write_ticket_set_without_operator() {
+    local src="$1" dst="$2"
+    [ -n "${TICKET_NUMBER:-}" ] || die "манифест не задал TICKET_NUMBER"
+    local before after
+    before="$(grep -c . "$src" || true)"
+    # Номер ищется вместе с ключом и разделителем: `number=tk-e2e-1;` не совпадёт
+    # с `number=tk-e2e-10;`, а подстрока без ключа совпала бы и с чужим полем.
+    grep -v -F "number=$TICKET_NUMBER;" "$src" >"$dst" || true
+    after="$(grep -c . "$dst" || true)"
+    [ "$after" -lt "$before" ] || die \
+        "билет $TICKET_NUMBER не найден в $src — набор не изменился, кейсу нечего проверять"
+}
+
 # ----------------------------------------------------------------------------
 # package
 # ----------------------------------------------------------------------------
 
 cmd_package() {
-    local fixtures="" epoch="" with_codes=1 revoke=0
+    local fixtures="" epoch="" with_codes=1 revoke=0 without_ticket=0
     while [ $# -gt 0 ]; do
         case "$1" in
+        --without-ticket)
+            without_ticket=1
+            shift
+            ;;
         --epoch)
             [ $# -ge 2 ] || usage_error "--epoch без значения"
             epoch="$2"
@@ -168,6 +200,10 @@ cmd_package() {
         esac
     done
     [ -n "$fixtures" ] || usage_error "не задан каталог фикстур"
+    # Молча принятая пара ключей собрала бы пакет без части Codes вовсе, и кейс
+    # проверял бы отсутствие метода вместо набора без билета.
+    [ "$without_ticket" = "0" ] || [ "$with_codes" = "1" ] \
+        || usage_error "--without-ticket несовместим с --without-codes: вычёркивать нечего"
     require_root
     require_tool tessera
     require_tool sha256sum
@@ -195,7 +231,12 @@ EOF
 
     if [ "$with_codes" = "1" ]; then
         cp "$fixtures/device.p12" "$PACKAGE_DIR/codes-device.p12"
-        cp "$fixtures/tickets.txt" "$PACKAGE_DIR/codes-tickets.txt"
+        if [ "$without_ticket" = "1" ]; then
+            write_ticket_set_without_operator "$fixtures/tickets.txt" \
+                "$PACKAGE_DIR/codes-tickets.txt"
+        else
+            cp "$fixtures/tickets.txt" "$PACKAGE_DIR/codes-tickets.txt"
+        fi
         cp "$fixtures/ticket-authority.pem" "$PACKAGE_DIR/codes-ticket-authority.pem"
         {
             echo "epoch = $epoch"

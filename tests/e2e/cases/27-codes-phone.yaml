@@ -78,18 +78,31 @@ cases:
       - run: helpers/codes-phone.sh cleanup
 
   - id: CODE-005
-    title: Ранее принятый код не пускает повторно после перезапуска
+    title: Записанный код не пускает во второй раз, и перезапуск этого не меняет
     requirement: openspec/specs/qr-login-method/spec.md
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
       # Первый вход проходит, код запоминается; хелпер перезапускает службы и
       # сбрасывает кэши, после чего подаёт тот же код снова.
-      # Честная граница кейса: снаружи нельзя предъявить ТОТ ЖЕ challenge —
-      # каждый разговор порождает новый nonce, поэтому старый код не сойдётся уже
-      # по MAC. Одноразовость самого nonce стережёт unit-тест ядра; здесь
-      # проверяется наблюдаемая пользователем гарантия: записанный код повторно
-      # не работает, и перезапуск этого не меняет.
+      #
+      # Заголовок сужен намеренно, и вот его граница. Одноразовость
+      # ПОТРЕБЛЁННОГО nonce снаружи не предъявить: половину nonce составляет
+      # случайный хвост, который устройство тянет из системного генератора на
+      # КАЖДЫЙ challenge (`crates/tessera_core/src/codes/tail.rs`), а печатает
+      # challenge только само устройство. Разговора со старым nonce не бывает ни
+      # при каком внешнем воздействии — даже откат счётчика даст другой хвост, —
+      # поэтому прежний код не сходится уже по MAC, до всякой проверки
+      # потреблённости. Ту гарантию держат unit-тесты ядра:
+      # `a_spent_nonce_stays_spent_across_a_reboot` и
+      # `a_counter_file_behind_the_state_is_a_rollback`
+      # (`crates/tessera_core/src/codes/state.rs`).
+      #
+      # Кейсу остаётся полный путь целиком — выдача, вход, перезапуск, повтор —
+      # и наблюдаемое инженером: записанный на бумажке код после перезапуска
+      # остаётся мусором. Код здесь настоящий, посчитанный живым оператором для
+      # этого устройства и однажды сработавший, — этим кейс отличается от
+      # CODE-003; механика отказа у них общая, и на большее кейс не претендует.
       - run: helpers/codes-phone.sh replay-after-restart {{user}}
         expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
         timeout: 120
@@ -119,13 +132,19 @@ cases:
       - run: helpers/codes-phone.sh cleanup
 
   - id: CODE-007
-    title: Отозванный билет оператора закрывает выдачу кодов на устройстве
+    title: Билет оператора, внесённый в список отзыва, закрывает вход по коду
     requirement: openspec/specs/qr-login-method/spec.md
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
       # Список отзыва билетов приезжает payload'ом и применяется ДО аутентификации —
-      # тем же порядком, что CRL.
+      # тем же порядком, что CRL. Хелпер дописывает номер билета в
+      # `tickets.revoked`, то есть кейс проверяет ровно ЭТОТ путь снятия права.
+      #
+      # Второй путь — сборка нового набора билетов без этого билета — отзывом НЕ
+      # является: набор не монотонен, и повторная подача прежнего standalone-
+      # носителя возвращает билет вместе с собой (модель угроз, §5.15). Это
+      # отдельная гарантия и отдельный кейс — ENRC-012 в `28-codes-enrollment`.
       - run: helpers/codes-phone.sh revoke-ticket
       - run: helpers/codes-phone.sh authenticate {{user}} --level 0
         expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
@@ -217,7 +236,17 @@ cases:
       - run: helpers/codes-phone.sh issue-storm {{user}} --level 0 --count 12
         expect: { exit_code: 11, stdout_matches: 'auth: PAM_MAXTRIES \(11\)' }
         timeout: 180
-      - expect_journal: { identifier: pam_tessera, matches: 'qr_code_login' }
+      # Ищется именно отказ по бюджету ВЫДАЧИ, а не общее событие входа: срез
+      # журнала берётся за весь кейс, а поток начинается с разговоров, которым
+      # challenge выдаётся, поэтому строка `qr_code_login` появилась бы и в
+      # прогоне, где лимит не сработал вовсе. Причина `issuance_throttled` —
+      # константа ядра (`codes::audit::REASON_ISSUANCE_THROTTLED`), она не
+      # переводится и в журнал попадает полем той же записи `qr_code_login`.
+      # Регексп не привязан к кавычкам вокруг значения поля: их ставит
+      # форматтер трассировки, а не продукт.
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'qr_code_login.*issuance_throttled'
     teardown:
       - run: helpers/codes-phone.sh cleanup
 
@@ -234,5 +263,62 @@ cases:
       - run: helpers/codes-phone.sh issue-storm {{user}} --level 0 --count 12 --recover-after 130
         expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
         timeout: 300
+    teardown:
+      - run: helpers/codes-phone.sh cleanup
+
+  - id: CODE-013
+    title: Устройство, восстановленное из копии, не пускает по коду вовсе
+    requirement: openspec/specs/qr-login-method/spec.md
+    requires: [service-manager]
+    # Сценарий делает не злоумышленник, а владелец парка своими руками:
+    # восстановил машину из копии, чтобы «заработало как было», и вернул на неё
+    # счётчик, отстающий от того, что устройство уже произнесло вслух. Дальше
+    # выдаются значения, которые кто-то мог записать, — репляй с вероятностью
+    # единица. Обещанное поведение: устройство фиксирует откат и отказывает
+    # ЦЕЛИКОМ, до всякого разговора о коде, а парк обязан провести смену эпохи
+    # ключа (спека, сценарий «Устройство восстановлено из снапшота»).
+    #
+    # Отказ приходит как PAM_SYSTEM_ERR (4), а НЕ как PAM_AUTHINFO_UNAVAIL (9):
+    # девятка — единственный отказ, который стек вправе переступить и пойти
+    # следующим методом, и откаченное состояние ею быть не может. Ожидание
+    # снято с кода: `CodeLoginError::StateRollback` → `CodeFlowError::DeviceState`
+    # → `pam_code() == 4` (`crates/pam_tessera/src/codes_flow/`, unit-тест
+    # `a_device_that_cannot_run_the_method_is_not_a_failed_attempt`).
+    #
+    # Чего кейс НЕ покрывает: СОГЛАСОВАННОГО отката, где из копии вернулись оба
+    # файла разом. Он не детектируется ничем и записан в модели угроз именно так
+    # (§5.15 и соседние). Снаружи воспроизводим только частичный откат — счётчик
+    # и состояние пишутся раздельно, счётчик первым, и отставший счётчик и есть
+    # то единственное, по чему устройство узнаёт о подмене.
+    steps:
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      # Копия снимается с УЖЕ работавшего устройства: снимок нулевого счётчика
+      # откатывать нечему, и хелпер такой прогон останавливает.
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      - run: helpers/codes-phone.sh snapshot-counter
+        expect: { exit_code: 0 }
+      # Ещё один вход — после него копия отстала, и отстала на произнесённое.
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      # Возврат копии и перезапуск машины — ровно то, чем кончается процедура
+      # восстановления у владельца парка.
+      - run: helpers/codes-phone.sh restore-counter
+        expect: { exit_code: 0 }
+        timeout: 60
+      # Код не подаётся вовсе: устройство обязано отказать раньше, чем спросит
+      # его. Разговор, дошедший до промпта кода, — уже нарушение гарантии.
+      - run: helpers/codes-phone.sh authenticate-without-code {{user}}
+        expect: { exit_code: 4, stdout_matches: 'auth: PAM_SYSTEM_ERR \(4\)' }
+        timeout: 60
+      # Отказ обязан быть объяснён: `artefacts` — причина, которой ядро
+      # обозначает нечитаемое или откаченное хранилище
+      # (`codes::audit::REASON_ARTEFACTS`). Успешные входы этого же кейса пишут
+      # ту же запись без причины, поэтому строка не появится «сама».
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'qr_code_login.*artefacts'
     teardown:
       - run: helpers/codes-phone.sh cleanup
