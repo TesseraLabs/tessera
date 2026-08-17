@@ -29,6 +29,7 @@ use cryptoki::mechanism::elliptic_curve::{EcKdf, Ecdh1DeriveParams};
 use cryptoki::mechanism::Mechanism;
 use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
+use cryptoki::types::Ulong;
 
 use tessera_codes_contract::key::{KeyAgreement, KeyAgreementError, SharedSecret};
 use tessera_codes_contract::profile::AlgorithmProfile;
@@ -42,7 +43,15 @@ use crate::pkcs11::{find_slot_in, PinSource, Pkcs11SignError};
 /// The null key derivation function of `CKM_ECDH1_DERIVE` takes the agreed
 /// value as it is, and on P-256 that is the x coordinate — the same 32 bytes
 /// the device's OpenSSL derivation produces.
-const P256_SECRET_LEN: u64 = 32;
+///
+/// A byte length, so `usize` — and that is not a formality here. PKCS#11's
+/// `CK_ULONG` is 64 bits on Unix and 32 on Windows, so `cryptoki::types::Ulong`
+/// converts infallibly only from whatever the platform's width happens to be:
+/// a `u64` constant stops compiling on Windows, a `u32` one would stop
+/// compiling everywhere else. The portable door is `TryFrom<usize>`, which the
+/// same crate provides, and it is taken at the one place the value crosses into
+/// the token.
+const P256_SECRET_LEN: usize = 32;
 
 /// Length of an uncompressed SEC1 point on P-256, in bytes.
 const P256_UNCOMPRESSED_LEN: usize = 65;
@@ -214,7 +223,15 @@ impl<P: PinSource> TokenOperatorKey<P> {
             Attribute::Token(false),
             Attribute::Sensitive(false),
             Attribute::Extractable(true),
-            Attribute::ValueLen(P256_SECRET_LEN.into()),
+            // The one crossing into PKCS#11's own integer, and it is fallible by
+            // construction rather than by taste: the width of `CK_ULONG` is a
+            // property of the platform, not of this length.
+            Attribute::ValueLen(Ulong::try_from(P256_SECRET_LEN).map_err(|_| {
+                TokenKeyError::Derive(format!(
+                    "the agreed value length {P256_SECRET_LEN} does not fit this platform's \
+                     CK_ULONG"
+                ))
+            })?),
         ];
         let derived = session
             .derive_key(&Mechanism::Ecdh1Derive(params), private, &template)
@@ -237,10 +254,9 @@ impl<P: PinSource> TokenOperatorKey<P> {
         // and the result would be a code computed from a shortened key — weaker
         // than the channel promises, and indistinguishable afterwards from a
         // correct one.
-        let expected = usize::try_from(P256_SECRET_LEN).unwrap_or(usize::MAX);
-        if value.len() != expected {
+        if value.len() != P256_SECRET_LEN {
             return Err(TokenKeyError::UnusableSecretLength {
-                expected,
+                expected: P256_SECRET_LEN,
                 got: value.len(),
             });
         }

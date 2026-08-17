@@ -15,7 +15,7 @@ crate-type = ["rlib"]
 default = []
 # The plain file storage. Off by default so the wasm issuer core, which brings
 # its own host-side storage, never compiles a `std::fs` path it cannot use.
-file = ["dep:rustix"]
+file = ["dep:rustix", "dep:windows-sys"]
 # The in-memory and always-failing storages. A dependent turns this on for its
 # own tests; it is not a runtime backend.
 testing = []
@@ -32,6 +32,13 @@ thiserror = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, optional = true }
 
+# `LockFileEx` for the same transaction on Windows. The issuing tool is
+# cross-platform by construction, and its journal has the same two-writer
+# problem there as a device journal has on Unix. Already a workspace dependency
+# with the needed features on — no new crate enters the graph for this.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # The crate's own integration tests reach the in-memory and failing storages,
@@ -39,7 +46,7 @@ tempfile = { workspace = true }
 # crate's own test targets unless it is asked for here — without this line
 # `cargo test -p tessera_hashchain` does not build, and every guarantee of the
 # chain is checked only under `--all-features`.
-tessera_hashchain = { path = ".", features = ["testing", "file"] }
+tessera_hashchain = { path = ".", version = "0.5.0", features = ["testing", "file"] }
 
 [lints.rust]
 missing_docs = "deny"

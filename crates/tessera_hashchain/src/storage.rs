@@ -150,7 +150,7 @@ impl FileStorage {
 /// filtered through the umask of whichever process happens to create the file
 /// first. A daemon started with a lax umask would otherwise decide the security
 /// of the record.
-#[cfg(feature = "file")]
+#[cfg(all(feature = "file", unix))]
 const OWNER_ONLY: u32 = 0o600;
 
 /// Longest an append waits for another process to finish its transaction.
@@ -283,6 +283,15 @@ fn pin_owner_only(path: &std::path::Path) -> Result<(), ChainError> {
 }
 
 /// Where POSIX modes do not exist there is nothing to pin.
+///
+/// On Windows the journal takes the ACL it inherits from its directory, and
+/// this crate does not narrow it. That is a real gap rather than a portability
+/// footnote: the umask defence above has no Windows counterpart here, so a
+/// journal in a directory an installer left permissive is writable by whoever
+/// that directory admits — and whoever may write it may rewrite the history and
+/// recompute the chain over it. Closing it properly means setting a DACL, which
+/// belongs with the privileged-path machinery that already does DACL work, not
+/// in the format crate. Named here so it is not mistaken for handled.
 #[cfg(all(feature = "file", not(unix)))]
 fn pin_owner_only(path: &std::path::Path) -> Result<(), ChainError> {
     let _ = path;
@@ -382,12 +391,116 @@ fn acquire(path: &std::path::Path) -> Result<Box<dyn ChainLock>, ChainError> {
     }
 }
 
-/// Where there is no `flock(2)`, the transaction cannot be made exclusive.
+/// Takes the exclusive hold on Windows, retrying until the deadline.
+///
+/// Windows has inter-process file locking of its own — `LockFileEx` — and the
+/// issuing tool needs it for the same reason the device does: two issuances at
+/// once read the same tail, claim the same position, and break the chain from
+/// there on, silently and for good. The tool is cross-platform by construction
+/// (its journal predates this crate on all three platforms), so a hold that
+/// existed only on Unix would leave the cabinet's own record unprotected on the
+/// platform a good many operators run it on.
+///
+/// `LOCKFILE_FAIL_IMMEDIATELY` gives the same non-blocking attempt `flock`'s
+/// `LOCK_NB` gives, so the waiting policy is one policy on both platforms: retry
+/// briefly, then refuse rather than hang a login or an issuance.
+///
+/// The lock is released when the handle closes, including when the process
+/// dies — the same property that made `flock(2)` the right choice on Unix, and
+/// the reason neither side expresses the hold as "a lock file exists".
+///
+/// # Why this crate makes an exception for `unsafe` here
+///
+/// The crate denies `unsafe_code`, and this is the one place it is lifted.
+/// `LockFileEx` is a raw system call with no safe wrapper in the dependency
+/// graph, and the alternative was to add one (`fs4`, `fd-lock`) — a new crate
+/// in the graph of the component that carries the audit record, to save two
+/// `unsafe` expressions whose obligations fit in a paragraph. `windows-sys` is
+/// already a workspace dependency with these features on, so nothing new enters
+/// the graph. The exception is scoped to this function and to no other.
+#[cfg(all(feature = "file", windows))]
+#[expect(
+    unsafe_code,
+    reason = "LockFileEx is a raw system call with no safe wrapper in this \
+              dependency graph; the obligations are discharged in the SAFETY \
+              comments below and the exception covers this function alone"
+)]
+fn acquire(path: &std::path::Path) -> Result<Box<dyn ChainLock>, ChainError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    /// The hold: the handle the lock lives on. Dropping it releases the lock.
+    struct FileLock {
+        /// Never read, and never allowed to drop early — see the module.
+        _file: std::fs::File,
+    }
+    impl ChainLock for FileLock {}
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| ChainError::Storage(format!("the journal lock could not be opened: {e}")))?;
+
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        // SAFETY: `OVERLAPPED` is a plain C struct of integers and a pointer,
+        // for which an all-zero bit pattern is both valid and the value
+        // `LockFileEx` documents for a non-overlapped wait.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` is a live `File`, so its raw handle is open and valid
+        // for the duration of this call; `overlapped` is a zeroed `OVERLAPPED`
+        // owned by this frame and outlives the call, which is what
+        // `LockFileEx` requires of it for a non-overlapped handle. The byte
+        // range is the whole possible file, and the call writes only through
+        // the pointer given.
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &raw mut overlapped,
+            )
+        };
+        if locked != 0 {
+            return Ok(Box::new(FileLock { _file: file }));
+        }
+
+        let error = std::io::Error::last_os_error();
+        let would_block = error
+            .raw_os_error()
+            .is_some_and(|code| u32::try_from(code).is_ok_and(|code| code == ERROR_LOCK_VIOLATION));
+        if !would_block {
+            return Err(ChainError::Storage(format!(
+                "the journal lock could not be taken: {error}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(ChainError::Storage(
+                "another process held the journal longer than this one may wait".to_owned(),
+            ));
+        }
+        std::thread::sleep(LOCK_RETRY_INTERVAL);
+    }
+}
+
+/// Where there is neither `flock(2)` nor `LockFileEx`, the transaction cannot
+/// be made exclusive.
 ///
 /// Refused rather than silently unlocked: an unlocked append is the defect this
 /// lock exists to prevent, and pretending otherwise would hide it on exactly
-/// the platform that cannot help.
-#[cfg(all(feature = "file", not(unix)))]
+/// the platform that cannot help. No target this product ships to lands here —
+/// Unix and Windows are both served above — so this is the arm that keeps a
+/// future port from getting an unprotected journal by default.
+#[cfg(all(feature = "file", not(unix), not(windows)))]
 fn acquire(path: &std::path::Path) -> Result<Box<dyn ChainLock>, ChainError> {
     let _ = path;
     Err(ChainError::Storage(
