@@ -293,6 +293,13 @@ fn pin_owner_only(path: &std::path::Path) -> Result<(), ChainError> {
 /// belongs with the privileged-path machinery that already does DACL work, not
 /// in the format crate. Named here so it is not mistaken for handled.
 #[cfg(all(feature = "file", not(unix)))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Result is not spurious: it is the signature the unix arm has, \
+              and the shared call site reaches both with `?`. Narrowing this arm \
+              to `()` would move the platform difference from one `cfg` here into \
+              every place that pins a mode"
+)]
 fn pin_owner_only(path: &std::path::Path) -> Result<(), ChainError> {
     let _ = path;
     Ok(())
@@ -329,6 +336,13 @@ fn sync_parent_directory(path: &std::path::Path) -> Result<(), ChainError> {
 
 /// The same, where directories cannot be synchronised at all.
 #[cfg(all(feature = "file", not(unix)))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Result is not spurious: it is the signature the unix arm has, \
+              and the shared call site reaches both with `?`. Narrowing this arm \
+              to `()` would move the platform difference from one `cfg` here into \
+              the append path"
+)]
 fn sync_parent_directory(path: &std::path::Path) -> Result<(), ChainError> {
     let _ = path;
     Ok(())

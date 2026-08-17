@@ -245,7 +245,20 @@ fn owner_only_violation(path: &Path) -> std::io::Result<Option<u32>> {
 }
 
 /// Off Unix the mode word does not exist; the walk refuses on its own there.
+///
+/// What this arm does *not* say is that the store is safe there. The same
+/// question on Windows is a DACL, which belongs with the privileged-path
+/// machinery that already does DACL work and not with a mode word this file
+/// would have to invent. Named here so the `None` is not mistaken for a check
+/// that passed.
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Result is not spurious: it is the signature the unix arm has, \
+              and the shared caller reaches both arms with `?`. Narrowing this \
+              arm to `Option<u32>` would move the platform difference from one \
+              `cfg` here into every call site of the walk"
+)]
 fn owner_only_violation(_path: &Path) -> std::io::Result<Option<u32>> {
     Ok(None)
 }

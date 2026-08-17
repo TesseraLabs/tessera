@@ -57,6 +57,14 @@ const LOCK_MODE: u32 = 0o600;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to sleep between attempts while waiting.
+///
+/// Declared only where waiting happens. There is no `flock(2)` outside Unix, so
+/// [`StateLock::acquire`] refuses there before any wait begins — a platform
+/// with no retry loop has no retry cadence, and naming one would be inventing a
+/// second answer about timing for a path that never asks the question.
+/// [`LOCK_TIMEOUT`] is deliberately *not* gated this way: it is the deadline
+/// [`StateLock::acquire`] computes on every platform before it branches.
+#[cfg(unix)]
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 /// An exclusive hold on the state of one device, released on drop.

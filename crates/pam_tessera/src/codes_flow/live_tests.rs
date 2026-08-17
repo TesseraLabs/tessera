@@ -457,7 +457,7 @@ fn drive(
     fixture: &LiveFixture,
     engineer: Engineer<'_>,
 ) -> Result<tessera_core::pam_data::AuthContext, CodeFlowError> {
-    drive_with_config(fixture, engineer, "").0
+    drive_with_config(fixture, engineer, toml::Table::new()).0
 }
 
 /// Drives one attempt with the device's audit chain set up **from `audit_toml`
@@ -471,8 +471,11 @@ fn drive(
 /// Here the only way a journal reaches the sink is the way production reaches
 /// it, so a regression that unwires the install shows up as a failure.
 ///
-/// `audit_toml` is the `[audit]` section as an operator would write it; an
-/// empty string means the device has no such section at all.
+/// `sections` are the configuration tables this test adds — `[audit]`, and
+/// `[codes]` where it matters. They arrive as TOML *values*, not as text: a
+/// path spliced into TOML text is a unicode escape on Windows and a path
+/// everywhere else, which is a defect that hides until a Windows runner meets
+/// it.
 ///
 /// The sink lock is taken here and nowhere else: the sink is one handle per
 /// process, and a test holding it across a call into [`drive`] would deadlock
@@ -480,13 +483,13 @@ fn drive(
 fn drive_with_config(
     fixture: &LiveFixture,
     mut engineer: Engineer<'_>,
-    audit_toml: &str,
+    sections: toml::Table,
 ) -> (
     Result<tessera_core::pam_data::AuthContext, CodeFlowError>,
     bool,
 ) {
     let _sink = super::test_sink::hold();
-    let config = config_with_audit(audit_toml);
+    let config = config_with_audit(sections);
     let installed = tessera_core::audit::sink::install_from_config(&config)
         .expect("the audit journal described by the test configuration could not be opened");
 
@@ -501,36 +504,117 @@ fn drive_with_config(
 /// `load_validated_config` performs — so the `[audit]` section under test is
 /// parsed and validated by production code rather than by the test's idea of
 /// what the section means.
-fn config_with_audit(audit_toml: &str) -> tessera_core::config::ValidatedConfig {
+fn config_with_audit(sections: toml::Table) -> tessera_core::config::ValidatedConfig {
     // A trust anchor has to exist for the configuration to validate at all.
     // Nothing here uses it — the code method authenticates without one — so the
     // shortest well-formed PEM does.
     const FAKE_PEM_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
         MIIBfTCCAS6gAwIBAgIUcheCkYc5VvuuVlZ8KqfA8R6Bvs8wCgYIKoZIzj0EAwIw\n\
         -----END CERTIFICATE-----\n";
+
+    // The skeleton carries no interpolation at all, which is the point: every
+    // value that could contain a backslash is put in as *data* below, never as
+    // text. A Windows temporary directory is `C:\Users\...`, and `\U` inside a
+    // TOML basic string is the start of a unicode escape — so a path spliced
+    // into this text does not parse there and parses fine everywhere else,
+    // which is how it survived until a Windows runner met it.
+    const SKELETON: &str = r#"
+crypto_backend = "openssl"
+mode = "pkcs12"
+pkcs12_path_pattern = "{user}.p12"
+[trust]
+anchors = []
+[trust.revocation]
+mode = "none"
+[host_identity]
+sources = ["machine_id"]
+[logging]
+level = "info"
+"#;
+
     let anchors = tempfile::tempdir().expect("anchor directory");
     let anchor = anchors.path().join("anchor.pem");
     std::fs::write(&anchor, FAKE_PEM_CERT).expect("write the anchor");
 
-    let text = format!(
-        "crypto_backend = \"openssl\"\n\
-         mode = \"pkcs12\"\n\
-         pkcs12_path_pattern = \"{{user}}.p12\"\n\
-         [trust]\n\
-         anchors = [\"{anchor}\"]\n\
-         [trust.revocation]\n\
-         mode = \"none\"\n\
-         [host_identity]\n\
-         sources = [\"machine_id\"]\n\
-         [logging]\n\
-         level = \"info\"\n\
-         {audit_toml}",
-        anchor = anchor.display(),
-    );
-    let raw: tessera_core::config::RawConfig =
-        toml::from_str(&text).expect("the test configuration does not parse");
+    let mut document: toml::Table =
+        toml::from_str(SKELETON).expect("the test configuration skeleton does not parse");
+    document
+        .get_mut("trust")
+        .and_then(toml::Value::as_table_mut)
+        .expect("the skeleton has a [trust] table")
+        .insert(
+            "anchors".to_owned(),
+            toml::Value::Array(vec![path(&anchor)]),
+        );
+    for (name, value) in sections {
+        document.insert(name, value);
+    }
+
+    let raw: tessera_core::config::RawConfig = toml::Value::Table(document)
+        .try_into()
+        .expect("the test configuration does not parse");
     tessera_core::config::ValidatedConfig::try_from(&raw)
         .expect("the test configuration does not validate")
+}
+
+/// The defect this harness had, frozen so it cannot come back.
+///
+/// A Windows temporary directory is `C:\Users\runneradmin\AppData\Local\Temp\…`,
+/// and `\U` inside a TOML **basic** string begins a unicode escape. Splicing
+/// such a path into configuration text therefore fails to parse on Windows and
+/// parses perfectly everywhere else — which is exactly why eleven tests here
+/// were green on two platforms and red on the third.
+///
+/// The test needs no Windows to catch the class: the shape of the path is what
+/// matters, not the machine running it.
+#[test]
+fn a_windows_style_path_breaks_spliced_toml_and_survives_a_toml_value() {
+    let windows_path = r"C:\Users\runneradmin\AppData\Local\Temp\.tmpAbC\audit.ndjson";
+
+    // The old harness: the path pasted into a basic string.
+    let spliced = format!("[audit]\nfile = \"{windows_path}\"\n");
+    let refused = toml::from_str::<toml::Table>(&spliced).expect_err(
+        "a Windows path spliced into TOML text parsed; this test no longer guards anything",
+    );
+    assert!(
+        refused.message().contains("unicode"),
+        "refused for another reason than the escape: {}",
+        refused.message(),
+    );
+
+    // The harness as it is now: the path handed over as a value.
+    let mut audit = toml::Table::new();
+    audit.insert("file".to_owned(), path(std::path::Path::new(windows_path)));
+    let rendered = toml::to_string(&audit).expect("a table of one string encodes");
+    let parsed: toml::Table = toml::from_str(&rendered).expect("what the encoder wrote, it reads");
+    assert_eq!(
+        parsed
+            .get("file")
+            .and_then(toml::Value::as_str)
+            .expect("a string came back"),
+        windows_path,
+        "the path did not survive the encoder unchanged",
+    );
+}
+
+/// A filesystem path as a TOML value.
+///
+/// Going through the value type instead of `format!` means the encoder owns the
+/// quoting, and the backslashes of a Windows path are data rather than escape
+/// sequences.
+///
+/// There are two safe routes in this repository and this is the second of them.
+/// [`crate::test_support::toml_path`] is the first: it renders a path as an
+/// already-quoted, already-escaped TOML fragment for a harness that builds its
+/// configuration as text, and `flow.rs` uses it that way. This harness builds
+/// its configuration as a table instead, so it needs the value rather than the
+/// fragment.
+///
+/// What there is no route for — and what this module used to do — is
+/// `format!("file = \"{}\"", path.display())`. Either helper would have
+/// prevented it; hand-rolling the quotes is what did not.
+fn path(path: &std::path::Path) -> toml::Value {
+    toml::Value::String(path.to_string_lossy().into_owned())
 }
 
 /// The attempt itself, with the sink already held.
@@ -705,25 +789,61 @@ fn a_code_typed_in_the_groups_it_was_dictated_in_is_accepted() {
 /// the guarantee read as present and was absent. Going through
 /// `sink::install_from_config` means unwiring the install shows up here.
 mod fail_closed {
-    use super::{config_with_audit, drive_with_config, Engineer, LiveFixture, Typed};
+    use super::{config_with_audit, drive_with_config, path, Engineer, LiveFixture, Typed};
     use crate::codes_flow::CodeFlowError;
 
+    /// The `[audit]` table naming a journal in `dir`.
+    ///
+    /// Built as a table rather than as text: the path goes in through
+    /// [`super::path`], so the encoder owns the quoting and a Windows
+    /// `C:\Users\...` stays a path instead of becoming a broken escape.
+    fn audit_table(dir: &std::path::Path) -> toml::Table {
+        let mut audit = toml::Table::new();
+        audit.insert("enabled".to_owned(), toml::Value::Boolean(true));
+        audit.insert("file".to_owned(), path(&dir.join("audit.ndjson")));
+        audit
+    }
+
     /// A device told to keep a journal it can write.
-    fn keeping_a_journal(dir: &std::path::Path) -> String {
-        format!(
-            "[audit]\nenabled = true\nfile = \"{}\"\n",
-            dir.join("audit.ndjson").display()
-        )
+    fn keeping_a_journal(dir: &std::path::Path) -> toml::Table {
+        let mut sections = toml::Table::new();
+        sections.insert("audit".to_owned(), toml::Value::Table(audit_table(dir)));
+        sections
     }
 
     /// A device told to keep a journal that is already at its ceiling: the
     /// ceiling is zero, so the very first record meets it, and the configured
     /// behaviour is to refuse.
-    fn keeping_a_full_journal(dir: &std::path::Path) -> String {
-        format!(
-            "[audit]\nenabled = true\nfile = \"{}\"\nceiling_bytes = 0\nwhen_full = \"refuse\"\n",
-            dir.join("audit.ndjson").display()
-        )
+    fn keeping_a_full_journal(dir: &std::path::Path) -> toml::Table {
+        let mut audit = audit_table(dir);
+        audit.insert("ceiling_bytes".to_owned(), toml::Value::Integer(0));
+        audit.insert(
+            "when_full".to_owned(),
+            toml::Value::String("refuse".to_owned()),
+        );
+        let mut sections = toml::Table::new();
+        sections.insert("audit".to_owned(), toml::Value::Table(audit));
+        sections
+    }
+
+    /// A `[codes]` table for a device that offers the method.
+    fn codes_table() -> toml::Table {
+        let mut codes = toml::Table::new();
+        codes.insert(
+            "tags".to_owned(),
+            toml::Value::Array(vec![toml::Value::String("site=dc1".to_owned())]),
+        );
+        codes.insert("enabled".to_owned(), toml::Value::Boolean(true));
+        codes.insert(
+            "device_number".to_owned(),
+            toml::Value::String("77000123S".to_owned()),
+        );
+        codes.insert("epoch".to_owned(), toml::Value::Integer(7));
+        codes.insert(
+            "region".to_owned(),
+            toml::Value::String("ru-central".to_owned()),
+        );
+        codes
     }
 
     #[test]
@@ -734,7 +854,7 @@ mod fail_closed {
         let (outcome, installed) = drive_with_config(
             &fixture,
             Engineer::new(&fixture, [Typed::Right]),
-            &keeping_a_full_journal(dir.path()),
+            keeping_a_full_journal(dir.path()),
         );
         assert!(installed, "the configuration did not produce a journal");
 
@@ -760,7 +880,7 @@ mod fail_closed {
         let (outcome, installed) = drive_with_config(
             &fixture,
             Engineer::new(&fixture, [Typed::Right]),
-            &keeping_a_journal(dir.path()),
+            keeping_a_journal(dir.path()),
         );
         assert!(installed, "the configuration did not produce a journal");
         outcome.expect("a login the chain accepted was refused");
@@ -783,8 +903,11 @@ mod fail_closed {
         // coupling resolves to "no journal". The chain is opt-in and its
         // absence has never been what authorises a login — a device that was
         // never given one must not be locked out by this change.
-        let (outcome, installed) =
-            drive_with_config(&fixture, Engineer::new(&fixture, [Typed::Right]), "");
+        let (outcome, installed) = drive_with_config(
+            &fixture,
+            Engineer::new(&fixture, [Typed::Right]),
+            toml::Table::new(),
+        );
 
         assert!(!installed, "a device with no [audit] section got a journal");
         outcome.expect("a device without an audit chain was refused a valid login");
@@ -797,15 +920,14 @@ mod fail_closed {
     #[test]
     fn enabling_the_code_method_enables_the_journal_by_itself() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("audit.ndjson");
 
         // `[codes].enabled = true` and no `[audit].enabled` anywhere.
-        let config = config_with_audit(&format!(
-            "[codes]\ntags = [\"site=dc1\"]\nenabled = true\ndevice_number = \"77000123S\"\nepoch = 7\n\
-             region = \"ru-central\"\n\
-             [audit]\nfile = \"{}\"\n",
-            file.display()
-        ));
+        let mut audit = toml::Table::new();
+        audit.insert("file".to_owned(), path(&dir.path().join("audit.ndjson")));
+        let mut sections = toml::Table::new();
+        sections.insert("codes".to_owned(), toml::Value::Table(codes_table()));
+        sections.insert("audit".to_owned(), toml::Value::Table(audit));
+        let config = config_with_audit(sections);
         assert!(
             config.audit.policy.is_some(),
             "a device offering the code method was left without a journal",
@@ -813,10 +935,12 @@ mod fail_closed {
 
         // …and turning it off explicitly is still allowed, or an operator with
         // a reason would have no way to say so.
-        let off = config_with_audit(
-            "[codes]\ntags = [\"site=dc1\"]\nenabled = true\ndevice_number = \"77000123S\"\n\
-             epoch = 7\nregion = \"ru-central\"\n[audit]\nenabled = false\n",
-        );
+        let mut audit = toml::Table::new();
+        audit.insert("enabled".to_owned(), toml::Value::Boolean(false));
+        let mut sections = toml::Table::new();
+        sections.insert("codes".to_owned(), toml::Value::Table(codes_table()));
+        sections.insert("audit".to_owned(), toml::Value::Table(audit));
+        let off = config_with_audit(sections);
         assert!(off.audit.policy.is_none());
     }
 }
