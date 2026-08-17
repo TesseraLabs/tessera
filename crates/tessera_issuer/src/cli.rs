@@ -34,6 +34,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tessera_ext::delegation::DelegationConstraints;
 use tessera_ext::der::{encode_tlv, TAG_INTEGER, TAG_SEQUENCE};
 
+use crate::codes::RefusalGroup;
 use crate::crl::{CrlReason, CrlRequest, RevokedEntry};
 use crate::csr::{Csr, LeafRequestFromCsr, LeafScope};
 use crate::error::IssueError;
@@ -86,6 +87,8 @@ enum Command {
     VerifyJournal(VerifyJournalArgs),
     /// Build a certificate request signed by the engineer's token key.
     Csr(CsrArgs),
+    /// The operator side of the Tessera Codes phone channel.
+    Codes(codes::CodesArgs),
 }
 
 /// The signing backend a subcommand uses.
@@ -536,6 +539,71 @@ struct CsrArgs {
     der: bool,
 }
 
+/// Exit code of an operation the tool could not carry out: a missing flag, an
+/// unreadable file, a document that is not the document it claims to be, a
+/// backend that would not answer.
+///
+/// It says the check never happened, and nothing about the request. A caller
+/// that reads it as a verdict reads a stand that was never set up as a working
+/// refusal — which is how an assertion turns green while nothing is checked.
+///
+/// One is the conventional "general failure" of a command-line tool, and that is
+/// the point: an environment that treats a non-zero code it does not recognise
+/// as a broken run treats this one correctly by default.
+pub const EXIT_TOOL_FAILURE: u8 = 1;
+
+/// Exit code of a request that fell outside the operator's ticket, on any of its
+/// axes — device, epoch, operator, region, tags, role, level.
+pub const EXIT_REFUSED_TICKET_SCOPE: u8 = 10;
+
+/// Exit code of a challenge whose nonce counter does not fit the receipts:
+/// running ahead, falling behind, or arriving with no history at all.
+pub const EXIT_REFUSED_COUNTER: u8 = 11;
+
+/// Exit code of a refusal by signature, anchor or key: the organisation
+/// signature, the proof of possession, an unanchored signer, an expired or
+/// forged ticket, an operator key the ticket does not name.
+pub const EXIT_REFUSED_TRUST: u8 = 12;
+
+/// Exit code of an issuance with no grounds recorded.
+pub const EXIT_REFUSED_GROUNDS: u8 = 13;
+
+/// Exit code of a refusal that is none of the above — an override where nothing
+/// was overridden, a challenge that is not well formed, a document that cannot
+/// be encoded.
+///
+/// The class exists so the table is total: a refusal nobody classified lands
+/// here and is visible, rather than borrowing a neighbour's code and being read
+/// as something it is not.
+pub const EXIT_REFUSED_OTHER: u8 = 14;
+
+/// The exit code a refusal of `group` leaves behind.
+///
+/// The numbers avoid `0`, `1` and `2` (a caller that knows nothing of this table
+/// must not read a verdict as a generic failure or the reverse), the sysexits
+/// range the e2e harness reserves for its own stand failures (`64`, `70`), and
+/// everything a shell claims from `126` upwards.
+#[must_use]
+pub const fn exit_code_for(group: RefusalGroup) -> u8 {
+    match group {
+        RefusalGroup::TicketScope => EXIT_REFUSED_TICKET_SCOPE,
+        RefusalGroup::Counter => EXIT_REFUSED_COUNTER,
+        RefusalGroup::Trust => EXIT_REFUSED_TRUST,
+        RefusalGroup::Grounds => EXIT_REFUSED_GROUNDS,
+        RefusalGroup::Other => EXIT_REFUSED_OTHER,
+        // Not a verdict: the check did not happen.
+        RefusalGroup::Environment => EXIT_TOOL_FAILURE,
+    }
+}
+
+/// Prefix of the machine-readable refusal line written to standard error.
+///
+/// The line carries the refusal's stable class
+/// ([`crate::codes::Refusal::class`]); the localized sentence after it is for
+/// the operator, and matching on translated prose is how a harness starts
+/// failing at the first improvement to the wording.
+pub const REFUSAL_LINE_PREFIX: &str = "codes-refusal:";
+
 /// Parse arguments, resolve the operator locale, run the selected command, and
 /// map the outcome to a process exit code (failures print a localized message to
 /// stderr and exit non-zero).
@@ -548,9 +616,111 @@ pub fn main() -> ExitCode {
     match run(cli.command, locale) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            // The class first, on its own line: a caller reads one line and
+            // acts, and the sentence below is for the person at the terminal.
+            if let CliError::Codes { class, .. } = &err {
+                eprintln!("{REFUSAL_LINE_PREFIX} {class}");
+            }
             eprintln!("{}", err.render(locale));
-            ExitCode::FAILURE
+            ExitCode::from(err.exit_code())
         }
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::{
+        exit_code_for, CliError, EXIT_REFUSED_COUNTER, EXIT_REFUSED_GROUNDS, EXIT_REFUSED_OTHER,
+        EXIT_REFUSED_TICKET_SCOPE, EXIT_REFUSED_TRUST, EXIT_TOOL_FAILURE,
+    };
+    use crate::codes::RefusalGroup;
+
+    /// Коды, которые заняты не нами и заняты не под вердикт.
+    ///
+    /// `0` — успех; `1` — общий сбой (он же наш «проверка не состоялась»); `2`
+    /// обычно значит «неверные аргументы» и вердиктом быть не должен; `64` и
+    /// `70` прогон реестра слушает как сбой стенда (`error_exit_codes` в
+    /// профилях); от `126` коды забирает оболочка.
+    const RESERVED: [u8; 7] = [0, 1, 2, 64, 70, 126, 127];
+
+    /// Все группы — чтобы таблица проверялась целиком, а не выборочно.
+    const GROUPS: [RefusalGroup; 6] = [
+        RefusalGroup::TicketScope,
+        RefusalGroup::Counter,
+        RefusalGroup::Trust,
+        RefusalGroup::Grounds,
+        RefusalGroup::Other,
+        RefusalGroup::Environment,
+    ];
+
+    #[test]
+    fn every_verdict_has_a_code_of_its_own() {
+        let mut verdicts: Vec<u8> = GROUPS
+            .into_iter()
+            .filter(|group| *group != RefusalGroup::Environment)
+            .map(exit_code_for)
+            .collect();
+        let before = verdicts.len();
+        verdicts.sort_unstable();
+        verdicts.dedup();
+        assert_eq!(verdicts.len(), before, "два вердикта делят один код");
+    }
+
+    #[test]
+    fn no_verdict_takes_a_reserved_code() {
+        for group in GROUPS {
+            if group == RefusalGroup::Environment {
+                continue;
+            }
+            let code = exit_code_for(group);
+            assert!(
+                !RESERVED.contains(&code),
+                "вердикт {} занял зарезервированный код {code}",
+                group.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_check_that_did_not_happen_is_the_general_failure() {
+        assert_eq!(exit_code_for(RefusalGroup::Environment), EXIT_TOOL_FAILURE);
+        // И оно же — код всего, что не дошло до вердикта.
+        assert_eq!(
+            CliError::Usage("нет флага".to_owned()).exit_code(),
+            EXIT_TOOL_FAILURE
+        );
+        assert_eq!(
+            CliError::Backend("токен молчит".to_owned()).exit_code(),
+            EXIT_TOOL_FAILURE
+        );
+        assert_eq!(
+            CliError::Io("файл не читается".to_owned()).exit_code(),
+            EXIT_TOOL_FAILURE
+        );
+    }
+
+    #[test]
+    fn the_table_is_the_one_the_help_and_the_harness_name() {
+        // Значения зафиксированы числами: их знают хелпер e2e и спека, и
+        // молчаливая смена сломала бы обоих.
+        assert_eq!(EXIT_REFUSED_TICKET_SCOPE, 10);
+        assert_eq!(EXIT_REFUSED_COUNTER, 11);
+        assert_eq!(EXIT_REFUSED_TRUST, 12);
+        assert_eq!(EXIT_REFUSED_GROUNDS, 13);
+        assert_eq!(EXIT_REFUSED_OTHER, 14);
+        assert_eq!(EXIT_TOOL_FAILURE, 1);
+    }
+
+    #[test]
+    fn a_refusal_carries_the_code_of_its_group() {
+        let refusal = CliError::Codes {
+            class: "ticket_scope_level",
+            group: RefusalGroup::TicketScope,
+            detail: "уровень выше потолка".to_owned(),
+        };
+        assert_eq!(refusal.exit_code(), EXIT_REFUSED_TICKET_SCOPE);
+        assert_eq!(refusal.refusal_class(), Some("ticket_scope_level"));
+        assert_eq!(refusal.refusal_group(), Some(RefusalGroup::TicketScope));
     }
 }
 
@@ -572,8 +742,14 @@ fn run(command: Command, locale: Locale) -> Result<(), CliError> {
         Command::Csr(args) => dispatch_with_backend(&args.backend, locale, CsrJob { args: &args }),
         Command::PrepareCarrier(args) => prepare_carrier(&args, locale),
         Command::VerifyJournal(args) => verify_journal(&args, locale),
+        Command::Codes(args) => codes::run(args, locale),
     }
 }
+
+// The phone-channel commands, in a module of their own: they share this file's
+// helpers (the secret ladder, the journal, the file readers) and none of its
+// signing backends — a code is not signed, it is agreed.
+mod codes;
 
 /// An error surfaced by the CLI, carrying enough to print a localized message
 /// and to let a test compare against the core's own error.
@@ -588,6 +764,22 @@ pub enum CliError {
     Usage(String),
     /// The signing backend could not be built or reached.
     Backend(String),
+    /// The phone channel refused the operation (the same refusal the cabinet
+    /// gets from [`crate::codes`]).
+    ///
+    /// The class travels beside the sentence because the sentence is prose: it
+    /// is localized, and it will be reworded. A caller that has to act on
+    /// *which* check refused matches the class.
+    Codes {
+        /// Stable class of the refusal — [`crate::codes::Refusal::class`] for a
+        /// refused issuance, or a document-level class for a file that does not
+        /// hold what it claims to.
+        class: &'static str,
+        /// What kind of answer this is, which is what decides the exit code.
+        group: RefusalGroup,
+        /// The refusal itself, in English, as every other API-level message.
+        detail: String,
+    },
 }
 
 impl CliError {
@@ -601,6 +793,45 @@ impl CliError {
             CliError::Io(detail) => format!("{} {detail}", Msg::CliIoError.text(locale)),
             CliError::Usage(detail) => format!("{} {detail}", Msg::CliUsage.text(locale)),
             CliError::Backend(detail) => format!("{} {detail}", Msg::CliBackendError.text(locale)),
+            // The refusal text is the core's, in English, as every other
+            // API-level message here; the operator-facing prefix is localized.
+            CliError::Codes { detail, .. } => {
+                format!("{} {detail}", Msg::CodesRefused.text(locale))
+            }
+        }
+    }
+
+    /// The process exit code this error leaves behind.
+    ///
+    /// A refusal carries the code of its group (see [`exit_code_for`]);
+    /// everything else is [`EXIT_TOOL_FAILURE`], because everything else means
+    /// the tool never got as far as an answer.
+    #[must_use]
+    pub const fn exit_code(&self) -> u8 {
+        match self {
+            CliError::Codes { group, .. } => exit_code_for(*group),
+            CliError::Issue(_) | CliError::Io(_) | CliError::Usage(_) | CliError::Backend(_) => {
+                EXIT_TOOL_FAILURE
+            }
+        }
+    }
+
+    /// What kind of answer this error is, for a caller that would rather match
+    /// on the group than on the exit code.
+    #[must_use]
+    pub const fn refusal_group(&self) -> Option<RefusalGroup> {
+        match self {
+            CliError::Codes { group, .. } => Some(*group),
+            _ => None,
+        }
+    }
+
+    /// The stable refusal class, for a refusal of the phone channel.
+    #[must_use]
+    pub const fn refusal_class(&self) -> Option<&'static str> {
+        match self {
+            CliError::Codes { class, .. } => Some(class),
+            _ => None,
         }
     }
 }
@@ -1251,6 +1482,14 @@ fn verify_journal(args: &VerifyJournalArgs, locale: Locale) -> Result<(), CliErr
             // A broken chain is a verification failure: report it and exit non-zero.
             return Err(CliError::Io(format!(
                 "{} {position}",
+                Msg::CliJournalBroken.text(locale)
+            )));
+        }
+        // A status this build cannot name is not something to summarise
+        // optimistically: verification that cannot say what it saw has failed.
+        other => {
+            return Err(CliError::Io(format!(
+                "{} {other:?}",
                 Msg::CliJournalBroken.text(locale)
             )));
         }
@@ -4096,6 +4335,14 @@ mod generate_key_tests {
             vec![
                 "ivanov.p12".to_owned(),
                 "journal.ndjson".to_owned(),
+                // The journal's lock. An empty file that only ever carries an
+                // advisory `flock(2)`, and a file of its own rather than the
+                // journal itself so the hold survives the journal being
+                // replaced. It holds no data and no key material — which is
+                // what this assertion is really about — but it is a real
+                // artifact of a run and is listed rather than filtered out, so
+                // that anything else appearing here still fails the test.
+                "journal.ndjson.lock".to_owned(),
                 // The password source the test supplied, not something the run
                 // produced.
                 "p12-password.txt".to_owned(),

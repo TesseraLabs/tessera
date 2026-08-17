@@ -80,6 +80,7 @@ pub fn emit_device_enrolled_full(mode: &str, bundle_version: u64, ids: EnrollAud
         mode,
         bundle_version,
     );
+    mirror(ids, mode, bundle_version, None);
 }
 
 /// Emit `enrollment_rejected` — an import was rejected (fail-closed).
@@ -102,4 +103,24 @@ pub fn emit_enrollment_rejected_full(reason: &str, ids: EnrollAuditIds<'_>) {
         serial = ids.serial,
         reason,
     );
+    mirror(ids, "", 0, Some(reason));
+}
+
+/// Put the same enrollment outcome on the device's hash-chained journal.
+///
+/// The `enrollment.audit` tracing event above is unchanged — its target and its
+/// fields are what operators grep. This is the second destination, and it is the
+/// one where removing the line leaves a mark.
+///
+/// Enrollment is recorded after the fact on purpose: by the time either event is
+/// emitted the import has already been applied or already been rolled back, and
+/// refusing at that point would leave the device changed with nothing saying so.
+fn mirror(ids: EnrollAuditIds<'_>, mode: &str, bundle_version: u64, reason: Option<&str>) {
+    crate::audit::sink::mirror(&crate::audit::AuditRecord::Enrollment {
+        host_id_prefix8: ids.host_id_prefix8.to_owned(),
+        serial: ids.serial.to_owned(),
+        bundle_version,
+        mode: mode.to_owned(),
+        reason: reason.map(str::to_owned),
+    });
 }

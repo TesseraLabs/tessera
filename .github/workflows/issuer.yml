@@ -175,3 +175,37 @@ jobs:
 
       - name: cargo test (tessera_core, mac-tests)
         run: cargo test -p tessera_core --features mac-tests
+
+  # Контракт кодов собирается и под устройство, и под wasm32: кабинет оператора
+  # линкует его как WASM-ядро, а PAM-модуль — как обычную библиотеку. Расхождение
+  # двух сборок выглядит на телефонном канале как «код не подходит» на объекте,
+  # поэтому обе цели проверяются в одном прогоне. Голден-векторы гоняются нативно;
+  # прогон их же под wasm ждёт headless-раннера (задача 2.4 change'а codes-contract).
+  codes-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          shared-key: codes-contract
+
+      - name: cargo test (golden vectors, native)
+        run: cargo test -p tessera_codes_contract
+
+      - name: Build for wasm32
+        run: cargo check -p tessera_codes_contract --target wasm32-unknown-unknown
+
+      # CI линтит --all-features, а дефолтная сборка успевала быть красной
+      # незамеченной — линтуются оба набора.
+      - name: cargo clippy (both feature sets)
+        run: |
+          cargo clippy -p tessera_codes_contract --all-features -- -D warnings
+          cargo clippy -p tessera_codes_contract -- -D warnings

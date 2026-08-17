@@ -1,0 +1,277 @@
+suite: codes-enrollment
+description: >
+  Часть Codes в пакете первичной настройки: устройство получает контейнер ключа,
+  билеты операторов и список их отзыва тем же импортом, что роли и теги. Пакет без
+  этой части обязан импортироваться ровно как прежде — парк «только Access» готовится
+  тем же процессом.
+setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
+
+# Кейсы написаны ДО реализации (правило «кейс раньше кода»): ожидания взяты из
+# спеки openspec/changes/codes-device-artifacts/specs/device-enrollment/spec.md,
+# а не измерены на стенде. Подгонять их под факт нельзя.
+#
+# Чтения пакета с CCID-токена и партионного носителя здесь нет намеренно: этот
+# раздел change'а едет отдельно и требует живого токена, которого не объявляет ни
+# один профиль.
+
+cases:
+  - id: ENRC-001
+    title: Пакет с частью Codes раскладывает артефакты метода на устройство
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # Наблюдаемая гарантия: после импорта устройство несёт контейнер ключа,
+    # билеты и анкер — и несёт их под правами, за которыми они и защищены.
+    # PIN-контейнер — форма доставки, а не форма хранения: ключ остаётся
+    # открываемым без человека в зале, поэтому проверяются права, а не PIN.
+    steps:
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - expect_file: { path: /var/lib/tessera/codes/device.p12, mode: "0600" }
+      - expect_file: { path: /var/lib/tessera/codes/tickets.txt, exists: true }
+      - expect_file: { path: /var/lib/tessera/codes/ticket-authority.pem, exists: true }
+      - expect_file: { path: /var/lib/tessera/codes/state/key.epoch, matches: "^1$" }
+      # Владелец парка сверяет запись реестра устройства по эпохе из события, а не
+      # по файлу на устройстве, до которого ему не дотянуться.
+      - expect_journal: { identifier: tessera, matches: 'codes_artefacts_applied' }
+    teardown:
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-002
+    title: Пакет без части Codes импортируется как прежде
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # Обратная совместимость — не приятная мелочь, а условие того, что парк
+    # «только Access» готовится тем же процессом. Импорт обязан пройти, а
+    # артефактов метода на устройстве обязано не появиться: молча заведённый
+    # пустой каталог метода выглядел бы как включённый метод.
+    steps:
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --without-codes
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - expect_file: { path: /var/lib/tessera/codes/device.p12, exists: false }
+      - expect_file: { path: /var/lib/tessera/codes/state/key.epoch, exists: false }
+    teardown:
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-003
+    title: Пакет с новой эпохой заменяет ключ и обнуляет счётчик nonce
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: [service-manager]
+    # Счётчик уникален внутри одной эпохи, и новый ключ не потратил из него
+    # ничего. Чтобы обнуление было наблюдаемым, счётчик сперва двигают настоящим
+    # разговором: устройство, не выдавшее ни одного challenge, ничего бы здесь
+    # не проверило — хелпер откажется работать с нулевым запомненным значением.
+    steps:
+      # Подготовка телефонного канала идёт ПЕРЕД импортом: она приводит устройство
+      # к чистому состоянию (включая state/), и после импорта затёрла бы ровно ту
+      # эпоху, которую кейс проверяет.
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      - run: helpers/codes-enroll.sh note-counter
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 2
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - expect_file: { path: /var/lib/tessera/codes/state/key.epoch, matches: "^2$" }
+      - run: helpers/codes-enroll.sh assert-counter-reset
+        expect: { exit_code: 0 }
+    teardown:
+      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-004
+    title: Пакет с эпохой ниже принятой отвергается
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # Anti-rollback: восстановленный носитель не должен уговорить устройство
+    # вернуться к ключу, коды которого уже произнесены вслух. Отказ обязан быть
+    # полным — эпоха на устройстве остаётся прежней.
+    steps:
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 3
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 2
+      - run: helpers/codes-enroll.sh import-expect-refused 'epoch rollback'
+        expect: { exit_code: 0 }
+        timeout: 60
+      - expect_file: { path: /var/lib/tessera/codes/state/key.epoch, matches: "^3$" }
+    teardown:
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-005
+    title: Повторный импорт той же эпохи не воскрешает потреблённые nonce
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: [service-manager]
+    # Самая дорогая гарантия этого suite: если повтор носителя обнулит счётчик,
+    # каждый уже произнесённый по телефону код станет действительным заново.
+    # Поэтому счётчик сначала двигают настоящим входом, а потом подают тот же
+    # пакет второй раз.
+    steps:
+      # Порядок тот же, что в ENRC-003, и по той же причине.
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      - run: helpers/codes-enroll.sh note-counter
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-enroll.sh assert-counter-kept
+        expect: { exit_code: 0 }
+    teardown:
+      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-006
+    title: Отзыв билета, привезённый пакетом, закрывает вход в той же попытке
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: [service-manager]
+    # Список отзыва билетов едет ритмом CRL и применяется ДО аутентификации:
+    # отозванный оператор перестаёт пускать в той же попытке входа, в которой
+    # список приехал, а не после перезагрузки.
+    steps:
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1 --revoke-ticket
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-007
+    title: Вывод устройства из парка вытирает артефакты Codes
+    requirement: openspec/specs/device-unenroll/spec.md
+    requires: []
+    # Команда `tessera un-enroll` вводится change'ем device-lifecycle, здесь
+    # проверяется только расширение её wipe-списка: ключ, билеты, список отзыва и
+    # nonce-store обязаны уйти вместе с устройством, а последняя эпоха — попасть
+    # в финальное событие, чтобы владелец знал, какую запись реестра отзывать.
+    steps:
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: tessera un-enroll --non-interactive --no-restart
+        expect: { exit_code: 0 }
+        timeout: 120
+      - expect_file: { path: /var/lib/tessera/codes/device.p12, exists: false }
+      - expect_file: { path: /var/lib/tessera/codes/tickets.txt, exists: false }
+      - expect_file: { path: /var/lib/tessera/codes/state/nonce.counter, exists: false }
+      # Каталог состояния обязан опустеть ЦЕЛИКОМ, а не по списку имён: в нём
+      # лежит ещё и файл межпроцессной блокировки, который устройство создаёт
+      # само. Перечисление имён — список, который однажды расширят, а тут
+      # проверять надо обещание модуля: следов метода не остаётся.
+      - run: test -z "$(ls -A /var/lib/tessera/codes/state 2>/dev/null)"
+        expect: { exit_code: 0 }
+      - expect_journal: { identifier: tessera, matches: 'codes_artefacts_wiped' }
+    teardown:
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-008
+    title: Импорт в ослабленное хранилище не кладёт ни одного артефакта
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # Самопроверка хранилища — предусловие записи, а не отчёт о ней. Если каталог,
+    # в котором лежит хранилище, доступен на запись кому попало, ключ туда класть
+    # нельзя вовсе: положить и затем сообщить об отказе — значит оставить ключ на
+    # чужом каталоге и сдвинуть эпоху, после чего повтор импорта уже ничего не
+    # починит, а инженер уедет в уверенности, что не применилось ничего.
+    steps:
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: chmod 0777 /var/lib/tessera
+      - run: helpers/codes-enroll.sh import-expect-refused 'not trustworthy'
+        expect: { exit_code: 0 }
+        timeout: 60
+      - expect_file: { path: /var/lib/tessera/codes/device.p12, exists: false }
+      - expect_file: { path: /var/lib/tessera/codes/tickets.txt, exists: false }
+      - expect_file: { path: /var/lib/tessera/codes/state/key.epoch, exists: false }
+    teardown:
+      - run: chmod 0755 /var/lib/tessera
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-009
+    title: Файл части Codes больше потолка отвергается, а не читается целиком
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # Пакет приезжает на съёмном носителе, и его содержимое — воля того, кто этот
+    # носитель собрал. Файл в десятки гигабайт обязан упереться в потолок формата,
+    # а не в память машины: импорт, убитый OOM, — это отказ в первичной настройке
+    # устройства без единой подписи со стороны атакующего.
+    # Файл разрежённый, поэтому шаг ничего не занимает на диске.
+    steps:
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      # Путь пакета задан хелпером (RUN_DIR в codes-enroll.sh); переменная берётся
+      # из окружения раннера, чтобы профиль мог его перенести.
+      - run: truncate -s 4G "${TESSERA_E2E_STATE_DIR:-/run/tessera-e2e}/codes-enroll/package/codes-tickets.txt"
+      - run: helpers/codes-enroll.sh import-expect-refused 'cap'
+        expect: { exit_code: 0 }
+        timeout: 60
+      - expect_file: { path: /var/lib/tessera/codes/tickets.txt, exists: false }
+    teardown:
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-010
+    title: Имя из части Codes, ведущее на симлинк, отвергается
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # Имя внутри секции проверено на «голость», и этого мало: голое имя всё равно
+    # разрешается тем, что положил на носитель его хозяин. Симлинк на /dev/zero —
+    # чтение, которое не кончится никогда, и импорт обязан отказать по типу файла,
+    # а не начать читать.
+    steps:
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: ln -sf /dev/zero "${TESSERA_E2E_STATE_DIR:-/run/tessera-e2e}/codes-enroll/package/codes-tickets.txt"
+      - run: helpers/codes-enroll.sh import-expect-refused 'codes ticket set|not a regular file|Too many levels'
+        expect: { exit_code: 0 }
+        timeout: 60
+      - expect_file: { path: /var/lib/tessera/codes/tickets.txt, exists: false }
+    teardown:
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-011
+    title: Секция Codes применяется только из подписанных байтов манифеста
+    requirement: openspec/specs/device-enrollment/spec.md
+    requires: []
+    # ЗАГОТОВКА, прогону сегодня не поддаётся — см. BASELINE.md.
+    # Гарантия: в managed-пакете секция [codes] называет удостоверяющий центр
+    # билетов, то есть решает, чьи коды это устройство впустит. Она обязана
+    # приходить ровно из тех байтов, на которых сошлась подпись. Повтор того же
+    # bundle_version — самый опасный случай: Access-части делать нечего, и секция,
+    # прочитанная после этого решения, въехала бы в хранилище вообще без подписи.
+    # Хелпер сегодня собирает только standalone-пакет; managed требует ключа
+    # организации на стенде.
+    steps:
+      - run: helpers/codes-enroll.sh package --managed {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-enroll.sh tamper-manifest-codes
+      - run: helpers/codes-enroll.sh import-expect-refused 'signature'
+        expect: { exit_code: 0 }
+        timeout: 60
+      - run: helpers/codes-enroll.sh assert-anchor-unchanged
+        expect: { exit_code: 0 }
+    teardown:
+      - run: helpers/codes-enroll.sh cleanup

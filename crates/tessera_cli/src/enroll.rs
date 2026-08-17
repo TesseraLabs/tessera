@@ -19,16 +19,40 @@
 //! check is surfaced as a non-zero exit (fail-closed). On any import error the
 //! command exits non-zero; the import core guarantees the device is left in its
 //! prior consistent state (atomic rollback).
+//!
+//! # The Codes part of a package
+//!
+//! A package may carry the device half of the code login method beside the
+//! Access part. The command applies it when the package has one, into the store
+//! the device configuration names (`[codes].dir`, overridable with
+//! `--codes-dir`). Two things about it are decisions of the operator standing
+//! at the device rather than properties of the package, and so they are command
+//! line input:
+//!
+//! - the **PIN of the delivery container** (`--codes-pin-file`), because a
+//!   container whose password travels beside it is not a protected container.
+//!   It is read from a file rather than taken as a value: an argument is
+//!   readable in the process table by everyone on the machine for as long as
+//!   the import runs, and it survives in shell history afterwards;
+//! - **whether to apply the part at all** (`--no-codes`), for the operator who
+//!   is importing the Access part of a package onto a device the method is not
+//!   being enabled on.
+//!
+//! A package without a Codes part imports exactly as it did before the part
+//! existed — no flag, no store, no report line.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Args;
+use secrecy::SecretString;
 
+use tessera_core::codes::artefacts::StoreCheck;
+use tessera_core::codes::CodesPaths;
 use tessera_core::config::ValidatedConfig;
 use tessera_core::enrollment::audit::EnrollAuditIds;
 use tessera_core::enrollment::{
-    EnrollmentPackage, ImportError, ImportMode, ImportOutcome, InstallPaths,
+    CodesImport, EnrollmentPackage, ImportError, ImportMode, ImportOutcome, InstallPaths,
 };
 use tessera_core::host_identity::HostIdentityResolver;
 use tessera_core::role::RoleOs;
@@ -65,6 +89,25 @@ pub struct EnrollArgs {
     #[arg(long, default_value = "/etc/tessera/config.toml")]
     pub config: PathBuf,
 
+    /// File holding the PIN of the Codes delivery container, first line taken.
+    ///
+    /// Required only for a package whose Codes part carries a key container;
+    /// a package that rotates tickets alone needs none. The file must not be
+    /// readable beyond its owner.
+    #[arg(long)]
+    pub codes_pin_file: Option<PathBuf>,
+
+    /// Where the Codes artefacts are installed. Defaults to `[codes].dir` of
+    /// the device configuration, and to the product default when the
+    /// configuration names none.
+    #[arg(long)]
+    pub codes_dir: Option<PathBuf>,
+
+    /// Ignore the Codes part of the package, if it has one. The device is
+    /// enrolled as an Access-only device.
+    #[arg(long, default_value_t = false)]
+    pub no_codes: bool,
+
     /// Skip the post-import `tessera check` preflight. NOT recommended: the
     /// check is the fail-closed gate that a half-broken config never reaches a
     /// reboot. Provided for environments where the config is validated out of
@@ -96,6 +139,28 @@ pub struct EnrollOptions {
     pub run_check: bool,
     /// Config path for the post-import check.
     pub config: PathBuf,
+    /// What to do with the Codes part of the package.
+    ///
+    /// `None` means "leave it alone": a caller that never enabled the method,
+    /// an operator who asked for `--no-codes`, and every caller written before
+    /// the part existed all land here, and for all three a package carrying a
+    /// Codes part imports as an Access-only package.
+    pub codes: Option<CodesOptions>,
+}
+
+/// Where the Codes part of a package is applied, and what opens it.
+#[derive(Debug, Clone)]
+pub struct CodesOptions {
+    /// Store the artefacts are installed into.
+    pub paths: CodesPaths,
+    /// PIN that opens the delivery container, when the operator supplied one.
+    pub container_pin: Option<SecretString>,
+    /// Path to the GOST engine, forwarded to the container.
+    pub gost_engine_path: Option<PathBuf>,
+    /// Whether the finished store is walked with the ownership policy a login
+    /// applies. A device enrols with it enforced; a test importing into a
+    /// temporary directory cannot satisfy any ownership policy and says so.
+    pub store_check: StoreCheck,
 }
 
 /// What `enroll` produced on success: the import outcome plus the identifiers
@@ -141,6 +206,27 @@ pub enum EnrollError {
         path: String,
         /// Why it failed, including the ownership/mode detail when the path
         /// failed the root-control policy.
+        reason: String,
+    },
+    /// The device configuration could not be loaded, and it is the only thing
+    /// that says where the Codes artefacts belong.
+    #[error(
+        "cannot decide where the Codes artefacts belong: the device configuration {path} did \
+         not load ({reason}). Fix the configuration, or name the store explicitly with \
+         --codes-dir, or import the Access part alone with --no-codes"
+    )]
+    ConfigUnreadable {
+        /// Configuration path.
+        path: String,
+        /// Why it did not load.
+        reason: String,
+    },
+    /// The `--codes-pin-file` could not be read, or is readable beyond its owner.
+    #[error("cannot read the codes container PIN file {path}: {reason}")]
+    PinFileRead {
+        /// PIN file path.
+        path: String,
+        /// Why it was refused.
         reason: String,
     },
 }
@@ -342,12 +428,26 @@ pub fn run(opts: EnrollOptions) -> Result<EnrollReport, EnrollError> {
     // failure, fail-closed. The post-import preflight reuses `tessera check`;
     // a failing config is fail-closed — the operator must fix it before the
     // device is trusted.
+    let codes = opts.codes.as_ref().map(|codes| CodesImport {
+        paths: codes.paths.clone(),
+        container_pin: codes.container_pin.as_ref(),
+        gost_engine_path: codes.gost_engine_path.as_deref(),
+        store_check: codes.store_check,
+    });
     let outcome = import_and_check(
         &opts,
         &crate::startup_check::StartupCheckOptions::default(),
         tessera_core::config::load_privileged_validated_config,
         probe_engine_before_import,
-        || pkg.install_with_ids(&opts.paths, opts.os, pubkey_bytes.as_deref(), ids),
+        || {
+            pkg.install_with_codes(
+                &opts.paths,
+                opts.os,
+                pubkey_bytes.as_deref(),
+                ids,
+                codes.as_ref(),
+            )
+        },
     )?;
 
     Ok(EnrollReport {
@@ -355,6 +455,164 @@ pub fn run(opts: EnrollOptions) -> Result<EnrollReport, EnrollError> {
         host_id_prefix8: opts.host_id_prefix8,
         serial,
     })
+}
+
+/// One line describing what the Codes part of the package did.
+fn codes_summary(outcome: &ImportOutcome) -> String {
+    let Some(applied) = &outcome.codes else {
+        return "-".to_owned();
+    };
+    let epoch = applied
+        .epoch
+        .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string());
+    format!(
+        "epoch={epoch} key_replaced={} counter_reset={} tickets={} revocations={}",
+        applied.key_replaced,
+        applied.counter_reset,
+        applied.tickets_applied,
+        applied.revocations_applied
+    )
+}
+
+/// Read the PIN of the delivery container from `path`, first line only.
+///
+/// Three things are refused rather than read, and each of them is a way the
+/// operator's own file system can be turned against the import:
+///
+/// * a file reachable beyond its owner — a PIN in a world-readable file is a
+///   PIN everybody on the device has, and this is the last moment at which that
+///   can be said out loud. The check runs on the metadata of the open handle
+///   rather than on the path, so a path repointed between the check and the
+///   read cannot smuggle in a file that was never checked;
+/// * a symlink — the open does not follow one, so a name under `/run` cannot
+///   redirect the read at a file elsewhere on the system;
+/// * anything that is not a regular file — a named pipe would otherwise block
+///   the import until a writer that never comes appears, and a device node
+///   would feed it bytes without end.
+///
+/// The bytes are held in buffers that wipe themselves: a PIN left in freed heap
+/// outlives the command that read it, and the rest of this codebase is careful
+/// about that.
+///
+/// On targets that do not express permissions this way the ownership check
+/// passes and the directory carries the protection.
+fn read_pin_file(path: &Path) -> Result<SecretString, EnrollError> {
+    use secrecy::zeroize::Zeroizing;
+    use std::io::Read as _;
+
+    /// A PIN is a handful of characters; the bound is what makes the read
+    /// finite when the source carries no line terminator at all — a binary
+    /// stream, a device, a FIFO nobody closes.
+    const MAX_PIN_BYTES: u64 = 4096;
+
+    let fail = |reason: String| EnrollError::PinFileRead {
+        path: path.display().to_string(),
+        reason,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // `O_NOFOLLOW` refuses the symlink. `O_NONBLOCK` is what keeps the
+        // *open itself* from waiting on a FIFO: checking the file type after
+        // the open is too late, because opening a pipe for reading blocks
+        // until a writer appears, and on the import path that writer never
+        // comes. It is a no-op on the regular file this is meant to be.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|e| fail(e.to_string()))?;
+    let metadata = file.metadata().map_err(|e| fail(e.to_string()))?;
+    if !metadata.is_file() {
+        return Err(fail("the path is not a regular file".to_owned()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = metadata.permissions().mode() & 0o7777;
+        if mode & 0o077 != 0 {
+            return Err(fail(format!(
+                "the file is reachable beyond its owner (mode {mode:04o})"
+            )));
+        }
+    }
+
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_PIN_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| fail(e.to_string()))?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| fail(e.to_string()))?;
+    // `SecretString` owns the only copy that outlives this call, and wipes it
+    // when it is dropped.
+    Ok(SecretString::from(
+        text.lines().next().unwrap_or_default().to_owned(),
+    ))
+}
+
+/// Work out where the Codes artefacts go and what opens them.
+///
+/// The store is the one the device configuration names, so that an import and
+/// the login path never disagree about where the artefacts live; `--codes-dir`
+/// overrides it, and the product default is the last resort.
+///
+/// # Why a configuration that will not load stops the import
+///
+/// Unlike the `host_id` of the report, which is cosmetic when it is missing,
+/// this answer decides *where the key of the device is written*. Falling back
+/// to the default store on a configuration that could not be read is a silent
+/// wrong answer with an irreversible tail: the artefacts land in a directory
+/// the login path may never look at, and the delivery container — the operator's
+/// only copy of that key material — is shredded from the medium as part of the
+/// same import. Repairing the configuration afterwards does not bring it back.
+///
+/// So the failure is reported before the import begins, and the one way past it
+/// is to say where the store is: an operator who passes `--codes-dir` has
+/// answered the question the configuration was being asked, and does not need
+/// it to load.
+fn resolve_codes(args: &EnrollArgs) -> Result<Option<CodesOptions>, EnrollError> {
+    if args.no_codes {
+        return Ok(None);
+    }
+    let (configured, configured_store) =
+        match tessera_core::config::load_validated_config(&args.config) {
+            // The store comes from the section whether or not the method is
+            // switched on: a device is normally prepared before it is enabled, and
+            // an import that wrote the key into the default directory while the
+            // login path reads the configured one would leave the only copy of that
+            // key in the wrong place — the delivery container is shredded from the
+            // medium by the same import.
+            Ok(validated) => (validated.codes.method, Some(validated.codes.paths)),
+            // The store was named on the command line, so nothing below depends on
+            // the configuration; the GOST engine path is the only thing lost, and a
+            // fleet on that profile carries it in the configuration it just failed
+            // to load anyway.
+            Err(_) if args.codes_dir.is_some() => (None, None),
+            Err(error) => {
+                return Err(EnrollError::ConfigUnreadable {
+                    path: args.config.display().to_string(),
+                    reason: error.to_string(),
+                })
+            }
+        };
+    let paths = match (&args.codes_dir, configured_store) {
+        (Some(dir), _) => CodesPaths::under(dir),
+        (None, Some(store)) => store,
+        (None, None) => CodesPaths::default(),
+    };
+    let container_pin = match &args.codes_pin_file {
+        Some(path) => Some(read_pin_file(path)?),
+        None => None,
+    };
+    Ok(Some(CodesOptions {
+        paths,
+        container_pin,
+        gost_engine_path: configured.and_then(|method| method.gost_engine_path),
+        // A device enrols with the store checked: the artefacts are the whole
+        // of what the method trusts, and permissions that would let somebody
+        // else rewrite them are not a warning.
+        store_check: StoreCheck::Enforced,
+    }))
 }
 
 /// Print the success report (one `key\tvalue` line per field, then a summary),
@@ -378,6 +636,10 @@ fn print_report(report: &EnrollReport) {
     println!("serial\t{serial}");
     println!("bundle_version\t{}", report.outcome.bundle_version);
     println!("mode\t{mode}");
+    // The line is printed whether or not the package carried a Codes part: an
+    // operator who expected one has to see that it was not there, and "no line
+    // at all" reads as "the command is older than the feature".
+    println!("codes\t{}", codes_summary(&report.outcome));
     println!("---");
     if report.outcome.no_op {
         println!("summary: enrollment no-op (bundle already applied)");
@@ -414,6 +676,15 @@ pub fn run_cli(args: EnrollArgs) -> ExitCode {
         ImportMode::Managed
     };
     let host_id_prefix8 = resolve_host_id_prefix8(&args.config);
+    // Resolved before the import starts: a PIN file nobody can read, or one the
+    // whole device can, has to stop the command while it has changed nothing.
+    let codes = match resolve_codes(&args) {
+        Ok(codes) => codes,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let opts = EnrollOptions {
         import: args.import,
         mode,
@@ -423,6 +694,7 @@ pub fn run_cli(args: EnrollArgs) -> ExitCode {
         host_id_prefix8,
         run_check: !args.skip_check,
         config: args.config,
+        codes,
     };
     match run(opts) {
         Ok(report) => {
@@ -457,6 +729,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::fmt::Write as _;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use tempfile::TempDir;
     use tessera_core::gost::GostEngineError;
 
@@ -556,6 +830,7 @@ mod tests {
             host_id_prefix8: "deadbeef".to_string(),
             run_check: false,
             config: PathBuf::from("/nonexistent/config.toml"),
+            codes: None,
         };
         let report = run(opts).expect("managed import ok");
         assert_eq!(report.outcome.mode, ImportMode::Managed);
@@ -584,6 +859,7 @@ mod tests {
             host_id_prefix8: String::new(),
             run_check: false,
             config: PathBuf::from("/nonexistent/config.toml"),
+            codes: None,
         };
         let err = run(opts).expect_err("missing pubkey must fail");
         assert!(matches!(err, EnrollError::MissingPubkey));
@@ -602,6 +878,7 @@ mod tests {
             host_id_prefix8: "abc12345".to_string(),
             run_check: false,
             config: PathBuf::from("/nonexistent/config.toml"),
+            codes: None,
         };
         let report = run(opts).expect("standalone import ok");
         assert_eq!(report.outcome.mode, ImportMode::Standalone);
@@ -628,6 +905,7 @@ mod tests {
             host_id_prefix8: String::new(),
             run_check: false,
             config: PathBuf::from("/nonexistent/config.toml"),
+            codes: None,
         };
         let err = run(opts).expect_err("malformed package must fail");
         assert!(matches!(err, EnrollError::Import(ImportError::NoP12)));
@@ -645,6 +923,7 @@ mod tests {
             host_id_prefix8: String::new(),
             run_check: false,
             config: PathBuf::from("/nonexistent/config.toml"),
+            codes: None,
         };
         let err = run(opts).expect_err("missing path must fail");
         assert!(matches!(
@@ -669,6 +948,7 @@ mod tests {
             host_id_prefix8: String::new(),
             run_check: true,
             config: PathBuf::from("/nonexistent/config.toml"),
+            codes: None,
         };
         let err = run(opts).expect_err("post-check must fail-closed");
         let EnrollError::ConfigLoad { path, reason } = &err else {
@@ -693,6 +973,7 @@ mod tests {
             host_id_prefix8: String::new(),
             run_check: false,
             config: PathBuf::from("/nonexistent/config.toml"),
+            codes: None,
         };
         let first = run(mk_opts()).expect("first import ok");
         assert!(!first.outcome.no_op);
@@ -761,6 +1042,7 @@ mod tests {
             host_id_prefix8: String::new(),
             run_check,
             config: root.join("config.toml"),
+            codes: None,
         }
     }
 
@@ -770,6 +1052,7 @@ mod tests {
             bundle_version: 0,
             baseline_established: false,
             no_op: false,
+            codes: None,
         }
     }
 
@@ -905,5 +1188,310 @@ mod tests {
     fn parse_os_rejects_unknown() {
         assert!(parse_os("bsd").is_err());
         assert_eq!(parse_os("astra").unwrap(), RoleOs::Astra);
+    }
+
+    /// Codes options rooted at a tempdir. The ownership walk is skipped for the
+    /// same reason the login path has an unprivileged entry: no temporary
+    /// directory satisfies a policy that demands root ownership.
+    fn codes_options(base: &Path) -> CodesOptions {
+        CodesOptions {
+            paths: CodesPaths::under(&base.join("codes")),
+            container_pin: None,
+            gost_engine_path: None,
+            store_check: StoreCheck::Skipped,
+        }
+    }
+
+    #[test]
+    fn a_package_without_a_codes_part_imports_as_before() {
+        // The compatibility guarantee, at the level an operator sees it: the
+        // Access-only package of a fleet that never enabled the method imports
+        // with the Codes options supplied and leaves no Codes store behind.
+        let pkg = build_standalone_pkg();
+        let root = tempfile::tempdir().unwrap();
+        let codes = codes_options(root.path());
+        let opts = EnrollOptions {
+            import: pkg.path().to_path_buf(),
+            mode: ImportMode::Standalone,
+            manifest_pubkey: None,
+            os: RoleOs::Linux,
+            paths: install_paths(root.path()),
+            host_id_prefix8: String::new(),
+            run_check: false,
+            config: PathBuf::from("/nonexistent/config.toml"),
+            codes: Some(codes.clone()),
+        };
+        let report = run(opts).expect("import without a codes part ok");
+        assert!(
+            report.outcome.codes.is_none(),
+            "a package with no Codes part must not report one applied"
+        );
+        assert!(!codes.paths.device_key_container.exists());
+        assert!(!codes.paths.tickets.exists());
+        assert_eq!(codes_summary(&report.outcome), "-");
+    }
+
+    #[test]
+    fn a_standalone_package_with_a_codes_part_installs_it() {
+        // The anchor alone is a whole delivery: a package that rotates the trust
+        // anchor carries no key container and needs no PIN. It is also the part
+        // of the section that can be checked without fixture key material.
+        let pkg = build_standalone_pkg();
+        let anchor = gen_key().pub_pem;
+        fs::write(pkg.path().join("codes-ticket-authority.pem"), &anchor).unwrap();
+        let sha = hex::encode(Sha256::digest(&anchor));
+        fs::write(
+            pkg.path().join("codes.toml"),
+            format!(
+                "epoch = 4\nticket_authority = {{ file = \"codes-ticket-authority.pem\", \
+                 sha256 = \"{sha}\" }}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let codes = codes_options(root.path());
+        let opts = EnrollOptions {
+            import: pkg.path().to_path_buf(),
+            mode: ImportMode::Standalone,
+            manifest_pubkey: None,
+            os: RoleOs::Linux,
+            paths: install_paths(root.path()),
+            host_id_prefix8: String::new(),
+            run_check: false,
+            config: PathBuf::from("/nonexistent/config.toml"),
+            codes: Some(codes.clone()),
+        };
+        let report = run(opts).expect("import with a codes part ok");
+        let applied = report
+            .outcome
+            .codes
+            .as_ref()
+            .expect("the codes part was applied");
+        assert!(!applied.key_replaced);
+        assert!(!applied.counter_reset);
+        assert_eq!(
+            fs::read(&codes.paths.ticket_authority).unwrap(),
+            anchor,
+            "the delivered anchor is the one that landed in the store"
+        );
+        assert!(codes_summary(&report.outcome).contains("key_replaced=false"));
+    }
+
+    #[test]
+    fn a_codes_section_whose_pin_does_not_match_stops_the_import() {
+        // The pin is what authenticates the file inside a package: bytes that do
+        // not match it are refused rather than installed, standalone or not.
+        let pkg = build_standalone_pkg();
+        fs::write(pkg.path().join("codes-ticket-authority.pem"), b"not a key").unwrap();
+        fs::write(
+            pkg.path().join("codes.toml"),
+            b"epoch = 1\nticket_authority = { file = \"codes-ticket-authority.pem\", \
+              sha256 = \"00\" }\n"
+                .as_slice(),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let codes = codes_options(root.path());
+        let opts = EnrollOptions {
+            import: pkg.path().to_path_buf(),
+            mode: ImportMode::Standalone,
+            manifest_pubkey: None,
+            os: RoleOs::Linux,
+            paths: install_paths(root.path()),
+            host_id_prefix8: String::new(),
+            run_check: false,
+            config: PathBuf::from("/nonexistent/config.toml"),
+            codes: Some(codes.clone()),
+        };
+        let err = run(opts).expect_err("a mismatched pin must stop the import");
+        assert!(matches!(
+            err,
+            EnrollError::Import(ImportError::CodesHashMismatch { .. })
+        ));
+        assert!(!codes.paths.ticket_authority.exists());
+    }
+
+    /// Arguments naming a config path and nothing else, so each test below can
+    /// set exactly the one field it is about.
+    fn enroll_args(config: &Path) -> EnrollArgs {
+        EnrollArgs {
+            import: PathBuf::from("/nonexistent/package"),
+            standalone: true,
+            manifest_pubkey: None,
+            os: "linux".to_owned(),
+            config: config.to_path_buf(),
+            codes_pin_file: None,
+            codes_dir: None,
+            no_codes: false,
+            skip_check: true,
+        }
+    }
+
+    #[test]
+    fn a_configuration_that_will_not_load_stops_the_import_before_it_starts() {
+        // Where the key of this device is written is not a cosmetic answer, and
+        // the default store is a silent wrong one: the artefacts would land
+        // where the login path may never look, and the delivery container — the
+        // only copy of that key material — is shredded from the medium by the
+        // same import. Repairing the configuration afterwards does not bring it
+        // back, so the refusal has to happen before anything is read.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, b"this is not toml at all\n").unwrap();
+
+        let error = resolve_codes(&enroll_args(&config))
+            .expect_err("an unreadable configuration must stop the import");
+        assert!(matches!(error, EnrollError::ConfigUnreadable { .. }));
+    }
+
+    /// Writes the shipped example config into `dir`, with its documented paths
+    /// swapped for scratch files that exist and one extra line in `[codes]`.
+    ///
+    /// The example is used rather than a hand-built fragment because the
+    /// mandatory keys of the schema are not this test's subject: a minimal
+    /// config would go red on whichever key was forgotten and say nothing about
+    /// the store.
+    fn config_with_codes_line(dir: &Path, line: &str) -> PathBuf {
+        let example =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/config/config.toml.example");
+        let text = fs::read_to_string(&example).expect("read the shipped example config");
+
+        let anchor_pem = dir.join("anchor.pem");
+        fs::write(
+            &anchor_pem,
+            b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".as_slice(),
+        )
+        .unwrap();
+        let module = dir.join("dummy_pkcs11.so");
+        fs::write(&module, b"\x7fELF".as_slice()).unwrap();
+
+        let section = "[codes]\n";
+        let at = text.find(section).expect("the example carries [codes]") + section.len();
+        let (head, tail) = text.split_at(at);
+        let rewritten = format!("{head}{line}\n{tail}")
+            .replace(
+                "/etc/tessera/ca/bundle.pem",
+                anchor_pem.to_str().expect("utf8 anchor"),
+            )
+            .replace(
+                "/usr/lib/librtpkcs11ecp.so",
+                module.to_str().expect("utf8 module"),
+            );
+
+        let path = dir.join("config.toml");
+        fs::write(&path, rewritten.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_import_writes_into_the_configured_store_even_before_the_method_is_enabled() {
+        // The ordinary way a fleet is prepared: the artefacts are delivered
+        // first and the method is switched on afterwards. If the import read
+        // the store only from an *enabled* section, the key would land in the
+        // default directory while the login path later reads the configured
+        // one — and the delivery container is shredded from the medium by that
+        // same import, so the only copy of the key would be in a place nothing
+        // looks at.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("fleet-codes");
+        let config = config_with_codes_line(
+            dir.path(),
+            &format!("dir = \"{}\"", store.to_str().expect("utf8 store")),
+        );
+
+        let options = resolve_codes(&enroll_args(&config))
+            .expect("a valid configuration resolves")
+            .expect("the codes part is not disabled by --no-codes");
+        assert!(
+            options.paths.device_key_container.starts_with(&store),
+            "the import must follow the configured store, got {}",
+            options.paths.device_key_container.display()
+        );
+    }
+
+    #[test]
+    fn a_store_named_on_the_command_line_does_not_need_the_configuration() {
+        // The operator answered the question the configuration was being asked.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, b"this is not toml at all\n").unwrap();
+        let store = dir.path().join("codes");
+
+        let options = resolve_codes(&EnrollArgs {
+            codes_dir: Some(store.clone()),
+            ..enroll_args(&config)
+        })
+        .expect("an explicit store stands on its own")
+        .expect("the codes part is not disabled");
+        assert!(options.paths.device_key_container.starts_with(&store));
+    }
+
+    #[test]
+    fn an_access_only_import_asks_nothing_of_the_configuration() {
+        // `--no-codes` decides the question outright, so a configuration that
+        // will not load is not this command's problem.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, b"this is not toml at all\n").unwrap();
+
+        let options = resolve_codes(&EnrollArgs {
+            no_codes: true,
+            ..enroll_args(&config)
+        })
+        .expect("--no-codes needs no configuration");
+        assert!(options.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pin_file_that_is_not_a_regular_file_is_refused_rather_than_read() {
+        // A named pipe would block the import on the open until a writer that
+        // never comes appears — and the import is the step an engineer is
+        // standing over.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("container.pin");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+
+        let error = read_pin_file(&fifo).expect_err("a FIFO must be refused");
+        assert!(matches!(error, EnrollError::PinFileRead { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pin_file_that_is_a_symlink_is_refused() {
+        // The name is under the operator's control; following it would let a
+        // link point the read at a file elsewhere on the system, and the mode
+        // that was checked would be the mode of the link's target chosen by
+        // whoever planted it.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.pin");
+        fs::write(&real, b"secret-pin\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("container.pin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let error = read_pin_file(&link).expect_err("a symlinked PIN file must be refused");
+        assert!(matches!(error, EnrollError::PinFileRead { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pin_file_reachable_beyond_its_owner_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.pin");
+        fs::write(&path, b"secret-pin\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = read_pin_file(&path).expect_err("a world-readable PIN must be refused");
+        assert!(matches!(err, EnrollError::PinFileRead { .. }));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let pin = read_pin_file(&path).expect("an owner-only PIN is read");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&pin), "secret-pin");
     }
 }

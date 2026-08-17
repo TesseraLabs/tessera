@@ -134,6 +134,25 @@ async fn run_async(args: DaemonArgs) -> anyhow::Result<()> {
     // `TESSERA_LOG` environment variable keeps precedence (no-op then).
     logging::apply_config_level(validated.logging.level)?;
 
+    // The audit chain of this process. The daemon writes no login events, but
+    // it is the process that outlives them, and a journal it cannot open is a
+    // fact an operator should learn at start rather than at the first refused
+    // login. Unlike the PAM module, a failure here is reported and not fatal:
+    // refusing to start the session monitor would take away the enforcement
+    // that does work, and the login path fails closed on its own.
+    match tessera_core::audit::sink::install_from_config(&validated) {
+        Ok(true) => tracing::info!(
+            target: "tessera.audit_chain",
+            "the device audit journal is open",
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::error!(
+            target: "tessera.audit_chain",
+            error = %error,
+            "this device is configured to keep an audit journal and it could not be opened",
+        ),
+    }
+
     // Run the startup-validation sweep once per boot. Log every record at
     // its severity level; if any check reported `Error`, refuse to start
     // so misconfigurations surface loudly in `systemctl status` instead of

@@ -350,3 +350,108 @@ update_wallpaper = false
 # wallpaper_offset_y   = 120
 # template_ru          = "Устройство %n  host_id={host_id_short} ({source})"
 # template_en          = "Device %n  host_id={host_id_short} ({source})"
+
+# --- Code login (telephone channel) ------------------------------------------
+# The device prints a challenge, the engineer reads it to an operator over the
+# telephone, the operator computes a code in their cabinet and reads it back,
+# the device verifies it locally. No network, no site, no trusted clock — which
+# is the point: this is the method for the device nobody can reach any other
+# way.
+#
+# The artefacts the method needs (the device key container, the operator ticket
+# set, its revocation list and the ticket anchor) are NOT configured here. They
+# are delivered by the enrolment package or a courier payload and land in `dir`:
+#
+#   tessera enroll --standalone --import /mnt/usb/pkg --codes-pin-file /run/pin
+#
+# The PIN of the delivery container is supplied to that command and to nothing
+# else: it protects the container while it travels. After the import the key is
+# stored without one, because the device has to come back from a power cut on
+# its own, with nobody in the room to type anything, and what guards it there is
+# the ownership and mode of the store — dir `0700`, key `0600`, root — which the
+# method verifies before it offers itself. `[codes].key_password` existed for a
+# while and has been REMOVED: a password kept beside the container it opens
+# protects nothing from anyone the file permissions admit already, and a config
+# still naming it is rejected at load with an explanation.
+[codes]
+# Whether this device offers the method. Default false — a fleet that has not
+# provisioned the artefacts has not configured a method, and silence is not an
+# opt-in.
+#
+# Switching this on also switches on the hash-chained journal below: a code
+# login is provable after the fact only if it was written down, so `[audit]`
+# follows this flag whenever it does not state `enabled` itself. Writing that
+# key explicitly overrides the coupling in either direction.
+enabled = false
+# Where the artefacts and the nonce state live. Absolute path. Default:
+# dir = "/var/lib/tessera/codes"
+# Number of THIS device including its check character, exactly as printed on
+# the device label and read aloud. Required when enabled.
+# device_number = "77-000123S"
+# Key epoch of this device. Required when enabled. It is a declaration, not the
+# authority: the number written beside the key at import wins, and a
+# configuration naming an epoch the store does not hold refuses the method
+# rather than deriving codes nobody can match.
+# epoch = 1
+# Region and tags of this device, matched against the scope of an operator
+# ticket. Required when enabled; a device carrying no tag is reached by no
+# ticket, so an empty list is rejected rather than silently refusing every code.
+# region = "ru-central"
+# tags = ["dc-1", "hq"]
+# Local lifetime of a printed challenge, in seconds. Device policy, not part of
+# the agreed code. Default 300.
+# code_ttl_seconds = 300
+# Parameters BOTH sides must agree on. They are fleet-wide: a device and the
+# cabinet computing its codes have to carry the same values, and a device may
+# only be stricter than the contract, never weaker. Defaults shown.
+# code_len = 8
+# attempts_per_nonce = 5
+# alphabet = "decimal"        # decimal | crockford-base32
+# counter_width = 6
+# tail_width = 4
+# Key agreement of the device pairs. The only value this device can actually
+# perform today is "p256", and naming any other is refused when the file is
+# loaded rather than at the keyboard: a configuration that loads says the method
+# works, and a code that cannot be verified is reported exactly like a wrong one.
+# profile = "p256"
+#
+# The contract of the channel also defines "x25519" and "gost-vko-34.10-2012",
+# and the operator cabinet computes against them — the device half is not
+# written yet, so a fleet cannot run on them. The GOST profile additionally
+# carries an open vendor gate (its key agreement has not been exercised on a
+# Linux build of the vendor PKCS#11 library), which is what
+# `accept_unconfirmed_profile` below is about.
+# Whether the fleet owner accepted a key-agreement profile whose vendor gate is
+# still open. Default false — an unconfirmed profile does not validate, and
+# silence is not consent.
+# accept_unconfirmed_profile = false
+
+# --- Audit journal -----------------------------------------------------------
+# The device's own journal, hash-chained: each record carries the hash of the
+# previous one, so a record removed later leaves a mark instead of a gap nobody
+# can see.
+#
+# It switches itself on together with the code login method, and that coupling
+# is not a convenience. Control over the operator of the telephone channel
+# rests on reconciling the logins a device saw against the receipts its
+# operators wrote, and this journal is what makes that reconciliation possible.
+# A device offering the method without a journal is broken in a way it cannot
+# discover about itself: every login looks fine locally and nothing can be
+# paired afterwards. Stating `enabled` here decides it outright, in either
+# direction.
+[audit]
+# enabled = true
+# Where the chain lives. Default:
+# file = "/var/lib/tessera/audit.ndjson"
+# Size the chain may reach, in bytes. Default 67108864 (64 MiB).
+# ceiling_bytes = 67108864
+# What happens at the ceiling: refuse | rotate.
+#   refuse — new records are refused, and everything whose record is
+#            load-bearing stops with them. The default, because a journal that
+#            silently drops what it cannot fit is not a journal.
+#   rotate — start a new chain, leaving a record of the break in it, so the
+#            discontinuity is visible rather than inferred from a gap.
+# when_full = "refuse"
+# How often the head of the chain is attested on a schedule, in seconds.
+# Default 86400 (a day).
+# attest_interval_seconds = 86400

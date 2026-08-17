@@ -1,0 +1,51 @@
+[package]
+name = "tessera_codes_contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Frozen contract of the Tessera Codes phone channel: canonical serialisation, key derivation, code computation, fleet parameters and hybrid nonce."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# SHA-256 only. HMAC and HKDF are written here on top of it: the workspace `hmac`
+# is on the `digest` 0.10 generation while `sha2` is on 0.11, and pulling a
+# second digest generation into a crate that has to compile to
+# `wasm32-unknown-unknown` buys nothing — both constructions are a few dozen
+# lines and are pinned to RFC 4231 / RFC 5869 vectors in the tests.
+sha2 = { workspace = true }
+# Constant-time comparison of the presented code against the computed one.
+subtle = { workspace = true }
+# The shared secret and the derived key are wiped when dropped.
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+# Strings enter the canonical encoding in NFC, so that a name typed on a device
+# and the same name pasted in the cabinet hash to the same bytes.
+unicode-normalization = { workspace = true }
+# The wire form of the documents writes keys and signatures in hexadecimal; the
+# golden vectors read the same encoding back.
+hex = { workspace = true }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Футган-ловушки (порт unsafe-hardening пака из ветки 2026-05-14).
+mem_forget = "deny"
+panic_in_result_fn = "deny"
+let_underscore_must_use = "deny"
+let_underscore_lock = "deny"
+indexing_slicing = "deny"

@@ -1,0 +1,31 @@
+# Golden vector: a role identifier that arrives decomposed (NFD).
+#
+# `role_id_hex` holds the exact input bytes — "ro" + U+0302 + "le-de" + U+0301 +
+# "part" — because a plain-text field would be composed by any editor that
+# touched the file. The canonical bytes below are the composed (NFC) form: a
+# device and a cabinet that received the same name in different normalisations
+# must still meet on the same code.
+#
+# The expected values below are the compatibility surface of the phone channel.
+# They are not to be regenerated when a test fails: a change here is a breaking
+# change of the contract and travels through the two-step procedure of the
+# workspace compatibility policy.
+
+device_number = 77-000777-Q
+nonce = 0000070042
+role_id_hex = 726fcc826c652d6465cc8170617274
+level = 3
+epoch = 12
+ticket = tessera-codes/v1/ticket;operator=op-3;key=0499;tags=hq;roles=*;region=ru-central;max_level=3;not_after=1790000000;number=tk-1;signature=77
+z_hex = a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+
+alphabet = decimal
+code_len = 6
+counter_width = 6
+tail_width = 4
+
+canon_hex = 000000093737303030373737510000000a303030303037303034320000000d72c3b46c652d64c3a9706172740000000400000003
+ticket_hex = 000000046f702d3300000002049900000004000000010000000268710000000400000001000000012a0000000a72752d63656e7472616c000000040000000300000008000000006ab13b8000000004746b2d310000000177
+context_hex = 00000009373730303037373751000000040000000c000000201af44e518f436ace9028fe49dff9b5c057d67f411e983eb7f2153c7351bf6628
+k_hex = 086ba58525aea4d3abd7e5fc1512e8475dddd3f6b5553a63064041e0f31b5fab
+code = 356540

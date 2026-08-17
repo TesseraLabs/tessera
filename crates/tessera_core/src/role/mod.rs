@@ -30,7 +30,7 @@ pub mod windows_account;
 pub use manifest::{
     accept_bundle_version, last_accepted_bundle_version, parse_manifest, persist_bundle_version,
     signed_payload, verify_manifest, verify_manifest_without_accepting, verify_signature, Manifest,
-    ManifestCrl, ManifestError, ManifestRole, VerifiedManifest,
+    ManifestCodes, ManifestCodesFile, ManifestCrl, ManifestError, ManifestRole, VerifiedManifest,
 };
 pub use schema::{parse_slice, Payload, RoleId, RoleOs, RoleSchemaError, RoleSlice, SessionLimits};
 pub use selection::{

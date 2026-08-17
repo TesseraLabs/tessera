@@ -15,16 +15,16 @@
 |---|---|
 | Спек в `openspec/specs/` | 32 |
 | Сценариев в них | 338 |
-| Кейсов в реестре | 89 |
-| Спек, к которым привязан хотя бы один кейс | 26 |
-| Спек без единого кейса | 6 |
+| Кейсов в реестре | 115 |
+| Спек, к которым привязан хотя бы один кейс | 25 |
+| Спек без единого кейса | 7 |
 
 ## Спеки, к которым привязаны кейсы
 
 | Спека | Сценариев | Кейсов |
 |---|---:|---:|
 | configuration | 19 | 13 |
-| cli-diagnostics | 3 | 9 |
+| device-enrollment | 5 | 12 |
 | revocation | 19 | 6 |
 | cert-authentication-flow | 15 | 6 |
 | trust-chain-validation | 14 | 5 |
@@ -37,16 +37,15 @@
 | usb-media-pkcs12 | 11 | 3 |
 | pam-integration | 9 | 3 |
 | host-identity | 6 | 3 |
+| cli-diagnostics | 3 | 3 |
 | build-release | 10 | 2 |
 | hooks | 7 | 2 |
-| device-enrollment | 5 | 2 |
 | role-store | 13 | 1 |
 | cert-scope-binding | 12 | 1 |
 | issuance-journal | 12 | 1 |
 | daemon-lifecycle | 10 | 1 |
 | ipc-protocol | 10 | 1 |
 | session-monitoring | 9 | 1 |
-| gost-crypto | 7 | 1 |
 | licensing-distribution | 5 | 1 |
 | challenge-response | 4 | 1 |
 
@@ -57,19 +56,24 @@
 | token-pkcs11 | 26 |
 | windows-privileged-path | 10 |
 | windows-removable-media | 8 |
+| gost-crypto | 7 |
 | mac-integrity | 6 |
 | clone-image-bootstrap | 5 |
 | fly-dm-greeter | 4 |
 
 ## Спеки, ещё не синкнутые из предложений
 
-На них ссылается кейсов: 5. Именно на столько сумма по таблицам выше меньше числа кейсов в сводке: строки в тех таблицах эти спеки получат, когда переедут в `openspec/specs/`.
+На них ссылается кейсов: 28. Именно на столько сумма по таблицам выше меньше числа кейсов в сводке: строки в тех таблицах эти спеки получат, когда переедут в `openspec/specs/`.
 
 | Спека | Предложение | Кейсов |
 |---|---|---:|
+| qr-login-method | online-approval | 12 |
+| audit-chain | audit-chain | 6 |
+| codes-operator-cli | codes-operator-cli | 4 |
 | credential-packaging | issuer-key-generation | 2 |
 | token-data-carrier | pkcs12-token-carrier | 2 |
 | carrier-presence | token-presence-monitor | 1 |
+| device-unenroll | codes-device-artifacts | 1 |
 <!-- END GENERATED -->
 
 ## Чем проверять непокрытое

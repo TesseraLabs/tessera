@@ -1,0 +1,107 @@
+suite: codes-reconcile
+description: >
+  Сверка квитанций оператора с журналом устройства — шов между двумя половинами
+  телефонного канала. Устройство пишет входы в свою хеш-цепочку, оператор пишет
+  квитанции выдачи, и `issuer codes reconcile` читает и то, и другое. Кейсы здесь
+  проверяют именно шов: что сверка читает тот формат, который устройство пишет на
+  самом деле, и что журнал, из которого что-то изъяли, не выглядит чистым.
+setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
+
+# Шов ломается тихо. Читатель, разбирающий не тот формат, не падает: он находит
+# ноль строк входа, считает множество входов пустым — и объявляет отчёт ПОЛНЫМ.
+# На выходе ни одной находки класса «вход без квитанции» и ни одной пометки
+# неполноты, то есть отчёт, неотличимый от честного. Именно так это и жило,
+# пока сверка фильтровала строки по имени tracing-события `qr_code_login`, а
+# цепочка писала `op: code_login`; unit-тесты были зелёными, потому что подавали
+# сверке ту форму, которую она сама и ждала.
+#
+# Поэтому кейсы этой сюиты берут НАСТОЯЩИЙ журнал, который устройство написало
+# само во время входа по коду, и никогда — выгрузку, собранную стендом.
+
+cases:
+  - id: REC-001
+    title: Вход по коду, на который нет квитанции, находится сверкой
+    requirement: openspec/specs/codes-operator-cli/spec.md
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      # Каталог квитанций пуст намеренно: это не «нет данных», а сценарий
+      # аудита — журнал устройства сверяется с записями, в которых этих входов
+      # нет. Ровно так выглядит код, выданный мимо записи.
+      - run: helpers/codes-reconcile.sh reconcile --receipts empty
+        expect:
+          exit_code: 0
+          stdout_matches: "login-without-receipt device=[0-9A-Z]+ epoch=[0-9]+ nonce=[0-9]+"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-phone.sh cleanup
+
+  - id: REC-002
+    title: Журнал устройства, из которого изъята запись, сверку не проходит
+    requirement: openspec/specs/codes-operator-cli/spec.md
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      # Изымается строка из СЕРЕДИНЫ: хвост цепочка не ловит (префикс валидной
+      # цепочки валиден), и кейс, обрезающий хвост, проверял бы не то, что
+      # обещает его заголовок. Границу стережёт REC-004.
+      - run: helpers/codes-reconcile.sh reconcile --journal drop-middle
+        expect:
+          exit_code: 1
+          stderr_matches: "codes-refusal: journal_malformed"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-phone.sh cleanup
+
+  - id: REC-003
+    title: Журнал без единого входа отвергается, а не выдаётся за чистый отчёт
+    requirement: openspec/specs/codes-operator-cli/spec.md
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      # Журнал, в котором строк входа не осталось, — это либо не тот файл, либо
+      # форма, которую сборка не читает. И то, и другое обязано быть отказом:
+      # пустое множество входов даёт отчёт, который объявляет себя полным и не
+      # находит ничего, то есть выглядит как «всё в порядке».
+      - run: helpers/codes-reconcile.sh reconcile --journal strip-logins
+        expect:
+          exit_code: 1
+          stderr_matches: "codes-refusal: journal_without_logins"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-phone.sh cleanup
+
+  - id: REC-004
+    title: Отчёт не объявляет отсутствие находок, пока хвост журнала не заверен
+    requirement: openspec/specs/codes-operator-cli/spec.md
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      # Гарантия здесь не про находки, а про то, чего отчёт НЕ имеет права
+      # утверждать. Хеш-цепочка держит всё до последнего заверения головы;
+      # после него строку можно уронить, оставив валидный префикс. Пока такой
+      # хвост есть, «находок нет» — утверждение более сильное, чем проверено,
+      # и оговорка о незаверённом хвосте обязана стоять рядом.
+      - run: helpers/codes-reconcile.sh reconcile
+        expect:
+          exit_code: 0
+          stdout_matches: "unsigned-tail from=[0-9]+"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-phone.sh cleanup

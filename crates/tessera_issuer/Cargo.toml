@@ -21,13 +21,13 @@ required-features = ["cli"]
 # the `wasm32-unknown-unknown` core build, where entropy comes from the browser
 # host and the binary is not built.
 default = ["native"]
-native = ["dep:rand"]
+native = ["dep:rand", "tessera_hashchain/file"]
 # The container password travels the same ladder as the backend secrets, so
 # the CLI needs the secret wrapper even when no signing backend is built in.
 cli = ["native", "dep:clap", "dep:rpassword", "dep:secrecy"]
 # Exposes the deterministic in-crate signer so integration tests (and, later,
 # the CLI's dry-run mode) can assemble artifacts without a real key store.
-test-support = []
+test-support = ["tessera_hashchain/testing"]
 # PKCS#11 signing adapter (token/HSM). Native-only: not built for the wasm core.
 pkcs11 = ["native", "dep:cryptoki", "dep:secrecy"]
 # Vault/OpenBao Transit signing adapter. Native-only. serde/serde_json/base64/
@@ -55,6 +55,15 @@ vault-tests = ["vault"]
 
 [dependencies]
 tessera_ext = { path = "../tessera_ext", version = "0.5.0" }
+# The frozen contract of the phone channel: the code formula, the documents and
+# their canonical bytes. The operator side of the channel holds no second
+# implementation of any of them — a divergence would show up as "the code does
+# not fit" at the device, not in CI.
+tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.5.0" }
+# The shared hash-chained record: line framing, head-signature accounting and
+# verification. The device's audit chain is built on the same crate, so the two
+# journals cannot drift into two dialects of one format.
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.5.0" }
 der = { workspace = true }
 spki = { workspace = true }
 const-oid = { workspace = true }
@@ -64,7 +73,9 @@ thiserror = { workspace = true }
 # self-signature and generate a leaf key pair; sha2 chains the issuance journal
 # and hashes CSR contents; serde/serde_json render and parse the NDJSON journal;
 # base64 encodes head signatures.
-p256 = { workspace = true }
+# `ecdh` is on top of the CSR use: the operator side of the phone channel agrees
+# the shared secret with the device on the fleet's P-256 profile.
+p256 = { workspace = true, features = ["ecdh"] }
 p384 = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
@@ -102,6 +113,10 @@ getrandom = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
 p256 = { workspace = true, features = ["pem"] }
+# The crate's own tests reach the shared chain's in-memory and failing storages
+# through `journal::storage`; the feature that carries them is a test aid, not a
+# runtime backend, so it is turned on here rather than in `[dependencies]`.
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.5.0", features = ["testing", "file"] }
 # The file-backend tests write key fixtures to disk with restricted permissions;
 # tempfile gives a self-cleaning path. Native-only test aid.
 tempfile = { workspace = true }

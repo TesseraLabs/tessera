@@ -9,6 +9,13 @@
 //! deleting, or reordering any line breaks the chain, which
 //! [`verify_lines`] reports with the position of the first bad entry.
 //!
+//! The framing, the head-signature accounting and the verification are not
+//! written here: they live in `tessera_hashchain` and are shared with the
+//! device's audit chain, so the two records cannot drift into two dialects of
+//! the same format. What stays here is the vocabulary — the issuance operations
+//! a line can record — and the genesis anchor that keeps a line of this journal
+//! from verifying inside another.
+//!
 //! The journal is secondary evidence — the primary record of access is the
 //! login audit on the devices — so it exists for inventory and incident
 //! review, not enforcement.
@@ -42,87 +49,31 @@
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use tessera_hashchain::{Annotation, Chain, ChainPayload, EntryKind, HeadSignature};
 
 use crate::error::IssueError;
 use crate::sign::{KeyId, SignatureAlgorithm, SignatureBackend};
 
 /// The fixed domain-separation preimage whose SHA-256 anchors an empty chain.
-const GENESIS_PREIMAGE: &[u8] = b"tessera-issuance-journal/v1/genesis";
+///
+/// Declared with the format it identifies, in [`tessera_hashchain::domain`].
+/// The bytes are unchanged and must stay so: they are in every issuance journal
+/// ever written.
+use tessera_hashchain::domain::ISSUANCE_JOURNAL as GENESIS_PREIMAGE;
 
 /// Errors from journal storage or record encoding.
 ///
 /// These are fail-closed at the issuance boundary: an issuance that cannot be
 /// journaled does not return an artifact (see [`IssueError::Journal`]).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum JournalError {
-    /// The backing storage could not append or read (permissions, disk, a
-    /// browser-side failure).
-    #[error("journal storage unavailable: {0}")]
-    Storage(String),
-    /// A record could not be serialized to NDJSON.
-    #[error("journal record encoding failed: {0}")]
-    Encoding(String),
-    /// An annotation was appended with an empty `kind`. The `kind` is the
-    /// writer's namespace tag and MUST identify who wrote the annotation, so an
-    /// empty one is rejected before it reaches the chain.
-    #[error("annotation kind must not be empty")]
-    EmptyAnnotationKind,
-    /// An annotation's `data` was not a JSON object. The format promises an
-    /// object (a null, array, or scalar would let writers smuggle a bare value
-    /// past the contract), so a non-object is rejected before it reaches the
-    /// chain.
-    #[error("annotation data must be a JSON object")]
-    AnnotationDataNotObject,
-}
+pub use tessera_hashchain::ChainError as JournalError;
 
 /// Append-only storage backing a [`Journal`].
 ///
 /// The core works only with record lines (no newline framing of its own): a
 /// native caller backs this with a file, the browser cabinet with its own
 /// persistence. Implementations MUST persist an appended line before returning
-/// `Ok`, and MUST return the lines from [`read_lines`](JournalStorage::read_lines)
-/// in append order.
-pub trait JournalStorage {
-    /// Appends one record line. The line contains no trailing newline; the
-    /// storage owns line framing.
-    ///
-    /// # Errors
-    ///
-    /// [`JournalError::Storage`] if the line could not be durably appended.
-    fn append(&mut self, line: &str) -> Result<(), JournalError>;
-
-    /// Reads every record line, in append order.
-    ///
-    /// # Errors
-    ///
-    /// [`JournalError::Storage`] if the records could not be read.
-    fn read_lines(&self) -> Result<Vec<String>, JournalError>;
-}
-
-/// One journal line: chain metadata plus an operation payload.
-///
-/// The payload is flattened, so a line is a single flat JSON object whose `op`
-/// field selects the operation, e.g.
-/// `{"seq":0,"prev_hash":"…","ts":1,"op":"issue_leaf","serial":"2a",…}`.
-///
-/// `Eq` is not derived: the `annotation` payload carries an arbitrary
-/// [`serde_json::Value`], which is only `PartialEq`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct Entry {
-    /// Monotonic position, from 0, incremented for every line (head signatures
-    /// included).
-    seq: u64,
-    /// Lowercase hex SHA-256 of the previous line's bytes; the genesis anchor
-    /// for `seq == 0`.
-    prev_hash: String,
-    /// Caller-supplied issuance time, Unix seconds.
-    ts: u64,
-    /// The operation this line records.
-    #[serde(flatten)]
-    payload: Payload,
-}
+/// `Ok`, and MUST return the lines from `read_lines` in append order.
+pub use tessera_hashchain::ChainStorage as JournalStorage;
 
 /// The operation a journal line records, tagged by its `op` field. No secret,
 /// PIN, or key material ever appears here.
@@ -173,24 +124,38 @@ enum Payload {
         /// Lowercase hex SHA-256 fingerprint of the issuing CA certificate.
         parent: String,
     },
-    /// A signature over the chain head, recorded as its own line.
+    /// A signature over the chain head, recorded as its own line. Its fields
+    /// are the shared ones, so this journal and the device's audit chain spell
+    /// a head signature identically.
     #[serde(rename = "head_signature")]
-    HeadSignature {
-        /// The signing algorithm label.
-        algorithm: String,
-        /// Base64 of the raw signature over the covered head's 32-byte hash.
-        signature: String,
-    },
+    HeadSignature(HeadSignature),
     /// A general-purpose annotation. The core chains and verifies it like any
     /// other line but never interprets `kind` or `data`.
     #[serde(rename = "annotation")]
-    Annotation {
-        /// The writer's namespace tag. Non-empty; opaque to the core.
-        kind: String,
-        /// An arbitrary JSON object of writer-defined context. Opaque to the
-        /// core, which neither reads nor validates its contents.
-        data: serde_json::Value,
-    },
+    Annotation(Annotation),
+}
+
+impl ChainPayload for Payload {
+    const GENESIS_PREIMAGE: &'static [u8] = GENESIS_PREIMAGE;
+
+    fn kind(&self) -> EntryKind {
+        match self {
+            Payload::HeadSignature { .. } => EntryKind::HeadSignature,
+            _ => EntryKind::Record,
+        }
+    }
+
+    /// An annotation is structurally invalid without a namespace tag or with a
+    /// non-object `data`; a hand-crafted empty `kind` or a bare value breaks the
+    /// chain at this position even though its JSON parses. The core still reads
+    /// neither `kind`'s value (beyond non-emptiness) nor `data`'s contents
+    /// (beyond being an object).
+    fn is_structurally_valid(&self) -> bool {
+        match self {
+            Payload::Annotation(annotation) => annotation.is_structurally_valid(),
+            _ => true,
+        }
+    }
 }
 
 /// Where the key pair a leaf certifies came from.
@@ -230,18 +195,6 @@ impl KeyOrigin {
     }
 }
 
-/// SHA-256 of `bytes` as a 32-byte array.
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(bytes));
-    out
-}
-
-/// The anchor a fresh chain's first `prev_hash` points at.
-fn genesis_hash() -> [u8; 32] {
-    sha256(GENESIS_PREIMAGE)
-}
-
 /// The stable label recorded for a signing algorithm.
 fn algorithm_label(algorithm: SignatureAlgorithm) -> &'static str {
     match algorithm {
@@ -260,9 +213,7 @@ fn algorithm_label(algorithm: SignatureAlgorithm) -> &'static str {
 /// after a durable append, so a storage failure leaves the journal unchanged.
 #[derive(Debug)]
 pub struct Journal<S: JournalStorage> {
-    storage: S,
-    next_seq: u64,
-    head: [u8; 32],
+    chain: Chain<S, Payload>,
 }
 
 impl<S: JournalStorage> Journal<S> {
@@ -276,15 +227,8 @@ impl<S: JournalStorage> Journal<S> {
     ///
     /// [`JournalError::Storage`] if the existing records cannot be read.
     pub fn load(storage: S) -> Result<Self, JournalError> {
-        let lines = storage.read_lines()?;
-        let next_seq = lines.len() as u64;
-        let head = lines
-            .last()
-            .map_or_else(genesis_hash, |line| sha256(line.as_bytes()));
         Ok(Self {
-            storage,
-            next_seq,
-            head,
+            chain: Chain::load(storage)?,
         })
     }
 
@@ -293,19 +237,19 @@ impl<S: JournalStorage> Journal<S> {
     /// covers.
     #[must_use]
     pub fn head(&self) -> [u8; 32] {
-        self.head
+        self.chain.head()
     }
 
     /// The seq the next appended line will carry.
     #[must_use]
     pub fn next_seq(&self) -> u64 {
-        self.next_seq
+        self.chain.next_seq()
     }
 
     /// Borrows the backing storage (for reading lines out for verification).
     #[must_use]
     pub fn storage(&self) -> &S {
-        &self.storage
+        self.chain.storage()
     }
 
     /// Records a shift-leaf issuance, noting where the certified key came from.
@@ -322,7 +266,7 @@ impl<S: JournalStorage> Journal<S> {
         now_unix: u64,
     ) -> Result<(), JournalError> {
         self.append(
-            Payload::IssueLeaf {
+            &Payload::IssueLeaf {
                 serial: hex::encode(serial),
                 parent: fingerprint(parent_cert_der),
                 subject: subject.to_owned(),
@@ -348,7 +292,7 @@ impl<S: JournalStorage> Journal<S> {
         now_unix: u64,
     ) -> Result<(), JournalError> {
         self.append(
-            Payload::IssueRoot {
+            &Payload::IssueRoot {
                 serial: hex::encode(serial),
                 parent: fingerprint(root_cert_der),
                 subject: subject.to_owned(),
@@ -370,7 +314,7 @@ impl<S: JournalStorage> Journal<S> {
         now_unix: u64,
     ) -> Result<(), JournalError> {
         self.append(
-            Payload::IssueCa {
+            &Payload::IssueCa {
                 serial: hex::encode(serial),
                 parent: fingerprint(parent_cert_der),
                 subject: subject.to_owned(),
@@ -391,7 +335,7 @@ impl<S: JournalStorage> Journal<S> {
         now_unix: u64,
     ) -> Result<(), JournalError> {
         self.append(
-            Payload::IssueCrl {
+            &Payload::IssueCrl {
                 crl_number,
                 parent: fingerprint(issuer_cert_der),
             },
@@ -418,7 +362,7 @@ impl<S: JournalStorage> Journal<S> {
         now_unix: u64,
     ) -> Result<(), IssueError> {
         let algorithm = backend.algorithm(key_id)?;
-        let signature = backend.sign(&self.head, key_id)?;
+        let signature = backend.sign(&self.chain.head(), key_id)?;
         if signature.algorithm != algorithm {
             return Err(IssueError::AlgorithmMismatch {
                 declared: algorithm,
@@ -426,10 +370,10 @@ impl<S: JournalStorage> Journal<S> {
             });
         }
         self.append(
-            Payload::HeadSignature {
+            &Payload::HeadSignature(HeadSignature {
                 algorithm: algorithm_label(algorithm).to_owned(),
                 signature: base64::engine::general_purpose::STANDARD.encode(&signature.bytes),
-            },
+            }),
             now_unix,
         )?;
         Ok(())
@@ -465,10 +409,10 @@ impl<S: JournalStorage> Journal<S> {
             return Err(JournalError::AnnotationDataNotObject);
         }
         self.append(
-            Payload::Annotation {
+            &Payload::Annotation(Annotation {
                 kind: kind.to_owned(),
                 data,
-            },
+            }),
             now_unix,
         )
     }
@@ -479,64 +423,25 @@ impl<S: JournalStorage> Journal<S> {
     ///
     /// [`JournalError::Storage`] if the records cannot be read.
     pub fn verify(&self) -> Result<JournalReport, JournalError> {
-        Ok(verify_lines(&self.storage.read_lines()?))
+        self.chain.verify()
     }
 
     /// Encodes and appends one entry, advancing chain state only on success.
-    fn append(&mut self, payload: Payload, now_unix: u64) -> Result<(), JournalError> {
-        let entry = Entry {
-            seq: self.next_seq,
-            prev_hash: hex::encode(self.head),
-            ts: now_unix,
-            payload,
-        };
-        let line =
-            serde_json::to_string(&entry).map_err(|e| JournalError::Encoding(e.to_string()))?;
-        // Fail-closed: if the append errors, `head`/`next_seq` are left untouched
-        // and no artifact is released by the caller.
-        self.storage.append(&line)?;
-        self.head = sha256(line.as_bytes());
-        self.next_seq = self.next_seq.saturating_add(1);
-        Ok(())
+    fn append(&mut self, payload: &Payload, now_unix: u64) -> Result<(), JournalError> {
+        self.chain.append(payload, now_unix)
     }
 }
 
 /// The lowercase hex SHA-256 fingerprint of a certificate's DER.
 fn fingerprint(cert_der: &[u8]) -> String {
-    hex::encode(sha256(cert_der))
+    hex::encode(tessera_hashchain::sha256(cert_der))
 }
 
 /// The outcome of verifying a journal's chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum JournalStatus {
-    /// The chain is intact and every record is covered by a later head
-    /// signature (no unsigned tail).
-    Intact,
-    /// The chain is intact, but records after the last head signature (or all
-    /// records, if none is signed) are not yet covered by a signature.
-    IntactUnsignedTail {
-        /// The `seq` of the first record in the unsigned tail.
-        unsigned_from_seq: u64,
-    },
-    /// The chain is broken: the entry at `position` (its index / expected
-    /// `seq`) is missing, reordered, or altered.
-    Broken {
-        /// Zero-based position of the first invalid entry.
-        position: u64,
-    },
-}
+pub use tessera_hashchain::ChainStatus as JournalStatus;
 
 /// A verification result: the [`JournalStatus`] plus summary counters.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JournalReport {
-    /// The chain status.
-    pub status: JournalStatus,
-    /// The number of lines examined.
-    pub entry_count: u64,
-    /// The `seq` of the last head-signature line, if any.
-    pub last_signed_seq: Option<u64>,
-}
+pub use tessera_hashchain::ChainReport as JournalReport;
 
 /// Verifies a journal's `lines` (in append order): recomputes the hash chain
 /// from genesis, checks `seq` is dense and monotonic from 0, and classifies the
@@ -554,168 +459,22 @@ pub struct JournalReport {
 /// exactly like an issuance line.
 #[must_use]
 pub fn verify_lines(lines: &[String]) -> JournalReport {
-    let mut expected_prev = genesis_hash();
-    let mut last_signed_seq: Option<u64> = None;
-    let mut unsigned_from: Option<u64> = None;
-
-    for (index, line) in lines.iter().enumerate() {
-        let position = index as u64;
-        let broken = |last_signed_seq| JournalReport {
-            status: JournalStatus::Broken { position },
-            entry_count: lines.len() as u64,
-            last_signed_seq,
-        };
-
-        let Ok(entry) = serde_json::from_str::<Entry>(line) else {
-            return broken(last_signed_seq);
-        };
-        if entry.seq != position {
-            return broken(last_signed_seq);
-        }
-        let Some(prev) = decode_hash(&entry.prev_hash) else {
-            return broken(last_signed_seq);
-        };
-        if prev != expected_prev {
-            return broken(last_signed_seq);
-        }
-
-        match &entry.payload {
-            Payload::HeadSignature { .. } => {
-                last_signed_seq = Some(entry.seq);
-                unsigned_from = None;
-            }
-            // An annotation is structurally invalid without a namespace tag or
-            // with a non-object `data`; a hand-crafted empty `kind` or a bare
-            // value breaks the chain at this position even though its JSON
-            // parses. The core still reads neither `kind`'s value (beyond
-            // non-emptiness) nor `data`'s contents (beyond being an object).
-            Payload::Annotation { kind, data } if kind.is_empty() || !data.is_object() => {
-                return broken(last_signed_seq);
-            }
-            _ => {
-                if unsigned_from.is_none() {
-                    unsigned_from = Some(entry.seq);
-                }
-            }
-        }
-        expected_prev = sha256(line.as_bytes());
-    }
-
-    let status = match unsigned_from {
-        Some(seq) => JournalStatus::IntactUnsignedTail {
-            unsigned_from_seq: seq,
-        },
-        None => JournalStatus::Intact,
-    };
-    JournalReport {
-        status,
-        entry_count: lines.len() as u64,
-        last_signed_seq,
-    }
+    tessera_hashchain::verify_lines::<Payload>(lines)
 }
 
-/// Decodes a lowercase-hex 32-byte hash, returning `None` on any malformed input.
-fn decode_hash(hex_str: &str) -> Option<[u8; 32]> {
-    let bytes = hex::decode(hex_str).ok()?;
-    <[u8; 32]>::try_from(bytes.as_slice()).ok()
-}
-
-/// In-memory and file storage backends, plus a failure-injecting storage for
-/// the fail-closed tests. Available under `test-support` (and this crate's own
-/// tests); the file backend is native-only.
+/// In-memory storage plus a failure-injecting one for the fail-closed tests.
+///
+/// Both come from `tessera_hashchain`, which is where the chain itself lives;
+/// they are re-exported here so a caller reaches them through the journal it is
+/// testing rather than through a second crate name.
 #[cfg(any(test, feature = "test-support"))]
 pub mod storage {
-    use std::cell::RefCell;
-
-    use super::{JournalError, JournalStorage};
-
-    /// A `Vec`-backed storage for tests and the wasm/browser core.
-    #[derive(Debug, Default, Clone)]
-    pub struct MemoryStorage {
-        lines: RefCell<Vec<String>>,
-    }
-
-    impl MemoryStorage {
-        /// An empty in-memory journal store.
-        #[must_use]
-        pub fn new() -> Self {
-            Self::default()
-        }
-
-        /// The currently stored lines.
-        #[must_use]
-        pub fn lines(&self) -> Vec<String> {
-            self.lines.borrow().clone()
-        }
-    }
-
-    impl JournalStorage for MemoryStorage {
-        fn append(&mut self, line: &str) -> Result<(), JournalError> {
-            self.lines.borrow_mut().push(line.to_owned());
-            Ok(())
-        }
-
-        fn read_lines(&self) -> Result<Vec<String>, JournalError> {
-            Ok(self.lines.borrow().clone())
-        }
-    }
-
-    /// A storage whose `append` always fails, to drive the fail-closed path
-    /// (an issuance whose journal write fails must not return an artifact).
-    #[derive(Debug, Default, Clone)]
-    pub struct FailingStorage;
-
-    impl JournalStorage for FailingStorage {
-        fn append(&mut self, _line: &str) -> Result<(), JournalError> {
-            Err(JournalError::Storage("append disabled for test".to_owned()))
-        }
-
-        fn read_lines(&self) -> Result<Vec<String>, JournalError> {
-            Ok(Vec::new())
-        }
-    }
+    pub use tessera_hashchain::storage::{FailingStorage, MemoryStorage};
 }
 
 /// A file-backed journal storage: one NDJSON line per record.
 ///
-/// Appends are opened `create(true).append(true)`; reads split the file on
-/// newlines and drop the trailing empty segment. Native only — the wasm core
-/// receives a host-supplied [`JournalStorage`] instead.
+/// Native only — the wasm core receives a host-supplied [`JournalStorage`]
+/// instead.
 #[cfg(feature = "native")]
-#[derive(Debug, Clone)]
-pub struct FileStorage {
-    path: std::path::PathBuf,
-}
-
-#[cfg(feature = "native")]
-impl FileStorage {
-    /// A file store at `path` (created on first append).
-    #[must_use]
-    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-}
-
-#[cfg(feature = "native")]
-impl JournalStorage for FileStorage {
-    fn append(&mut self, line: &str) -> Result<(), JournalError> {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| JournalError::Storage(e.to_string()))?;
-        file.write_all(line.as_bytes())
-            .and_then(|()| file.write_all(b"\n"))
-            .map_err(|e| JournalError::Storage(e.to_string()))
-    }
-
-    fn read_lines(&self) -> Result<Vec<String>, JournalError> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => Ok(text.lines().map(str::to_owned).collect()),
-            // A never-written journal has no lines yet.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(JournalError::Storage(e.to_string())),
-        }
-    }
-}
+pub use tessera_hashchain::storage::FileStorage;
