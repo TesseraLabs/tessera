@@ -717,18 +717,22 @@ fn child_process_reports_how_long_the_lock_made_it_wait() {
 /// The state of a device is locked against another **process**, not merely
 /// against another thread.
 ///
-/// Threads would prove nothing here: `flock(2)` is held per open file
-/// description, so two threads of one process share the hold and never
-/// contend. The defect this guards lives between processes, which is what a
-/// PAM module is — `sshd` forks per connection, a console login is its own
-/// process, and a device reachable both ways runs them at the same time.
-/// Without a lock spanning the whole load-mutate-save, the second process
-/// writes back a snapshot taken before the first one spent the attempt budget,
-/// and the budget resets to zero as often as an attacker likes.
+/// Threads would prove nothing here: the hold belongs to an open handle, so
+/// two threads of one process share it and never contend. The defect this
+/// guards lives between processes, which is what a PAM module is — `sshd`
+/// forks per connection, a console login is its own process, and a device
+/// reachable both ways runs them at the same time. Without a lock spanning the
+/// whole load-mutate-save, the second process writes back a snapshot taken
+/// before the first one spent the attempt budget, and the budget resets to zero
+/// as often as an attacker likes.
 ///
 /// So the second party is a real process: this binary, re-executed against the
 /// child test above.
-#[cfg(unix)]
+///
+/// Runs on every platform that has a hold to take. It was Unix-only while the
+/// other arm refused outright; now that Windows takes a real hold through
+/// `LockFileEx`, the platform where the mechanism is newest is exactly the one
+/// that must not be taken on trust.
 #[test]
 fn the_state_is_locked_against_a_second_process() {
     use std::process::Command;

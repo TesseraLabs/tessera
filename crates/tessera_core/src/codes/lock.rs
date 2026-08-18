@@ -22,12 +22,28 @@
 //! was already atomic, and that is precisely why the corruption is invisible —
 //! nothing is torn, the state is simply the wrong one.
 //!
-//! # Why `flock` and not a lock file
+//! # Why a hold on a handle, and not a lock file
 //!
 //! A lock expressed as "the file exists" leaks on a crash, and a PAM module
-//! lives inside a process it does not control. `flock(2)` is held by an open
-//! descriptor, so the kernel releases it when the process dies however it dies.
-//! The lock file itself is never deleted; only the advisory lock on it moves.
+//! lives inside a process it does not control. A hold on an open handle —
+//! `flock(2)` on Unix, `LockFileEx` on Windows — is released by the system when
+//! the process dies however it dies. The lock file itself is never deleted;
+//! only the hold on it moves.
+//!
+//! The hold is [`tessera_hashchain::file_lock`], the same primitive the journal
+//! of this product takes for the same reason. One mechanism rather than two is
+//! the point: this one keeps codes one-time, and two implementations of it
+//! would drift apart exactly where nobody is looking.
+//!
+//! # What is not closed off Unix
+//!
+//! The lock file carries mode `0600` on Unix. Off Unix there is no mode word,
+//! so it carries whatever the directory grants, and "a file anyone may replace
+//! is a lock anyone may take somewhere else" stays open there — as it does for
+//! the artefacts of the store and for the journal, and for the same reason:
+//! closing it means a DACL, which belongs with the machinery that already does
+//! DACL work. Named here so that the absence of the check is not read as a
+//! check that passed.
 //!
 //! # Why the wait is bounded
 //!
@@ -40,12 +56,17 @@
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Name of the lock file inside the state directory.
 pub const LOCK_FILENAME: &str = "nonce.lock";
 
 /// Permissions of the lock file: root alone, like everything beside it.
+///
+/// Declared only where a mode word exists. Off Unix the file carries what the
+/// directory grants — see the module docs, where that gap is named rather than
+/// papered over with a constant nothing applies.
+#[cfg(unix)]
 const LOCK_MODE: u32 = 0o600;
 
 /// Longest a login waits for another process to finish its transaction.
@@ -58,13 +79,8 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to sleep between attempts while waiting.
 ///
-/// Declared only where waiting happens. There is no `flock(2)` outside Unix, so
-/// [`StateLock::acquire`] refuses there before any wait begins — a platform
-/// with no retry loop has no retry cadence, and naming one would be inventing a
-/// second answer about timing for a path that never asks the question.
-/// [`LOCK_TIMEOUT`] is deliberately *not* gated this way: it is the deadline
-/// [`StateLock::acquire`] computes on every platform before it branches.
-#[cfg(unix)]
+/// Both values are handed to the shared hold, which does the waiting, so the
+/// cadence and the bound are named once here and apply on every platform.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 /// An exclusive hold on the state of one device, released on drop.
@@ -74,14 +90,9 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// and exists only to be held for the length of a transaction.
 #[derive(Debug)]
 pub struct StateLock {
-    /// The locked descriptor. Never read or written: what is held is the lock,
-    /// not the file, and the file exists only to have an inode to hold it on.
-    #[cfg(unix)]
-    _file: nix::fcntl::Flock<File>,
-    /// The same, where there is no `flock(2)` to hold — unreachable, because
-    /// [`StateLock::acquire`] refuses first.
-    #[cfg(not(unix))]
-    _file: File,
+    /// The hold. Never read or written: what is held is the lock, not the file,
+    /// and the file exists only to have something to hold it on.
+    _held: tessera_hashchain::file_lock::FileLock,
 }
 
 impl StateLock {
@@ -94,56 +105,41 @@ impl StateLock {
     /// # Errors
     ///
     /// [`io::ErrorKind::TimedOut`] when another process held the lock for
-    /// longer than the bound, [`io::ErrorKind::Unsupported`] on a target
-    /// without `flock(2)`, and the underlying failure when the lock file
-    /// cannot be opened.
+    /// longer than the bound, [`io::ErrorKind::Unsupported`] on a platform with
+    /// no inter-process file locking at all, and the underlying failure when
+    /// the lock file cannot be opened.
     pub fn acquire(state_dir: &Path) -> io::Result<Self> {
         let path = state_dir.join(LOCK_FILENAME);
-        let file = crate::fs_mode::create_with_mode(&path, LOCK_MODE)?;
-        // The mode of `open(2)` is filtered through the umask, and this file
-        // names the transaction of every login on the device.
-        crate::fs_mode::pin_mode(&path, LOCK_MODE)?;
-
-        acquire_with_deadline(file, Instant::now() + LOCK_TIMEOUT)
+        let file = open_lock_file(&path)?;
+        let held =
+            tessera_hashchain::file_lock::lock_exclusive(file, LOCK_TIMEOUT, LOCK_RETRY_INTERVAL)?;
+        Ok(Self { _held: held })
     }
 }
 
-/// Takes the lock, retrying without blocking until `deadline`.
+/// Opens the lock file with the mode a file naming every login deserves.
 #[cfg(unix)]
-fn acquire_with_deadline(file: File, deadline: Instant) -> io::Result<StateLock> {
-    use nix::errno::Errno;
-    use nix::fcntl::{Flock, FlockArg};
-
-    let mut candidate = file;
-    loop {
-        match Flock::lock(candidate, FlockArg::LockExclusiveNonblock) {
-            Ok(locked) => return Ok(StateLock { _file: locked }),
-            // The file comes back on failure so the next attempt reuses the
-            // same descriptor: reopening would take a fresh one and, if the
-            // path were replaced in between, lock a different inode.
-            Err((returned, Errno::EWOULDBLOCK | Errno::EINTR)) => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "another login held the code state longer than this one may wait",
-                    ));
-                }
-                candidate = returned;
-                std::thread::sleep(LOCK_RETRY_INTERVAL);
-            }
-            Err((_, errno)) => return Err(io::Error::from(errno)),
-        }
-    }
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    let file = crate::fs_mode::create_with_mode(path, LOCK_MODE)?;
+    // The mode of `open(2)` is filtered through the umask, and this file names
+    // the transaction of every login on the device.
+    crate::fs_mode::pin_mode(path, LOCK_MODE)?;
+    Ok(file)
 }
 
-/// Takes the lock — refused where there is no `flock(2)` to take.
+/// The same, where there is no mode word to pin.
+///
+/// Opened without one rather than refused: the hold is what makes the state a
+/// transaction, and refusing here would take the whole code method off the
+/// platform to protect a permission the platform does not express. What that
+/// leaves open is stated in the module docs, not silently accepted.
 #[cfg(not(unix))]
-fn acquire_with_deadline(file: File, deadline: Instant) -> io::Result<StateLock> {
-    let _ = (file, deadline);
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "the code state cannot be locked on this platform",
-    ))
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
 }
 
 #[cfg(test)]

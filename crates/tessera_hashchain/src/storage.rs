@@ -348,178 +348,65 @@ fn sync_parent_directory(path: &std::path::Path) -> Result<(), ChainError> {
     Ok(())
 }
 
-/// Takes the exclusive hold, retrying without blocking until the deadline.
-#[cfg(all(feature = "file", unix))]
+/// Takes the exclusive hold on the journal.
+///
+/// The hold itself — the system call, the non-blocking attempt, the retries and
+/// the refusal — is [`crate::file_lock`], shared with the device code state,
+/// which needs exactly the same thing for exactly the same reason. What stays
+/// here is what belongs to the journal: where the file is, what mode it carries
+/// and which error a failure becomes.
+#[cfg(feature = "file")]
 fn acquire(path: &std::path::Path) -> Result<Box<dyn ChainLock>, ChainError> {
-    use rustix::fs::{flock, FlockOperation};
-    use std::time::Instant;
-
-    /// The hold: the descriptor the advisory lock lives on. Dropping it — or
-    /// the process dying — releases the lock, which a lock file expressed as
-    /// "the path exists" could not promise inside a PAM module.
+    /// The hold, in the shape the chain expects.
     struct FileLock {
-        /// Never read. What is held is the advisory lock on this descriptor,
-        /// and the kernel releases it when the descriptor closes — including
-        /// when the process dies, which a PAM module inside somebody else's
-        /// process cannot otherwise promise.
-        _file: std::fs::File,
+        /// Never read. Dropping it releases the hold — including when the
+        /// process dies, which a lock expressed as "the path exists" could not
+        /// promise inside a PAM module.
+        _held: crate::file_lock::FileLock,
     }
     impl ChainLock for FileLock {}
 
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .mode(OWNER_ONLY)
-            .open(path)
-            .map_err(|e| {
-                ChainError::Storage(format!("the journal lock could not be opened: {e}"))
-            })?
-    };
-    // The lock holds no data — only an advisory hold on a descriptor — so a
-    // permissive mode leaks nothing. It is pinned all the same: a file anyone
-    // may replace is a lock anyone may take somewhere else, and the whole point
-    // of the hold is that two writers contend for the same one.
-    pin_owner_only(path)?;
-
-    let deadline = Instant::now() + LOCK_TIMEOUT;
-    loop {
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(Box::new(FileLock { _file: file })),
-            Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::INTR) => {
-                if Instant::now() >= deadline {
-                    return Err(ChainError::Storage(
-                        "another process held the journal longer than this one may wait".to_owned(),
-                    ));
-                }
-                std::thread::sleep(LOCK_RETRY_INTERVAL);
-            }
-            Err(errno) => {
-                return Err(ChainError::Storage(format!(
-                    "the journal lock could not be taken: {errno}"
-                )))
-            }
-        }
-    }
+    let file = open_lock_file(path)?;
+    let held = crate::file_lock::lock_exclusive(file, LOCK_TIMEOUT, LOCK_RETRY_INTERVAL)
+        .map_err(|e| ChainError::Storage(format!("the journal lock could not be taken: {e}")))?;
+    Ok(Box::new(FileLock { _held: held }))
 }
 
-/// Takes the exclusive hold on Windows, retrying until the deadline.
-///
-/// Windows has inter-process file locking of its own — `LockFileEx` — and the
-/// issuing tool needs it for the same reason the device does: two issuances at
-/// once read the same tail, claim the same position, and break the chain from
-/// there on, silently and for good. The tool is cross-platform by construction
-/// (its journal predates this crate on all three platforms), so a hold that
-/// existed only on Unix would leave the cabinet's own record unprotected on the
-/// platform a good many operators run it on.
-///
-/// `LOCKFILE_FAIL_IMMEDIATELY` gives the same non-blocking attempt `flock`'s
-/// `LOCK_NB` gives, so the waiting policy is one policy on both platforms: retry
-/// briefly, then refuse rather than hang a login or an issuance.
-///
-/// The lock is released when the handle closes, including when the process
-/// dies — the same property that made `flock(2)` the right choice on Unix, and
-/// the reason neither side expresses the hold as "a lock file exists".
-///
-/// # Why this crate makes an exception for `unsafe` here
-///
-/// The crate denies `unsafe_code`, and this is the one place it is lifted.
-/// `LockFileEx` is a raw system call with no safe wrapper in the dependency
-/// graph, and the alternative was to add one (`fs4`, `fd-lock`) — a new crate
-/// in the graph of the component that carries the audit record, to save two
-/// `unsafe` expressions whose obligations fit in a paragraph. `windows-sys` is
-/// already a workspace dependency with these features on, so nothing new enters
-/// the graph. The exception is scoped to this function and to no other.
-#[cfg(all(feature = "file", windows))]
-#[expect(
-    unsafe_code,
-    reason = "LockFileEx is a raw system call with no safe wrapper in this \
-              dependency graph; the obligations are discharged in the SAFETY \
-              comments below and the exception covers this function alone"
-)]
-fn acquire(path: &std::path::Path) -> Result<Box<dyn ChainLock>, ChainError> {
-    use std::os::windows::io::AsRawHandle as _;
-    use std::time::Instant;
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    };
-    use windows_sys::Win32::System::IO::OVERLAPPED;
-
-    /// The hold: the handle the lock lives on. Dropping it releases the lock.
-    struct FileLock {
-        /// Never read, and never allowed to drop early — see the module.
-        _file: std::fs::File,
-    }
-    impl ChainLock for FileLock {}
+/// Opens the lock file with the mode the journal insists on.
+#[cfg(all(feature = "file", unix))]
+fn open_lock_file(path: &std::path::Path) -> Result<std::fs::File, ChainError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
+        .mode(OWNER_ONLY)
         .open(path)
         .map_err(|e| ChainError::Storage(format!("the journal lock could not be opened: {e}")))?;
-
-    let deadline = Instant::now() + LOCK_TIMEOUT;
-    loop {
-        // SAFETY: `OVERLAPPED` is a plain C struct of integers and a pointer,
-        // for which an all-zero bit pattern is both valid and the value
-        // `LockFileEx` documents for a non-overlapped wait.
-        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-        // SAFETY: `file` is a live `File`, so its raw handle is open and valid
-        // for the duration of this call; `overlapped` is a zeroed `OVERLAPPED`
-        // owned by this frame and outlives the call, which is what
-        // `LockFileEx` requires of it for a non-overlapped handle. The byte
-        // range is the whole possible file, and the call writes only through
-        // the pointer given.
-        let locked = unsafe {
-            LockFileEx(
-                file.as_raw_handle() as HANDLE,
-                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                0,
-                u32::MAX,
-                u32::MAX,
-                &raw mut overlapped,
-            )
-        };
-        if locked != 0 {
-            return Ok(Box::new(FileLock { _file: file }));
-        }
-
-        let error = std::io::Error::last_os_error();
-        let would_block = error
-            .raw_os_error()
-            .is_some_and(|code| u32::try_from(code).is_ok_and(|code| code == ERROR_LOCK_VIOLATION));
-        if !would_block {
-            return Err(ChainError::Storage(format!(
-                "the journal lock could not be taken: {error}"
-            )));
-        }
-        if Instant::now() >= deadline {
-            return Err(ChainError::Storage(
-                "another process held the journal longer than this one may wait".to_owned(),
-            ));
-        }
-        std::thread::sleep(LOCK_RETRY_INTERVAL);
-    }
+    // The lock holds no data — only a hold on a descriptor — so a permissive
+    // mode leaks nothing. It is pinned all the same: a file anyone may replace
+    // is a lock anyone may take somewhere else, and the whole point of the hold
+    // is that two writers contend for the same one.
+    pin_owner_only(path)?;
+    Ok(file)
 }
 
-/// Where there is neither `flock(2)` nor `LockFileEx`, the transaction cannot
-/// be made exclusive.
+/// The same, where the mode word does not exist.
 ///
-/// Refused rather than silently unlocked: an unlocked append is the defect this
-/// lock exists to prevent, and pretending otherwise would hide it on exactly
-/// the platform that cannot help. No target this product ships to lands here —
-/// Unix and Windows are both served above — so this is the arm that keeps a
-/// future port from getting an unprotected journal by default.
-#[cfg(all(feature = "file", not(unix), not(windows)))]
-fn acquire(path: &std::path::Path) -> Result<Box<dyn ChainLock>, ChainError> {
-    let _ = path;
-    Err(ChainError::Storage(
-        "the journal cannot be locked on this platform".to_owned(),
-    ))
+/// Named rather than absorbed: off Unix the lock file carries whatever the
+/// directory grants, so "a file anyone may replace is a lock anyone may take
+/// somewhere else" is not closed here. Closing it means a DACL, which belongs
+/// with the machinery that already does DACL work — see the note on
+/// [`FileStorage`].
+#[cfg(all(feature = "file", not(unix)))]
+fn open_lock_file(path: &std::path::Path) -> Result<std::fs::File, ChainError> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| ChainError::Storage(format!("the journal lock could not be opened: {e}")))
 }
 
 /// A `Vec`-backed storage, for tests and for hosts that persist elsewhere.

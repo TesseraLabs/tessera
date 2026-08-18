@@ -76,6 +76,12 @@ mod chain;
 mod payload;
 mod verify;
 
+/// The exclusive file hold both journals and the device code state take.
+///
+/// Gated with the file storage: a caller that persists elsewhere has no file to
+/// hold, and the wasm build has neither the syscalls nor a use for them.
+#[cfg(feature = "file")]
+pub mod file_lock;
 pub mod storage;
 
 pub use chain::{Chain, ChainError, ChainStorage};
