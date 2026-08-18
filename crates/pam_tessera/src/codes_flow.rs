@@ -243,6 +243,16 @@ pub enum CodeFlowError {
     #[error("the code login method is not provisioned on this device")]
     Unavailable,
 
+    /// The platform cannot provide what the method rests on.
+    ///
+    /// Reported like an unprovisioned device — the stack steps over the method
+    /// and goes on — because for a stack the two are the same instruction. What
+    /// they are not is a fault: see
+    /// [`CodeLoginError::UnsupportedPlatform`] for why the method cannot exist
+    /// where file permissions cannot be checked.
+    #[error("the code login method is not available on this platform")]
+    UnsupportedPlatform,
+
     /// The attempt was refused. The reason is in the audit journal.
     #[error("the code login attempt was refused")]
     Denied,
@@ -350,7 +360,7 @@ impl CodeFlowError {
     ///
     /// | Variant                                | Code                       |
     /// | -------------------------------------- | -------------------------- |
-    /// | `Unavailable`                          | `PAM_AUTHINFO_UNAVAIL` (9) |
+    /// | `Unavailable` / `UnsupportedPlatform`  | `PAM_AUTHINFO_UNAVAIL` (9) |
     /// | `AttemptsExhausted` / `TemporarilyLocked` | `PAM_MAXTRIES` (11)     |
     /// | `Denied` / `Conv` / `Input`            | `PAM_AUTH_ERR` (7)         |
     /// | `RoleDenied` / `Level` / `LevelChanged`| `PAM_PERM_DENIED` (6)      |
@@ -358,9 +368,17 @@ impl CodeFlowError {
     /// | `Unaccountable`                        | `PAM_PERM_DENIED` (6)      |
     /// | `DeviceState`                          | `PAM_SYSTEM_ERR` (4)       |
     ///
-    /// `Unavailable` is the only code a stack can be configured to step over
-    /// (`authinfo_unavail=ignore`), and that is deliberate: it is the one
-    /// refusal that says nothing about the attempt.
+    /// `PAM_AUTHINFO_UNAVAIL` is the only code a stack can be configured to
+    /// step over (`authinfo_unavail=ignore`), and the two variants that carry
+    /// it are deliberate and few: a device that was never given the artefacts,
+    /// and a platform where the method cannot exist. Both say nothing about the
+    /// attempt, and both leave a stack free to try the certificate path.
+    ///
+    /// Nothing else may join them. A state that moved backwards, a store that
+    /// cannot be read, a lock that could not be taken — those are faults of a
+    /// device that *does* run this method, and a stack stepping over a fault
+    /// would be stepping over the refusal that fault produced. They stay
+    /// `DeviceState`, which is `PAM_SYSTEM_ERR`, and a test below pins that.
     ///
     /// `AttemptsExhausted` is `PAM_MAXTRIES` — 11. Not 8, which is
     /// `PAM_CRED_INSUFFICIENT` and tells the application a different story
@@ -388,7 +406,7 @@ impl CodeFlowError {
     #[must_use]
     pub const fn pam_code(&self) -> i32 {
         match self {
-            Self::Unavailable => PAM_AUTHINFO_UNAVAIL,
+            Self::Unavailable | Self::UnsupportedPlatform => PAM_AUTHINFO_UNAVAIL,
             Self::AttemptsExhausted | Self::TemporarilyLocked { .. } => PAM_MAXTRIES,
             Self::Denied | Self::Conv(_) | Self::Input { .. } => PAM_AUTH_ERR,
             // `MonitorRegistration` shares the code the certificate path
@@ -497,6 +515,7 @@ pub fn open_method(
     CodeMethod::open_privileged(config.clone(), LocalRoles::from_store(store)).map_err(|error| {
         match error {
             CodeLoginError::Unavailable => CodeFlowError::Unavailable,
+            CodeLoginError::UnsupportedPlatform => CodeFlowError::UnsupportedPlatform,
             other => CodeFlowError::DeviceState(other),
         }
     })
@@ -804,6 +823,7 @@ fn read_markers<P: DeviceProbe>(
 fn flow_error(error: CodeLoginError, epoch: u32) -> CodeFlowError {
     match error {
         CodeLoginError::Unavailable => CodeFlowError::Unavailable,
+        CodeLoginError::UnsupportedPlatform => CodeFlowError::UnsupportedPlatform,
         CodeLoginError::Denied => CodeFlowError::Denied,
         CodeLoginError::AttemptsExhausted => CodeFlowError::AttemptsExhausted,
         CodeLoginError::TemporarilyLocked { retry_after } => {

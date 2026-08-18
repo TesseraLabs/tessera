@@ -942,6 +942,27 @@ fn a_device_that_cannot_run_the_method_is_not_a_failed_attempt() {
 }
 
 #[test]
+fn a_platform_without_the_method_falls_through_instead_of_failing_the_stack() {
+    // The companion of the test above, and the line between them is the whole
+    // point: a fault gets `PAM_SYSTEM_ERR`, and a method that cannot exist on
+    // this platform gets the one code a stack may be configured to step over.
+    // A Windows service offering both the certificate path and the code path
+    // must reach the certificate path, not stop at a system error.
+    let harness = Harness::new();
+    let method = ScriptedMethod::refusing_to_start(CodeLoginError::UnsupportedPlatform);
+    let mut conv = ScriptedConversation::new(["op-42"]);
+    let probe = ScriptedProbe::at_level(1);
+
+    let flow_error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
+
+    assert!(matches!(flow_error, CodeFlowError::UnsupportedPlatform));
+    assert_eq!(flow_error.pam_code(), 9);
+    // And it is the same code an unprovisioned device gets, because a stack has
+    // one thing to do about either.
+    assert_eq!(CodeFlowError::Unavailable.pam_code(), 9);
+}
+
+#[test]
 fn a_device_without_the_method_falls_through_to_the_next_one() {
     let dir = tempfile::tempdir().unwrap();
     let store = role_store(dir.path());

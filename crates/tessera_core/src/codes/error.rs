@@ -24,6 +24,27 @@ pub enum CodeLoginError {
     #[error("the code login method is not provisioned on this device")]
     Unavailable,
 
+    /// The platform cannot provide what the method rests on.
+    ///
+    /// Not a fault of the device and not a state it can be repaired into: the
+    /// key that computes the codes is stored **without a password**, because a
+    /// device has to verify codes after a reboot with nobody standing next to
+    /// it, so what protects that key is the permissions of the file it sits in
+    /// and nothing else. Outside Unix there is no mode word to check — the
+    /// equivalent is a DACL, and no DACL work exists here — which leaves two
+    /// possibilities, of which only one is acceptable: the method does not run
+    /// there, or the key that computes the access codes of a cash machine lies
+    /// under permissions nobody verified.
+    ///
+    /// Kept apart from [`CodeLoginError::Unavailable`] because the facts differ
+    /// — a provisioned device on the wrong platform against an unprovisioned
+    /// one — even though a PAM stack answers both the same way: skip this
+    /// method, try the next.
+    #[error(
+        "the code login method needs POSIX file permissions, which this platform does not have"
+    )]
+    UnsupportedPlatform,
+
     /// The attempt was refused. The reason is in the audit journal.
     #[error("the code login attempt was refused")]
     Denied,

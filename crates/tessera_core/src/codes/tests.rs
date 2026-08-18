@@ -1239,3 +1239,37 @@ fn the_method_reports_the_epoch_it_is_running_under_not_the_configured_one() {
          made the journal of one login disagree with itself",
     );
 }
+
+/// Off Unix the method refuses as unsupported, not as broken.
+///
+/// The distinction is what a PAM stack acts on: a stack can be configured to
+/// step over "there is no method here" and go on to the certificate path, and
+/// it cannot step over "this device is faulty". A device on Windows is not
+/// faulty — the method it cannot offer rests on file permissions the platform
+/// does not express, which is a fact about the platform and known before a
+/// single artefact is read.
+///
+/// Runs where the answer is, which is the platform this product does not serve
+/// with this method; on Unix there is nothing here to check.
+#[cfg(not(unix))]
+#[test]
+fn a_platform_without_posix_permissions_offers_no_code_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = CodesConfig {
+        paths: CodesPaths::under(dir.path()),
+        params: FleetParams::defaults(),
+        device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
+        epoch: Epoch::new(7),
+        device_scope: DeviceScope {
+            tags: vec!["dc-1".to_owned()],
+            region: "ru-south".to_owned(),
+        },
+        code_ttl: DEFAULT_CODE_TTL,
+        gost_engine_path: None,
+    };
+
+    assert!(matches!(
+        CodeMethod::open(config, LocalRoles::default()),
+        Err(CodeLoginError::UnsupportedPlatform)
+    ));
+}

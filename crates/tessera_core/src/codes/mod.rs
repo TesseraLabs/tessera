@@ -277,6 +277,15 @@ impl CodeMethod {
         roles: LocalRoles,
         privileged: bool,
     ) -> Result<Self, CodeLoginError> {
+        // Answered before a single artefact is read, because it is decided by
+        // the platform rather than by anything on disk. The store walk would
+        // refuse a moment later anyway — `fs_mode` cannot pin a mode here — but
+        // it would refuse as a device in a broken state, and this device is not
+        // broken: the method does not exist on this platform. A stack can step
+        // over "no method here" and reach the certificate path; it cannot step
+        // over "this device is faulty".
+        platform_offers_the_method()?;
+
         if !config.paths.artefacts_present() {
             return Err(CodeLoginError::Unavailable);
         }
@@ -952,6 +961,40 @@ struct SpentAttempt<'a> {
     nonce: &'a str,
     /// Number of the ticket the operator worked under.
     ticket_number: &'a str,
+}
+
+/// Reports whether this platform can carry the method at all.
+///
+/// The whole method rests on being able to check the permissions of the files
+/// it keeps: the device key is stored without a password, because codes have to
+/// be verified after a reboot with nobody there to type one, so the permissions
+/// are what protect it. Outside Unix there is no mode word — the equivalent is
+/// a DACL, and none is written here.
+///
+/// Written as one function rather than as a `cfg` around the body of
+/// [`CodeMethod::open`] so that both platforms compile the same code and only
+/// the answer differs: a `cfg` around the body would leave arguments unused and
+/// lines unreachable on one side, and every one of those is a warning that has
+/// to be silenced somewhere.
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "the Result is not spurious: it is the signature the other arm has, \
+                  and the one call site reaches both with `?`. Narrowing this arm to \
+                  `()` would move the platform difference from one `cfg` here into the \
+                  opening of the method"
+    )
+)]
+fn platform_offers_the_method() -> Result<(), CodeLoginError> {
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(CodeLoginError::UnsupportedPlatform)
+    }
 }
 
 /// Reads the boot markers, mapping the failure to the method's error.

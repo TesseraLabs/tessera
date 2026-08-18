@@ -17,46 +17,107 @@
 //! privately, and the code is computed from that text with the contract crate.
 //! An e2e helper has no other way in either, so anything this fixture cannot do
 //! from the printed form, the helper will not be able to do on a stand.
+//!
+//! # Why the store-backed tests here are Unix-only
+//!
+//! Every test that stands up a [`LiveFixture`] carries `#[cfg(unix)]`, and the
+//! reason is a property of the product rather than of the harness.
+//!
+//! The device key is stored **without a password** — a deliberate decision of
+//! this channel, because a device has to verify codes after a reboot, when
+//! nobody is standing next to it to type anything. What protects that key is
+//! therefore the permissions of the file it sits in, and nothing else. Outside
+//! Unix there is no mode word to check: the equivalent is a DACL, and no DACL
+//! work exists here. That leaves two possibilities, and only one of them is
+//! acceptable — either the method does not run there, or the key that computes
+//! the access codes of a cash machine lies under permissions nobody verified.
+//!
+//! So the refusal these tests would meet (`fs_mode`: "file permissions cannot
+//! be pinned on this platform") is not an obstacle to work around. It is the
+//! boundary it was written to be, and it is stated in the same terms wherever
+//! else this product meets it: the artefact store (`codes::store`), the state
+//! lock (`codes::lock`) and the journal storage of `tessera_hashchain`.
+//!
+//! What stays cross-platform is everything that does **not** stand up a store:
+//! the two portability tests below, which exist precisely to catch defects that
+//! only appear off Unix, and the configuration test that couples the method to
+//! its journal. Gating those would hide the class of defect they guard.
 
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::panic_in_result_fn,
     reason = "a failed setup step in a test should fail the test on the spot, \
               including from the helper that drives one attempt"
 )]
+// The helper that drives one attempt is the only thing here that panics from a
+// function returning `Result`, and it is part of the store-backed half — so off
+// Unix there is nothing for this expectation to catch, and an expectation
+// nothing fulfils is itself a warning.
+#![cfg_attr(
+    unix,
+    expect(
+        clippy::panic_in_result_fn,
+        reason = "the helper driving one attempt fails the test where the step failed"
+    )
+)]
 
+#[cfg(unix)]
 use std::cell::RefCell;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use openssl::bn::{BigNum, BigNumContext};
+#[cfg(unix)]
 use openssl::ec::{EcGroup, EcKey, PointConversionForm};
+#[cfg(unix)]
 use openssl::nid::Nid;
+#[cfg(unix)]
 use openssl::pkey::{PKey, Private};
+#[cfg(unix)]
 use openssl::x509::{X509Builder, X509NameBuilder};
+#[cfg(unix)]
 use secrecy::SecretString;
+#[cfg(unix)]
 use tempfile::TempDir;
 
+#[cfg(unix)]
 use tessera_codes_contract::canon::Level;
+#[cfg(unix)]
 use tessera_codes_contract::challenge::Challenge;
+#[cfg(unix)]
 use tessera_codes_contract::code::compute_code;
+#[cfg(unix)]
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
+#[cfg(unix)]
 use tessera_codes_contract::key::{derive_key, Epoch, KeyAgreement as _, KeyContext};
+#[cfg(unix)]
 use tessera_codes_contract::nonce::Nonce;
+#[cfg(unix)]
 use tessera_codes_contract::params::{FleetParams, FleetParamsInput};
+#[cfg(unix)]
 use tessera_codes_contract::profile::AlgorithmProfile;
+#[cfg(unix)]
 use tessera_codes_contract::signature::{PublicKey, Signature};
+#[cfg(unix)]
 use tessera_codes_contract::ticket::{
     OperatorTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
 };
+#[cfg(unix)]
 use tessera_codes_contract::time::ClaimedTime;
+#[cfg(unix)]
 use tessera_core::codes::agreement::DeviceKeyAgreement;
+#[cfg(unix)]
 use tessera_core::codes::{CodeMethod, CodesConfig, CodesPaths, DeviceScope, LocalRoles};
+#[cfg(unix)]
 use tessera_core::ipc::{MonitorFailMode, StubClient};
+#[cfg(unix)]
 use tessera_core::pam_conv::PamConvError;
+#[cfg(unix)]
 use tessera_core::role::{AccountCheck, RoleOs, RoleStore, SystemAccounts, TrustMode};
 
+#[cfg(unix)]
 use super::{
     authenticate_by_code, CodeConversation, CodeDeps, CodeFlowError, CodeLogin, DeviceProbe,
     HostIdSourceKind, LevelError, SystemTime,
@@ -65,21 +126,27 @@ use super::{
 /// The fixture container carries no password, the way a stored one does: the
 /// PIN protects a container while it travels, and the import re-writes the key
 /// without one before it ever reaches the store.
+#[cfg(unix)]
 const STORED_CONTAINER_PASSWORD: &str = "";
 
 /// The login account, which is also the role.
+#[cfg(unix)]
 const ROLE: &str = "oper";
 
 /// The operator on the telephone.
+#[cfg(unix)]
 const OPERATOR: &str = "op-42";
 
 /// The level the fixture logs in at.
+#[cfg(unix)]
 const LEVEL: u32 = 1;
 
 /// A code that meets no key: eight digits the fixture never computes.
+#[cfg(unix)]
 const WRONG_CODE: &str = "00000000";
 
 /// A P-256 key pair, as a private key and its uncompressed public point.
+#[cfg(unix)]
 fn p256_pair() -> (PKey<Private>, Vec<u8>) {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
     let key = EcKey::generate(&group).unwrap();
@@ -92,6 +159,7 @@ fn p256_pair() -> (PKey<Private>, Vec<u8>) {
 }
 
 /// A PKCS#12 container holding `key` and a self-signed certificate for it.
+#[cfg(unix)]
 fn container(key: &PKey<Private>) -> Vec<u8> {
     let mut name = X509NameBuilder::new().unwrap();
     name.append_entry_by_nid(Nid::COMMONNAME, "device 77-000123")
@@ -128,6 +196,7 @@ fn container(key: &PKey<Private>) -> Vec<u8> {
 }
 
 /// The whole channel on disk, plus the operator's half in memory.
+#[cfg(unix)]
 struct LiveFixture {
     _dir: TempDir,
     store: RoleStore,
@@ -140,8 +209,10 @@ struct LiveFixture {
     monitor: StubClient,
 }
 
+#[cfg(unix)]
 impl LiveFixture {
     /// Builds a fixture whose nonce allows `attempts` verifications.
+    #[cfg(unix)]
     fn with_attempts(attempts: u8) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let paths = CodesPaths::under(dir.path());
@@ -260,6 +331,7 @@ impl LiveFixture {
 }
 
 /// Signs an operator ticket the way the fleet authority would.
+#[cfg(unix)]
 fn sign_ticket(authority: &PKey<Private>, operator_point: Vec<u8>) -> SignedTicket {
     let ticket = OperatorTicket::new(
         OPERATOR,
@@ -290,6 +362,7 @@ fn sign_ticket(authority: &PKey<Private>, operator_point: Vec<u8>) -> SignedTick
 /// the nonce broken into groups of three for reading aloud. Everything an
 /// operator needs is in there and nothing else is: this function is the whole
 /// of what the cabinet — or an e2e helper scraping `PAM_TEXT_INFO` — has to do.
+#[cfg(unix)]
 fn challenge_from_spoken(spoken: &str, params: FleetParams) -> Challenge {
     let line = spoken.lines().next_back().unwrap_or(spoken);
     let fields: Vec<&str> = line.split(" / ").collect();
@@ -309,8 +382,10 @@ fn challenge_from_spoken(spoken: &str, params: FleetParams) -> Challenge {
 }
 
 /// A device standing at [`LEVEL`] whose boot markers never move.
+#[cfg(unix)]
 struct SteadyDevice;
 
+#[cfg(unix)]
 impl DeviceProbe for SteadyDevice {
     fn integrity_level(&self) -> Result<Level, LevelError> {
         Ok(Level::new(LEVEL))
@@ -325,6 +400,7 @@ impl DeviceProbe for SteadyDevice {
 }
 
 /// What the engineer types when the branch asks for a code.
+#[cfg(unix)]
 enum Typed {
     /// A code that meets nothing.
     Wrong,
@@ -336,6 +412,7 @@ enum Typed {
 
 /// The engineer at the device: names the operator, reads the printed challenge
 /// down the telephone, and types back whatever the script says.
+#[cfg(unix)]
 struct Engineer<'a> {
     fixture: &'a LiveFixture,
     /// One entry per code prompt, in order.
@@ -347,7 +424,9 @@ struct Engineer<'a> {
     asked_secret: RefCell<bool>,
 }
 
+#[cfg(unix)]
 impl<'a> Engineer<'a> {
+    #[cfg(unix)]
     fn new<I: IntoIterator<Item = Typed>>(fixture: &'a LiveFixture, script: I) -> Self {
         Self {
             fixture,
@@ -358,7 +437,9 @@ impl<'a> Engineer<'a> {
     }
 }
 
+#[cfg(unix)]
 impl CodeConversation for Engineer<'_> {
+    #[cfg(unix)]
     fn show_info(&mut self, message: &str) {
         if let Some(rest) = message.strip_prefix("Продиктуйте оператору:\n") {
             *self.printed.borrow_mut() =
@@ -366,6 +447,7 @@ impl CodeConversation for Engineer<'_> {
         }
     }
 
+    #[cfg(unix)]
     fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
         if prompt == super::OPERATOR_PROMPT {
             return Ok(OPERATOR.to_owned());
@@ -403,11 +485,14 @@ impl CodeConversation for Engineer<'_> {
 }
 
 /// An engineer who types one fixed code, whatever the device printed.
+#[cfg(unix)]
 struct Replay(String);
 
+#[cfg(unix)]
 impl CodeConversation for Replay {
     fn show_info(&mut self, _message: &str) {}
 
+    #[cfg(unix)]
     fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
         if prompt == super::OPERATOR_PROMPT {
             return Ok(OPERATOR.to_owned());
@@ -423,6 +508,7 @@ impl CodeConversation for Replay {
 }
 
 /// Drives one attempt against the real method.
+#[cfg(unix)]
 fn run<I: IntoIterator<Item = Typed>>(
     fixture: &LiveFixture,
     script: I,
@@ -436,6 +522,7 @@ fn run<I: IntoIterator<Item = Typed>>(
 /// process, so a login driven outside it meets whatever journal another test
 /// installed — and a journal with a zero ceiling refuses every record, which
 /// turns an unrelated test into a failure of this one.
+#[cfg(unix)]
 fn drive_conversation<C: super::CodeConversation>(
     fixture: &LiveFixture,
     conv: &mut C,
@@ -453,6 +540,7 @@ fn drive_conversation<C: super::CodeConversation>(
 }
 
 /// Drives one attempt with an engineer already built.
+#[cfg(unix)]
 fn drive(
     fixture: &LiveFixture,
     engineer: Engineer<'_>,
@@ -480,6 +568,7 @@ fn drive(
 /// The sink lock is taken here and nowhere else: the sink is one handle per
 /// process, and a test holding it across a call into [`drive`] would deadlock
 /// against this.
+#[cfg(unix)]
 fn drive_with_config(
     fixture: &LiveFixture,
     mut engineer: Engineer<'_>,
@@ -686,6 +775,7 @@ fn path(path: &std::path::Path) -> toml::Value {
 }
 
 /// The attempt itself, with the sink already held.
+#[cfg(unix)]
 fn drive_locked(
     fixture: &LiveFixture,
     engineer: &mut Engineer<'_>,
@@ -708,6 +798,8 @@ fn drive_locked(
     outcome.map(|outcome| outcome.auth_ctx)
 }
 
+// Stands up a real store: Unix-only, see the module docs.
+#[cfg(unix)]
 #[test]
 fn a_code_computed_from_the_printed_challenge_admits_the_engineer() {
     // The whole channel, end to end: the branch prints, the cabinet computes
@@ -725,6 +817,8 @@ fn a_code_computed_from_the_printed_challenge_admits_the_engineer() {
     );
 }
 
+// Stands up a real store: Unix-only, see the module docs.
+#[cfg(unix)]
 #[test]
 fn every_allowed_attempt_spent_on_a_wrong_code_reports_max_tries() {
     // The claim under test, and the reason this fixture exists: N wrong codes
@@ -748,6 +842,8 @@ fn every_allowed_attempt_spent_on_a_wrong_code_reports_max_tries() {
     }
 }
 
+// Stands up a real store: Unix-only, see the module docs.
+#[cfg(unix)]
 #[test]
 fn a_wrong_code_short_of_the_budget_is_not_an_exhausted_budget() {
     // One wrong code out of five is an ordinary refusal. The engineer is asked
@@ -767,6 +863,8 @@ fn a_wrong_code_short_of_the_budget_is_not_an_exhausted_budget() {
     assert_ne!(error.pam_code(), 11);
 }
 
+// Stands up a real store: Unix-only, see the module docs.
+#[cfg(unix)]
 #[test]
 fn refusals_that_cost_no_attempt_never_read_as_an_exhausted_budget() {
     // A key container that will not open is the device's failure, not a wrong
@@ -792,6 +890,8 @@ fn refusals_that_cost_no_attempt_never_read_as_an_exhausted_budget() {
     assert_eq!(error.pam_code(), 7);
 }
 
+// Stands up a real store: Unix-only, see the module docs.
+#[cfg(unix)]
 #[test]
 fn the_last_allowed_attempt_still_admits_a_right_code() {
     // The other side of the budget: spending every attempt but one and then
@@ -805,6 +905,8 @@ fn the_last_allowed_attempt_still_admits_a_right_code() {
     assert_eq!(ctx.role.as_ref().unwrap().role.as_str(), ROLE);
 }
 
+// Stands up a real store: Unix-only, see the module docs.
+#[cfg(unix)]
 #[test]
 fn a_second_conversation_cannot_replay_the_first_code() {
     // The nonce of a successful login is spent, and the code cut for it is a
@@ -829,6 +931,8 @@ fn a_second_conversation_cannot_replay_the_first_code() {
     );
 }
 
+// Stands up a real store: Unix-only, see the module docs.
+#[cfg(unix)]
 #[test]
 fn a_code_typed_in_the_groups_it_was_dictated_in_is_accepted() {
     // The operator reads the code out in groups and the printed challenge is
@@ -857,7 +961,10 @@ fn a_code_typed_in_the_groups_it_was_dictated_in_is_accepted() {
 /// the guarantee read as present and was absent. Going through
 /// `sink::install_from_config` means unwiring the install shows up here.
 mod fail_closed {
-    use super::{config_with_audit, drive_with_config, path, Engineer, LiveFixture, Typed};
+    use super::{config_with_audit, path};
+    #[cfg(unix)]
+    use super::{drive_with_config, Engineer, LiveFixture, Typed};
+    #[cfg(unix)]
     use crate::codes_flow::CodeFlowError;
 
     /// The `[audit]` table naming a journal in `dir`.
@@ -865,6 +972,7 @@ mod fail_closed {
     /// Built as a table rather than as text: the path goes in through
     /// [`super::path`], so the encoder owns the quoting and a Windows
     /// `C:\Users\...` stays a path instead of becoming a broken escape.
+    #[cfg(unix)]
     fn audit_table(dir: &std::path::Path) -> toml::Table {
         let mut audit = toml::Table::new();
         audit.insert("enabled".to_owned(), toml::Value::Boolean(true));
@@ -873,6 +981,7 @@ mod fail_closed {
     }
 
     /// A device told to keep a journal it can write.
+    #[cfg(unix)]
     fn keeping_a_journal(dir: &std::path::Path) -> toml::Table {
         let mut sections = toml::Table::new();
         sections.insert("audit".to_owned(), toml::Value::Table(audit_table(dir)));
@@ -882,6 +991,7 @@ mod fail_closed {
     /// A device told to keep a journal that is already at its ceiling: the
     /// ceiling is zero, so the very first record meets it, and the configured
     /// behaviour is to refuse.
+    #[cfg(unix)]
     fn keeping_a_full_journal(dir: &std::path::Path) -> toml::Table {
         let mut audit = audit_table(dir);
         audit.insert("ceiling_bytes".to_owned(), toml::Value::Integer(0));
@@ -914,6 +1024,8 @@ mod fail_closed {
         codes
     }
 
+    // Stands up a real store: Unix-only, see the module docs.
+    #[cfg(unix)]
     #[test]
     fn a_login_the_chain_will_not_record_is_refused() {
         let fixture = LiveFixture::with_attempts(5);
@@ -940,6 +1052,8 @@ mod fail_closed {
         assert_eq!(error.pam_code(), 6);
     }
 
+    // Stands up a real store: Unix-only, see the module docs.
+    #[cfg(unix)]
     #[test]
     fn a_login_the_chain_records_is_granted_and_lands_on_the_chain() {
         let fixture = LiveFixture::with_attempts(5);
@@ -963,6 +1077,8 @@ mod fail_closed {
         );
     }
 
+    // Stands up a real store: Unix-only, see the module docs.
+    #[cfg(unix)]
     #[test]
     fn a_device_with_no_audit_section_authenticates_exactly_as_before() {
         let fixture = LiveFixture::with_attempts(5);
