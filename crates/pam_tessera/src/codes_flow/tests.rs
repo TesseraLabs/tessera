@@ -979,6 +979,13 @@ fn a_device_without_the_method_falls_through_to_the_next_one() {
     );
 }
 
+// Unix-only: this asserts a state of a device that runs the method — it was
+// given no artefacts — and off Unix the method does not run at all, so the
+// answer there is `UnsupportedPlatform` and comes first, before anything on
+// disk is looked at. Accepting either verdict here would blur the line
+// between "this device is not set up" and "this platform cannot carry the
+// method", which is the distinction the return codes were just split on.
+#[cfg(unix)]
 #[test]
 fn a_device_carrying_no_artefacts_does_not_offer_the_method() {
     let dir = tempfile::tempdir().unwrap();
