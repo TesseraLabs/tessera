@@ -114,21 +114,12 @@ fn counter_path(state_dir: &Path) -> PathBuf {
     reason = "a failed setup step in a test should fail the test on the spot"
 )]
 mod tests {
-    use super::{read_issued, write_issued, COUNTER_FILENAME};
+    use super::{read_issued, COUNTER_FILENAME};
 
     #[test]
     fn an_absent_counter_reads_as_nothing_issued() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_issued(dir.path()).unwrap().is_none());
-    }
-
-    #[test]
-    fn a_written_counter_reads_back() {
-        let dir = tempfile::tempdir().unwrap();
-        write_issued(dir.path(), 41).unwrap();
-        assert_eq!(read_issued(dir.path()).unwrap().unwrap().get(), 41);
-        write_issued(dir.path(), 42).unwrap();
-        assert_eq!(read_issued(dir.path()).unwrap().unwrap().get(), 42);
     }
 
     #[test]
@@ -138,16 +129,46 @@ mod tests {
         assert!(read_issued(dir.path()).is_err());
     }
 
-    #[test]
-    fn the_write_leaves_no_temporary_file_behind() {
-        let dir = tempfile::tempdir().unwrap();
-        write_issued(dir.path(), 7).unwrap();
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name != COUNTER_FILENAME)
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+    /// Tests that write the persisted state of the device.
+    ///
+    /// They need a platform whose file permissions can be checked, and that is a
+    /// property of the method rather than of the harness: the device key is kept
+    /// **without a password**, because codes have to be verified after a reboot
+    /// with nobody there to type one, so what protects it is the mode of the
+    /// files beside it. Outside Unix there is no mode word — the equivalent is a
+    /// DACL, and none is written here — so the writes below refuse by design.
+    /// See `codes::store`, `codes::lock` and the storage of `tessera_hashchain`,
+    /// where the same boundary is stated, and `platform_offers_the_method`,
+    /// which is where the product answers it.
+    ///
+    /// Reading the same state stays outside this group: a device that cannot
+    /// write a counter can still parse one, and those tests keep running
+    /// everywhere.
+    #[cfg(unix)]
+    mod persisted {
+        use super::super::write_issued;
+        use super::*;
+
+        #[test]
+        fn a_written_counter_reads_back() {
+            let dir = tempfile::tempdir().unwrap();
+            write_issued(dir.path(), 41).unwrap();
+            assert_eq!(read_issued(dir.path()).unwrap().unwrap().get(), 41);
+            write_issued(dir.path(), 42).unwrap();
+            assert_eq!(read_issued(dir.path()).unwrap().unwrap().get(), 42);
+        }
+
+        #[test]
+        fn the_write_leaves_no_temporary_file_behind() {
+            let dir = tempfile::tempdir().unwrap();
+            write_issued(dir.path(), 7).unwrap();
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name != COUNTER_FILENAME)
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
     }
 }

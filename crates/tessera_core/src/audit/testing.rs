@@ -130,6 +130,13 @@ pub(crate) fn with_outcome<'a>(
 ///
 /// Used to pick this test's own record out of a journal that other tests
 /// running in parallel may also have written to.
+///
+/// Its only caller is the store-backed test module of `codes`, which does not
+/// compile where the store cannot be carried — the device key is kept without a
+/// password, so file permissions are what protect it, and outside Unix there is
+/// no mode word to check. Gated for that reason alone: nothing about the helper
+/// itself is platform-bound.
+#[cfg(unix)]
 pub(crate) fn matching<'a>(
     records: &'a [serde_json::Value],
     fields: &[(&str, &str)],

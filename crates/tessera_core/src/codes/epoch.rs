@@ -175,28 +175,12 @@ fn epoch_path(state_dir: &Path) -> PathBuf {
 mod tests {
     use tessera_codes_contract::key::Epoch;
 
-    use super::{effective, read, remove, write, EPOCH_FILENAME};
+    use super::{effective, read};
 
     #[test]
     fn an_absent_epoch_reads_as_never_provisioned() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read(dir.path()).unwrap().is_none());
-    }
-
-    #[test]
-    fn a_written_epoch_reads_back() {
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), Epoch::new(3)).unwrap();
-        assert_eq!(read(dir.path()).unwrap(), Some(Epoch::new(3)));
-        write(dir.path(), Epoch::new(4)).unwrap();
-        assert_eq!(read(dir.path()).unwrap(), Some(Epoch::new(4)));
-    }
-
-    #[test]
-    fn a_corrupt_epoch_is_not_an_absent_one() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(EPOCH_FILENAME), b"seven\n").unwrap();
-        assert!(read(dir.path()).is_err());
     }
 
     #[test]
@@ -228,12 +212,49 @@ mod tests {
         assert_eq!(error.persisted, Epoch::new(5));
     }
 
-    #[test]
-    fn removing_an_epoch_that_was_never_written_is_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        remove(dir.path()).unwrap();
-        write(dir.path(), Epoch::new(1)).unwrap();
-        remove(dir.path()).unwrap();
-        assert!(read(dir.path()).unwrap().is_none());
+    /// Tests that write the persisted state of the device.
+    ///
+    /// They need a platform whose file permissions can be checked, and that is a
+    /// property of the method rather than of the harness: the device key is kept
+    /// **without a password**, because codes have to be verified after a reboot
+    /// with nobody there to type one, so what protects it is the mode of the
+    /// files beside it. Outside Unix there is no mode word — the equivalent is a
+    /// DACL, and none is written here — so the writes below refuse by design.
+    /// See `codes::store`, `codes::lock` and the storage of `tessera_hashchain`,
+    /// where the same boundary is stated, and `platform_offers_the_method`,
+    /// which is where the product answers it.
+    ///
+    /// Reading the same state stays outside this group: a device that cannot
+    /// write a counter can still parse one, and those tests keep running
+    /// everywhere.
+    #[cfg(unix)]
+    mod persisted {
+        use super::super::{remove, write, EPOCH_FILENAME};
+        use super::*;
+
+        #[test]
+        fn a_written_epoch_reads_back() {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), Epoch::new(3)).unwrap();
+            assert_eq!(read(dir.path()).unwrap(), Some(Epoch::new(3)));
+            write(dir.path(), Epoch::new(4)).unwrap();
+            assert_eq!(read(dir.path()).unwrap(), Some(Epoch::new(4)));
+        }
+
+        #[test]
+        fn a_corrupt_epoch_is_not_an_absent_one() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(EPOCH_FILENAME), b"seven\n").unwrap();
+            assert!(read(dir.path()).is_err());
+        }
+
+        #[test]
+        fn removing_an_epoch_that_was_never_written_is_not_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            remove(dir.path()).unwrap();
+            write(dir.path(), Epoch::new(1)).unwrap();
+            remove(dir.path()).unwrap();
+            assert!(read(dir.path()).unwrap().is_none());
+        }
     }
 }

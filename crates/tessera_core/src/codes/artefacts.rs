@@ -237,6 +237,14 @@ pub enum ArtefactError {
     /// The store is not trustworthy, so nothing was applied to it.
     #[error("the code artefact store is not trustworthy, nothing was applied: {0}")]
     Untrusted(String),
+    /// This platform does not carry the code login method at all.
+    ///
+    /// Not a broken device and not a broken package: the method rests on POSIX
+    /// permissions, and where there are none it cannot be carried. Kept as its
+    /// own variant because the operator's next step differs — nothing here is
+    /// repairable by fixing the store or re-cutting the medium.
+    #[error("the code artefacts were not applied: {0}")]
+    UnsupportedPlatform(#[source] super::CodeLoginError),
     /// An artefact could not be read or written.
     #[error("code artefact I/O error at {path}: {reason}")]
     Io {
@@ -262,8 +270,10 @@ pub enum ArtefactError {
 /// number, [`ArtefactError::Container`] when the delivery container does not
 /// open with the PIN, [`ArtefactError::Tickets`] for an artefact that does not
 /// parse, [`ArtefactError::Untrusted`] when the store does not pass the check
-/// the login path makes, and [`ArtefactError::Io`] for a failed read or write.
-/// Nothing is published unless every check above has passed.
+/// the login path makes, [`ArtefactError::UnsupportedPlatform`] where the
+/// method cannot be carried at all, and [`ArtefactError::Io`] for a failed read
+/// or write. Nothing is published — and nothing is created — unless every check
+/// above has passed.
 pub fn apply(
     paths: &CodesPaths,
     delivery: &CodesDelivery,
@@ -279,6 +289,14 @@ pub fn apply(
             revocations_applied: false,
         });
     }
+
+    // Asked before a single directory is made, and asked of the same predicate
+    // the login path asks so the two cannot drift apart. An import that reached
+    // `ensure_store_dirs` here would create the store and only then fail on
+    // pinning its mode — leaving the litter of an operation that could never
+    // have finished, and reporting it as an I/O fault rather than as what it
+    // is. The device is not broken; the platform does not carry the method.
+    super::platform_offers_the_method().map_err(ArtefactError::UnsupportedPlatform)?;
 
     ensure_store_dirs(paths)?;
     let _lock = StateLock::acquire(&paths.state_dir).map_err(|error| ArtefactError::Io {
@@ -804,3 +822,77 @@ fn push_removed(removed: &mut Vec<String>, path: &Path) {
 #[cfg(all(test, unix))]
 #[path = "artefacts_tests.rs"]
 mod tests;
+
+// The tests above assert on POSIX modes and so are Unix-only. These are not:
+// they are about what happens on a platform that does not carry the method at
+// all, and one of them has to run *there* to mean anything.
+#[cfg(test)]
+mod platform_tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "a failed setup step in a test should fail the test on the spot"
+    )]
+
+    use super::{apply, CodesDelivery, CodesPaths, StoreCheck};
+
+    /// A package with no Codes part, applied on any platform whatsoever.
+    ///
+    /// This is the Access-only import, and it has nothing to do with the code
+    /// method: it must keep working where the method cannot be carried, and it
+    /// must leave no store behind on its way through.
+    #[test]
+    fn an_empty_delivery_changes_nothing_on_any_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodesPaths::under(dir.path());
+
+        let applied = apply(
+            &paths,
+            &CodesDelivery::default(),
+            None,
+            StoreCheck::Enforced,
+        )
+        .unwrap();
+
+        assert_eq!(applied.epoch, None);
+        assert!(!applied.key_replaced);
+        assert!(
+            !paths.state_dir.exists() && !paths.device_key_container.exists(),
+            "an import that carries no Codes part leaves no trace of the method"
+        );
+    }
+
+    /// A consignment that arrives where the method cannot run.
+    ///
+    /// The refusal has to come before the store is made. The import that
+    /// created its directories and then failed on their permissions left litter
+    /// from an operation that could never have finished, and told the operator
+    /// about an I/O fault rather than about the platform.
+    #[test]
+    #[cfg(not(unix))]
+    fn a_consignment_is_refused_before_the_store_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodesPaths::under(dir.path());
+        let delivery = CodesDelivery {
+            tickets: Some(b"anything at all".to_vec()),
+            ..CodesDelivery::default()
+        };
+
+        let error = apply(&paths, &delivery, None, StoreCheck::Enforced).unwrap_err();
+
+        assert!(
+            matches!(error, super::ArtefactError::UnsupportedPlatform(_)),
+            "the platform is the reason, and it is not an I/O fault: {error:?}"
+        );
+        assert!(
+            !paths.state_dir.exists(),
+            "a refused import creates no state directory"
+        );
+        assert!(
+            !paths
+                .device_key_container
+                .parent()
+                .is_some_and(std::path::Path::exists),
+            "a refused import creates no store directory"
+        );
+    }
+}

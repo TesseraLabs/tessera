@@ -484,6 +484,10 @@ pub(crate) mod tests {
         }
 
         /// The anchor file a device would be enrolled with.
+        ///
+        /// Used only by the tests that stand up a real store, which do not
+        /// compile where the store cannot be carried.
+        #[cfg(unix)]
         pub(crate) fn public_key_pem(&self) -> Vec<u8> {
             self.key.public_key_to_pem().unwrap()
         }

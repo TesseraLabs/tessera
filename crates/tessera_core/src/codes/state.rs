@@ -570,24 +570,11 @@ fn parse_ledger(value: &str) -> Result<(String, RoleLedger), StateError> {
 mod tests {
     use std::time::Duration;
 
-    use tempfile::TempDir;
-
-    use super::{CodeState, StateError, MAX_CONSUMED_NONCES, MAX_PENDING_ATTEMPTS, STATE_FILENAME};
+    use super::{CodeState, MAX_PENDING_ATTEMPTS};
     use crate::codes::boot::BootMarkers;
-    use crate::codes::counter;
 
     fn markers(boot: &str, since_boot: u64) -> BootMarkers {
         BootMarkers::new(boot, Duration::from_secs(since_boot))
-    }
-
-    /// Issues one nonce and persists both files, the way the method does.
-    fn issue(dir: &TempDir, markers: &BootMarkers) -> u64 {
-        let mut state = CodeState::load(dir.path(), markers).unwrap();
-        let counter = state.next_counter().unwrap();
-        counter::write_issued(dir.path(), counter).unwrap();
-        state.record_issued(counter, markers.since_boot_secs());
-        state.save(dir.path()).unwrap();
-        counter
     }
 
     #[test]
@@ -596,96 +583,6 @@ mod tests {
         let state = CodeState::load(dir.path(), &markers("boot-a", 10)).unwrap();
         assert_eq!(state.next_counter().unwrap(), 1);
         assert!(state.pending_attempts().is_empty());
-    }
-
-    #[test]
-    fn the_counter_only_moves_forward_across_restarts() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 10);
-        assert_eq!(issue(&dir, &boot), 1);
-        assert_eq!(issue(&dir, &boot), 2);
-        // A new process on the same boot keeps counting where the last left off.
-        let state = CodeState::load(dir.path(), &boot).unwrap();
-        assert_eq!(state.next_counter().unwrap(), 3);
-        assert_eq!(state.pending_attempts().len(), 2);
-    }
-
-    #[test]
-    fn a_reboot_drops_pending_attempts_and_spends_their_nonces() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = issue(&dir, &markers("boot-a", 10));
-
-        let state = CodeState::load(dir.path(), &markers("boot-b", 3)).unwrap();
-        assert!(state.pending(counter).is_none());
-        assert!(state.is_consumed(counter));
-        // The counter itself survives: the nonce is spent, not re-issuable.
-        assert_eq!(state.next_counter().unwrap(), counter + 1);
-    }
-
-    #[test]
-    fn a_monotonic_clock_dragged_backwards_drops_pending_attempts() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = issue(&dir, &markers("boot-a", 500));
-
-        let state = CodeState::load(dir.path(), &markers("boot-a", 499)).unwrap();
-        assert!(state.pending(counter).is_none());
-        assert!(state.is_consumed(counter));
-    }
-
-    #[test]
-    fn a_spent_nonce_stays_spent_across_a_reboot() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = issue(&dir, &markers("boot-a", 10));
-        let mut state = CodeState::load(dir.path(), &markers("boot-a", 20)).unwrap();
-        state.consume(counter);
-        state.save(dir.path()).unwrap();
-
-        let reloaded = CodeState::load(dir.path(), &markers("boot-b", 5)).unwrap();
-        assert!(reloaded.is_consumed(counter));
-        assert!(reloaded.pending(counter).is_none());
-    }
-
-    #[test]
-    fn wrong_codes_accumulate_across_restarts() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 10);
-        let counter = issue(&dir, &boot);
-
-        let mut state = CodeState::load(dir.path(), &boot).unwrap();
-        assert_eq!(state.charge_attempt(counter), Some(1));
-        state.save(dir.path()).unwrap();
-
-        let mut reloaded = CodeState::load(dir.path(), &boot).unwrap();
-        assert_eq!(reloaded.pending(counter).unwrap().attempts_used, 1);
-        assert_eq!(reloaded.charge_attempt(counter), Some(2));
-        assert_eq!(reloaded.charge_attempt(u64::MAX), None);
-    }
-
-    #[test]
-    fn a_counter_file_behind_the_state_is_a_rollback() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 10);
-        issue(&dir, &boot);
-        issue(&dir, &boot);
-        // The snapshot brought an older counter back while the state file kept
-        // the value the device really reached.
-        counter::write_issued(dir.path(), 1).unwrap();
-        assert!(matches!(
-            CodeState::load(dir.path(), &boot),
-            Err(StateError::Rollback)
-        ));
-    }
-
-    #[test]
-    fn a_counter_file_ahead_of_the_state_is_survivable() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 10);
-        issue(&dir, &boot);
-        // A crash between the two writes: the counter advanced, the state file
-        // did not. The nonce is burned and none is repeated.
-        counter::write_issued(dir.path(), 9).unwrap();
-        let state = CodeState::load(dir.path(), &boot).unwrap();
-        assert_eq!(state.next_counter().unwrap(), 10);
     }
 
     #[test]
@@ -701,57 +598,180 @@ mod tests {
         assert!(state.is_consumed(1));
     }
 
-    #[test]
-    fn the_spent_set_folds_into_a_floor_without_forgetting_anything() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 10);
-        let mut state = CodeState::load(dir.path(), &boot).unwrap();
-        let last = MAX_CONSUMED_NONCES as u64 + 20;
-        for counter in 1..=last {
+    /// Tests that write the persisted state of the device.
+    ///
+    /// They need a platform whose file permissions can be checked, and that is a
+    /// property of the method rather than of the harness: the device key is kept
+    /// **without a password**, because codes have to be verified after a reboot
+    /// with nobody there to type one, so what protects it is the mode of the
+    /// files beside it. Outside Unix there is no mode word — the equivalent is a
+    /// DACL, and none is written here — so the writes below refuse by design.
+    /// See `codes::store`, `codes::lock` and the storage of `tessera_hashchain`,
+    /// where the same boundary is stated, and `platform_offers_the_method`,
+    /// which is where the product answers it.
+    ///
+    /// Reading the same state stays outside this group: a device that cannot
+    /// write a counter can still parse one, and those tests keep running
+    /// everywhere.
+    #[cfg(unix)]
+    mod persisted {
+        use super::super::{StateError, MAX_CONSUMED_NONCES, STATE_FILENAME};
+        use super::*;
+        use crate::codes::counter;
+        use tempfile::TempDir;
+
+        /// Issues one nonce and persists both files, the way the method does.
+        fn issue(dir: &TempDir, markers: &BootMarkers) -> u64 {
+            let mut state = CodeState::load(dir.path(), markers).unwrap();
+            let counter = state.next_counter().unwrap();
+            counter::write_issued(dir.path(), counter).unwrap();
+            state.record_issued(counter, markers.since_boot_secs());
+            state.save(dir.path()).unwrap();
+            counter
+        }
+
+        #[test]
+        fn the_counter_only_moves_forward_across_restarts() {
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 10);
+            assert_eq!(issue(&dir, &boot), 1);
+            assert_eq!(issue(&dir, &boot), 2);
+            // A new process on the same boot keeps counting where the last left off.
+            let state = CodeState::load(dir.path(), &boot).unwrap();
+            assert_eq!(state.next_counter().unwrap(), 3);
+            assert_eq!(state.pending_attempts().len(), 2);
+        }
+
+        #[test]
+        fn a_reboot_drops_pending_attempts_and_spends_their_nonces() {
+            let dir = tempfile::tempdir().unwrap();
+            let counter = issue(&dir, &markers("boot-a", 10));
+
+            let state = CodeState::load(dir.path(), &markers("boot-b", 3)).unwrap();
+            assert!(state.pending(counter).is_none());
+            assert!(state.is_consumed(counter));
+            // The counter itself survives: the nonce is spent, not re-issuable.
+            assert_eq!(state.next_counter().unwrap(), counter + 1);
+        }
+
+        #[test]
+        fn a_monotonic_clock_dragged_backwards_drops_pending_attempts() {
+            let dir = tempfile::tempdir().unwrap();
+            let counter = issue(&dir, &markers("boot-a", 500));
+
+            let state = CodeState::load(dir.path(), &markers("boot-a", 499)).unwrap();
+            assert!(state.pending(counter).is_none());
+            assert!(state.is_consumed(counter));
+        }
+
+        #[test]
+        fn a_spent_nonce_stays_spent_across_a_reboot() {
+            let dir = tempfile::tempdir().unwrap();
+            let counter = issue(&dir, &markers("boot-a", 10));
+            let mut state = CodeState::load(dir.path(), &markers("boot-a", 20)).unwrap();
             state.consume(counter);
+            state.save(dir.path()).unwrap();
+
+            let reloaded = CodeState::load(dir.path(), &markers("boot-b", 5)).unwrap();
+            assert!(reloaded.is_consumed(counter));
+            assert!(reloaded.pending(counter).is_none());
         }
-        for counter in 1..=last {
-            assert!(state.is_consumed(counter), "{counter} was forgotten");
+
+        #[test]
+        fn wrong_codes_accumulate_across_restarts() {
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 10);
+            let counter = issue(&dir, &boot);
+
+            let mut state = CodeState::load(dir.path(), &boot).unwrap();
+            assert_eq!(state.charge_attempt(counter), Some(1));
+            state.save(dir.path()).unwrap();
+
+            let mut reloaded = CodeState::load(dir.path(), &boot).unwrap();
+            assert_eq!(reloaded.pending(counter).unwrap().attempts_used, 1);
+            assert_eq!(reloaded.charge_attempt(counter), Some(2));
+            assert_eq!(reloaded.charge_attempt(u64::MAX), None);
         }
-        assert!(!state.is_consumed(last + 1));
 
-        state.save(dir.path()).unwrap();
-        let reloaded = CodeState::load(dir.path(), &boot).unwrap();
-        assert!(reloaded.is_consumed(1));
-        assert!(!reloaded.is_consumed(last + 1));
-    }
-
-    #[test]
-    fn a_state_file_of_unknown_shape_does_not_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 10);
-        issue(&dir, &boot);
-        let path = dir.path().join(STATE_FILENAME);
-
-        let good = std::fs::read_to_string(&path).unwrap();
-        for damaged in [
-            good.replace("tessera-codes/state/v1", "tessera-codes/state/v2"),
-            format!("{good}surprise=1\n"),
-            good.replace("issued=", "issued=x"),
-            good.replacen("boot=", "", 1),
-        ] {
-            std::fs::write(&path, damaged.as_bytes()).unwrap();
+        #[test]
+        fn a_counter_file_behind_the_state_is_a_rollback() {
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 10);
+            issue(&dir, &boot);
+            issue(&dir, &boot);
+            // The snapshot brought an older counter back while the state file kept
+            // the value the device really reached.
+            counter::write_issued(dir.path(), 1).unwrap();
             assert!(matches!(
                 CodeState::load(dir.path(), &boot),
-                Err(StateError::Corrupt { .. })
+                Err(StateError::Rollback)
             ));
         }
-    }
 
-    #[test]
-    fn the_state_round_trips_through_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 10);
-        let counter = issue(&dir, &boot);
-        let mut state = CodeState::load(dir.path(), &boot).unwrap();
-        state.charge_attempt(counter);
-        state.consume(2);
-        state.save(dir.path()).unwrap();
-        assert_eq!(CodeState::load(dir.path(), &boot).unwrap(), state);
+        #[test]
+        fn a_counter_file_ahead_of_the_state_is_survivable() {
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 10);
+            issue(&dir, &boot);
+            // A crash between the two writes: the counter advanced, the state file
+            // did not. The nonce is burned and none is repeated.
+            counter::write_issued(dir.path(), 9).unwrap();
+            let state = CodeState::load(dir.path(), &boot).unwrap();
+            assert_eq!(state.next_counter().unwrap(), 10);
+        }
+
+        #[test]
+        fn the_spent_set_folds_into_a_floor_without_forgetting_anything() {
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 10);
+            let mut state = CodeState::load(dir.path(), &boot).unwrap();
+            let last = MAX_CONSUMED_NONCES as u64 + 20;
+            for counter in 1..=last {
+                state.consume(counter);
+            }
+            for counter in 1..=last {
+                assert!(state.is_consumed(counter), "{counter} was forgotten");
+            }
+            assert!(!state.is_consumed(last + 1));
+
+            state.save(dir.path()).unwrap();
+            let reloaded = CodeState::load(dir.path(), &boot).unwrap();
+            assert!(reloaded.is_consumed(1));
+            assert!(!reloaded.is_consumed(last + 1));
+        }
+
+        #[test]
+        fn a_state_file_of_unknown_shape_does_not_load() {
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 10);
+            issue(&dir, &boot);
+            let path = dir.path().join(STATE_FILENAME);
+
+            let good = std::fs::read_to_string(&path).unwrap();
+            for damaged in [
+                good.replace("tessera-codes/state/v1", "tessera-codes/state/v2"),
+                format!("{good}surprise=1\n"),
+                good.replace("issued=", "issued=x"),
+                good.replacen("boot=", "", 1),
+            ] {
+                std::fs::write(&path, damaged.as_bytes()).unwrap();
+                assert!(matches!(
+                    CodeState::load(dir.path(), &boot),
+                    Err(StateError::Corrupt { .. })
+                ));
+            }
+        }
+
+        #[test]
+        fn the_state_round_trips_through_the_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 10);
+            let counter = issue(&dir, &boot);
+            let mut state = CodeState::load(dir.path(), &boot).unwrap();
+            state.charge_attempt(counter);
+            state.consume(2);
+            state.save(dir.path()).unwrap();
+            assert_eq!(CodeState::load(dir.path(), &boot).unwrap(), state);
+        }
     }
 }

@@ -1004,5 +1004,13 @@ fn read_markers() -> Result<BootMarkers, CodeLoginError> {
     })
 }
 
-#[cfg(test)]
+// Every test in this module stands up a real store, and a store is what this
+// platform cannot carry: the device key is kept without a password — codes are
+// verified after a reboot with nobody there to type one — so what protects it
+// is the mode of the files beside it, and outside Unix there is no mode word.
+// The product answers the same question in `platform_offers_the_method`, and
+// the same boundary is stated in `codes::store`, `codes::lock` and the storage
+// of `tessera_hashchain`. One gate for the module, because there is not one
+// test here that would still mean anything without the store.
+#[cfg(all(test, unix))]
 mod tests;
