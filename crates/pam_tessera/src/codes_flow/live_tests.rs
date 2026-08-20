@@ -1,0 +1,822 @@
+//! The branch driven against a real [`CodeMethod`] on real artefacts.
+//!
+//! The scripted tests next door check what the PAM half decides. These check
+//! the one thing a script cannot: what the method actually answers, and
+//! therefore what the branch actually returns to a stack.
+//!
+//! That distinction is not academic. Whether `PAM_MAXTRIES` is reachable at all
+//! turns on **when** the method reports an exhausted budget — on the last
+//! attempt it allowed, or on the call after it. A scripted method answers
+//! whichever way the test author assumed, so it can only restate the
+//! assumption. Here the assumption is removed: the codes are wrong because they
+//! are wrong, the counter is the persisted one, and the verdict is whatever the
+//! method really gives.
+//!
+//! The operator's side is played the way the telephone plays it — the challenge
+//! is taken from the text the branch **printed**, not from the attempt it holds
+//! privately, and the code is computed from that text with the contract crate.
+//! An e2e helper has no other way in either, so anything this fixture cannot do
+//! from the printed form, the helper will not be able to do on a stand.
+
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    reason = "a failed setup step in a test should fail the test on the spot, \
+              including from the helper that drives one attempt"
+)]
+
+use std::cell::RefCell;
+use std::time::Duration;
+
+use openssl::bn::{BigNum, BigNumContext};
+use openssl::ec::{EcGroup, EcKey, PointConversionForm};
+use openssl::nid::Nid;
+use openssl::pkey::{PKey, Private};
+use openssl::x509::{X509Builder, X509NameBuilder};
+use secrecy::SecretString;
+use tempfile::TempDir;
+
+use tessera_codes_contract::canon::Level;
+use tessera_codes_contract::challenge::Challenge;
+use tessera_codes_contract::code::compute_code;
+use tessera_codes_contract::device_number::CheckedDeviceNumber;
+use tessera_codes_contract::key::{derive_key, Epoch, KeyAgreement as _, KeyContext};
+use tessera_codes_contract::nonce::Nonce;
+use tessera_codes_contract::params::{FleetParams, FleetParamsInput};
+use tessera_codes_contract::profile::AlgorithmProfile;
+use tessera_codes_contract::signature::{PublicKey, Signature};
+use tessera_codes_contract::ticket::{
+    OperatorTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
+};
+use tessera_codes_contract::time::ClaimedTime;
+use tessera_core::codes::agreement::DeviceKeyAgreement;
+use tessera_core::codes::{CodeMethod, CodesConfig, CodesPaths, DeviceScope, LocalRoles};
+use tessera_core::ipc::{MonitorFailMode, StubClient};
+use tessera_core::pam_conv::PamConvError;
+use tessera_core::role::{AccountCheck, RoleOs, RoleStore, SystemAccounts, TrustMode};
+
+use super::{
+    authenticate_by_code, CodeConversation, CodeDeps, CodeFlowError, CodeLogin, DeviceProbe,
+    HostIdSourceKind, LevelError, SystemTime,
+};
+
+/// The fixture container carries no password, the way a stored one does: the
+/// PIN protects a container while it travels, and the import re-writes the key
+/// without one before it ever reaches the store.
+const STORED_CONTAINER_PASSWORD: &str = "";
+
+/// The login account, which is also the role.
+const ROLE: &str = "oper";
+
+/// The operator on the telephone.
+const OPERATOR: &str = "op-42";
+
+/// The level the fixture logs in at.
+const LEVEL: u32 = 1;
+
+/// A code that meets no key: eight digits the fixture never computes.
+const WRONG_CODE: &str = "00000000";
+
+/// A P-256 key pair, as a private key and its uncompressed public point.
+fn p256_pair() -> (PKey<Private>, Vec<u8>) {
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+    let key = EcKey::generate(&group).unwrap();
+    let mut context = BigNumContext::new().unwrap();
+    let point = key
+        .public_key()
+        .to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut context)
+        .unwrap();
+    (PKey::from_ec_key(key).unwrap(), point)
+}
+
+/// A PKCS#12 container holding `key` and a self-signed certificate for it.
+fn container(key: &PKey<Private>) -> Vec<u8> {
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_nid(Nid::COMMONNAME, "device 77-000123")
+        .unwrap();
+    let name = name.build();
+
+    let mut builder = X509Builder::new().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+    builder.set_pubkey(key).unwrap();
+    builder
+        .set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap())
+        .unwrap();
+    builder
+        .set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&openssl::asn1::Asn1Time::days_from_now(365).unwrap())
+        .unwrap();
+    builder
+        .sign(key, openssl::hash::MessageDigest::sha256())
+        .unwrap();
+    let cert = builder.build();
+
+    openssl::pkcs12::Pkcs12::builder()
+        .name("device")
+        .pkey(key)
+        .cert(&cert)
+        .build2(STORED_CONTAINER_PASSWORD)
+        .unwrap()
+        .to_der()
+        .unwrap()
+}
+
+/// The whole channel on disk, plus the operator's half in memory.
+struct LiveFixture {
+    _dir: TempDir,
+    store: RoleStore,
+    config: CodesConfig,
+    operator_key: PKey<Private>,
+    device_point: Vec<u8>,
+    ticket: SignedTicket,
+    /// A daemon that accepts every registration, so nothing in these tests
+    /// fails for a reason other than the channel itself.
+    monitor: StubClient,
+}
+
+impl LiveFixture {
+    /// Builds a fixture whose nonce allows `attempts` verifications.
+    fn with_attempts(attempts: u8) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodesPaths::under(dir.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+
+        let (device_key, device_point) = p256_pair();
+        std::fs::write(&paths.device_key_container, container(&device_key)).unwrap();
+
+        let (operator_key, operator_point) = p256_pair();
+        // Ed25519 for the fleet authority: pure EdDSA, which is the branch the
+        // anchor takes without a digest.
+        let authority = PKey::generate_ed25519().unwrap();
+        let ticket = sign_ticket(&authority, operator_point);
+        std::fs::write(&paths.tickets, format!("{}\n", ticket.to_wire())).unwrap();
+        std::fs::write(
+            &paths.ticket_authority,
+            authority.public_key_to_pem().unwrap(),
+        )
+        .unwrap();
+
+        let params = FleetParams::parse(FleetParamsInput {
+            attempts_per_nonce: attempts,
+            ..FleetParamsInput::defaults()
+        })
+        .unwrap();
+
+        let config = CodesConfig {
+            paths,
+            params,
+            device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
+            epoch: Epoch::new(7),
+            device_scope: DeviceScope {
+                tags: vec!["dc-1".to_owned()],
+                region: "ru-south".to_owned(),
+            },
+            code_ttl: Duration::from_mins(5),
+            gost_engine_path: None,
+        };
+
+        let roles_dir = dir.path().join("roles");
+        std::fs::create_dir_all(&roles_dir).unwrap();
+        std::fs::write(
+            roles_dir.join("oper.toml"),
+            b"role = \"oper\"\nversion = 1\nos = \"linux\"\nname = \"oper\"\nlevel = 1\n"
+                .as_slice(),
+        )
+        .unwrap();
+        let store = RoleStore::load(
+            &roles_dir,
+            RoleOs::Linux,
+            TrustMode::Standalone,
+            SystemAccounts::empty(),
+        )
+        .unwrap();
+
+        Self {
+            _dir: dir,
+            store,
+            config,
+            operator_key,
+            device_point,
+            ticket,
+            monitor: StubClient,
+        }
+    }
+
+    /// The same device whose key container the device cannot open — an
+    /// enrolment that went wrong, or a store damaged after it.
+    fn with_unopenable_key_container(self) -> Self {
+        std::fs::write(
+            &self.config.paths.device_key_container,
+            b"not a container at all".as_slice(),
+        )
+        .unwrap();
+        self
+    }
+
+    fn method(&self) -> CodeMethod {
+        CodeMethod::open(self.config.clone(), LocalRoles::from_store(&self.store)).unwrap()
+    }
+
+    fn deps(&self) -> CodeDeps<'_> {
+        CodeDeps {
+            config: &self.config,
+            store: &self.store,
+            accounts: AccountCheck::from_store(&self.store),
+            default_session_ttl: Duration::from_hours(12),
+            host_id_hash: "0123456789abcdef",
+            host_id_source: HostIdSourceKind::Override,
+            // A daemon that records everything: these tests are about the
+            // channel, and a registration failure here would only add a second
+            // reason for a login to fail.
+            monitor: &self.monitor,
+            monitor_fail_mode: MonitorFailMode::Strict,
+            pam_target: tessera_proto::SessionTarget::tty("/dev/tty3"),
+        }
+    }
+
+    /// What the operator's cabinet computes for a challenge it was read.
+    fn cabinet_code(&self, challenge: &Challenge) -> String {
+        let secret = DeviceKeyAgreement::new(&self.operator_key, AlgorithmProfile::P256)
+            .unwrap()
+            .agree(&self.device_point)
+            .unwrap();
+        let context = KeyContext::new(
+            &self.config.device_number,
+            self.config.epoch,
+            self.ticket.context_hash().unwrap(),
+        );
+        let key = derive_key(&secret, &context).unwrap();
+        compute_code(&key, &challenge.code_input(), &self.config.params)
+            .unwrap()
+            .as_str()
+            .to_owned()
+    }
+}
+
+/// Signs an operator ticket the way the fleet authority would.
+fn sign_ticket(authority: &PKey<Private>, operator_point: Vec<u8>) -> SignedTicket {
+    let ticket = OperatorTicket::new(
+        OPERATOR,
+        PublicKey::new(operator_point).unwrap(),
+        TicketScope::new(TicketScopeInput {
+            tags: vec!["dc-1".to_owned()],
+            roles: vec![ROLE.to_owned()],
+            region: "ru-south".to_owned(),
+            max_level: Level::new(LEVEL),
+        })
+        .unwrap(),
+        // Well past the moment the tests claim, so no run is refused by term.
+        ClaimedTime::new(1_800_000_000),
+        TicketNumber::parse("tk-17").unwrap(),
+    )
+    .unwrap();
+    let message = ticket.encode().unwrap();
+    let raw = openssl::sign::Signer::new_without_digest(authority)
+        .unwrap()
+        .sign_oneshot_to_vec(&message)
+        .unwrap();
+    SignedTicket::new(ticket, Signature::new(raw).unwrap())
+}
+
+/// Rebuilds a challenge out of the text the branch printed.
+///
+/// The spoken form is six fields separated by ` / `, with the device number and
+/// the nonce broken into groups of three for reading aloud. Everything an
+/// operator needs is in there and nothing else is: this function is the whole
+/// of what the cabinet — or an e2e helper scraping `PAM_TEXT_INFO` — has to do.
+fn challenge_from_spoken(spoken: &str, params: FleetParams) -> Challenge {
+    let line = spoken.lines().next_back().unwrap_or(spoken);
+    let fields: Vec<&str> = line.split(" / ").collect();
+    let [device, epoch, nonce, role, level, operator] = <[&str; 6]>::try_from(fields.as_slice())
+        .unwrap_or_else(|_| panic!("unexpected spoken form: {line}"));
+    let ungrouped = |text: &str| text.replace(' ', "");
+
+    Challenge::new(
+        CheckedDeviceNumber::parse(&ungrouped(device)).unwrap(),
+        Epoch::new(epoch.parse().unwrap()),
+        Nonce::parse(&ungrouped(nonce), &params).unwrap(),
+        role,
+        Level::new(level.parse().unwrap()),
+        operator,
+    )
+    .unwrap()
+}
+
+/// A device standing at [`LEVEL`] whose boot markers never move.
+struct SteadyDevice;
+
+impl DeviceProbe for SteadyDevice {
+    fn integrity_level(&self) -> Result<Level, LevelError> {
+        Ok(Level::new(LEVEL))
+    }
+
+    fn boot_markers(&self) -> Result<tessera_core::codes::boot::BootMarkers, std::io::Error> {
+        Ok(tessera_core::codes::boot::BootMarkers::new(
+            "boot-live",
+            Duration::from_mins(2),
+        ))
+    }
+}
+
+/// What the engineer types when the branch asks for a code.
+enum Typed {
+    /// A code that meets nothing.
+    Wrong,
+    /// The code the operator computed for the printed challenge.
+    Right,
+    /// The same code, written down the way it was dictated: in groups.
+    RightInGroups,
+}
+
+/// The engineer at the device: names the operator, reads the printed challenge
+/// down the telephone, and types back whatever the script says.
+struct Engineer<'a> {
+    fixture: &'a LiveFixture,
+    /// One entry per code prompt, in order.
+    script: RefCell<std::collections::VecDeque<Typed>>,
+    /// The challenge that was printed, once it has been.
+    printed: RefCell<Option<Challenge>>,
+    /// Whether the branch asked for anything in secret. It must not: the
+    /// device opens its own key, and an engineer has no secret to give.
+    asked_secret: RefCell<bool>,
+}
+
+impl<'a> Engineer<'a> {
+    fn new<I: IntoIterator<Item = Typed>>(fixture: &'a LiveFixture, script: I) -> Self {
+        Self {
+            fixture,
+            script: RefCell::new(script.into_iter().collect()),
+            printed: RefCell::new(None),
+            asked_secret: RefCell::new(false),
+        }
+    }
+}
+
+impl CodeConversation for Engineer<'_> {
+    fn show_info(&mut self, message: &str) {
+        if let Some(rest) = message.strip_prefix("Продиктуйте оператору:\n") {
+            *self.printed.borrow_mut() =
+                Some(challenge_from_spoken(rest, self.fixture.config.params));
+        }
+    }
+
+    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
+        if prompt == super::OPERATOR_PROMPT {
+            return Ok(OPERATOR.to_owned());
+        }
+        let Some(next) = self.script.borrow_mut().pop_front() else {
+            // The engineer gave up rather than keep typing.
+            return Err(PamConvError::ConvFailed);
+        };
+        Ok(match next {
+            Typed::Wrong => WRONG_CODE.to_owned(),
+            Typed::Right | Typed::RightInGroups => {
+                let printed = self.printed.borrow();
+                let challenge = printed
+                    .as_ref()
+                    .expect("the challenge is printed before the code is asked for");
+                let code = self.fixture.cabinet_code(challenge);
+                if matches!(next, Typed::RightInGroups) {
+                    // What an engineer actually writes on the pad in front of
+                    // them, and then types.
+                    let (head, tail) = code.split_at(code.len() / 2);
+                    format!("{head} {tail}")
+                } else {
+                    code
+                }
+            }
+        })
+    }
+
+    fn prompt_secret(&mut self, _prompt: &str) -> Result<SecretString, PamConvError> {
+        // Recorded rather than answered: the assertion belongs where a failing
+        // test can name what went wrong — see `drive`.
+        *self.asked_secret.borrow_mut() = true;
+        Err(PamConvError::ConvFailed)
+    }
+}
+
+/// An engineer who types one fixed code, whatever the device printed.
+struct Replay(String);
+
+impl CodeConversation for Replay {
+    fn show_info(&mut self, _message: &str) {}
+
+    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
+        if prompt == super::OPERATOR_PROMPT {
+            return Ok(OPERATOR.to_owned());
+        }
+        Ok(self.0.clone())
+    }
+
+    fn prompt_secret(&mut self, _prompt: &str) -> Result<SecretString, PamConvError> {
+        // Nothing should reach here; a branch that asks fails its own test on
+        // the refusal, which is the outcome that belongs in a `Result`.
+        Err(PamConvError::ConvFailed)
+    }
+}
+
+/// Drives one attempt against the real method.
+fn run<I: IntoIterator<Item = Typed>>(
+    fixture: &LiveFixture,
+    script: I,
+) -> Result<tessera_core::pam_data::AuthContext, CodeFlowError> {
+    drive(fixture, Engineer::new(fixture, script))
+}
+
+/// Drives one attempt with any conversation, holding the sink lock.
+///
+/// The lock matters more than it looks: the audit sink is one handle per
+/// process, so a login driven outside it meets whatever journal another test
+/// installed — and a journal with a zero ceiling refuses every record, which
+/// turns an unrelated test into a failure of this one.
+fn drive_conversation<C: super::CodeConversation>(
+    fixture: &LiveFixture,
+    conv: &mut C,
+) -> Result<tessera_core::pam_data::AuthContext, CodeFlowError> {
+    let _sink = super::test_sink::hold();
+    let method = fixture.method();
+    let login = CodeLogin {
+        pam_user: ROLE,
+        pam_service: "codeauth",
+        session_id: "sess-live".to_owned(),
+        now: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+    };
+    authenticate_by_code(&fixture.deps(), login, &method, conv, &SteadyDevice)
+        .map(|outcome| outcome.auth_ctx)
+}
+
+/// Drives one attempt with an engineer already built.
+fn drive(
+    fixture: &LiveFixture,
+    engineer: Engineer<'_>,
+) -> Result<tessera_core::pam_data::AuthContext, CodeFlowError> {
+    drive_with_config(fixture, engineer, "").0
+}
+
+/// Drives one attempt with the device's audit chain set up **from `audit_toml`
+/// the way a real device sets it up** — through the configuration layer and
+/// `sink::install_from_config`, never by handing the sink a journal directly.
+///
+/// That distinction is the whole point of this helper. A test that calls
+/// `sink::install` itself proves the journal works and proves nothing about
+/// whether a device ever gets one, which is exactly the gap that made the
+/// fail-closed contour dead on real hardware while these tests were green.
+/// Here the only way a journal reaches the sink is the way production reaches
+/// it, so a regression that unwires the install shows up as a failure.
+///
+/// `audit_toml` is the `[audit]` section as an operator would write it; an
+/// empty string means the device has no such section at all.
+///
+/// The sink lock is taken here and nowhere else: the sink is one handle per
+/// process, and a test holding it across a call into [`drive`] would deadlock
+/// against this.
+fn drive_with_config(
+    fixture: &LiveFixture,
+    mut engineer: Engineer<'_>,
+    audit_toml: &str,
+) -> (
+    Result<tessera_core::pam_data::AuthContext, CodeFlowError>,
+    bool,
+) {
+    let _sink = super::test_sink::hold();
+    let config = config_with_audit(audit_toml);
+    let installed = tessera_core::audit::sink::install_from_config(&config)
+        .expect("the audit journal described by the test configuration could not be opened");
+
+    let outcome = drive_locked(fixture, &mut engineer);
+    let _ = tessera_core::audit::sink::uninstall();
+    (outcome, installed)
+}
+
+/// The smallest configuration that validates, with `audit_toml` spliced in.
+///
+/// Built through `toml` + `ValidatedConfig::try_from` — the same two steps
+/// `load_validated_config` performs — so the `[audit]` section under test is
+/// parsed and validated by production code rather than by the test's idea of
+/// what the section means.
+fn config_with_audit(audit_toml: &str) -> tessera_core::config::ValidatedConfig {
+    // A trust anchor has to exist for the configuration to validate at all.
+    // Nothing here uses it — the code method authenticates without one — so the
+    // shortest well-formed PEM does.
+    const FAKE_PEM_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+        MIIBfTCCAS6gAwIBAgIUcheCkYc5VvuuVlZ8KqfA8R6Bvs8wCgYIKoZIzj0EAwIw\n\
+        -----END CERTIFICATE-----\n";
+    let anchors = tempfile::tempdir().expect("anchor directory");
+    let anchor = anchors.path().join("anchor.pem");
+    std::fs::write(&anchor, FAKE_PEM_CERT).expect("write the anchor");
+
+    let text = format!(
+        "crypto_backend = \"openssl\"\n\
+         mode = \"pkcs12\"\n\
+         pkcs12_path_pattern = \"{{user}}.p12\"\n\
+         [trust]\n\
+         anchors = [\"{anchor}\"]\n\
+         [trust.revocation]\n\
+         mode = \"none\"\n\
+         [host_identity]\n\
+         sources = [\"machine_id\"]\n\
+         [logging]\n\
+         level = \"info\"\n\
+         {audit_toml}",
+        anchor = anchor.display(),
+    );
+    let raw: tessera_core::config::RawConfig =
+        toml::from_str(&text).expect("the test configuration does not parse");
+    tessera_core::config::ValidatedConfig::try_from(&raw)
+        .expect("the test configuration does not validate")
+}
+
+/// The attempt itself, with the sink already held.
+fn drive_locked(
+    fixture: &LiveFixture,
+    engineer: &mut Engineer<'_>,
+) -> Result<tessera_core::pam_data::AuthContext, CodeFlowError> {
+    let method = fixture.method();
+    let login = CodeLogin {
+        pam_user: ROLE,
+        pam_service: "codeauth",
+        session_id: "sess-live".to_owned(),
+        now: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+    };
+    let outcome = authenticate_by_code(&fixture.deps(), login, &method, engineer, &SteadyDevice);
+    // Checked on every run rather than in one test of its own: an engineer at
+    // a device has no secret to give, and a device coming back from a power
+    // cut with nobody in front of it has nobody to ask.
+    assert!(
+        !*engineer.asked_secret.borrow(),
+        "the branch asked for something in secret; the device opens its own key",
+    );
+    outcome.map(|outcome| outcome.auth_ctx)
+}
+
+#[test]
+fn a_code_computed_from_the_printed_challenge_admits_the_engineer() {
+    // The whole channel, end to end: the branch prints, the cabinet computes
+    // from what was printed, the branch verifies. Nothing is scripted but the
+    // engineer's typing.
+    let fixture = LiveFixture::with_attempts(5);
+
+    let ctx = run(&fixture, [Typed::Right]).unwrap();
+
+    assert_eq!(ctx.role.as_ref().unwrap().role.as_str(), ROLE);
+    assert_eq!(
+        ctx.cert_max_integrity.unwrap().level,
+        i8::try_from(LEVEL).unwrap(),
+        "the ceiling of the session comes from the ticket the code was cut under",
+    );
+}
+
+#[test]
+fn every_allowed_attempt_spent_on_a_wrong_code_reports_max_tries() {
+    // The claim under test, and the reason this fixture exists: N wrong codes
+    // in ONE conversation must reach the stack as PAM_MAXTRIES (11). The method
+    // reports the exhausted budget on the last attempt it allowed — not on a
+    // call after it, of which there would be none, because the next
+    // `pam_sm_authenticate` raises a fresh nonce with a fresh budget.
+    for attempts in [2_u8, 3, 5] {
+        let fixture = LiveFixture::with_attempts(attempts);
+        let script = std::iter::repeat_with(|| Typed::Wrong).take(usize::from(attempts));
+
+        let Err(error) = run(&fixture, script) else {
+            panic!("{attempts} wrong codes must not admit anyone");
+        };
+
+        assert!(
+            matches!(error, CodeFlowError::AttemptsExhausted),
+            "budget of {attempts}: unexpected {error:?}",
+        );
+        assert_eq!(error.pam_code(), 11, "budget of {attempts}");
+    }
+}
+
+#[test]
+fn a_wrong_code_short_of_the_budget_is_not_an_exhausted_budget() {
+    // One wrong code out of five is an ordinary refusal. The engineer is asked
+    // again; here they give up instead, and what comes back must not claim the
+    // budget ran out — it did not, and an engineer told to stop trying would
+    // stop for nothing.
+    let fixture = LiveFixture::with_attempts(5);
+
+    let Err(error) = run(&fixture, [Typed::Wrong]) else {
+        panic!("a wrong code must not admit anyone");
+    };
+
+    assert!(
+        !matches!(error, CodeFlowError::AttemptsExhausted),
+        "a single wrong code reported an exhausted budget: {error:?}",
+    );
+    assert_ne!(error.pam_code(), 11);
+}
+
+#[test]
+fn refusals_that_cost_no_attempt_never_read_as_an_exhausted_budget() {
+    // A key container that will not open is the device's failure, not a wrong
+    // code, and the method charges the nonce nothing for it. The branch must
+    // pass that through: reporting PAM_MAXTRIES here would tell the engineer
+    // to stop trying about a device fault they cannot do anything about, and
+    // send an administrator looking for a spent nonce that is still untouched.
+    //
+    // This is the test that fails if the branch ever starts deciding
+    // exhaustion by counting its own prompts instead of reporting what the
+    // method said.
+    let fixture = LiveFixture::with_attempts(2).with_unopenable_key_container();
+    let engineer = Engineer::new(&fixture, [Typed::Wrong, Typed::Wrong]);
+
+    let Err(error) = drive(&fixture, engineer) else {
+        panic!("a container that will not open must not admit anyone");
+    };
+
+    assert!(
+        matches!(error, CodeFlowError::Denied),
+        "a refusal that costs no attempt was reported as {error:?}",
+    );
+    assert_eq!(error.pam_code(), 7);
+}
+
+#[test]
+fn the_last_allowed_attempt_still_admits_a_right_code() {
+    // The other side of the budget: spending every attempt but one and then
+    // getting it right is a successful login, not an exhausted nonce. A branch
+    // that reported exhaustion by counting its own prompts would fail here.
+    let fixture = LiveFixture::with_attempts(3);
+    let script = [Typed::Wrong, Typed::Wrong, Typed::Right];
+
+    let ctx = run(&fixture, script).unwrap();
+
+    assert_eq!(ctx.role.as_ref().unwrap().role.as_str(), ROLE);
+}
+
+#[test]
+fn a_second_conversation_cannot_replay_the_first_code() {
+    // The nonce of a successful login is spent, and the code cut for it is a
+    // code for a nonce that no longer exists.
+    // Both halves go through `drive`, which holds the sink lock: the audit
+    // sink is one handle per process, and a login driven outside the lock
+    // fails on whatever journal another test happens to have installed.
+    let fixture = LiveFixture::with_attempts(5);
+
+    let mut first = Engineer::new(&fixture, [Typed::Right]);
+    drive_conversation(&fixture, &mut first).unwrap();
+    let spent = first.printed.borrow().clone().unwrap();
+
+    // A fresh conversation raises a new challenge; the engineer types the code
+    // of the old one.
+    let mut replay = Replay(fixture.cabinet_code(&spent));
+    let outcome = drive_conversation(&fixture, &mut replay);
+
+    assert!(
+        outcome.is_err(),
+        "a code cut for a spent nonce must not admit anyone"
+    );
+}
+
+#[test]
+fn a_code_typed_in_the_groups_it_was_dictated_in_is_accepted() {
+    // The operator reads the code out in groups and the printed challenge is
+    // grouped too, so an engineer writes down "1234 5678" and types what they
+    // wrote. The contract alphabet holds no space, so without normalising the
+    // input this costs one attempt out of five for doing exactly what the
+    // channel encouraged — and the engineer cannot see what was wrong with it.
+    let fixture = LiveFixture::with_attempts(5);
+
+    let ctx = run(&fixture, [Typed::RightInGroups]).unwrap();
+
+    assert_eq!(ctx.role.as_ref().unwrap().role.as_str(), ROLE);
+}
+
+/// The audit chain as a load-bearing part of the decision to let somebody in.
+///
+/// The record of a successful login is not a report about the session — it is
+/// part of granting it. The control over an operator of the telephone channel
+/// is the reconciliation between the logins a fleet saw and the receipts its
+/// operators wrote, so a session that reached no journal is precisely the
+/// session an operator with something to hide would want.
+///
+/// **Every test here reaches the sink only through the configuration**, the
+/// way a device does. An earlier version of this module installed the journal
+/// by hand, and so stayed green while no production path installed one at all:
+/// the guarantee read as present and was absent. Going through
+/// `sink::install_from_config` means unwiring the install shows up here.
+mod fail_closed {
+    use super::{config_with_audit, drive_with_config, Engineer, LiveFixture, Typed};
+    use crate::codes_flow::CodeFlowError;
+
+    /// A device told to keep a journal it can write.
+    fn keeping_a_journal(dir: &std::path::Path) -> String {
+        format!(
+            "[audit]\nenabled = true\nfile = \"{}\"\n",
+            dir.join("audit.ndjson").display()
+        )
+    }
+
+    /// A device told to keep a journal that is already at its ceiling: the
+    /// ceiling is zero, so the very first record meets it, and the configured
+    /// behaviour is to refuse.
+    fn keeping_a_full_journal(dir: &std::path::Path) -> String {
+        format!(
+            "[audit]\nenabled = true\nfile = \"{}\"\nceiling_bytes = 0\nwhen_full = \"refuse\"\n",
+            dir.join("audit.ndjson").display()
+        )
+    }
+
+    #[test]
+    fn a_login_the_chain_will_not_record_is_refused() {
+        let fixture = LiveFixture::with_attempts(5);
+        let dir = tempfile::tempdir().unwrap();
+
+        let (outcome, installed) = drive_with_config(
+            &fixture,
+            Engineer::new(&fixture, [Typed::Right]),
+            &keeping_a_full_journal(dir.path()),
+        );
+        assert!(installed, "the configuration did not produce a journal");
+
+        // The code was right and every other step passed. The one thing that
+        // did not happen is the record, and that is enough to refuse.
+        let error = outcome.expect_err(
+            "a login the audit chain refused to record was granted anyway: the \
+             fail-closed rule is not wired to the boundary that returns the PAM result",
+        );
+        assert!(
+            matches!(error, CodeFlowError::Unaccountable(_)),
+            "refused for the wrong reason: {error}",
+        );
+        // The neighbour of an unregistered session, and the same code for it.
+        assert_eq!(error.pam_code(), 6);
+    }
+
+    #[test]
+    fn a_login_the_chain_records_is_granted_and_lands_on_the_chain() {
+        let fixture = LiveFixture::with_attempts(5);
+        let dir = tempfile::tempdir().unwrap();
+
+        let (outcome, installed) = drive_with_config(
+            &fixture,
+            Engineer::new(&fixture, [Typed::Right]),
+            &keeping_a_journal(dir.path()),
+        );
+        assert!(installed, "the configuration did not produce a journal");
+        outcome.expect("a login the chain accepted was refused");
+
+        // …and the record is really there, or the test above would pass for
+        // the trivial reason that nothing is ever written.
+        let written = std::fs::read_to_string(dir.path().join("audit.ndjson"))
+            .expect("the configured journal file was never created");
+        assert!(
+            written.contains(r#""op":"code_login""#) && written.contains(r#""outcome":"success""#),
+            "the granted login is not on the chain: {written}",
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_audit_section_authenticates_exactly_as_before() {
+        let fixture = LiveFixture::with_attempts(5);
+
+        // No `[audit]` section at all, and `[codes]` absent too, so the
+        // coupling resolves to "no journal". The chain is opt-in and its
+        // absence has never been what authorises a login — a device that was
+        // never given one must not be locked out by this change.
+        let (outcome, installed) =
+            drive_with_config(&fixture, Engineer::new(&fixture, [Typed::Right]), "");
+
+        assert!(!installed, "a device with no [audit] section got a journal");
+        outcome.expect("a device without an audit chain was refused a valid login");
+    }
+
+    /// The default is not "off": a device that offers the code method gets a
+    /// journal without anybody remembering to ask for one. That coupling is
+    /// the difference between a guarantee and a footnote — the method's whole
+    /// control model rests on the reconciliation this journal makes possible.
+    #[test]
+    fn enabling_the_code_method_enables_the_journal_by_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("audit.ndjson");
+
+        // `[codes].enabled = true` and no `[audit].enabled` anywhere.
+        let config = config_with_audit(&format!(
+            "[codes]\ntags = [\"site=dc1\"]\nenabled = true\ndevice_number = \"77000123S\"\nepoch = 7\n\
+             region = \"ru-central\"\n\
+             [audit]\nfile = \"{}\"\n",
+            file.display()
+        ));
+        assert!(
+            config.audit.policy.is_some(),
+            "a device offering the code method was left without a journal",
+        );
+
+        // …and turning it off explicitly is still allowed, or an operator with
+        // a reason would have no way to say so.
+        let off = config_with_audit(
+            "[codes]\ntags = [\"site=dc1\"]\nenabled = true\ndevice_number = \"77000123S\"\n\
+             epoch = 7\nregion = \"ru-central\"\n[audit]\nenabled = false\n",
+        );
+        assert!(off.audit.policy.is_none());
+    }
+}

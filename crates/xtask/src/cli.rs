@@ -20,6 +20,23 @@ pub enum Command {
     E2e(E2eArgs),
     /// Пересборка матрицы покрытия спек кейсами реестра.
     E2eCoverage(CoverageArgs),
+    /// Пересборка фикстур телефонного канала (сюита `27-codes-phone`).
+    CodesFixtures(CodesFixturesArgs),
+}
+
+/// Аргументы генератора фикстур телефонного канала.
+#[derive(Debug, Clone, clap::Args)]
+pub struct CodesFixturesArgs {
+    /// Каталог комплекта. Подменяется целиком.
+    #[arg(long, default_value = "crates/tessera_core/tests/fixtures/codes")]
+    pub out: PathBuf,
+
+    /// Роль-учётная запись, которую допускает билет оператора (можно повторить).
+    ///
+    /// По умолчанию — учётные записи профилей стенда. Задавать нужно, только
+    /// если прогон идёт под другой.
+    #[arg(long = "role")]
+    pub roles: Vec<String>,
 }
 
 /// Аргументы сборки матрицы покрытия.

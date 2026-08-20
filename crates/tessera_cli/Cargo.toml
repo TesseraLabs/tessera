@@ -22,6 +22,12 @@ mac-tests = ["tessera_core/mac-tests"]
 
 [dependencies]
 tessera_core = { path = "../tessera_core", version = "0.5.0" }
+# `tessera audit verify` reports the chain status the shared crate defines; the
+# CLI names those states, so it names the type they come from.
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.5.0" }
+# `audit attest` records when the head was signed; the device's own clock is the
+# only one it has.
+chrono = { workspace = true }
 tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time", "sync", "process"] }
 tokio-util = { workspace = true, features = ["rt"] }
@@ -46,6 +52,7 @@ async-trait = "0.1"
 libc = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+secrecy = { workspace = true }
 openssl = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ab_glyph_rasterizer = "0.1"

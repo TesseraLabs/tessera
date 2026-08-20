@@ -2,10 +2,14 @@
 //! `pam_sm_*` entry points can lift PAM_USER and PAM_SERVICE off a live
 //! handle without scattering `unsafe` blocks across the call sites.
 //!
-//! Read-only by design: there is deliberately no `pam_set_item` binding. The
-//! module never rewrites the user name the stack read, because the difference
-//! between the name before and after such a rewrite is exactly what other
-//! modules in the stack can observe (the polkit CVE-2021-3560 class).
+//! Read-only about identity by design: there is deliberately no
+//! `pam_set_item` binding. The module never rewrites the user name the stack
+//! read, because the difference between the name before and after such a
+//! rewrite is exactly what other modules in the stack can observe (the polkit
+//! CVE-2021-3560 class).
+//!
+//! [`set_fail_delay`] is the one call here that writes, and it writes nothing
+//! the stack reads as identity: it asks libpam to slow a refusal down.
 //!
 //! Only compiled on Linux (where `pam-sys` is available).
 
@@ -41,6 +45,11 @@ extern "C" {
         user: *mut *const c_char,
         prompt: *const c_char,
     ) -> c_int;
+
+    /// Sets the delay libpam applies when this transaction ends in a refusal.
+    ///
+    /// Re-declared for the same reason as the calls above.
+    fn pam_fail_delay(pamh: *mut pam_sys::pam_handle_t, usec: std::os::raw::c_uint) -> c_int;
 
     /// Same rationale as [`pam_get_user`] above.
     fn pam_get_item(
@@ -232,5 +241,88 @@ mod tests {
     #[test]
     fn data_key_rejects_interior_nul() {
         assert!(data_key_cstring("bad\0key").is_err());
+    }
+}
+
+/// The delay in microseconds, as `pam_fail_delay` takes it.
+///
+/// Saturating rather than wrapping: a delay so long that it leaves the range
+/// would otherwise come out as a short one — or none — and a refusal that
+/// answers instantly is exactly what the delay exists to prevent.
+#[must_use]
+pub fn fail_delay_micros(delay: std::time::Duration) -> std::os::raw::c_uint {
+    std::os::raw::c_uint::try_from(delay.as_micros()).unwrap_or(std::os::raw::c_uint::MAX)
+}
+
+/// Ask libpam to delay this transaction by `delay` if it ends in a refusal.
+///
+/// libpam applies the delay itself, and **only when the transaction fails** —
+/// so this is called once, unconditionally, before anything can refuse, rather
+/// than on each refusing branch. Two reasons, and the second is the point:
+///
+/// - a list of branches to delay is a list the next branch added will not be
+///   on, and it fails open;
+/// - the refusals of the code method are many and of different cost — no
+///   ticket, scope that does not cover, a revoked ticket, a code that does not
+///   meet, a spent budget, a role briefly locked. If some answer at once and
+///   others after a wait, the wait itself tells a caller which happened, and
+///   several of those answers would disclose that a role and a ticket exist
+///   before anything has been authenticated.
+///
+/// The randomisation is libpam's and is the reason for using it rather than
+/// sleeping here: a fixed sleep is as good a clock to measure against as no
+/// sleep at all.
+///
+/// A successful login pays nothing: libpam never applies the delay to one.
+///
+/// # Safety
+///
+/// `pamh` must be the live PAM handle of the current `pam_sm_*` callback.
+///
+/// # Errors
+///
+/// [`PamHelperError::PamRc`] when libpam refuses the call. The caller treats
+/// it as best-effort — a refusal that could not be slowed down is still a
+/// refusal — but it is worth a line in the journal.
+pub unsafe fn set_fail_delay(
+    pamh: *mut pam_sys::pam_handle_t,
+    delay: std::time::Duration,
+) -> Result<(), PamHelperError> {
+    // SAFETY: `pamh` is the live PAM handle (caller contract); the second
+    // argument is a plain integer.
+    let rc = unsafe { pam_fail_delay(pamh, fail_delay_micros(delay)) };
+    if rc == PAM_SUCCESS {
+        Ok(())
+    } else {
+        Err(PamHelperError::PamRc(rc))
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "a failed setup step in a test should fail the test on the spot"
+)]
+mod fail_delay_tests {
+    use super::fail_delay_micros;
+    use std::time::Duration;
+
+    #[test]
+    fn the_configured_delay_survives_the_conversion() {
+        // The value the throttle publishes is the value libpam is handed:
+        // a second constant here would drift from it silently.
+        assert_eq!(
+            fail_delay_micros(tessera_core::codes::throttle::FAILURE_DELAY),
+            u32::try_from(tessera_core::codes::throttle::FAILURE_DELAY.as_micros()).unwrap(),
+        );
+        assert!(fail_delay_micros(tessera_core::codes::throttle::FAILURE_DELAY) > 0);
+    }
+
+    #[test]
+    fn a_delay_beyond_the_range_saturates_rather_than_wrapping() {
+        // Wrapping would turn a very long delay into a very short one, which
+        // is the one outcome a delay must never produce.
+        assert_eq!(fail_delay_micros(Duration::MAX), std::os::raw::c_uint::MAX);
+        assert_eq!(fail_delay_micros(Duration::ZERO), 0);
     }
 }

@@ -32,9 +32,19 @@ serde_norway = "0.9"
 # Безопасная регистрация обработчика сигнала: перехват Ctrl-C нужен, чтобы
 # teardown отработал, а поднимать ради этого unsafe-обёртку над sigaction незачем.
 signal-hook = { version = "0.3", default-features = false }
+# Генератор фикстур телефонного канала собирает документы контракта и контейнер
+# ключа устройства теми же крейтами, что читают их продукт и устройство: своей
+# сериализации, своих подписей и своей сборки PKCS#12 у генератора нет.
+tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.5.0" }
+tessera_issuer = { path = "../tessera_issuer", version = "0.5.0" }
+tessera_ext = { path = "../tessera_ext", version = "0.5.0" }
+# Ключи фикстур: генерация, подписи документов и запись в PKCS#8/SPKI PEM.
+p256 = { workspace = true, features = ["pem"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Тест связности комплекта читает PEM-якоря обратно в DER.
+base64 = { workspace = true }
 
 [lints.rust]
 missing_docs = "warn"

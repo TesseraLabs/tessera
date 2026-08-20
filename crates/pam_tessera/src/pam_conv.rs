@@ -30,6 +30,7 @@ use tessera_core::pam_conv::PamConvError;
 const PAM_SUCCESS: c_int = pam_sys::PAM_SUCCESS as c_int;
 const PAM_CONV: c_int = pam_sys::PAM_CONV as c_int;
 const PAM_PROMPT_ECHO_OFF: c_int = pam_sys::PAM_PROMPT_ECHO_OFF as c_int;
+const PAM_PROMPT_ECHO_ON: c_int = pam_sys::PAM_PROMPT_ECHO_ON as c_int;
 const PAM_TEXT_INFO: c_int = pam_sys::PAM_TEXT_INFO as c_int;
 
 // ----- ABI-compatible struct shapes ------------------------------------------
@@ -99,6 +100,56 @@ pub unsafe fn prompt_pin(
     pamh: *mut pam_sys::pam_handle_t,
     prompt: &str,
 ) -> Result<SecretString, PamConvError> {
+    // SAFETY: `pamh` is the live PAM handle (caller contract).
+    let answer = unsafe { converse(pamh, PAM_PROMPT_ECHO_OFF, prompt) }?;
+    Ok(SecretString::from(answer))
+}
+
+/// Ask the user for a value that is meant to be seen while it is typed.
+///
+/// The code read back over the telephone is one: it is spoken aloud in the
+/// same room a moment earlier, so hiding it on screen buys nothing and costs
+/// the engineer the ability to check what they typed before an attempt of a
+/// small budget is spent on a typo.
+///
+/// The answer is returned verbatim and unbounded — PAM caps a response at
+/// `PAM_MAX_RESP_SIZE` and nothing here narrows that further, because what
+/// counts as too long is the caller's question, not the conversation's.
+///
+/// # Safety
+///
+/// Same contract as [`prompt_pin`].
+///
+/// # Errors
+///
+/// * [`PamConvError::NoConv`] — PAM did not return a `pam_conv` item.
+/// * [`PamConvError::ConvFailed`] — the conv callback returned non-success
+///   or produced a NULL response (which is also how a cancelled prompt
+///   arrives).
+/// * [`PamConvError::NonUtf8`] — the response is not valid UTF-8.
+pub unsafe fn prompt_visible(
+    pamh: *mut pam_sys::pam_handle_t,
+    prompt: &str,
+) -> Result<String, PamConvError> {
+    // SAFETY: `pamh` is the live PAM handle (caller contract).
+    unsafe { converse(pamh, PAM_PROMPT_ECHO_ON, prompt) }
+}
+
+/// Drive one prompt of the live PAM conversation and return the answer.
+///
+/// The PAM-allocated response buffer is overwritten with zeros before it is
+/// freed on every path, including the UTF-8 failure: the shared helper serves
+/// the PIN prompt as well, and a buffer that is wiped only sometimes is a
+/// buffer that is not wiped.
+///
+/// # Safety
+///
+/// `pamh` must be the live PAM handle handed to a `pam_sm_*` callback.
+unsafe fn converse(
+    pamh: *mut pam_sys::pam_handle_t,
+    style: c_int,
+    prompt: &str,
+) -> Result<String, PamConvError> {
     let mut conv_ptr: *const c_void = std::ptr::null();
     // SAFETY: PAM guarantees `pamh` is non-null and `pam_get_item` accepts a
     // valid out-pointer.  We initialise `conv_ptr` to NULL and check the rc
@@ -118,7 +169,7 @@ pub unsafe fn prompt_pin(
     // which would be a programmer error.
     let c_prompt = CString::new(prompt).map_err(|_| PamConvError::ConvFailed)?;
     let msg = PamMessage {
-        msg_style: PAM_PROMPT_ECHO_OFF,
+        msg_style: style,
         msg: c_prompt.as_ptr(),
     };
     // PAM expects an array-of-pointers.  Use a stack-allocated 1-elem array.
@@ -143,14 +194,14 @@ pub unsafe fn prompt_pin(
     }
 
     // SAFETY: `resp.resp` is a non-null PAM-allocated NUL-terminated buffer.
-    let pin_cstr = unsafe { CStr::from_ptr(resp.resp) };
-    let pin_result = pin_cstr.to_str().map(str::to_string);
+    let answer_cstr = unsafe { CStr::from_ptr(resp.resp) };
+    let answer_result = answer_cstr.to_str().map(str::to_string);
 
     // Always overwrite the PAM-allocated buffer before freeing — even on the
     // UTF-8-error path — to keep the PIN out of process memory longer than
     // strictly necessary.  The buffer is always at least one byte (the NUL
     // terminator).
-    let len = pin_cstr.to_bytes().len();
+    let len = answer_cstr.to_bytes().len();
     if len > 0 {
         // SAFETY: `resp.resp` is a PAM-allocated buffer of at least `len`
         // bytes; we own it until the `free` calls below.
@@ -161,8 +212,7 @@ pub unsafe fn prompt_pin(
     // SAFETY: `resp_ptr` is the PAM-allocated `pam_response` we own.
     unsafe { free(resp_ptr.cast::<c_void>()) };
 
-    let pin_str = pin_result.map_err(|_| PamConvError::NonUtf8)?;
-    Ok(SecretString::from(pin_str))
+    answer_result.map_err(|_| PamConvError::NonUtf8)
 }
 
 /// Emit a `PAM_TEXT_INFO` message to the live PAM conversation handle.

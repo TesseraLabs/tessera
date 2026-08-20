@@ -1,0 +1,146 @@
+suite: audit-chain
+description: >
+  Hash-chained журнал устройства: запись, обнаружение вырезанной записи,
+  явное сообщение о заполнении, заверение головы ключом устройства.
+  Кейсы работают через `tessera audit` на журнале во временном каталоге —
+  живой PAM-стек им не нужен, нужен установленный пакет с этой подкомандой.
+setup: [install-package]
+
+# Suite заведён вместе с change'ом audit-chain. Ожидания измерены на локальной
+# сборке (`tessera audit annotate|verify|status|attest`), но стенд ставит .deb из
+# релизных артефактов main, где подкоманды `audit` ещё нет: до мержа кейсы
+# красные по этой одной причине. Подгонять их под факт нельзя.
+
+cases:
+  - id: AUD-001
+    title: Вырезанная из журнала запись обнаруживается верификацией
+    requirement: openspec/specs/audit-chain/spec.md
+    steps:
+      - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
+      - run: tessera audit annotate --file /tmp/tessera-audit/audit.ndjson --kind e2e.audit --data '{"n":1}'
+        expect: { exit_code: 0, stdout_matches: "status: recorded" }
+      - run: tessera audit annotate --file /tmp/tessera-audit/audit.ndjson --kind e2e.audit --data '{"n":2}'
+        expect: { exit_code: 0, stdout_matches: "status: recorded" }
+      - run: tessera audit annotate --file /tmp/tessera-audit/audit.ndjson --kind e2e.audit --data '{"n":3}'
+        expect: { exit_code: 0, stdout_matches: "status: recorded" }
+      # Целая цепочка: незаверённый хвост — это норма живого устройства, а не отказ.
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 0, stdout_matches: "status: intact" }
+      # Ровно то, ради чего цепочка и заводится: строку вынули из середины.
+      - run: sed -i '2d' /tmp/tessera-audit/audit.ndjson
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 1, stdout_matches: "status: broken" }
+      # Позиция первого разрыва — это то, с чем аудитор идёт дальше.
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 1, stdout_matches: "first invalid record: 1" }
+    teardown:
+      - run: rm -rf /tmp/tessera-audit
+
+  - id: AUD-002
+    title: Заполненный журнал сообщает об этом явно, а не молчит
+    requirement: openspec/specs/audit-chain/spec.md
+    steps:
+      - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
+      - run: helpers/audit-fill.sh /tmp/tessera-audit/audit.ndjson 300
+        expect: { exit_code: 3, stdout_matches: "status: full" }
+      # Факт заполнения лежит в самой цепочке, а не только в диагностике: его
+      # удаление так же обнаружимо, как удаление любой другой записи.
+      - run: grep -c '"op":"journal_full"' /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 0, stdout_matches: "^1$" }
+      - run: tessera audit status --file /tmp/tessera-audit/audit.ndjson --ceiling-bytes 300
+        expect: { exit_code: 0, stdout_matches: "full: yes" }
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 0, stdout_matches: "status: intact" }
+    teardown:
+      - run: rm -rf /tmp/tessera-audit
+
+  - id: AUD-003
+    title: Ротация заполненного журнала оставляет запись об обрыве цепочки
+    requirement: openspec/specs/audit-chain/spec.md
+    steps:
+      - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
+      - run: helpers/audit-fill.sh /tmp/tessera-audit/audit.ndjson 300 rotate
+        expect: { exit_code: 0 }
+      - run: test -f /tmp/tessera-audit/audit.ndjson.1
+        expect: { exit_code: 0 }
+      # Молчаливой ротации быть не должно: новая цепочка ОТКРЫВАЕТСЯ записью о том,
+      # что было отрезано и куда оно уехало.
+      - run: head -1 /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 0, stdout_matches: '"op":"chain_break".*"previous_entries"' }
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson.1
+        expect: { exit_code: 0, stdout_matches: "status: intact" }
+    teardown:
+      - run: rm -rf /tmp/tessera-audit
+
+  - id: AUD-004
+    title: Заверение головы отличает заверенную цепочку от незаверённого хвоста
+    requirement: openspec/specs/audit-chain/spec.md
+    steps:
+      - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
+      - run: openssl ecparam -name prime256v1 -genkey -noout -out /tmp/tessera-audit/attestation.pem
+      - run: tessera audit annotate --file /tmp/tessera-audit/audit.ndjson --kind e2e.audit --data '{"n":1}'
+        expect: { exit_code: 0, stdout_matches: "status: recorded" }
+      # До первого заверения хвост не покрыт ничем, и верификация говорит именно это.
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 0, stdout_matches: "records from seq 0 are not yet attested" }
+      - run: tessera audit attest --file /tmp/tessera-audit/audit.ndjson --key /tmp/tessera-audit/attestation.pem
+        expect: { exit_code: 0, stdout_matches: "attested_ts: [0-9]+" }
+      # «Покрыто подписью» — утверждение о ПРИСУТСТВИИ строки заверения, и без
+      # ключа больше ничем не является: цепочка не ключевая, её пересчитывает
+      # любой, кто может писать в файл. Поэтому кейс требует, чтобы вывод без
+      # ключа честно говорил, что подпись не проверялась.
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 0, stdout_matches: "attestation: not checked" }
+      # А с открытой половиной ключа — проверялась и сошлась.
+      - run: openssl ec -in /tmp/tessera-audit/attestation.pem -pubout -out /tmp/tessera-audit/attestation.pub.pem
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson --attestation-key /tmp/tessera-audit/attestation.pub.pem
+        expect: { exit_code: 0, stdout_matches: "attestation: verified" }
+      # Подпись чужим ключом отвергается — иначе проверка ничего не значит.
+      - run: openssl ecparam -name prime256v1 -genkey -noout -out /tmp/tessera-audit/other.pem
+      - run: openssl ec -in /tmp/tessera-audit/other.pem -pubout -out /tmp/tessera-audit/other.pub.pem
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson --attestation-key /tmp/tessera-audit/other.pub.pem
+        expect: { exit_code: 1, stdout_matches: "attestation: failed at record" }
+      # Заверение — не оправдание для подмены: заверенная цепочка ломается так же.
+      - run: sed -i '1d' /tmp/tessera-audit/audit.ndjson
+      - run: tessera audit verify --file /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 1, stdout_matches: "status: broken" }
+    teardown:
+      - run: rm -rf /tmp/tessera-audit
+
+  # Единственный кейс сюиты, который проверяет НЕ инструмент, а устройство:
+  # что настроенный `[audit]` действительно доезжает до PAM-модуля и вход по
+  # коду ложится в цепочку. Юнит-тесты этого места не покрывают — они зовут
+  # `install_from_config` напрямую, а здесь работает то, что вызывает её из
+  # `pam_sm_authenticate`. Ровно тот шов, на котором контур однажды уже оказался
+  # мёртвым при зелёных тестах.
+  - id: AUD-006
+    title: Вход по коду ложится в журнал устройства
+    requirement: openspec/specs/audit-chain/spec.md
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes --with-audit-chain
+      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      # Запись именно с операцией `code_login` и исходом `success` — то, по чему
+      # сверка ищет вход без квитанции.
+      - run: grep -c '"op":"code_login".*"outcome":"success"' /var/lib/tessera/audit.ndjson
+        expect: { exit_code: 0, stdout_matches: "^1$" }
+      - run: tessera audit verify --file /var/lib/tessera/audit.ndjson
+        expect: { exit_code: 0, stdout_matches: "status: intact" }
+    teardown:
+      - run: helpers/codes-phone.sh cleanup
+
+  - id: AUD-005
+    title: Секрет не попадает в журнал даже через аннотацию
+    requirement: openspec/specs/audit-chain/spec.md
+    steps:
+      - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
+      # Значение здесь не секрет — секретно ИМЯ поля, и отказ идёт по нему.
+      - run: tessera audit annotate --file /tmp/tessera-audit/audit.ndjson --kind e2e.audit --data '{"calls":[{"derived_key":"x"}]}'
+        expect: { exit_code: 2, stderr_matches: "calls\\[0\\].derived_key" }
+      # Отказ обязан быть полным: файла не должно появиться вовсе.
+      - run: test ! -e /tmp/tessera-audit/audit.ndjson
+        expect: { exit_code: 0 }
+    teardown:
+      - run: rm -rf /tmp/tessera-audit

@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/tessera_codes_contract",
     "crates/tessera_core",
     "crates/tessera_ext",
+    "crates/tessera_hashchain",
     "crates/tessera_issuer",
     "crates/tessera_proto",
     "crates/pam_tessera",
@@ -18,8 +20,10 @@ members = [
 # `-p xtask` / `-p tessera_pkcs11_liar`, поэтому не удлиняют ни сборку пакета,
 # ни прогон unit-тестов продукта.
 default-members = [
+    "crates/tessera_codes_contract",
     "crates/tessera_core",
     "crates/tessera_ext",
+    "crates/tessera_hashchain",
     "crates/tessera_issuer",
     "crates/tessera_proto",
     "crates/pam_tessera",

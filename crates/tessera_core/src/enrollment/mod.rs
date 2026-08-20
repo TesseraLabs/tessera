@@ -18,9 +18,11 @@
 //! its prior consistent state.
 
 pub mod audit;
+pub mod codes;
 pub mod import;
 
+pub use codes::{MAX_KEY_CONTAINER_BYTES, STANDALONE_CODES_FILENAME};
 pub use import::{
-    installed_managed_tags, EnrollmentPackage, ImportError, ImportMode, ImportOutcome,
+    installed_managed_tags, CodesImport, EnrollmentPackage, ImportError, ImportMode, ImportOutcome,
     InstallPaths, DEFAULT_CRL_PATH, DEFAULT_P12_PATH, MAX_CRL_BYTES, MAX_P12_BYTES,
 };
