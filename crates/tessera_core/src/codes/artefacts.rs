@@ -208,6 +208,20 @@ pub enum ArtefactError {
         /// Epoch the device has accepted.
         persisted: u32,
     },
+    /// The delivery names an epoch below the one the configuration runs on.
+    ///
+    /// Distinct from [`ArtefactError::EpochRollback`], which compares against
+    /// the epoch the device has already accepted: this one is about a device
+    /// that has no epoch file yet, where the configuration is the only floor
+    /// there is. Writing the older epoch down would leave the device refusing
+    /// every login afterwards.
+    #[error("key epoch behind the configuration: the delivery names {delivered} and the configuration runs on {configured}")]
+    EpochBehindConfigured {
+        /// Epoch of the consignment.
+        delivered: u32,
+        /// Epoch named by the configuration of the device.
+        configured: u32,
+    },
     /// The delivered revocation list has lost a number the device applies.
     #[error("the delivered ticket revocation list is older than the applied one")]
     RevocationRollback,
@@ -255,6 +269,8 @@ pub enum ArtefactError {
 /// # Errors
 ///
 /// [`ArtefactError::EpochRollback`] for a key epoch below the accepted one,
+/// [`ArtefactError::EpochBehindConfigured`] for a key epoch below the one the
+/// configuration runs on when the device has no epoch file yet,
 /// [`ArtefactError::RevocationRollback`] for a revocation list that lost a
 /// number, [`ArtefactError::Container`] when the delivery container does not
 /// open with the PIN, [`ArtefactError::Tickets`] for an artefact that does not
@@ -268,6 +284,7 @@ pub fn apply(
     delivery: &CodesDelivery,
     gost_engine_path: Option<&Path>,
     check: StoreCheck,
+    configured_epoch: Option<Epoch>,
 ) -> Result<Applied, ArtefactError> {
     if delivery.is_empty() {
         return Ok(Applied {
@@ -300,7 +317,12 @@ pub fn apply(
         path: paths.state_dir.display().to_string(),
         reason: error.to_string(),
     })?;
-    let plan = plan_key(delivery.key.as_ref(), persisted, has_spoken(paths))?;
+    let plan = plan_key(
+        delivery.key.as_ref(),
+        persisted,
+        has_spoken(paths),
+        configured_epoch,
+    )?;
     check_delivered_artefacts(paths, delivery)?;
     let stored_key = match (&delivery.key, plan.write_key) {
         (Some(key), true) => Some(restore_key(key, gost_engine_path)?),
@@ -451,6 +473,7 @@ fn plan_key(
     key: Option<&DeliveredKey>,
     persisted: Option<Epoch>,
     has_spoken: bool,
+    configured: Option<Epoch>,
 ) -> Result<KeyPlan, ArtefactError> {
     let Some(key) = key else {
         return Ok(KeyPlan {
@@ -460,6 +483,22 @@ fn plan_key(
     };
 
     if persisted.is_none() && has_spoken {
+        // The only floor such a device has is the epoch in its configuration:
+        // there is no epoch file to compare against, and the delivery is about
+        // to create one. Without this check an older epoch is written down
+        // happily, and every login afterwards refuses — `epoch::effective`
+        // finds the configuration ahead of the store and says so. That is a
+        // device taken out of service by a careful administrator applying a
+        // stale package, with no attack anywhere in the story, and the way back
+        // is editing files on the machine.
+        if let Some(configured) = configured {
+            if key.epoch < configured {
+                return Err(ArtefactError::EpochBehindConfigured {
+                    delivered: key.epoch.get(),
+                    configured: configured.get(),
+                });
+            }
+        }
         return Ok(KeyPlan {
             write_key: true,
             persist_epoch: Some(key.epoch),
@@ -828,6 +867,7 @@ mod platform_tests {
             &CodesDelivery::default(),
             None,
             StoreCheck::Enforced,
+            None,
         )
         .unwrap();
 

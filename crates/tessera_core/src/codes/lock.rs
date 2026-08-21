@@ -71,11 +71,14 @@ const LOCK_MODE: u32 = 0o600;
 
 /// Longest a login waits for another process to finish its transaction.
 ///
+/// Public because the caller turns a wait that reached it into the refusal that
+/// says how long to wait, and the two numbers have to be one.
+///
 /// One transaction is a handful of small file operations plus, on the
 /// verification path, one key agreement — milliseconds. A wait that reaches
 /// this bound means the holder is not making progress, and waiting longer would
 /// only move the failure from "refused" to "hung".
-const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to sleep between attempts while waiting.
 ///

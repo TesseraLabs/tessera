@@ -178,6 +178,25 @@ impl Grant {
     /// or carries a character the format cannot hold.
     pub fn new(fields: GrantFields<'_>) -> Result<Self, GrantError> {
         wire::check_free_text("server", fields.server_id)?;
+
+        // A confirmation by the engineer who asked is not a confirmation. The
+        // rule belongs here and not on the issuing side, because here is where
+        // the request and the confirmation are in one value: the server that
+        // would otherwise enforce it does not exist yet, and an invariant
+        // nobody can express is an invariant nobody keeps.
+        //
+        // What this is NOT: byte equality of identifiers is a necessary rule,
+        // not a sufficient one. Two spellings of one person — a login and a
+        // personal number, the same name in two registers — pass it, and the
+        // four-eyes rule this serves lives where identities are resolved into
+        // keys. This closes the case where the document says outright that one
+        // party did both.
+        if let Some(confirmation) = &fields.confirmation {
+            if confirmation.confirmer_id() == fields.request.request().engineer_id() {
+                return Err(GrantError::SelfConfirmation);
+            }
+        }
+
         Ok(Self {
             request: fields.request,
             server_id: fields.server_id.to_owned(),
@@ -412,6 +431,9 @@ pub enum GrantError {
     /// The confirmer is spelled exactly like the absence of one.
     #[error("the confirmer is spelled like the absence of a confirmation")]
     ConfirmerSpelling,
+    /// The confirmer of the grant is the engineer who asked for it.
+    #[error("the confirmation names the engineer who made the request; a second signature by the same party is not a second pair of eyes")]
+    SelfConfirmation,
     /// The wire form is not well formed.
     #[error(transparent)]
     Wire(#[from] WireError),
@@ -586,6 +608,50 @@ mod tests {
             other_attempt.confirmer_message().unwrap(),
             "a confirmation carried to another attempt must not cover it"
         );
+    }
+
+    #[test]
+    fn an_engineer_cannot_confirm_their_own_request() {
+        // The four-eyes rule the confirmation exists for, at the one point of
+        // this contract where both parties are in the same value.
+        let engineer = signed_request().request().engineer_id().to_owned();
+        assert_eq!(
+            Grant::new(GrantFields {
+                request: signed_request(),
+                server_id: "srv-1",
+                server_signature: Signature::new(vec![0x11, 0x22]).unwrap(),
+                confirmation: Some(
+                    Confirmation::by(&engineer, Signature::new(vec![0x33, 0x44]).unwrap()).unwrap(),
+                ),
+            })
+            .map(|_| ()),
+            Err(GrantError::SelfConfirmation)
+        );
+
+        // The wire form is refused for the same reason: a document assembled
+        // elsewhere goes through the same constructor.
+        let text = confirmed()
+            .to_wire()
+            .replace("confirmer=duty-officer", &format!("confirmer={engineer}"));
+        assert_eq!(
+            Grant::parse(&text, &params()),
+            Err(GrantError::SelfConfirmation)
+        );
+    }
+
+    #[test]
+    fn a_confirmation_by_anybody_else_is_accepted() {
+        // The other direction: the rule may not grow into a taste for
+        // identifiers. Anyone whose name is not the engineer's passes.
+        assert!(Grant::new(GrantFields {
+            request: signed_request(),
+            server_id: "srv-1",
+            server_signature: Signature::new(vec![0x11, 0x22]).unwrap(),
+            confirmation: Some(
+                Confirmation::by("eng-70", Signature::new(vec![0x33, 0x44]).unwrap()).unwrap(),
+            ),
+        })
+        .is_ok());
     }
 
     #[test]

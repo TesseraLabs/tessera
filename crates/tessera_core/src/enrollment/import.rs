@@ -179,6 +179,16 @@ pub struct CodesImport<'a> {
     /// has both [`crate::codes::CodeMethod::open`] and
     /// [`crate::codes::CodeMethod::open_privileged`].
     pub store_check: crate::codes::artefacts::StoreCheck,
+    /// Key epoch the configuration of this device runs on, when it could be
+    /// read.
+    ///
+    /// The floor a device with no epoch file has: without it a delivery naming
+    /// an older epoch is written down, and every login afterwards refuses
+    /// because the configuration is ahead of the store. [`None`] where the
+    /// store was named on the command line and the configuration could not be
+    /// loaded — there is nothing to compare against then, and inventing a floor
+    /// would refuse deliveries a fleet has every right to apply.
+    pub configured_epoch: Option<crate::codes::Epoch>,
 }
 
 /// Outcome of a successful import.
@@ -512,6 +522,7 @@ impl EnrollmentPackage {
             &delivery,
             codes.gost_engine_path,
             codes.store_check,
+            codes.configured_epoch,
         )?;
 
         // The container was a way to carry the key here, and the key now lives

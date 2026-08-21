@@ -887,6 +887,49 @@ fn an_empty_answer_is_refused() {
 }
 
 #[test]
+fn a_personal_number_the_format_cannot_carry_is_asked_again_not_blamed_on_the_device() {
+    // `TN=4471` on a badge, a paste with a tail, a number written with a
+    // semicolon: the value cannot go into a document of the channel, and until
+    // this was checked at the prompt it failed inside the challenge assembly
+    // and came back as `DeviceState` — documented as something no login
+    // proceeds from until an administrator acts. The engineer is standing right
+    // there; what they need is `PAM_AUTH_ERR` and another try.
+    for typed in ["TN=4471", "eng;1"] {
+        let harness = Harness::new();
+        let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+        let mut conv = ScriptedConversation::new(["op-42", typed]);
+        let probe = ScriptedProbe::at_level(1);
+
+        let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
+
+        assert!(
+            matches!(error, CodeFlowError::Input { .. }),
+            "{typed}: {error:?}"
+        );
+        assert_eq!(error.pam_code(), 7, "{typed}");
+        assert!(
+            method.presented.borrow().is_empty(),
+            "{typed}: nothing may be verified on an answer the format cannot carry"
+        );
+    }
+}
+
+/// Обратная сторона: то, что формат несёт, промпт не отвергает.
+///
+/// Пробел внутри значения формат принимает, и «Иван Петров» в личном номере
+/// метод сломать не должен — проверка набора символов не имеет права
+/// расширяться до вкуса.
+#[test]
+fn a_value_the_format_does_carry_is_not_refused_at_the_prompt() {
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new(["op 42", "Иван Петров", "123456"]);
+    let probe = ScriptedProbe::at_level(1);
+
+    assert!(harness.run(&method, &mut conv, &probe, ROLE).is_ok());
+}
+
+#[test]
 fn an_empty_personal_number_is_refused() {
     // The engineer's number is part of the code, so a blank one would compute a
     // code nobody could reproduce — and would put an empty name in the record

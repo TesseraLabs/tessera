@@ -209,6 +209,7 @@ fn codes_import<'a>(paths: &CodesPaths, pin: Option<&'a SecretString>) -> CodesI
         // ownership policy accepts; the modes it is written with are asserted
         // in the artefact tests instead.
         store_check: crate::codes::artefacts::StoreCheck::Skipped,
+        configured_epoch: None,
     }
 }
 

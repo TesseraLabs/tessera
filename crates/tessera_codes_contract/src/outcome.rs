@@ -27,28 +27,61 @@ pub const OUTCOME_DENIED: &str = "denied";
 /// Also a refusal, and the last one this nonce can carry.
 pub const OUTCOME_ATTEMPTS_EXHAUSTED: &str = "attempts_exhausted";
 
-/// Reports whether an outcome says a session was opened.
+/// What a reader of this vocabulary can say about one word.
 ///
-/// Written as a question about admission rather than a comparison against
-/// [`OUTCOME_SUCCESS`], so that a fourth word added to this vocabulary has one
-/// place to be classified in instead of every reader deciding for itself.
+/// Three cases and not two. A yes-or-no question about admission has a silent
+/// default — everything that is not a success becomes a refusal — and that
+/// default is where a reader stops being able to say "I do not know". A journal
+/// written by a build whose vocabulary is wider than this one, or a fourth word
+/// added here and not taught to a reader, would then turn admissions into
+/// refusals without a single edit: the sessions really opened, and the reader
+/// reports none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The attempt was answered and a session was opened.
+    Admission,
+    /// The attempt was refused, in one of the ways this vocabulary knows.
+    Refusal,
+    /// A word this vocabulary does not carry.
+    ///
+    /// Not a refusal. A reader that meets one cannot say what happened, and
+    /// what it does about that is its own business — but it may not decide
+    /// silently, because the answer it would default to is the one that hides
+    /// findings rather than the one that raises them.
+    Unknown,
+}
+
+/// Classifies one outcome word.
+///
+/// The one place a fourth word gets classified: readers ask this instead of
+/// comparing against [`OUTCOME_SUCCESS`] themselves, so teaching the vocabulary
+/// a new word is an edit here and nowhere else.
 #[must_use]
-pub fn is_admission(outcome: &str) -> bool {
-    outcome == OUTCOME_SUCCESS
+pub fn classify(outcome: &str) -> Outcome {
+    match outcome {
+        OUTCOME_SUCCESS => Outcome::Admission,
+        OUTCOME_DENIED | OUTCOME_ATTEMPTS_EXHAUSTED => Outcome::Refusal,
+        _ => Outcome::Unknown,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_admission, OUTCOME_ATTEMPTS_EXHAUSTED, OUTCOME_DENIED, OUTCOME_SUCCESS};
+    use super::{classify, Outcome, OUTCOME_ATTEMPTS_EXHAUSTED, OUTCOME_DENIED, OUTCOME_SUCCESS};
 
     #[test]
-    fn only_a_success_is_an_admission() {
-        assert!(is_admission(OUTCOME_SUCCESS));
-        assert!(!is_admission(OUTCOME_DENIED));
-        assert!(!is_admission(OUTCOME_ATTEMPTS_EXHAUSTED));
-        // An outcome this vocabulary does not know is not an admission: a
-        // reader that guessed would turn an unknown word into an open session.
-        assert!(!is_admission("granted"));
-        assert!(!is_admission(""));
+    fn each_word_of_the_vocabulary_lands_where_it_belongs() {
+        assert_eq!(classify(OUTCOME_SUCCESS), Outcome::Admission);
+        assert_eq!(classify(OUTCOME_DENIED), Outcome::Refusal);
+        assert_eq!(classify(OUTCOME_ATTEMPTS_EXHAUSTED), Outcome::Refusal);
+    }
+
+    #[test]
+    fn a_word_the_vocabulary_does_not_carry_is_neither() {
+        // Neither, and that is the whole point: as a refusal it would hide a
+        // session that was opened, and as an admission it would invent one.
+        for word in ["granted", "success_after_retry", "", "SUCCESS"] {
+            assert_eq!(classify(word), Outcome::Unknown, "word: {word:?}");
+        }
     }
 }

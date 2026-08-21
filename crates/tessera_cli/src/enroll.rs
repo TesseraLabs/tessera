@@ -161,6 +161,11 @@ pub struct CodesOptions {
     /// applies. A device enrols with it enforced; a test importing into a
     /// temporary directory cannot satisfy any ownership policy and says so.
     pub store_check: StoreCheck,
+    /// Key epoch the configuration of this device runs on, when it was read.
+    ///
+    /// See [`tessera_core::enrollment::CodesImport::configured_epoch`]: it is
+    /// the only floor a device with no epoch file has.
+    pub configured_epoch: Option<tessera_core::codes::Epoch>,
 }
 
 /// What `enroll` produced on success: the import outcome plus the identifiers
@@ -433,6 +438,7 @@ pub fn run(opts: EnrollOptions) -> Result<EnrollReport, EnrollError> {
         container_pin: codes.container_pin.as_ref(),
         gost_engine_path: codes.gost_engine_path.as_deref(),
         store_check: codes.store_check,
+        configured_epoch: codes.configured_epoch,
     });
     let outcome = import_and_check(
         &opts,
@@ -604,6 +610,11 @@ fn resolve_codes(args: &EnrollArgs) -> Result<Option<CodesOptions>, EnrollError>
     Ok(Some(CodesOptions {
         paths,
         container_pin,
+        // From the same section the store came from. `None` where the
+        // configuration could not be read at all and the store was named on the
+        // command line: there is nothing to compare a delivery against then,
+        // and inventing a floor would refuse deliveries a fleet may apply.
+        configured_epoch: configured.as_ref().map(|method| method.epoch),
         gost_engine_path: configured.and_then(|method| method.gost_engine_path),
         // A device enrols with the store checked: the artefacts are the whole
         // of what the method trusts, and permissions that would let somebody
@@ -1196,6 +1207,7 @@ mod tests {
             container_pin: None,
             gost_engine_path: None,
             store_check: StoreCheck::Skipped,
+            configured_epoch: None,
         }
     }
 

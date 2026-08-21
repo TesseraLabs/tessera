@@ -231,7 +231,15 @@ impl CodeState {
                 reason: "the state file names no boot".to_owned(),
             })?,
             throttle: {
-                let (started, issued_in_window) = window.unwrap_or((0, 0));
+                // Required like the boot line above it. The doctrine of this
+                // parser is that nothing is repaired and nothing is skipped,
+                // and a missing window quietly restored as "no issuances yet"
+                // is a repair: the file would come back as an open issuance
+                // budget, which is the one direction a missing field must not
+                // be read in.
+                let (started, issued_in_window) = window.ok_or_else(|| StateError::Corrupt {
+                    reason: "the state file names no issuance window".to_owned(),
+                })?;
                 Throttle::restore(started, issued_in_window, ledgers)
             },
         })
@@ -381,6 +389,21 @@ mod tests {
         std::fs::write(
             dir.path().join(STATE_FILENAME),
             "tessera-codes/state/v1\nboot=boot-a\nissued=7\nfloor=0\nconsumed=1,2\n",
+        )
+        .unwrap();
+        assert!(CodeState::load(dir.path(), &markers("boot-a", 10)).is_err());
+    }
+
+    #[test]
+    fn a_state_file_without_its_window_does_not_load() {
+        // "Nothing is repaired and nothing is skipped" is the doctrine of this
+        // parser, and the window used to be the one exception: a file missing
+        // it came back as a budget nobody had spent, which is the direction a
+        // missing field must never be read in.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(STATE_FILENAME),
+            "tessera-codes/state/v2\nboot=boot-a\n",
         )
         .unwrap();
         assert!(CodeState::load(dir.path(), &markers("boot-a", 10)).is_err());

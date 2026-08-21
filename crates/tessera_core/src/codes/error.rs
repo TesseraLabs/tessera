@@ -88,9 +88,16 @@ pub enum CodeLoginError {
 
     /// The trusted-time markers of the device could not be read.
     ///
-    /// Without them a pending attempt cannot be invalidated on a reboot, and
-    /// an attempt that survives a reboot is an attempt whose one-time nonce is
-    /// no longer one-time.
+    /// They are what the throttle and the term of an attempt are measured
+    /// against: seconds since boot, which no wall clock can be dragged
+    /// backwards past, and the identity of the boot itself. Without them a
+    /// device cannot say how long ago it refused the last login, so the budget
+    /// it hands out is a budget it cannot enforce.
+    ///
+    /// The reason written here used to be about invalidating attempts left on
+    /// disk across a reboot. Nothing is left on disk any more — the attempt
+    /// lives in the process and dies with it — so that justification described
+    /// a mechanism this method no longer has.
     #[error("the boot markers of the device are unreadable: {reason}")]
     BootMarkers {
         /// What the underlying read reported.

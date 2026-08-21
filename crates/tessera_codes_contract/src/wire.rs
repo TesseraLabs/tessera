@@ -175,6 +175,23 @@ pub(crate) fn check_free_text(field: &'static str, value: &str) -> Result<(), Wi
     Ok(())
 }
 
+/// Reports whether a value can be carried by a document of this channel.
+///
+/// The same question [`check_free_text`] answers, asked from outside the crate:
+/// a caller that collects a value from a person — the identifier of an issuing
+/// side, the personal number of an engineer — can refuse it at the prompt,
+/// where the person is still standing there to retype it, instead of letting a
+/// document assembly fail later and be reported as a device that cannot carry
+/// out the method.
+///
+/// One definition on both sides on purpose: a prompt that refused a different
+/// set of characters than the format does would either turn away values the
+/// channel accepts or pass on values it does not.
+#[must_use]
+pub fn is_usable_in_a_document(value: &str) -> bool {
+    check_free_text("value", value).is_ok()
+}
+
 /// Checks one item of a list-valued field, which additionally cannot carry the
 /// list separator.
 ///

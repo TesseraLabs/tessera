@@ -85,8 +85,12 @@ use tessera_codes_contract::challenge::{Challenge, ChallengeFields, SignedChalle
 use tessera_codes_contract::code::verify_code;
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
 use tessera_codes_contract::key::{
-    derive_key, EphemeralKeyAgreement as _, Epoch, KeyAgreement as _, KeyContext,
+    derive_key, EphemeralKeyAgreement as _, KeyAgreement as _, KeyContext,
 };
+// Re-exported rather than only used: consumers that carry a key epoch around —
+// the enrolment path and the command line — should not have to depend on the
+// contract crate to name the type this module speaks in.
+pub use tessera_codes_contract::key::Epoch;
 use tessera_codes_contract::nonce::Nonce;
 use tessera_codes_contract::params::FleetParams;
 use tessera_codes_contract::signature::Signature;
@@ -693,11 +697,12 @@ impl CodeMethod {
                 if used >= self.config.params.attempts_per_nonce() {
                     return Err(self.exhaust(&mut state, attempt, markers.since_boot_secs()));
                 }
-                // The run of failures this wrong code just extended has to
-                // reach the disk. What the throttle learned from the answer is
-                // written here, and a lock that lives only in this process
-                // locks nothing.
-                self.save_state(&state)?;
+                // Nothing is written here, and that is the point: the state
+                // holds the throttle, the throttle counts *ended* attempts, and
+                // this one is not over — the engineer has tries left. The
+                // comment that used to stand here said the opposite and the
+                // call under it wrote the file back unchanged, fsync and rename
+                // included, on every wrong character typed.
                 Err(self.deny(
                     &request,
                     Some(&nonce),
@@ -882,6 +887,19 @@ impl CodeMethod {
     /// had already made stale.
     fn lock(&self) -> Result<lock::StateLock, CodeLoginError> {
         lock::StateLock::acquire(&self.config.paths.state_dir).map_err(|error| {
+            // A hold that timed out is another login answering a call right
+            // now, not a device in a state nobody can proceed from. The two
+            // must not share a class: a device carries one live attempt by
+            // design — a console login while an SSH session is being answered
+            // is the ordinary case the lock exists for — and telling the second
+            // engineer to call an administrator would send them looking for a
+            // fault that does not exist. What they need is the length of the
+            // wait, which is what `TemporarilyLocked` carries.
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                return CodeLoginError::TemporarilyLocked {
+                    retry_after: lock::LOCK_TIMEOUT,
+                };
+            }
             CodeLoginError::State {
                 reason: format!("the code state of this device could not be locked: {error}"),
             }

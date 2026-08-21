@@ -799,11 +799,19 @@ fn normalise_code(typed: &str) -> String {
         .collect()
 }
 
-/// Refuse an answer that is empty or longer than the branch accepts.
+/// Refuse an answer that is empty, longer than the branch accepts, or carries
+/// what a document of the channel cannot.
 ///
 /// The bound is counted in characters rather than bytes: what the engineer
 /// typed is what is being bounded, and a Cyrillic name is not twice as long
 /// for having been written in Cyrillic.
+///
+/// The set of characters is asked of the contract rather than spelled out here,
+/// and it is asked *now* rather than when the challenge is assembled. A value
+/// carrying `;` or `=` — a number typed as `TN=4471`, a paste with a tail —
+/// would otherwise fail inside `Challenge::new` and arrive as a state no login
+/// proceeds from until an administrator acts. It is the engineer's input, they
+/// are standing at the device, and what they need is to be asked again.
 fn bounded_answer(
     answer: &str,
     limit: usize,
@@ -812,7 +820,10 @@ fn bounded_answer(
     epoch: u32,
 ) -> Result<String, CodeFlowError> {
     let trimmed = answer.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > limit {
+    if trimmed.is_empty()
+        || trimmed.chars().count() > limit
+        || !tessera_codes_contract::wire::is_usable_in_a_document(trimmed)
+    {
         audit::emit_denied(&audit::Denial {
             nonce: None,
             role_id: pam_user,

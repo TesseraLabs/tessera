@@ -818,12 +818,17 @@ fn a_device_holds_one_attempt_at_a_time() {
     let held = method
         .begin_with_markers(&Fixture::request(1), &boot)
         .unwrap();
+    // Refused as a wait, not as a fault. Two logins arriving at once on a
+    // device reachable both by console and by SSH is the ordinary case this
+    // lock exists for, and `State` is documented as something no login proceeds
+    // from until an administrator acts: the second engineer would go looking
+    // for a broken device instead of waiting ten seconds.
     assert!(
         matches!(
             method.begin_with_markers(&Fixture::request(1), &after_a_window(1)),
-            Err(CodeLoginError::State { .. })
+            Err(CodeLoginError::TemporarilyLocked { .. })
         ),
-        "a second attempt must not start while one is open"
+        "a second attempt must be told to wait, not that the device is unusable"
     );
 
     // And the device is not stuck: the attempt ends, the next one starts.
@@ -984,6 +989,7 @@ fn a_key_delivered_under_a_new_epoch_is_the_one_the_login_computes_with() {
         },
         None,
         artefacts::StoreCheck::Skipped,
+        Some(configured),
     )
     .unwrap();
 

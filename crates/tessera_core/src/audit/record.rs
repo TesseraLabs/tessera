@@ -38,15 +38,17 @@ pub enum WriteDiscipline {
 
 /// Outcome of a code login attempt, as the chain records it.
 ///
-/// The strings match the `outcome` field of the `qr_code_login` tracing event,
-/// so a reconciliation can join the two records without a translation table.
+/// The words are the contract's — [`tessera_codes_contract::outcome`] — and not
+/// a copy of them. This module decides the write discipline of a record by the
+/// outcome it carries, and a second spelling of "success" here would mean a
+/// word added to the vocabulary reaching the emitter and not this decision: a
+/// login that opened a session would be written the way a refusal is, best
+/// effort, instead of the way an admission must be, fail-closed.
 pub mod outcome {
-    /// The attempt succeeded.
-    pub const SUCCESS: &str = "success";
-    /// The attempt was refused.
-    pub const DENIED: &str = "denied";
-    /// The attempt budget of the nonce ran out.
-    pub const ATTEMPTS_EXHAUSTED: &str = "attempts_exhausted";
+    pub use tessera_codes_contract::outcome::{
+        OUTCOME_ATTEMPTS_EXHAUSTED as ATTEMPTS_EXHAUSTED, OUTCOME_DENIED as DENIED,
+        OUTCOME_SUCCESS as SUCCESS,
+    };
 }
 
 /// What the device does once its journal has reached its ceiling.
@@ -173,7 +175,13 @@ impl AuditRecord {
     #[must_use]
     pub fn write_discipline(&self) -> WriteDiscipline {
         match self {
-            AuditRecord::CodeLogin { outcome, .. } if outcome == outcome::SUCCESS => {
+            // Asked of the vocabulary rather than compared against one word:
+            // a fourth word meaning an opened session must land on the
+            // fail-closed side without an edit here.
+            AuditRecord::CodeLogin { outcome, .. }
+                if tessera_codes_contract::outcome::classify(outcome)
+                    == tessera_codes_contract::outcome::Outcome::Admission =>
+            {
                 WriteDiscipline::FailClosed
             }
             _ => WriteDiscipline::EscalateAfterTheFact,

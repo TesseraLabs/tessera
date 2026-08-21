@@ -146,6 +146,20 @@ fn store() -> (TempDir, CodesPaths) {
     (dir, paths)
 }
 
+/// Marks the store as one that has already been through a conversation.
+///
+/// A device provisioned by hand has no epoch file and does have a state file:
+/// that pair is what `plan_key` reads, and the tests of the delivery floor
+/// stand on it.
+fn mark_as_spoken(paths: &CodesPaths) {
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::write(
+        paths.state_dir.join(crate::codes::state::STATE_FILENAME),
+        b"tessera-codes/state/v2\n",
+    )
+    .unwrap();
+}
+
 /// The mode bits of a path.
 fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
@@ -154,7 +168,14 @@ fn mode_of(path: &Path) -> u32 {
 #[test]
 fn a_delivery_without_a_codes_part_changes_nothing() {
     let (_dir, paths) = store();
-    let applied = apply(&paths, &CodesDelivery::default(), None, StoreCheck::Skipped).unwrap();
+    let applied = apply(
+        &paths,
+        &CodesDelivery::default(),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
     assert_eq!(applied.epoch, None);
     assert!(!applied.key_replaced);
     // Not even the store directory is created: an Access-only fleet leaves no
@@ -168,7 +189,7 @@ fn a_full_consignment_makes_the_device_ready() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
 
-    let applied = apply(&paths, &delivery.full(3), None, StoreCheck::Skipped).unwrap();
+    let applied = apply(&paths, &delivery.full(3), None, StoreCheck::Skipped, None).unwrap();
     assert_eq!(applied.epoch, Some(Epoch::new(3)));
     assert!(applied.key_replaced);
     assert!(paths.artefacts_present());
@@ -181,7 +202,7 @@ fn the_stored_key_opens_without_the_delivery_pin() {
     // cut has nobody to type the PIN of the container it was delivered in.
     let (_dir, paths) = store();
     let delivery = Delivery::new();
-    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped, None).unwrap();
 
     let stored = load_device_key(&paths.device_key_container, None).unwrap();
     assert!(stored.public_eq(&delivery.key));
@@ -200,7 +221,14 @@ fn the_stored_key_opens_without_the_delivery_pin() {
 #[test]
 fn the_store_is_root_only_after_the_import() {
     let (_dir, paths) = store();
-    apply(&paths, &Delivery::new().full(1), None, StoreCheck::Skipped).unwrap();
+    apply(
+        &paths,
+        &Delivery::new().full(1),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(mode_of(&paths.device_key_container), 0o600);
     assert_eq!(mode_of(&paths.state_dir), 0o700);
@@ -218,10 +246,10 @@ fn the_store_is_root_only_after_the_import() {
 fn a_greater_epoch_replaces_the_key() {
     let (_dir, paths) = store();
     let first = Delivery::new();
-    apply(&paths, &first.full(1), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &first.full(1), None, StoreCheck::Skipped, None).unwrap();
 
     let second = Delivery::new();
-    let applied = apply(&paths, &second.full(2), None, StoreCheck::Skipped).unwrap();
+    let applied = apply(&paths, &second.full(2), None, StoreCheck::Skipped, None).unwrap();
     assert!(applied.key_replaced);
     assert_eq!(applied.epoch, Some(Epoch::new(2)));
 
@@ -234,11 +262,11 @@ fn a_greater_epoch_replaces_the_key() {
 fn a_smaller_epoch_is_refused_and_changes_nothing() {
     let (_dir, paths) = store();
     let current = Delivery::new();
-    apply(&paths, &current.full(5), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &current.full(5), None, StoreCheck::Skipped, None).unwrap();
 
     let old = Delivery::new();
     assert!(matches!(
-        apply(&paths, &old.full(4), None, StoreCheck::Skipped),
+        apply(&paths, &old.full(4), None, StoreCheck::Skipped, None),
         Err(ArtefactError::EpochRollback {
             delivered: 4,
             persisted: 5
@@ -250,14 +278,91 @@ fn a_smaller_epoch_is_refused_and_changes_nothing() {
     assert!(stored.public_eq(&current.key));
 }
 
+/// Устройство, укомплектованное руками, не запирается доставкой старой эпохи.
+///
+/// У такого прибора эпоха стоит только в `config.toml`, файла эпохи нет, а
+/// разговоры уже были. До правки доставка с ЛЮБОЙ эпохой принималась и
+/// записывалась, после чего `epoch::effective` находил конфигурацию впереди
+/// хранилища и отказывал на каждом входе. Прибор выходил из строя без атаки —
+/// руками добросовестного администратора, применившего устаревший пакет.
+#[test]
+fn a_delivery_behind_the_configuration_is_refused_on_a_device_with_no_epoch_file() {
+    let (_dir, paths) = store();
+    // Разговоры были: файл состояния есть, файла эпохи нет.
+    mark_as_spoken(&paths);
+    assert_eq!(epoch::read(&paths.state_dir).unwrap(), None);
+
+    let stale = Delivery::new();
+    assert!(matches!(
+        apply(
+            &paths,
+            &stale.full(3),
+            None,
+            StoreCheck::Skipped,
+            Some(Epoch::new(7)),
+        ),
+        Err(ArtefactError::EpochBehindConfigured {
+            delivered: 3,
+            configured: 7
+        })
+    ));
+
+    // Ничего не записано: ни эпохи, ни ключа. Отказ обязан оставлять прибор в
+    // том состоянии, в каком он был.
+    assert_eq!(epoch::read(&paths.state_dir).unwrap(), None);
+}
+
+/// Эпоха доставки, равная настроенной или новее, на том же приборе проходит.
+///
+/// Обратная сторона проверки выше: она не должна превращаться в отказ от
+/// доставок, которые парк имеет полное право применять.
+#[test]
+fn a_delivery_at_or_ahead_of_the_configuration_is_applied() {
+    for delivered in [7, 8] {
+        let (_dir, paths) = store();
+        mark_as_spoken(&paths);
+
+        let applied = apply(
+            &paths,
+            &Delivery::new().full(delivered),
+            None,
+            StoreCheck::Skipped,
+            Some(Epoch::new(7)),
+        )
+        .unwrap();
+        assert_eq!(applied.epoch, Some(Epoch::new(delivered)));
+    }
+}
+
+/// Без прочитанной конфигурации сравнивать не с чем — и выдумывать пол нельзя.
+///
+/// Так выглядит прогон, где хранилище названо флагом командной строки, а
+/// конфигурация не читается. Отказ здесь означал бы отказ от доставок, которые
+/// применить можно и нужно.
+#[test]
+fn a_device_with_no_configured_epoch_still_takes_the_delivery() {
+    let (_dir, paths) = store();
+    mark_as_spoken(&paths);
+
+    let applied = apply(
+        &paths,
+        &Delivery::new().full(3),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
+    assert_eq!(applied.epoch, Some(Epoch::new(3)));
+}
+
 #[test]
 fn the_same_epoch_again_writes_the_key_back() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
-    apply(&paths, &delivery.full(7), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &delivery.full(7), None, StoreCheck::Skipped, None).unwrap();
 
     // The same medium presented a second time.
-    let applied = apply(&paths, &delivery.full(7), None, StoreCheck::Skipped).unwrap();
+    let applied = apply(&paths, &delivery.full(7), None, StoreCheck::Skipped, None).unwrap();
     // The key is written back — see the test below for why that is the point of
     // presenting a medium twice.
     assert!(applied.key_replaced);
@@ -268,10 +373,10 @@ fn the_same_epoch_again_writes_the_key_back() {
 fn a_repeated_epoch_restores_a_key_the_store_has_lost() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
-    apply(&paths, &delivery.full(7), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &delivery.full(7), None, StoreCheck::Skipped, None).unwrap();
     std::fs::remove_file(&paths.device_key_container).unwrap();
 
-    let applied = apply(&paths, &delivery.full(7), None, StoreCheck::Skipped).unwrap();
+    let applied = apply(&paths, &delivery.full(7), None, StoreCheck::Skipped, None).unwrap();
     assert!(applied.key_replaced);
 }
 
@@ -285,11 +390,11 @@ fn a_repeated_epoch_replaces_a_key_that_does_not_belong_to_it() {
     // key" is not a store carrying the right one.
     let (_dir, paths) = store();
     let first = Delivery::new();
-    apply(&paths, &first.full(7), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &first.full(7), None, StoreCheck::Skipped, None).unwrap();
 
     // The fleet re-cut the container of the same epoch around a different key.
     let recut = Delivery::new();
-    let applied = apply(&paths, &recut.full(7), None, StoreCheck::Skipped).unwrap();
+    let applied = apply(&paths, &recut.full(7), None, StoreCheck::Skipped, None).unwrap();
 
     assert!(applied.key_replaced);
     let stored = load_device_key(&paths.device_key_container, None).unwrap();
@@ -311,7 +416,7 @@ fn a_first_delivery_to_a_device_that_has_been_talking_writes_its_epoch_down() {
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     assert!(epoch::read(&paths.state_dir).unwrap().is_none());
 
-    let applied = apply(&paths, &delivery.full(3), None, StoreCheck::Skipped).unwrap();
+    let applied = apply(&paths, &delivery.full(3), None, StoreCheck::Skipped, None).unwrap();
 
     assert!(applied.key_replaced);
     // The epoch the store was implicitly on is now written down, so the next
@@ -366,7 +471,14 @@ fn a_key_container_anybody_can_read_is_not_a_trusted_store() {
     // this host `/var` is itself a symlink), so a test that only demanded an
     // error here would pass without the mode ever being looked at.
     let (_dir, paths) = store();
-    apply(&paths, &Delivery::new().full(1), None, StoreCheck::Skipped).unwrap();
+    apply(
+        &paths,
+        &Delivery::new().full(1),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
 
     let store_dir = paths.device_key_container.parent().unwrap();
     std::fs::set_permissions(store_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -390,7 +502,14 @@ fn a_key_container_anybody_can_read_is_not_a_trusted_store() {
 #[test]
 fn a_state_directory_anybody_can_enter_is_not_a_trusted_store() {
     let (_dir, paths) = store();
-    apply(&paths, &Delivery::new().full(1), None, StoreCheck::Skipped).unwrap();
+    apply(
+        &paths,
+        &Delivery::new().full(1),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
     std::fs::set_permissions(&paths.state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let refused = paths.check_trusted().unwrap_err();
@@ -407,7 +526,14 @@ fn the_published_ticket_artefacts_stay_readable() {
     // check that demanded 0600 of them would refuse every store the product
     // itself writes.
     let (_dir, paths) = store();
-    apply(&paths, &Delivery::new().full(1), None, StoreCheck::Skipped).unwrap();
+    apply(
+        &paths,
+        &Delivery::new().full(1),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
     assert_eq!(mode_of(&paths.tickets), 0o644);
 
     let refused = paths.check_trusted().unwrap_err();
@@ -430,7 +556,7 @@ fn a_store_that_fails_the_check_receives_nothing() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
 
     let delivery = Delivery::new();
-    let error = apply(&paths, &delivery.full(3), None, StoreCheck::Enforced).unwrap_err();
+    let error = apply(&paths, &delivery.full(3), None, StoreCheck::Enforced, None).unwrap_err();
 
     assert!(matches!(error, ArtefactError::Untrusted(_)), "{error:?}");
     assert!(!paths.device_key_container.exists());
@@ -443,14 +569,14 @@ fn a_store_that_fails_the_check_receives_nothing() {
 fn a_rotation_carries_tickets_without_a_key() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
-    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped, None).unwrap();
 
     let rotation = CodesDelivery {
         tickets: Some(delivery.tickets("op-99")),
         revocations: Some(Delivery::revocations(&["tk-17"])),
         ..CodesDelivery::default()
     };
-    let applied = apply(&paths, &rotation, None, StoreCheck::Skipped).unwrap();
+    let applied = apply(&paths, &rotation, None, StoreCheck::Skipped, None).unwrap();
     assert!(applied.tickets_applied);
     assert!(applied.revocations_applied);
     assert!(!applied.key_replaced);
@@ -469,20 +595,20 @@ fn a_rotation_carries_tickets_without_a_key() {
 fn a_revocation_list_that_forgot_a_number_is_refused() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
-    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped, None).unwrap();
 
     let withdrawn = CodesDelivery {
         revocations: Some(Delivery::revocations(&["tk-17", "tk-18"])),
         ..CodesDelivery::default()
     };
-    apply(&paths, &withdrawn, None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &withdrawn, None, StoreCheck::Skipped, None).unwrap();
 
     let older = CodesDelivery {
         revocations: Some(Delivery::revocations(&["tk-17"])),
         ..CodesDelivery::default()
     };
     assert!(matches!(
-        apply(&paths, &older, None, StoreCheck::Skipped),
+        apply(&paths, &older, None, StoreCheck::Skipped, None),
         Err(ArtefactError::RevocationRollback)
     ));
 
@@ -496,14 +622,14 @@ fn a_revocation_list_that_forgot_a_number_is_refused() {
 fn a_revocation_list_that_only_grows_is_accepted() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
-    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped, None).unwrap();
 
     for numbers in [&["tk-17"][..], &["tk-17", "tk-18"][..]] {
         let payload = CodesDelivery {
             revocations: Some(Delivery::revocations(numbers)),
             ..CodesDelivery::default()
         };
-        apply(&paths, &payload, None, StoreCheck::Skipped).unwrap();
+        apply(&paths, &payload, None, StoreCheck::Skipped, None).unwrap();
     }
     let store = crate::codes::tickets::TicketStore::load(&paths.tickets, &paths.ticket_revocations)
         .unwrap();
@@ -514,7 +640,7 @@ fn a_revocation_list_that_only_grows_is_accepted() {
 fn a_malformed_ticket_set_is_refused_before_anything_is_written() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
-    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &delivery.full(1), None, StoreCheck::Skipped, None).unwrap();
     let good = std::fs::read(&paths.tickets).unwrap();
 
     let broken = CodesDelivery {
@@ -522,7 +648,7 @@ fn a_malformed_ticket_set_is_refused_before_anything_is_written() {
         ..CodesDelivery::default()
     };
     assert!(matches!(
-        apply(&paths, &broken, None, StoreCheck::Skipped),
+        apply(&paths, &broken, None, StoreCheck::Skipped, None),
         Err(ArtefactError::Tickets(_))
     ));
     assert_eq!(std::fs::read(&paths.tickets).unwrap(), good);
@@ -537,7 +663,7 @@ fn a_container_the_pin_does_not_open_is_refused() {
         key.pin = SecretString::from("wrong".to_owned());
     }
     assert!(matches!(
-        apply(&paths, &consignment, None, StoreCheck::Skipped),
+        apply(&paths, &consignment, None, StoreCheck::Skipped, None),
         Err(ArtefactError::Container(_))
     ));
     assert!(!paths.device_key_container.exists());
@@ -548,12 +674,12 @@ fn a_container_the_pin_does_not_open_is_refused() {
 fn a_wipe_removes_every_artefact_and_reports_the_last_epoch() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
-    apply(&paths, &delivery.full(4), None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &delivery.full(4), None, StoreCheck::Skipped, None).unwrap();
     let revocations = CodesDelivery {
         revocations: Some(Delivery::revocations(&["tk-17"])),
         ..CodesDelivery::default()
     };
-    apply(&paths, &revocations, None, StoreCheck::Skipped).unwrap();
+    apply(&paths, &revocations, None, StoreCheck::Skipped, None).unwrap();
 
     let wiped = wipe(&paths).unwrap();
     assert_eq!(wiped.last_epoch, Some(Epoch::new(4)));
@@ -593,10 +719,24 @@ fn a_wiped_device_accepts_the_next_enrolment() {
     // floor is gone with the rest: the anti-rollback protects the key a device
     // holds, not a device that holds none.
     let (_dir, paths) = store();
-    apply(&paths, &Delivery::new().full(9), None, StoreCheck::Skipped).unwrap();
+    apply(
+        &paths,
+        &Delivery::new().full(9),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
     wipe(&paths).unwrap();
 
-    let applied = apply(&paths, &Delivery::new().full(1), None, StoreCheck::Skipped).unwrap();
+    let applied = apply(
+        &paths,
+        &Delivery::new().full(1),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
     assert_eq!(applied.epoch, Some(Epoch::new(1)));
     assert!(applied.key_replaced);
 }

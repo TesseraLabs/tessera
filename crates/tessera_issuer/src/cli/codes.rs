@@ -597,6 +597,7 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
     let mut provenance = Provenance {
         chain_verified: true,
         unsigned_from_seq: None,
+        refusals_without_nonce: 0,
     };
     let logins = if args.device_journals.is_empty() {
         None
@@ -632,6 +633,9 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
                     }
                 })?;
             provenance.chain_verified &= journal.chain_verified;
+            provenance.refusals_without_nonce = provenance
+                .refusals_without_nonce
+                .saturating_add(journal.refusals_without_nonce);
             // The earliest unsigned tail across the journals: the weakest of
             // them is what the report may claim for all of them.
             provenance.unsigned_from_seq =
