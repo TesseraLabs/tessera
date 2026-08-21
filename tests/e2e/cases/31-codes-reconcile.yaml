@@ -83,6 +83,46 @@ cases:
       - run: helpers/codes-reconcile.sh cleanup
       - run: helpers/codes-phone.sh cleanup
 
+  - id: REC-005
+    title: Опечатка инженера не читается сверкой как компрометация устройства
+    requirement: openspec/specs/codes-operator-cli/spec.md
+    # Устройство пишет строку на КАЖДУЮ решённую попытку, отказы включительно.
+    # Инженер, ошибившийся в коде один раз и вошедший со второго, оставляет на
+    # одном nonce две строки: denied и success. Сверка, не различающая исход,
+    # видит два входа на один nonce и поднимает series-on-one-nonce — класс,
+    # который её же документация описывает как «прибор не тот, за который себя
+    # выдаёт». То есть штатная опечатка читается аудитором как компрометация.
+    #
+    # Кейс берёт настоящий журнал настоящего входа, а не собранный стендом:
+    # именно на синтетических фикстурах, где исход всегда success, дефект и
+    # прожил три задачи подряд незамеченным.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-phone.sh authenticate-mistyping-once {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      # Квитанция выдачи на этот вход есть, поэтому находок быть не должно
+      # вовсе. Отказная строка при этом обязана быть посчитана и названа —
+      # молча отброшенная улика хуже неверно истолкованной.
+      - run: helpers/codes-reconcile.sh reconcile
+        expect:
+          exit_code: 0
+          stdout_matches: "refusals-read count=[1-9]"
+        timeout: 60
+      # Отсутствие класса проверяется положительным утверждением: отчёт печатает
+      # «no findings» ровно тогда, когда ни одной находки нет. Ожидание вида
+      # «строки series-on-one-nonce нет» зеленело бы и на отчёте, который вовсе
+      # не собрался.
+      - run: helpers/codes-reconcile.sh reconcile
+        expect:
+          exit_code: 0
+          stdout_matches: "no findings"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-phone.sh cleanup
+
   - id: REC-004
     title: Отчёт не объявляет отсутствие находок, пока хвост журнала не заверен
     requirement: openspec/specs/codes-operator-cli/spec.md

@@ -123,6 +123,7 @@ pub mod grant;
 pub mod key;
 mod mac;
 pub mod nonce;
+pub mod outcome;
 pub mod params;
 pub mod profile;
 pub mod receipt;

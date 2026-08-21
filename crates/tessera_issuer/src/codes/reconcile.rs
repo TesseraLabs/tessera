@@ -12,11 +12,35 @@
 //! - a **receipt without a login**: a code was issued and never used, which is
 //!   ordinary once and a pattern of stockpiling when it repeats;
 //! - a **series on one nonce**: one device, one epoch, one nonce, and more than
-//!   one issuance or more than one login on it. A nonce belongs to one attempt
-//!   and an attempt is answered once, so a repetition is either a call that was
-//!   answered twice or a device that is not the device it claims to be;
+//!   one issuance or more than one *admission* on it. A nonce belongs to one
+//!   attempt and an attempt is answered once, so a repetition is either a call
+//!   that was answered twice or a device that is not the device it claims to be;
 //! - a **disagreement**: the two sides paired on device, epoch and nonce, and
 //!   then said different things about the role, the level or the ticket.
+//!
+//! # A refusal is not a login
+//!
+//! Every one of those classes is about codes that were handed out and sessions
+//! that were opened, so only the journal lines that record an *admission* enter
+//! them ([`tessera_codes_contract::outcome::is_admission`]). A device writes a
+//! line for every attempt it decides, refusals included, and reading a refusal
+//! as a login turns two ordinary things into accusations:
+//!
+//! - an engineer who mistypes a code once and gets it right on the second try
+//!   leaves two lines on one nonce. Counted as logins, that is a series on one
+//!   nonce — a finding whose documented meaning is a device that is not the
+//!   device it claims to be;
+//! - anyone at all standing at a console can type a role account name and any
+//!   code they like. No code is issued for it, so every one of those refusals
+//!   would be a login without a receipt — the class that describes a code
+//!   handed out off the books, generated at will by a passer-by, in the volume
+//!   it takes to bury a real finding.
+//!
+//! Refusals are not discarded silently: the report says how many were read, so
+//! an auditor knows the lines existed and were not interpreted as admissions.
+//! They are evidence of something — a device under a stream of wrong codes is
+//! worth a look — but not of an issuance, and this module answers only about
+//! issuances.
 //!
 //! # What a device journal is, and what is checked about it
 //!
@@ -47,6 +71,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use tessera_codes_contract::nonce::Nonce;
+use tessera_codes_contract::outcome;
 use tessera_codes_contract::params::FleetParams;
 use tessera_hashchain::{verify_lines, ChainPayload, ChainStatus, EntryKind, OP_HEAD_SIGNATURE};
 
@@ -93,7 +118,22 @@ pub struct LoginEntry {
     /// Ticket the device attributed the attempt to, when it got that far.
     pub ticket_number: Option<String>,
     /// What the device did with the attempt.
+    ///
+    /// One of the words of [`tessera_codes_contract::outcome`], as the device
+    /// wrote it. A word this vocabulary does not know is carried verbatim and
+    /// is not an admission.
     pub outcome: String,
+}
+
+impl LoginEntry {
+    /// Reports whether this line records a session that was opened.
+    ///
+    /// The four classes of the report are about issuances, and a refused
+    /// attempt is not one — see the module documentation.
+    #[must_use]
+    pub fn is_admission(&self) -> bool {
+        outcome::is_admission(&self.outcome)
+    }
 }
 
 /// One issuance, as a receipt recorded it.
@@ -178,6 +218,12 @@ pub struct Report {
     chain_verified: bool,
     /// The earliest `seq` of an unsigned tail across the journals read.
     unsigned_from_seq: Option<u64>,
+    /// Refused attempts read from the device side.
+    ///
+    /// Not a finding and not a class: a count, so that lines the report did not
+    /// interpret are still known to have been there. An auditor who sees none
+    /// of the four classes and a large number here has been told something.
+    refusals_read: u64,
 }
 
 impl Report {
@@ -197,6 +243,15 @@ impl Report {
     #[must_use]
     pub const fn chain_verified(&self) -> bool {
         self.chain_verified
+    }
+
+    /// Returns how many refused attempts the device side carried.
+    ///
+    /// Refusals take part in none of the four classes — see the module
+    /// documentation — and this is what says they were read rather than lost.
+    #[must_use]
+    pub const fn refusals_read(&self) -> u64 {
+        self.refusals_read
     }
 
     /// Reports whether anything at all was found.
@@ -280,6 +335,13 @@ impl fmt::Display for Report {
                 disagreement.fields.join(",")
             )?;
         }
+        if self.refusals_read > 0 {
+            writeln!(
+                f,
+                "refusals-read count={}: attempts the devices refused; they are not logins and                  take part in no finding above",
+                self.refusals_read
+            )?;
+        }
         if !self.has_findings() {
             writeln!(f, "no findings")?;
         }
@@ -303,19 +365,37 @@ pub fn reconcile(
     logins: Option<&[LoginEntry]>,
     provenance: Provenance,
 ) -> Report {
+    // Only the lines that record an admission take part in the four classes:
+    // a refusal is an attempt the device turned away, and reading it as a login
+    // makes an ordinary mistyped code look like a device answering one
+    // challenge twice. See the module documentation.
+    let admissions: Vec<LoginEntry> = logins.map_or_else(Vec::new, |logins| {
+        logins
+            .iter()
+            .filter(|login| login.is_admission())
+            .cloned()
+            .collect()
+    });
+    let refusals_read = logins.map_or(0, |logins| {
+        u64::try_from(logins.iter().filter(|login| !login.is_admission()).count())
+            .unwrap_or(u64::MAX)
+    });
+
     let mut report = Report {
         logins_without_receipt: Vec::new(),
         receipts_without_login: Vec::new(),
-        series_on_one_nonce: series(receipts, logins.unwrap_or_default()),
+        series_on_one_nonce: series(receipts, &admissions),
         disagreements: Vec::new(),
         device_side: logins.is_some(),
         chain_verified: logins.is_some() && provenance.chain_verified,
         unsigned_from_seq: provenance.unsigned_from_seq,
+        refusals_read,
     };
 
-    let Some(logins) = logins else {
+    if logins.is_none() {
         return report;
-    };
+    }
+    let logins = &admissions;
 
     let by_key: BTreeMap<(String, u32, String), &LoginEntry> = logins
         .iter()
@@ -356,6 +436,10 @@ pub fn reconcile(
 /// on one nonce are two admissions on an attempt that only ever had one code to
 /// give. Neither can happen on a device that is behaving, so either is worth a
 /// line of the report.
+///
+/// `logins` carries admissions only. Several refusals on one nonce are what an
+/// engineer mistyping a code leaves behind, and the attempt budget of the nonce
+/// exists precisely so that they can happen.
 fn series(receipts: &[ReceiptEntry], logins: &[LoginEntry]) -> Vec<NonceSeries> {
     let mut seen: BTreeMap<(String, u32, String), Bucket> = BTreeMap::new();
     for receipt in receipts {
@@ -629,13 +713,24 @@ fn is_login(value: &serde_json::Value) -> bool {
 
 /// Verifies the chain of a journal, or reports that it carries none.
 ///
-/// The question is asked of the first line: a file where the framing appears
-/// halfway through is not a chain with a preamble, it is a file somebody
-/// assembled, and the verifier says so at the position where it stops adding up.
+/// The question is asked of the whole file, not of its first line. A journal
+/// that carries framing anywhere is a chain, and it is verified as one: a file
+/// where the framing appears halfway through is not a chain with a preamble, it
+/// is a file somebody assembled, and the verifier says so at the position where
+/// it stops adding up.
+///
+/// Asking only the first line would price the whole difference between a
+/// verified journal and an unverifiable export at one edited line: strip `seq`
+/// from the top of a real chain, and everything below it — including the lines
+/// that were removed — becomes a flat export nothing can be checked against.
+/// Either field alone is enough to make the file answer as a chain, because a
+/// chain line with one of them removed is an edited chain line, not a flat one.
 fn chain_status(lines: &[String]) -> Option<ChainStatus> {
-    let first = lines.first()?;
-    let value: serde_json::Value = serde_json::from_str(first).ok()?;
-    if value.get("seq").is_none() || value.get("prev_hash").is_none() {
+    let framed = lines.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .is_ok_and(|value| value.get("seq").is_some() || value.get("prev_hash").is_some())
+    });
+    if !framed {
         return None;
     }
     Some(verify_lines::<DeviceLine>(lines).status)
@@ -686,6 +781,7 @@ pub enum JournalError {
 mod tests {
     use super::{read_journal, reconcile, JournalError, LoginEntry, Provenance, ReceiptEntry};
     use tessera_codes_contract::nonce::Nonce;
+    use tessera_codes_contract::outcome;
     use tessera_codes_contract::params::FleetParams;
 
     /// Происхождение «цепочка сошлась и покрыта заверением» — то, что не
@@ -722,6 +818,15 @@ mod tests {
     }
 
     fn login(mark: u8) -> LoginEntry {
+        login_with(mark, outcome::OUTCOME_SUCCESS)
+    }
+
+    /// Строка журнала с названным исходом.
+    ///
+    /// Отказные строки — не экзотика: устройство пишет их на каждую отвергнутую
+    /// попытку, и до этой правки ни одна фикстура их не подавала. Именно
+    /// поэтому сверка три задачи подряд считала отказ входом, а тесты молчали.
+    fn login_with(mark: u8, outcome: &str) -> LoginEntry {
         LoginEntry {
             device_number: "77000123".to_owned(),
             epoch: 7,
@@ -729,8 +834,85 @@ mod tests {
             role_id: "ops.dc.senior".to_owned(),
             level: 2,
             ticket_number: Some("tk-17".to_owned()),
-            outcome: "success".to_owned(),
+            outcome: outcome.to_owned(),
         }
+    }
+
+    /// Отвергнутая попытка на том же nonce.
+    fn refused(mark: u8) -> LoginEntry {
+        login_with(mark, outcome::OUTCOME_DENIED)
+    }
+
+    /// Инженер ошибся в коде и со второго раза ввёл верный.
+    ///
+    /// Бюджет попыток на nonce для этого и существует, поэтому две строки на
+    /// одном nonce здесь — норма, а не устройство, ответившее на один challenge
+    /// дважды. Класс series-on-one-nonce документирован как «прибор не тот, за
+    /// который себя выдаёт», и опечатка на клавиатуре не должна его поднимать.
+    #[test]
+    fn a_mistyped_code_is_not_a_series_on_one_nonce() {
+        let report = reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), verified());
+        assert!(
+            !report.has_findings(),
+            "штатная опечатка подняла находку: {report}"
+        );
+        assert!(report.series_on_one_nonce.is_empty());
+        assert_eq!(report.refusals_read(), 1);
+        assert!(report.to_string().contains("refusals-read count=1"));
+    }
+
+    /// Отказ без квитанции — не выдача без квитанции.
+    ///
+    /// Кто угодно у консоли набирает имя ролевой учётной записи и произвольный
+    /// код: кода ему не выдали, но отказная строка запишется. Считая её входом,
+    /// сверка позволяла бы прохожему сгенерировать сколько угодно находок
+    /// класса «код выдан мимо книг» и утопить в них настоящую.
+    #[test]
+    fn refusals_do_not_become_logins_without_a_receipt() {
+        let report = reconcile(&[], Some(&[refused(1), refused(2)]), verified());
+        assert!(
+            report.logins_without_receipt.is_empty(),
+            "отказ прочитан как вход: {report}"
+        );
+        assert!(!report.has_findings());
+        assert_eq!(report.refusals_read(), 2);
+    }
+
+    /// Исчерпанный бюджет попыток — тоже отказ.
+    #[test]
+    fn an_exhausted_budget_is_not_an_admission() {
+        let report = reconcile(
+            &[],
+            Some(&[login_with(1, outcome::OUTCOME_ATTEMPTS_EXHAUSTED)]),
+            verified(),
+        );
+        assert!(report.logins_without_receipt.is_empty());
+        assert_eq!(report.refusals_read(), 1);
+    }
+
+    /// Отказ не закрывает квитанцию собой.
+    ///
+    /// Код выдан, вошли по нему или нет — вопрос отдельный: если единственная
+    /// строка на этом nonce отказная, сессия не открывалась, и квитанция
+    /// остаётся неотоваренной. Иначе отказ прятал бы находку.
+    #[test]
+    fn a_refusal_does_not_answer_a_receipt() {
+        let report = reconcile(&[receipt(1)], Some(&[refused(1)]), verified());
+        assert_eq!(report.receipts_without_login.len(), 1);
+        assert!(report.disagreements.is_empty());
+        assert_eq!(report.refusals_read(), 1);
+    }
+
+    /// Незнакомое слово исхода входом не считается.
+    ///
+    /// Читатель, угадывающий значение неизвестного слова, превратил бы его в
+    /// открытую сессию — а словарь исходов живёт в контракте и может пополниться
+    /// раньше, чем эта сторона о том узнает.
+    #[test]
+    fn an_outcome_this_reader_does_not_know_is_not_an_admission() {
+        let report = reconcile(&[], Some(&[login_with(1, "granted")]), verified());
+        assert!(report.logins_without_receipt.is_empty());
+        assert_eq!(report.refusals_read(), 1);
     }
 
     #[test]
@@ -889,6 +1071,39 @@ mod tests {
             ),
             Err(JournalError::BrokenChain { position: 1 })
         ));
+    }
+
+    /// Снятое обрамление первой строки не превращает цепочку в выгрузку.
+    ///
+    /// Иначе вся разница между проверяемым журналом и непроверяемой выгрузкой
+    /// стоила бы одной правки: оператор, скрывающий внекнижные выдачи, удаляет
+    /// неудобные строки, снимает `seq` и `prev_hash` с первой — и файл
+    /// принимается как плоская выгрузка, где удалять можно без следа.
+    #[test]
+    fn a_chain_stripped_of_its_first_framing_is_not_a_flat_export() {
+        let text = device_chain(&[
+            device_login("0000014711", "success"),
+            device_login("0000020815", "success"),
+        ]);
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+
+        // Ровно то, что сделал бы прячущий: первая строка теряет обрамление,
+        // остальные остаются как были.
+        let head = lines.first_mut().unwrap();
+        let mut first: serde_json::Value = serde_json::from_str(head).unwrap();
+        let object = first.as_object_mut().unwrap();
+        object.remove("seq");
+        object.remove("prev_hash");
+        *head = serde_json::to_string(&first).unwrap();
+
+        let stripped = format!("{}\n", lines.join("\n"));
+        assert!(
+            matches!(
+                read_journal("77000123", &stripped, &FleetParams::defaults()),
+                Err(JournalError::BrokenChain { .. })
+            ),
+            "журнал с обрамлением принят как выгрузка без цепочки: {stripped}"
+        );
     }
 
     /// Выгрузка без цепочки принимается, но отчёт об этом говорит: строку из

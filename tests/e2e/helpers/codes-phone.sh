@@ -132,6 +132,9 @@ usage: codes-phone.sh <command> [args]
   authenticate <user> --level N
                         полный вход по коду: снять challenge, получить код у
                         `issuer codes issue`, подать его
+  authenticate-mistyping-once <user> --level N
+                        вход, где первый код набран неверно, а второй верно:
+                        журнал устройства получает отказ и успех на ОДИН nonce
   authenticate-with-code <user> --level N --code <код>
                         то же, но код задан снаружи и подаётся как есть;
                         выдача не вызывается вовсе
@@ -748,6 +751,20 @@ run_conversation() {
             die "режим other-name недоступен: подмена личного номера ломает подпись устройства, и проверяется теперь отказом выдачи — см. expect-issue-refused-under-another-name"
             ;;
         wrong) code="$WRONG_CODE" ;;
+        mistyped-then-right)
+            # Инженер ошибся в коде и со второго раза ввёл верный — самая
+            # обычная вещь, ради которой у nonce и есть бюджет попыток.
+            # Устройство пишет в свою цепочку ДВЕ строки на один nonce: отказ и
+            # успех. Кейс сверки живёт именно на этом журнале.
+            local spoken
+            spoken="$(await_challenge "$err" "$driver")"
+            code="$(issue_code "$(wire_from_spoken "$spoken")")"
+            [ -n "$code" ] || die "выдача не вернула код (см. $err)"
+            printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            printf '%s\n' "$WRONG_CODE" >&3
+            # Первый ответ уже подан; остальные — верный код.
+            code_answers=$((code_answers - 1))
+            ;;
         fixed:*) code="${source#fixed:}" ;;
         *) die "неизвестный источник кода: $source" ;;
     esac
@@ -881,6 +898,31 @@ cmd_authenticate_with_code() {
 
     load_prepared
     run_conversation "$user" "$level" "fixed:$code" "$ATTEMPTS_PER_NONCE"
+}
+
+# Вход, в котором инженер ошибается кодом один раз и вводит верный со второго.
+#
+# Нужен сверке: журнал устройства получает на один nonce две строки, отказ и
+# успех. Сверка обязана прочитать это как один вход, а не как два, — иначе
+# опечатка на клавиатуре поднимает класс находки, документированный как «прибор
+# не тот, за который себя выдаёт».
+cmd_authenticate_mistyping_once() {
+    local user="${1:-}" level=""
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --level)
+                level="${2:-}"
+                shift 2 || usage_error "--level без значения"
+                ;;
+            *) usage_error "неизвестный аргумент authenticate-mistyping-once: $1" ;;
+        esac
+    done
+    [ -n "$user" ] && [ -n "$level" ] \
+        || usage_error "usage: codes-phone.sh authenticate-mistyping-once <user> --level N"
+
+    load_prepared
+    run_conversation "$user" "$level" mistyped-then-right "$ATTEMPTS_PER_NONCE"
 }
 
 # Вход кодом, посчитанным из одного статического ключа устройства.
@@ -1326,6 +1368,7 @@ main() {
         prepare)              cmd_prepare "$@" ;;
         authenticate)         cmd_authenticate "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
+        authenticate-mistyping-once) cmd_authenticate_mistyping_once "$@" ;;
         authenticate-with-device-key) cmd_authenticate_with_device_key "$@" ;;
         expect-issue-refused-under-another-name) cmd_expect_issue_refused_under_another_name "$@" ;;
         expect-issue-refused) cmd_expect_issue_refused "$@" ;;

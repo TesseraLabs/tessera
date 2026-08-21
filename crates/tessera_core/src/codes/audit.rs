@@ -27,12 +27,13 @@ use crate::audit::AuditError;
 /// `qr_code_login` — the outcome of a code login attempt.
 pub const EVENT_QR_CODE_LOGIN: &str = "qr_code_login";
 
-/// Outcome recorded by [`emit_qr_code_login`].
-pub const OUTCOME_SUCCESS: &str = "success";
-/// Outcome recorded when the attempt was refused.
-pub const OUTCOME_DENIED: &str = "denied";
-/// Outcome recorded when the attempt budget of the nonce ran out.
-pub const OUTCOME_ATTEMPTS_EXHAUSTED: &str = "attempts_exhausted";
+// The vocabulary of outcomes belongs to the contract, not to this module: the
+// reconciliation of an audit reads these words out of the journals this module
+// writes, and a second spelling of them on the reading side would be a value
+// copied into two places that must never disagree.
+pub use tessera_codes_contract::outcome::{
+    OUTCOME_ATTEMPTS_EXHAUSTED, OUTCOME_DENIED, OUTCOME_SUCCESS,
+};
 
 /// Refusal detail: no ticket of that operator is on the device.
 pub const REASON_NO_TICKET: &str = "no_ticket";
