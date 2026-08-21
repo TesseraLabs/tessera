@@ -59,6 +59,7 @@ fn login(nonce: &str, outcome: &str) -> AuditRecord {
         level: 1,
         epoch: 7,
         ticket_no: "tk-17".to_owned(),
+        claimed_engineer_no: "eng-1".to_owned(),
         outcome: outcome.to_owned(),
         reason: None,
     }

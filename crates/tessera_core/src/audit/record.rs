@@ -92,6 +92,17 @@ pub enum AuditRecord {
         epoch: u32,
         /// Ticket the operator worked under, `"-"` when there was none.
         ticket_no: String,
+        /// Personal number of the engineer **as they gave it**, `"-"` when the
+        /// attempt was refused before they were asked.
+        ///
+        /// Claimed, not established, and the name says so: an offline device
+        /// holds no registry of people and checks nothing about the value. What
+        /// it is good for is the reconciliation this field exists for — the
+        /// logins a fleet saw against the grants its server issued — and for
+        /// that a claimed number is exactly what has to be recorded: the number
+        /// the code was computed for. A journal claiming more than it knows is
+        /// worse than one that stays quiet.
+        claimed_engineer_no: String,
         /// One of [`outcome`].
         outcome: String,
         /// The refusal detail, absent on success.
@@ -217,6 +228,7 @@ mod tests {
             level: 1,
             epoch: 7,
             ticket_no: "tk-17".to_owned(),
+            claimed_engineer_no: "eng-1".to_owned(),
             outcome: outcome.to_owned(),
             reason: None,
         }

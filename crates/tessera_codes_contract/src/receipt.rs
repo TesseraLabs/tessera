@@ -11,7 +11,7 @@
 //!
 //! Receipts are written as files, one per issuance, and the name of that file
 //! is composed rather than free ([`IssuanceReceipt::file_name`]): the device,
-//! the epoch, the nonce counter, the ticket, the operator and a digest of the
+//! the epoch, the head of the nonce, the ticket, the operator and a digest of the
 //! receipt itself. Two receipts of one channel therefore sort next to each
 //! other and never overwrite one another.
 
@@ -21,7 +21,7 @@ use crate::key::Epoch;
 use crate::mac::sha256;
 use crate::nonce::{Nonce, NonceError};
 use crate::params::FleetParams;
-use crate::ticket::OperatorTicket;
+use crate::ticket::ServerTicket;
 use crate::time::ClaimedTime;
 use crate::wire::{self, WireError};
 
@@ -44,7 +44,15 @@ const WIRE_KEYS: [&str; RECEIPT_FIELD_COUNT] = [
 
 /// Number of digest bytes the file name carries.
 ///
-/// Eight bytes distinguish the receipts of one device, epoch and counter — the
+/// Characters of the nonce that go into the file name.
+///
+/// The whole nonce would make the name unwieldy and buys nothing: what makes the
+/// name unique is the digest at its end, and the head of the nonce is there so a
+/// person scanning a directory can pair a file with a challenge they are looking
+/// at.
+const FILE_NAME_NONCE_STEM: usize = 12;
+
+/// Eight bytes distinguish the receipts of one device, epoch and nonce — the
 /// case where the rest of the name repeats — and the name still fits a line.
 /// The digest is not a secret and is not a signature: it separates names, it
 /// does not authenticate them.
@@ -180,8 +188,8 @@ impl IssuanceReceipt {
         Ok(encoder.finish())
     }
 
-    /// Returns the composed file name of the receipt: device, epoch, nonce
-    /// counter, ticket number, operator and a digest of the receipt.
+    /// Returns the composed file name of the receipt: device, epoch, the head of
+    /// the nonce, ticket number, operator and a digest of the receipt.
     ///
     /// The ticket is a parameter rather than a field of the receipt because the
     /// ticket number and the operator identifier have to come from one and the
@@ -198,15 +206,15 @@ impl IssuanceReceipt {
     ///
     /// Returns [`CanonError::FieldTooLong`] when the receipt cannot be encoded,
     /// since the digest is taken over its canonical bytes.
-    pub fn file_name(&self, ticket: &OperatorTicket) -> Result<String, CanonError> {
+    pub fn file_name(&self, ticket: &ServerTicket) -> Result<String, CanonError> {
         let digest = sha256(&self.encode()?);
         let digest_hex = hex::encode(digest.get(..FILE_NAME_DIGEST_BYTES).unwrap_or(&digest));
         let parts = [
             safe_part(self.device_number.significant()),
             self.epoch.get().to_string(),
-            self.nonce.counter().to_string(),
+            nonce_stem(&self.nonce),
             safe_part(ticket.number().as_str()),
-            safe_part(ticket.operator_id()),
+            safe_part(ticket.server_id()),
             digest_hex,
         ];
         Ok(parts.join(&FILE_NAME_SEPARATOR.to_string()))
@@ -265,6 +273,11 @@ impl core::fmt::Display for IssuanceReceipt {
 
 /// Reduces one part of the file name to characters a filesystem takes without
 /// interpreting them.
+/// Returns the head of a nonce, for the file name.
+fn nonce_stem(nonce: &Nonce) -> String {
+    nonce.as_str().chars().take(FILE_NAME_NONCE_STEM).collect()
+}
+
 fn safe_part(value: &str) -> String {
     let reduced: String = value
         .chars()
@@ -316,6 +329,11 @@ mod tests {
     use crate::device_number::{CheckedDeviceNumber, DeviceNumberError};
     use crate::key::Epoch;
     use crate::nonce::Nonce;
+
+    /// A nonce of the default width, in the default alphabet.
+    fn fixture_nonce(params: FleetParams) -> String {
+        "4".repeat(usize::from(params.nonce_width()))
+    }
     use crate::params::FleetParams;
     use crate::ticket::tests::signed_ticket;
     use crate::time::ClaimedTime;
@@ -329,7 +347,7 @@ mod tests {
         ReceiptFields {
             device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
             epoch: Epoch::new(7),
-            nonce: Nonce::new(420, "0713", &params()).unwrap(),
+            nonce: Nonce::parse(&fixture_nonce(params()), &params()).unwrap(),
             role_id,
             level: Level::new(2),
             issued_at: ClaimedTime::new(1_755_000_000),
@@ -364,8 +382,8 @@ mod tests {
                 "373730303031323353", // device number "77000123S", significant only
                 "00000004",
                 "00000007", // epoch 7
-                "0000000a",
-                "30303034323030373133", // nonce
+                "0000001a",
+                "3434343434343434343434343434343434343434343434343434", // nonce: 26 characters of the default width
                 "00000003",
                 "6f7073", // role "ops"
                 "00000004",
@@ -392,7 +410,18 @@ mod tests {
         let parts: Vec<&str> = name.split('-').collect();
         assert_eq!(parts.first().copied(), Some("77000123S"));
         assert_eq!(parts.get(1).copied(), Some("7"));
-        assert_eq!(parts.get(2).copied(), Some("420"));
+        assert_eq!(
+            parts.get(2).copied(),
+            Some(
+                receipt
+                    .nonce()
+                    .as_str()
+                    .chars()
+                    .take(super::FILE_NAME_NONCE_STEM)
+                    .collect::<String>()
+                    .as_str()
+            )
+        );
         // The ticket number "tk-17" carries the separator itself, so it spans
         // two parts; the name is a name, not a format to be split back.
         assert!(name.contains("-tk-17-op-42-"), "{name}");
@@ -404,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_name_separates_two_receipts_of_one_counter() {
+    fn the_file_name_separates_two_receipts_of_one_nonce() {
         let ticket = signed_ticket();
         let first = receipt();
         let second = IssuanceReceipt::new(ReceiptFields {
@@ -481,7 +510,7 @@ mod tests {
             IssuanceReceipt::parse(
                 &receipt
                     .to_wire()
-                    .replace("nonce=0004200713", "nonce=00042007"),
+                    .replace(&fixture_nonce(params()), &fixture_nonce(params())[1..]),
                 &params()
             ),
             Err(ReceiptError::Nonce(_))

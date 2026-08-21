@@ -24,7 +24,7 @@
 
 use tessera_codes_contract::challenge::Challenge;
 use tessera_codes_contract::registry::DeviceRecord;
-use tessera_codes_contract::ticket::OperatorTicket;
+use tessera_codes_contract::ticket::ServerTicket;
 
 use crate::codes::Refusal;
 
@@ -51,7 +51,7 @@ pub struct Coverage<'a> {
     /// The signed record of the device the challenge names.
     pub record: &'a DeviceRecord,
     /// The ticket the operator is working under.
-    pub ticket: &'a OperatorTicket,
+    pub ticket: &'a ServerTicket,
     /// Where the fleet says the device stands, when the operator supplied it.
     pub device_scope: Option<&'a DeviceScope>,
 }
@@ -94,10 +94,10 @@ pub fn check(coverage: &Coverage<'_>) -> Result<(), Refusal> {
             record: record.epoch().get(),
         });
     }
-    if challenge.operator_id() != ticket.operator_id() {
+    if challenge.server_id() != ticket.server_id() {
         return Err(Refusal::Operator {
-            challenge: challenge.operator_id().to_owned(),
-            ticket: ticket.operator_id().to_owned(),
+            challenge: challenge.server_id().to_owned(),
+            ticket: ticket.server_id().to_owned(),
         });
     }
 
@@ -142,7 +142,7 @@ mod tests {
         let world = fixtures::world();
         assert_eq!(
             check(&Coverage {
-                challenge: &world.challenge,
+                challenge: world.challenge.challenge(),
                 record: &world.record,
                 ticket: world.ticket.ticket(),
                 device_scope: Some(&world.device_scope),
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn a_challenge_naming_another_operator_is_refused() {
         let world = fixtures::world();
-        let challenge = fixtures::challenge_with(|input| input.operator_id = "op-99".to_owned());
+        let challenge = fixtures::challenge_with(|input| input.server_id = "op-99".to_owned());
         assert!(matches!(
             check(&Coverage {
                 challenge: &challenge,
@@ -207,7 +207,7 @@ mod tests {
         };
         assert!(matches!(
             check(&Coverage {
-                challenge: &world.challenge,
+                challenge: world.challenge.challenge(),
                 record: &world.record,
                 ticket: world.ticket.ticket(),
                 device_scope: Some(&elsewhere),
@@ -225,7 +225,7 @@ mod tests {
         };
         assert_eq!(
             check(&Coverage {
-                challenge: &world.challenge,
+                challenge: world.challenge.challenge(),
                 record: &world.record,
                 ticket: world.ticket.ticket(),
                 device_scope: Some(&elsewhere),
@@ -238,7 +238,7 @@ mod tests {
     fn an_undeclared_site_leaves_the_axis_unchecked_rather_than_admitted() {
         let world = fixtures::world();
         let coverage = Coverage {
-            challenge: &world.challenge,
+            challenge: world.challenge.challenge(),
             record: &world.record,
             ticket: world.ticket.ticket(),
             device_scope: None,

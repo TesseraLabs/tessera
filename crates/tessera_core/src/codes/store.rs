@@ -4,7 +4,7 @@
 //! by this code: the container holding the device private key, the ticket set,
 //! the revocation list of those tickets, and the anchor the tickets are checked
 //! against. Beside them sits a state directory this module does write — the
-//! nonce counter and the pending attempts.
+//! throttle of the device and the file its attempt lock is held on.
 //!
 //! A device missing any of the four does not offer the code method. That is not
 //! the same as a configuration error: a fleet that never issued this device a
@@ -52,7 +52,7 @@ pub const MAX_KEY_CONTAINER_BYTES: usize = 256 * 1024;
 /// paths over, and this module never has to know how a fleet spells them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodesPaths {
-    /// Directory this module writes the counter and the pending attempts to.
+    /// Directory this module writes the throttle and the lock file to.
     pub state_dir: PathBuf,
     /// Container holding the device private key, opened with a PIN.
     pub device_key_container: PathBuf,

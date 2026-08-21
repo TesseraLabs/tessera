@@ -11,9 +11,6 @@
 #                              [--revoke-ticket] [--without-ticket]
 #   codes-enroll.sh import
 #   codes-enroll.sh import-expect-refused <регексп причины>
-#   codes-enroll.sh note-counter
-#   codes-enroll.sh assert-counter-reset
-#   codes-enroll.sh assert-counter-kept
 #   codes-enroll.sh cleanup
 #
 # Пакет собирается в режиме standalone: подписанный манифест потребовал бы ключа
@@ -40,12 +37,10 @@ EXIT_INTERNAL=70
 
 CODES_DIR="${TESSERA_E2E_CODES_DIR:-/var/lib/tessera/codes}"
 STATE_DIR="$CODES_DIR/state"
-COUNTER_FILE="$STATE_DIR/nonce.counter"
 
 RUN_DIR="${TESSERA_E2E_STATE_DIR:-/run/tessera-e2e}/codes-enroll"
 PACKAGE_DIR="$RUN_DIR/package"
 PIN_FILE="$RUN_DIR/container.pin"
-NOTED_COUNTER="$RUN_DIR/noted.counter"
 
 # Пути, которые импорт перезаписывает помимо Codes. Снимаются до импорта и
 # возвращаются в cleanup.
@@ -80,9 +75,6 @@ usage: codes-enroll.sh <command> [args]
   import-expect-refused <регексп>
                         импорт обязан отказать, и причина обязана совпасть с
                         регекспом; 0 только на такой отказ
-  note-counter          запомнить текущее значение счётчика nonce
-  assert-counter-reset  счётчик обнулён относительно запомненного
-  assert-counter-kept   счётчик не обнулён относительно запомненного
   cleanup               вернуть окружение как было (идемпотентно)
 EOF
 }
@@ -301,56 +293,6 @@ cmd_import_expect_refused() {
 }
 
 # ----------------------------------------------------------------------------
-# счётчик nonce
-# ----------------------------------------------------------------------------
-
-read_counter() {
-    [ -f "$COUNTER_FILE" ] || {
-        echo 0
-        return 0
-    }
-    tr -d '[:space:]' <"$COUNTER_FILE"
-}
-
-cmd_note_counter() {
-    require_root
-    mkdir -p "$RUN_DIR"
-    read_counter >"$NOTED_COUNTER"
-    echo "counter noted: $(cat "$NOTED_COUNTER")"
-}
-
-noted_counter() {
-    [ -f "$NOTED_COUNTER" ] || die "счётчик не запомнен — вызови note-counter"
-    cat "$NOTED_COUNTER"
-}
-
-cmd_assert_counter_reset() {
-    require_root
-    local before after
-    before="$(noted_counter)"
-    after="$(read_counter)"
-    [ "$before" -gt 0 ] || die "запомненный счётчик нулевой — кейс ничего не проверяет"
-    if [ "$after" -ge "$before" ]; then
-        echo "счётчик не обнулён: было $before, стало $after" >&2
-        return 1
-    fi
-    echo "counter reset: $before -> $after"
-}
-
-cmd_assert_counter_kept() {
-    require_root
-    local before after
-    before="$(noted_counter)"
-    after="$(read_counter)"
-    [ "$before" -gt 0 ] || die "запомненный счётчик нулевой — кейс ничего не проверяет"
-    if [ "$after" -lt "$before" ]; then
-        echo "счётчик откатился: было $before, стало $after" >&2
-        return 1
-    fi
-    echo "counter kept: $before -> $after"
-}
-
-# ----------------------------------------------------------------------------
 # cleanup
 # ----------------------------------------------------------------------------
 
@@ -370,9 +312,6 @@ main() {
     package) cmd_package "$@" ;;
     import) cmd_import "$@" ;;
     import-expect-refused) cmd_import_expect_refused "$@" ;;
-    note-counter) cmd_note_counter "$@" ;;
-    assert-counter-reset) cmd_assert_counter_reset "$@" ;;
-    assert-counter-kept) cmd_assert_counter_kept "$@" ;;
     cleanup) cmd_cleanup "$@" ;;
     *) usage_error "неизвестная команда $command" ;;
     esac

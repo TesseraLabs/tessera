@@ -1,16 +1,17 @@
-# Golden vector: the longest decimal code the contract allows — nineteen
-# digits, the point where the value range 10^19 still fits the 64-bit sample the
-# unbiased truncation draws from. Half the samples fall outside the usable
-# multiple at this length, so the vector also exercises the retry rounds of the
-# truncation, not only its accepting path.
+# Golden vector: a nonce at the widest the contract accepts.
 #
-# The expected values below are the compatibility surface of the phone channel.
+# Sixty-four characters is `MAX_NONCE_WIDTH`, and the value is written out in
+# full so the framing of a long field is frozen: the length prefix of the nonce
+# is the one field of the canonical encoding that a fleet can move, and a parser
+# that started truncating or padding it would meet nothing else in this file.
+#
+# The expected values below are the compatibility surface of the channel.
 # They are not to be regenerated when a test fails: a change here is a breaking
 # change of the contract and travels through the two-step procedure of the
 # workspace compatibility policy.
 
 device_number = 77-000123-S
-nonce = 704219836150742938105647392018365470921
+nonce = 9999999999999999999999999999999999999999999999999999999999999999
 role_id = ops.dc.senior
 level = 2
 epoch = 7
@@ -19,11 +20,11 @@ ticket = tessera-codes/v1/ticket;server=op-42;key=041122;tags=dc-1;roles=ops.dc.
 z_hex = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
 
 alphabet = decimal
-code_len = 19
-nonce_width = 39
+code_len = 8
+nonce_width = 64
 
-canon_hex = 000000093737303030313233530000000400000007000000273730343231393833363135303734323933383130353634373339323031383336353437303932310000000d6f70732e64632e73656e696f72000000040000000200000005656e672d31
+canon_hex = 00000009373730303031323353000000040000000700000040393939393939393939393939393939393939393939393939393939393939393939393939393939393939393939393939393939393939393939393939393939390000000d6f70732e64632e73656e696f72000000040000000200000005656e672d31
 ticket_hex = 000000056f702d34320000000304112200000004000000010000000464632d3100000004000000010000000d6f70732e64632e73656e696f720000000a72752d63656e7472616c000000040000000300000008000000006b49d20000000005746b2d313700000002abcd
 context_hex = 0000000937373030303132335300000020d94d5722263226a698d6ffb525522fcf085860d48d94afd5f181a8ebab532b15
 k_hex = 26d6a0fd1f5c8745e70e38b84d0bfeacdad5ff4499694651ea2563b98417d7bb
-code = 1004725018760717776
+code = 23267766

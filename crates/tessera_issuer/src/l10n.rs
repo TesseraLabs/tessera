@@ -289,14 +289,12 @@ pub(crate) enum Msg {
     /// them looking for a code nobody asked for.
     CodesRefused,
     /// Codes: what the nonce counter said about the call (a token follows).
-    CodesCounterNote,
     /// Codes: how the operator key was held (a token follows).
     CodesKeyStorage,
     /// Codes: the site axis of the ticket was not checked (full-line warning).
     CodesSiteUndeclared,
     /// Codes: the second operator who approved an override (an identifier
     /// follows).
-    CodesOverrideApprover,
     /// Codes: the receipt is well formed and its name binds it to the ticket
     /// (full line).
     CodesReceiptValid,
@@ -401,13 +399,11 @@ impl Msg {
             Msg::CodesCodeHeading => "code to read out:",
             Msg::CodesReceiptWritten => "receipt written to",
             Msg::CodesRefused => "the command was refused:",
-            Msg::CodesCounterNote => "counter:",
             Msg::CodesKeyStorage => "operator key held:",
             Msg::CodesSiteUndeclared => {
                 "the site of the device was not declared, so the ticket's region and tags were \
                  not checked here; the device checks them itself before it accepts the code"
             }
-            Msg::CodesOverrideApprover => "counter refusal overridden, approved by:",
             Msg::CodesReceiptValid => {
                 "the receipt is well formed and its name binds it to the ticket"
             }
@@ -502,13 +498,11 @@ impl Msg {
             Msg::CodesCodeHeading => "код для диктовки:",
             Msg::CodesReceiptWritten => "квитанция записана в",
             Msg::CodesRefused => "команда отклонена:",
-            Msg::CodesCounterNote => "счётчик:",
             Msg::CodesKeyStorage => "ключ оператора хранится:",
             Msg::CodesSiteUndeclared => {
                 "место устройства не названо, поэтому регион и метки билета здесь не проверялись; \
                  устройство проверяет их само, прежде чем принять код"
             }
-            Msg::CodesOverrideApprover => "отказ по счётчику обойдён, подтвердил:",
             Msg::CodesReceiptValid => "квитанция целостна, имя файла связывает её с билетом",
             Msg::CodesReceiptInvalid => "квитанция не сходится:",
             Msg::CodesTicketVerified => "билет проверен по якорю удостоверяющей стороны",

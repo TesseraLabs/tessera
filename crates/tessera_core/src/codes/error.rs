@@ -9,9 +9,9 @@
 //! target instead, where it reaches an operator of the fleet and not a caller.
 //!
 //! The variants that are *not* denials are the ones an engineer has to act on:
-//! the method is not installed, the attempt budget is spent, the counter of the
-//! epoch is used up, or the persisted state moved backwards. None of them says
-//! anything about a secret.
+//! the method is not installed, the attempt budget is spent, or the device
+//! cannot read, write or lock its state directory. None of them says anything
+//! about a secret.
 
 /// Refusal of a code login.
 #[derive(Debug, thiserror::Error)]
@@ -59,35 +59,20 @@ pub enum CodeLoginError {
     /// The device refuses for now, and will stop refusing on its own.
     ///
     /// Two limits produce this: the budget of challenges the device issues in a
-    /// window, which is what keeps a caller from spending the nonce counter to
-    /// exhaustion, and the lock a run of failed attempts puts on one role. Both
-    /// expire without anybody clearing them — see [`super::throttle`].
+    /// window, which is what keeps a caller from making this device draw
+    /// ephemeral pairs all day, and the lock a run of failed attempts puts on
+    /// one role. Both expire without anybody clearing them — see
+    /// [`super::throttle`].
     #[error("the code method is refusing for another {} second(s)", retry_after.as_secs())]
     TemporarilyLocked {
         /// How long the caller has to wait.
         retry_after: std::time::Duration,
     },
 
-    /// The nonce counter no longer fits the width of the fleet parameters.
+    /// The operating system random generator refused to draw the nonce.
     ///
-    /// The counter is never carried around its modulus, because a repeated
-    /// nonce inside one key epoch repeats a code. The device owes a key epoch
-    /// rotation before it can issue another challenge.
-    #[error("the nonce counter of this key epoch is exhausted; rotate the key epoch")]
-    CounterExhausted,
-
-    /// The persisted state of the method moved backwards.
-    ///
-    /// Restoring a device from a snapshot rolls its counter back with it, and
-    /// a rolled-back counter re-issues nonces that have already been spoken
-    /// aloud. The method refuses until the key epoch is rotated.
-    #[error("the persisted code state moved backwards; rotate the key epoch")]
-    StateRollback,
-
-    /// The operating system random generator refused to fill the nonce tail.
-    ///
-    /// There is no fallback inside this method: a nonce tail drawn from
-    /// anything other than the system generator is not a nonce tail.
+    /// There is no fallback inside this method: a nonce drawn from anything
+    /// other than the system generator is not a nonce.
     #[error("the system random generator is unavailable: {reason}")]
     Rng {
         /// What the generator reported.

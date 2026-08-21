@@ -11,21 +11,22 @@
 //! 1. **The grounds.** Nothing is computed for an issuance nobody can answer
 //!    for later. It is first because it is the only thing here that does not
 //!    depend on any document.
-//! 2. **The device record**, then **the ticket**. The scope, the term and the
-//!    counter of documents nobody signed are not information about anything.
+//! 2. **The device record**, then **the ticket**. The scope and the term of
+//!    documents nobody signed are not information about anything.
 //! 3. **The coverage** of the request by the ticket — see
 //!    [`crate::codes::scope`].
-//! 4. **The counter** — see [`crate::codes::counter`].
-//! 5. **The key**, and only then the code. Key agreement is the one step that
+//! 4. **The key**, and only then the code. Key agreement is the one step that
 //!    reaches a token, so it happens after everything that can refuse the call
-//!    without touching one.
+//!    without touching one. It is performed against the ephemeral point the
+//!    challenge carries — the device key in the record identifies the device,
+//!    it does not derive the code.
 //!
 //! The check character of the device number is checked before all of this,
 //! where the challenge is parsed: a number typed wrong never reaches a
 //! computation, and the operator hears about the typo rather than about a code
 //! that does not fit.
 
-use tessera_codes_contract::challenge::Challenge;
+use tessera_codes_contract::challenge::SignedChallenge;
 use tessera_codes_contract::code::{compute_code, Code};
 use tessera_codes_contract::key::{derive_key, KeyContext};
 use tessera_codes_contract::params::FleetParams;
@@ -37,7 +38,6 @@ use tessera_codes_contract::time::ClaimedTime;
 
 use crate::codes::agreement::OperatorKey;
 use crate::codes::annex::{AnnexFields, ReceiptAnnex, SiteScope};
-use crate::codes::counter::{self, CounterOverride, KnownCounter};
 use crate::codes::scope::{self, Coverage, DeviceScope};
 use crate::codes::Refusal;
 
@@ -51,8 +51,8 @@ const SPOKEN_GROUP: usize = 3;
 /// One request an operator is answering.
 #[derive(Debug, Clone, Copy)]
 pub struct IssuanceRequest<'a> {
-    /// The challenge read out over the telephone.
-    pub challenge: &'a Challenge,
+    /// The challenge the device stated, with its signature.
+    pub challenge: &'a SignedChallenge,
     /// The signed record of the device.
     pub record: &'a DeviceRecord,
     /// The ticket the operator is working under.
@@ -66,16 +66,6 @@ pub struct IssuanceRequest<'a> {
     pub reason: &'a str,
     /// The moment the operator's side claims.
     pub now: ClaimedTime,
-    /// Where the history of this device says it was left — the later of what
-    /// the ledger and the receipts say (see [`crate::codes::ledger`]).
-    pub known_counter: Option<&'a KnownCounter>,
-    /// How many issuances that history holds for this device.
-    ///
-    /// It travels into the receipt, where it outlives the history itself.
-    pub history_depth: u64,
-    /// The decision of a second operator to answer a challenge the counter
-    /// refused.
-    pub override_decision: Option<&'a CounterOverride>,
 }
 
 /// What one issuance leaves behind.
@@ -119,26 +109,23 @@ pub fn issue(
     request.record.verify(verifier)?;
     request.ticket.verify(verifier, request.now)?;
 
+    let challenge = request.challenge.challenge();
     let coverage = Coverage {
-        challenge: request.challenge,
+        challenge,
         record: request.record,
         ticket: request.ticket.ticket(),
         device_scope: request.device_scope,
     };
     scope::check(&coverage)?;
 
-    let note = match counter::assess(
-        request.challenge.epoch(),
-        request.challenge.nonce().counter(),
-        request.challenge.nonce().as_str(),
-        request.known_counter,
-    ) {
-        Ok(_) if request.override_decision.is_some() => {
-            return Err(Refusal::OverrideNotNeeded);
-        }
-        Ok(note) => note,
-        Err(refusal) => counter::override_refusal(refusal, request.override_decision)?,
-    };
+    // After the coverage and not before it, for one reason: a challenge and a
+    // record about two different devices are refused by the step above in the
+    // fleet's own words — which number was read out, which number the record
+    // carries — and a signature check running first would answer the same
+    // situation with `the device did not sign this`. Both are refusals; only
+    // one of them tells the operator what to do about it. Before the key
+    // agreement, which is the step that reaches a token.
+    request.challenge.verify(request.record, verifier)?;
 
     if !same_point(
         key.public_point().as_slice(),
@@ -147,21 +134,22 @@ pub fn issue(
         return Err(Refusal::OperatorKeyMismatch);
     }
 
-    let secret = key.agree(request.record.public_key().as_bytes())?;
-    let context = KeyContext::new(
-        request.challenge.device_number(),
-        request.challenge.epoch(),
-        request.ticket.context_hash()?,
-    );
+    // Against the ephemeral point of this attempt, not against the key the
+    // device record carries: the record says which device holds which
+    // long-lived key, and a code derived from that key would be computable by
+    // anyone who ever held it. The record is still checked — it is what says
+    // the device is the one it claims — it just does not enter the code.
+    let secret = key.agree(challenge.ephemeral_point().as_bytes())?;
+    let context = KeyContext::new(challenge.device_number(), request.ticket.context_hash()?);
     let derived = derive_key(&secret, &context)?;
-    let code = compute_code(&derived, &request.challenge.code_input(), request.params)?;
+    let code = compute_code(&derived, &challenge.code_input(), request.params)?;
 
     let receipt = IssuanceReceipt::new(ReceiptFields {
-        device_number: request.challenge.device_number().clone(),
-        epoch: request.challenge.epoch(),
-        nonce: request.challenge.nonce().clone(),
-        role_id: request.challenge.role_id(),
-        level: request.challenge.level(),
+        device_number: challenge.device_number().clone(),
+        epoch: challenge.epoch(),
+        nonce: challenge.nonce().clone(),
+        role_id: challenge.role_id(),
+        level: challenge.level(),
         issued_at: request.now,
         reason: request.reason,
     })?;
@@ -169,14 +157,11 @@ pub fn issue(
         ticket: request.ticket.ticket(),
         organisation_id: request.record.organisation_id(),
         key_storage: key.storage(),
-        counter_note: note,
-        approval: request.override_decision,
         site_scope: if coverage.site_axis_checked() {
             SiteScope::Checked
         } else {
             SiteScope::Undeclared
         },
-        history_depth: request.history_depth,
     })?;
 
     Ok(Issuance {
@@ -220,14 +205,11 @@ fn spoken(value: &str) -> String {
 mod tests {
     use super::{issue, spoken, IssuanceRequest};
     use crate::codes::annex::{KeyStorage, SiteScope};
-    use crate::codes::counter::{CounterNote, CounterOverride, CounterRefusal, KnownCounter};
     use crate::codes::tests::fixtures;
     use crate::codes::Refusal;
-    use tessera_codes_contract::key::Epoch;
     use tessera_codes_contract::time::ClaimedTime;
 
-    /// The request every test starts from: covered, grounded, at the first
-    /// counter of the epoch with no receipts behind it.
+    /// The request every test starts from: covered and grounded.
     fn request(world: &fixtures::World) -> IssuanceRequest<'_> {
         IssuanceRequest {
             challenge: &world.challenge,
@@ -237,9 +219,6 @@ mod tests {
             device_scope: Some(&world.device_scope),
             reason: "work order 42",
             now: fixtures::NOW,
-            known_counter: None,
-            history_depth: 0,
-            override_decision: None,
         }
     }
 
@@ -248,13 +227,14 @@ mod tests {
         let world = fixtures::world();
         let issuance = issue(&request(&world), &world.anchors, &world.operator_key).unwrap();
 
-        assert_eq!(issuance.code.as_str().len(), 8);
+        assert_eq!(
+            issuance.code.as_str().len(),
+            usize::from(world.params.code_len())
+        );
         assert_eq!(issuance.receipt.reason(), "work order 42");
         assert_eq!(issuance.receipt.role_id(), "ops.dc.senior");
         assert_eq!(issuance.annex.key_storage(), KeyStorage::Software);
-        assert_eq!(issuance.annex.counter_note(), CounterNote::FirstOfEpoch);
         assert_eq!(issuance.annex.site_scope(), SiteScope::Checked);
-        assert_eq!(issuance.annex.approver(), None);
     }
 
     #[test]
@@ -305,6 +285,73 @@ mod tests {
     }
 
     #[test]
+    fn a_challenge_the_device_did_not_sign_is_refused() {
+        // The values are all the device's own — number, epoch, nonce, role,
+        // level — and only the signature is somebody else's. Without the
+        // signature check nothing here would tell this apart from a challenge
+        // the device stated, because there is nothing else to tell it by.
+        let world = fixtures::world();
+        let mut request = request(&world);
+        let composed =
+            fixtures::signed_by(fixtures::challenge_with(|_| {}), fixtures::OPERATOR_SEED);
+        request.challenge = &composed;
+
+        let refusal = issue(&request, &world.anchors, &world.operator_key).unwrap_err();
+        assert!(matches!(refusal, Refusal::ChallengeSignature(_)));
+        assert_eq!(refusal.class(), "challenge_signature_rejected");
+        assert_eq!(refusal.group(), crate::codes::RefusalGroup::Trust);
+    }
+
+    #[test]
+    fn a_challenge_edited_after_it_was_signed_is_refused() {
+        // The signature of the device travels verbatim, the level asked for is
+        // raised. This is the shape a rewritten challenge takes on the way to
+        // the issuing side, and it is the whole reason the signature covers the
+        // canonical bytes rather than the device number alone.
+        let world = fixtures::world();
+        let signed = fixtures::signed_challenge_with(|_| {});
+        let raised = tessera_codes_contract::challenge::SignedChallenge::new(
+            fixtures::challenge_with(|input| input.level = 1),
+            signed.signature().clone(),
+        );
+        let mut request = request(&world);
+        request.challenge = &raised;
+        assert!(matches!(
+            issue(&request, &world.anchors, &world.operator_key),
+            Err(Refusal::ChallengeSignature(_))
+        ));
+    }
+
+    #[test]
+    fn the_disk_holders_challenge_passes_issuance_and_is_left_to_the_device() {
+        // Условие кейса CODE-014, проверенное здесь, а не рассуждением: у
+        // снявшего диск ключ устройства есть, поэтому подменённый challenge он
+        // подписывает законно, и выдача обязана его ПРОПУСТИТЬ. Отказ на этой
+        // стороне означал бы, что кейс стережёт проверку подписи вместо
+        // проверки, ради которой он написан, — что код из статического ключа
+        // устройства не сходится при сверке НА УСТРОЙСТВЕ.
+        //
+        // Эфемерная точка здесь — открытая половина статического ключа
+        // устройства (тот же seed), то есть ровно то, что подставляет хелпер
+        // стенда.
+        let world = fixtures::world();
+        let doctored = fixtures::signed_by(
+            fixtures::challenge_with(|input| input.ephemeral_seed = fixtures::DEVICE_SEED),
+            fixtures::DEVICE_SEED,
+        );
+        let mut request = request(&world);
+        request.challenge = &doctored;
+
+        let issued = issue(&request, &world.anchors, &world.operator_key)
+            .map(|issuance| issuance.code.as_str().len());
+        assert_eq!(
+            issued,
+            Ok(usize::from(world.params.code_len())),
+            "выдача обязана посчитать код: подпись устройства законна"
+        );
+    }
+
+    #[test]
     fn an_expired_ticket_is_refused() {
         let world = fixtures::world();
         let mut request = request(&world);
@@ -318,68 +365,13 @@ mod tests {
     #[test]
     fn a_request_outside_the_ticket_is_refused_before_any_key_is_touched() {
         let world = fixtures::world();
-        let challenge = fixtures::challenge_with(|input| input.level = 9);
+        let challenge = fixtures::signed_challenge_with(|input| input.level = 9);
         let mut request = request(&world);
         request.challenge = &challenge;
         assert!(matches!(
             issue(&request, &world.anchors, &world.operator_key),
             Err(Refusal::ScopeLevel { .. })
         ));
-    }
-
-    #[test]
-    fn a_counter_running_ahead_is_refused() {
-        let world = fixtures::world();
-        let challenge = fixtures::challenge_with(|input| input.counter = 5);
-        let mut request = request(&world);
-        request.challenge = &challenge;
-        let known = KnownCounter {
-            epoch: Epoch::new(fixtures::EPOCH),
-            counter: 1,
-            nonce: "0000014711".to_owned(),
-        };
-        request.known_counter = Some(&known);
-        request.history_depth = 1;
-        assert!(matches!(
-            issue(&request, &world.anchors, &world.operator_key),
-            Err(Refusal::Counter(CounterRefusal::Ahead { .. }))
-        ));
-    }
-
-    #[test]
-    fn an_override_of_a_challenge_the_counter_admitted_is_refused() {
-        let world = fixtures::world();
-        let decision = CounterOverride::by("op-7", "op-42").unwrap();
-        let mut request = request(&world);
-        request.override_decision = Some(&decision);
-        assert_eq!(
-            issue(&request, &world.anchors, &world.operator_key)
-                .map(|_| ())
-                .unwrap_err(),
-            Refusal::OverrideNotNeeded
-        );
-    }
-
-    #[test]
-    fn an_override_is_recorded_in_the_receipt_it_produced() {
-        let world = fixtures::world();
-        let decision = CounterOverride::by("op-7", "op-42").unwrap();
-        let challenge = fixtures::challenge_with(|input| input.counter = 5);
-        let mut request = request(&world);
-        request.challenge = &challenge;
-        let known = KnownCounter {
-            epoch: Epoch::new(fixtures::EPOCH),
-            counter: 1,
-            nonce: "0000014711".to_owned(),
-        };
-        request.known_counter = Some(&known);
-        request.history_depth = 1;
-        request.override_decision = Some(&decision);
-
-        let issuance = issue(&request, &world.anchors, &world.operator_key).unwrap();
-        assert_eq!(issuance.annex.counter_note(), CounterNote::Overridden);
-        assert_eq!(issuance.annex.approver(), Some("op-7"));
-        assert!(issuance.annex.to_wire().contains("approver=op-7"));
     }
 
     #[test]

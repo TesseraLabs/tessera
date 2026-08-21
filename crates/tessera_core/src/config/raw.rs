@@ -224,11 +224,13 @@ pub struct RawAudit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RawCodeAlphabet {
-    /// Decimal digits — the only alphabet that survives being read aloud in
-    /// any language, and therefore the default of the telephone channel.
-    #[default]
+    /// Decimal digits — an explicit choice of a fleet whose devices have a
+    /// keypad and nothing else. It was the default while codes were read
+    /// aloud; the code is typed now, and a keyboard has letters.
     Decimal,
-    /// Crockford base32.
+    /// Crockford base32 — the default, and the reason the default code is
+    /// shorter than the decimal one it replaced without being weaker.
+    #[default]
     CrockfordBase32,
 }
 
@@ -292,15 +294,12 @@ pub struct RawCodes {
     /// Verification attempts allowed for one nonce. Contract default 5.
     #[serde(default)]
     pub attempts_per_nonce: Option<u8>,
-    /// Alphabet of the code and the nonce tail. Default `decimal`.
+    /// Alphabet of the code and the nonce. Default `crockford-base32`.
     #[serde(default)]
     pub alphabet: RawCodeAlphabet,
-    /// Width of the decimal nonce counter. Contract default 6.
+    /// Width of the nonce, in characters. Contract default 26.
     #[serde(default)]
-    pub counter_width: Option<u8>,
-    /// Width of the random nonce tail. Contract default 4.
-    #[serde(default)]
-    pub tail_width: Option<u8>,
+    pub nonce_width: Option<u8>,
     /// Key agreement profile of the device pairs. Default `p256`.
     #[serde(default)]
     pub profile: RawCodeProfile,

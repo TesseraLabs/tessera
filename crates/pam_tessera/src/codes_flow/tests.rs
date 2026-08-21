@@ -58,6 +58,9 @@ const RIGHT_CODE: &str = "13572468";
 /// has to name a single epoch across both halves of it.
 const EFFECTIVE_EPOCH: u32 = 9;
 
+/// Personal number the engineer gives at the device.
+const ENGINEER: &str = "eng-1";
+
 /// A conversation whose every answer is written down in advance.
 struct ScriptedConversation {
     /// Answers handed to the visible prompts, in order.
@@ -190,6 +193,7 @@ fn accepted(level: u32) -> Accepted {
 /// An accepted code whose ticket reaches higher than the login it granted.
 fn accepted_under_ceiling(level: u32, ceiling: u32) -> Accepted {
     Accepted {
+        claimed_engineer_no: ENGINEER.to_owned(),
         role_id: ROLE.to_owned(),
         level: Level::new(level),
         level_ceiling: Level::new(ceiling),
@@ -226,7 +230,7 @@ impl CodeMethodApi for ScriptedMethod {
 
     fn verify(
         &self,
-        _attempt: &Self::Attempt,
+        _attempt: &mut Self::Attempt,
         presented: &str,
         _markers: &BootMarkers,
     ) -> Result<Accepted, CodeLoginError> {
@@ -461,7 +465,7 @@ impl Harness {
 fn a_dictated_code_admits_the_engineer() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let ctx = harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -487,7 +491,7 @@ fn the_session_is_registered_with_a_deadline_the_daemon_can_enforce() {
     // ones it was told about.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let ctx = harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -520,7 +524,7 @@ fn the_deadline_is_the_term_of_the_role_measured_from_the_login() {
     // earlier of two things.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let ctx = harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -541,7 +545,7 @@ fn a_daemon_that_cannot_record_the_session_refuses_the_login_in_strict_mode() {
     // same way whichever method met it.
     let harness = Harness::with_refusing_daemon(IpcError::Timeout, MonitorFailMode::Strict);
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -558,7 +562,7 @@ fn a_permissive_mode_admits_the_login_and_says_the_term_will_not_apply() {
     // work out the consequence for themselves.
     let harness = Harness::with_refusing_daemon(IpcError::Timeout, MonitorFailMode::Permissive);
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let ctx = harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -577,7 +581,7 @@ fn a_daemon_that_rejects_the_registration_refuses_the_login_in_either_mode() {
     for mode in [MonitorFailMode::Strict, MonitorFailMode::Permissive] {
         let harness = Harness::with_refusing_daemon(IpcError::Unauthorized, mode);
         let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-        let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+        let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
         let probe = ScriptedProbe::at_level(1);
 
         let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -598,7 +602,7 @@ fn the_session_ceiling_is_the_ticket_and_not_the_level_of_the_login() {
     // rather than left empty for the session phase to guess at.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted_under_ceiling(1, 3))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let ctx = harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -621,7 +625,7 @@ fn the_session_ceiling_is_the_ticket_and_not_the_level_of_the_login() {
 fn a_ticket_above_what_a_label_can_hold_is_capped_rather_than_wrapped() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted_under_ceiling(1, 4096))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let ctx = harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -640,7 +644,7 @@ fn the_session_opens_when_the_cert_integrity_policy_is_required() {
     // computed at the level the operator had authorised.
     let harness = Harness::astra();
     let method = ScriptedMethod::with_verdicts([Ok(accepted_under_ceiling(1, 2))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let ctx = harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -710,7 +714,7 @@ fn the_session_opens_when_the_cert_integrity_policy_is_required() {
 fn the_challenge_is_printed_before_the_code_is_asked_for() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -718,11 +722,13 @@ fn the_challenge_is_printed_before_the_code_is_asked_for() {
     assert_eq!(
         conv.asked,
         vec![
-            super::OPERATOR_PROMPT.to_owned(),
+            super::SERVER_PROMPT.to_owned(),
+            super::ENGINEER_PROMPT.to_owned(),
             super::CODE_PROMPT.to_owned()
         ],
-        "the operator is named and then the code is asked for — and nothing \
-         else is, least of all anything about the key of the device",
+        "the operator is named, then the engineer names themselves, then the \
+         code is asked for — and nothing else is, least of all anything about \
+         the key of the device",
     );
     let shown = conv.shown.first().expect("the challenge is printed");
     assert!(
@@ -740,7 +746,7 @@ fn the_challenge_is_printed_before_the_code_is_asked_for() {
 fn a_wrong_code_is_asked_for_again() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Err(CodeLoginError::Denied), Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", "00000000", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, "00000000", RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     harness.run(&method, &mut conv, &probe, ROLE).unwrap();
@@ -766,7 +772,7 @@ fn a_spent_attempt_budget_is_passed_through_as_max_tries() {
     // go looking elsewhere for the credential.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Err(CodeLoginError::AttemptsExhausted)]);
-    let mut conv = ScriptedConversation::new(["op-42", "00000000"]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, "00000000"]);
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -822,7 +828,7 @@ fn a_level_that_changed_during_the_attempt_refuses_the_login() {
     // level 1 and the session is now running at level 3.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::levels([Ok(Level::new(1)), Ok(Level::new(3))]);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -841,7 +847,7 @@ fn a_level_that_changed_during_the_attempt_refuses_the_login() {
 fn a_level_that_became_unreadable_after_the_code_refuses_the_login() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::levels([Ok(Level::new(1)), Err(LevelError::Empty)]);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -855,7 +861,7 @@ fn an_answer_past_the_bound_is_refused_without_a_verification() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
     let long_code: &'static str = Box::leak("9".repeat(super::MAX_CODE_LEN + 1).into_boxed_str());
-    let mut conv = ScriptedConversation::new(["op-42", long_code]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, long_code]);
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -878,6 +884,29 @@ fn an_empty_answer_is_refused() {
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
 
     assert!(matches!(error, CodeFlowError::Input { .. }));
+}
+
+#[test]
+fn an_empty_personal_number_is_refused() {
+    // The engineer's number is part of the code, so a blank one would compute a
+    // code nobody could reproduce — and would put an empty name in the record
+    // of who came in. It is bounded exactly like the operator's.
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new(["op-42", "   "]);
+    let probe = ScriptedProbe::at_level(1);
+
+    let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
+
+    assert!(matches!(error, CodeFlowError::Input { .. }));
+    assert_eq!(
+        conv.asked,
+        vec![
+            super::SERVER_PROMPT.to_owned(),
+            super::ENGINEER_PROMPT.to_owned()
+        ],
+        "the refusal comes at the personal number, before any challenge exists",
+    );
 }
 
 #[test]
@@ -906,7 +935,7 @@ fn a_role_the_device_does_not_hold_is_refused_after_the_code() {
         role_id: "stranger".to_owned(),
         ..accepted(1)
     })]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -919,26 +948,21 @@ fn a_role_the_device_does_not_hold_is_refused_after_the_code() {
 
 #[test]
 fn a_device_that_cannot_run_the_method_is_not_a_failed_attempt() {
-    // An exhausted counter and a state that moved backwards both mean the
-    // device owes a key epoch rotation. Neither is a verdict about the code,
-    // and neither may read as "try the next method in the stack".
-    for error in [
-        CodeLoginError::CounterExhausted,
-        CodeLoginError::StateRollback,
-        CodeLoginError::State {
-            reason: "state.json is not readable".to_owned(),
-        },
-    ] {
-        let harness = Harness::new();
-        let method = ScriptedMethod::refusing_to_start(error);
-        let mut conv = ScriptedConversation::new(["op-42"]);
-        let probe = ScriptedProbe::at_level(1);
+    // A state directory that cannot be read or locked — another login already
+    // holding the one attempt this device has, a file the device cannot write —
+    // is not a verdict about the code, and it may not read as "try the next
+    // method in the stack".
+    let harness = Harness::new();
+    let method = ScriptedMethod::refusing_to_start(CodeLoginError::State {
+        reason: "the code state of this device could not be locked".to_owned(),
+    });
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER]);
+    let probe = ScriptedProbe::at_level(1);
 
-        let flow_error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
+    let flow_error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
 
-        assert!(matches!(flow_error, CodeFlowError::DeviceState(_)));
-        assert_eq!(flow_error.pam_code(), 4);
-    }
+    assert!(matches!(flow_error, CodeFlowError::DeviceState(_)));
+    assert_eq!(flow_error.pam_code(), 4);
 }
 
 #[test]
@@ -950,7 +974,7 @@ fn a_platform_without_the_method_falls_through_instead_of_failing_the_stack() {
     // must reach the certificate path, not stop at a system error.
     let harness = Harness::new();
     let method = ScriptedMethod::refusing_to_start(CodeLoginError::UnsupportedPlatform);
-    let mut conv = ScriptedConversation::new(["op-42"]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER]);
     let probe = ScriptedProbe::at_level(1);
 
     let flow_error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -1003,7 +1027,7 @@ fn a_device_carrying_no_artefacts_does_not_offer_the_method() {
 fn unreadable_boot_markers_refuse_the_login() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe {
         levels: RefCell::new(VecDeque::from([Ok(Level::new(1))])),
         markers_readable: false,
@@ -1107,7 +1131,7 @@ fn a_journal_that_takes_the_record_leaves_the_session_alone() {
 /// A context standing for a session that has just been registered.
 fn registered_context(harness: &Harness) -> tessera_core::pam_data::AuthContext {
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
     harness.run(&method, &mut conv, &probe, ROLE).unwrap()
 }
@@ -1136,7 +1160,7 @@ fn the_branch_takes_the_epoch_from_the_method_and_not_from_the_configuration() {
     // the field it used to read is gone from the epoch path.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     assert_ne!(
@@ -1161,7 +1185,7 @@ fn a_successful_login_says_whether_the_daemon_recorded_the_session() {
     // through the other door.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let outcome = super::authenticate_by_code(
@@ -1187,7 +1211,7 @@ fn a_permissive_login_the_daemon_refused_says_there_is_nothing_to_give_back() {
     // never saw — a call that can only confuse whoever reads its log.
     let harness = Harness::with_refusing_daemon(IpcError::Timeout, MonitorFailMode::Permissive);
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", RIGHT_CODE]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
 
     let outcome = super::authenticate_by_code(

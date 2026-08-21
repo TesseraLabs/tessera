@@ -2,7 +2,7 @@
 //! fields.
 //!
 //! The receipt of [`tessera_codes_contract::receipt`] is frozen: device, epoch,
-//! nonce, role, level, moment, grounds. Four things an auditor needs are not
+//! nonce, role, level, moment, grounds. Three things an auditor needs are not
 //! among them, and none of them can be recovered afterwards from anything else:
 //!
 //! - the **ticket** the operator worked under, and the operator themselves —
@@ -11,16 +11,8 @@
 //! - **how the operator key was held** — a code produced with a key on a token
 //!   and a code produced with a key file on a disk are different assurances,
 //!   and after the fact nothing distinguishes them;
-//! - **what the counter said**, including whether the refusal was overridden
-//!   and by whom — an override that leaves no trace is not an override, it is a
-//!   bypass;
 //! - whether the **site axis** of the ticket was checked at all — see
-//!   [`crate::codes::scope`];
-//! - **how deep the counter history was** when the code was issued. That number
-//!   is the one thing about the ledger that survives the ledger: a receipt
-//!   claiming no history, filed behind a run of receipts that claimed one, is
-//!   what a deleted history looks like afterwards
-//!   ([`crate::codes::ledger`]).
+//!   [`crate::codes::scope`].
 //!
 //! The annex is therefore a second line beside the receipt, in the same shape of
 //! document: a version-pinning prefix, then `key=value` fields in one fixed
@@ -29,15 +21,13 @@
 //! field quietly dropped — because an annex is a claim about how an issuance was
 //! made, and a parser that repairs one is deciding on the operator's behalf.
 
-use tessera_codes_contract::ticket::{OperatorTicket, TicketNumber};
-
-use crate::codes::counter::{CounterNote, CounterOverride};
+use tessera_codes_contract::ticket::{ServerTicket, TicketNumber};
 
 /// Marker that opens the annex and pins the version of the format.
 pub const ANNEX_PREFIX: &str = "tessera-issuer/v1/codes-receipt-annex";
 
 /// Number of fields the annex carries.
-pub const ANNEX_FIELD_COUNT: usize = 8;
+pub const ANNEX_FIELD_COUNT: usize = 5;
 
 /// Field keys, in the only order the parser accepts.
 const KEYS: [&str; ANNEX_FIELD_COUNT] = [
@@ -45,10 +35,7 @@ const KEYS: [&str; ANNEX_FIELD_COUNT] = [
     "operator",
     "organisation",
     "key_storage",
-    "counter",
-    "approver",
     "site_scope",
-    "history",
 ];
 
 /// Separator between the fields.
@@ -56,12 +43,6 @@ const FIELD_SEPARATOR: char = ';';
 
 /// Separator between a key and its value.
 const KEY_SEPARATOR: char = '=';
-
-/// Value of `approver` when the issuance was not overridden.
-///
-/// An operator identifier spelled exactly like this is refused when the annex is
-/// assembled, so the marker has one meaning.
-pub const NO_APPROVER: &str = "none";
 
 /// How the operator's private key was held during the issuance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,32 +106,23 @@ impl SiteScope {
 #[derive(Debug, Clone, Copy)]
 pub struct AnnexFields<'a> {
     /// Ticket the operator worked under.
-    pub ticket: &'a OperatorTicket,
+    pub ticket: &'a ServerTicket,
     /// Organisation that signed the device record.
     pub organisation_id: &'a str,
     /// How the operator's key was held.
     pub key_storage: KeyStorage,
-    /// What the counter said about the call.
-    pub counter_note: CounterNote,
-    /// The second operator who approved an override, when there was one.
-    pub approval: Option<&'a CounterOverride>,
     /// Whether the site axis was checked.
     pub site_scope: SiteScope,
-    /// How many issuances the history held for this device before this one.
-    pub history_depth: u64,
 }
 
 /// The annex of one receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptAnnex {
     ticket_number: TicketNumber,
-    operator_id: String,
+    server_id: String,
     organisation_id: String,
     key_storage: KeyStorage,
-    counter_note: CounterNote,
-    approver: Option<String>,
     site_scope: SiteScope,
-    history_depth: u64,
 }
 
 impl ReceiptAnnex {
@@ -159,34 +131,17 @@ impl ReceiptAnnex {
     /// # Errors
     ///
     /// Returns [`AnnexError::UnusableValue`] when an identifier carries a
-    /// character the format cannot hold or is spelled exactly like
-    /// [`NO_APPROVER`], and [`AnnexError::OverrideMismatch`] when an override is
-    /// recorded without an approver or an approver without an override — the two
-    /// are one statement, and an annex that carries half of it would let a
-    /// bypass read as an ordinary issuance.
+    /// character the format cannot hold.
     pub fn new(fields: AnnexFields<'_>) -> Result<Self, AnnexError> {
-        check_value("operator", fields.ticket.operator_id())?;
+        check_value("operator", fields.ticket.server_id())?;
         check_value("organisation", fields.organisation_id)?;
-        let approver = fields
-            .approval
-            .map(|decision| decision.approver().to_owned());
-        if let Some(approver) = approver.as_deref() {
-            check_value("approver", approver)?;
-            if approver == NO_APPROVER {
-                return Err(AnnexError::UnusableValue { field: "approver" });
-            }
-        }
-        check_override_pairing(fields.counter_note, approver.is_some())?;
 
         Ok(Self {
             ticket_number: fields.ticket.number().clone(),
-            operator_id: fields.ticket.operator_id().to_owned(),
+            server_id: fields.ticket.server_id().to_owned(),
             organisation_id: fields.organisation_id.to_owned(),
             key_storage: fields.key_storage,
-            counter_note: fields.counter_note,
-            approver,
             site_scope: fields.site_scope,
-            history_depth: fields.history_depth,
         })
     }
 
@@ -198,8 +153,8 @@ impl ReceiptAnnex {
 
     /// Returns the operator who handled the call.
     #[must_use]
-    pub fn operator_id(&self) -> &str {
-        &self.operator_id
+    pub fn server_id(&self) -> &str {
+        &self.server_id
     }
 
     /// Returns the organisation that signed the device record.
@@ -214,28 +169,10 @@ impl ReceiptAnnex {
         self.key_storage
     }
 
-    /// Returns what the counter said about the call.
-    #[must_use]
-    pub const fn counter_note(&self) -> CounterNote {
-        self.counter_note
-    }
-
-    /// Returns the second operator who approved an override, if there was one.
-    #[must_use]
-    pub fn approver(&self) -> Option<&str> {
-        self.approver.as_deref()
-    }
-
     /// Returns whether the site axis was checked.
     #[must_use]
     pub const fn site_scope(&self) -> SiteScope {
         self.site_scope
-    }
-
-    /// Returns how deep the counter history was when this code was issued.
-    #[must_use]
-    pub const fn history_depth(&self) -> u64 {
-        self.history_depth
     }
 
     /// Renders the annex.
@@ -243,15 +180,10 @@ impl ReceiptAnnex {
     pub fn to_wire(&self) -> String {
         let values = [
             self.ticket_number.as_str().to_owned(),
-            self.operator_id.clone(),
+            self.server_id.clone(),
             self.organisation_id.clone(),
             self.key_storage.as_str().to_owned(),
-            self.counter_note.as_str().to_owned(),
-            self.approver
-                .clone()
-                .unwrap_or_else(|| NO_APPROVER.to_owned()),
             self.site_scope.as_str().to_owned(),
-            self.history_depth.to_string(),
         ];
         let mut text = String::from(ANNEX_PREFIX);
         for (key, value) in KEYS.iter().zip(values.iter()) {
@@ -269,8 +201,8 @@ impl ReceiptAnnex {
     ///
     /// The [`AnnexError`] describing the first violation: a missing or
     /// misspelled prefix, a wrong number of fields, a field out of order or
-    /// unknown, an empty value, a token no variant is written under, a ticket
-    /// number the format does not allow, or an override without its approver.
+    /// unknown, an empty value, a token no variant is written under, or a
+    /// ticket number the format does not allow.
     pub fn parse(text: &str) -> Result<Self, AnnexError> {
         let values = split(text)?;
         let field = |index: usize| values.get(index).copied().unwrap_or_default();
@@ -282,32 +214,16 @@ impl ReceiptAnnex {
         let key_storage = KeyStorage::parse(field(3)).ok_or(AnnexError::UnknownToken {
             field: "key_storage",
         })?;
-        let counter_note =
-            CounterNote::parse(field(4)).ok_or(AnnexError::UnknownToken { field: "counter" })?;
-        let approver = match field(5) {
-            NO_APPROVER => None,
-            named => {
-                check_value("approver", named)?;
-                Some(named.to_owned())
-            }
-        };
-        let site_scope = SiteScope::parse(field(6)).ok_or(AnnexError::UnknownToken {
+        let site_scope = SiteScope::parse(field(4)).ok_or(AnnexError::UnknownToken {
             field: "site_scope",
         })?;
-        let history_depth = field(7)
-            .parse::<u64>()
-            .map_err(|_| AnnexError::UnknownToken { field: "history" })?;
-        check_override_pairing(counter_note, approver.is_some())?;
 
         Ok(Self {
             ticket_number,
-            operator_id: field(1).to_owned(),
+            server_id: field(1).to_owned(),
             organisation_id: field(2).to_owned(),
             key_storage,
-            counter_note,
-            approver,
             site_scope,
-            history_depth,
         })
     }
 }
@@ -350,9 +266,6 @@ pub enum AnnexError {
         /// Name of the offending field.
         field: &'static str,
     },
-    /// An override and its approver do not travel together.
-    #[error("an overridden issuance names the second operator who approved it, and only an overridden one does")]
-    OverrideMismatch,
 }
 
 /// Splits the text into the values of [`KEYS`], in that exact order.
@@ -397,117 +310,30 @@ fn check_value(field: &'static str, value: &str) -> Result<(), AnnexError> {
     Ok(())
 }
 
-/// Checks that an override and an approver travel together.
-fn check_override_pairing(note: CounterNote, has_approver: bool) -> Result<(), AnnexError> {
-    if (note == CounterNote::Overridden) == has_approver {
-        Ok(())
-    } else {
-        Err(AnnexError::OverrideMismatch)
-    }
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
     reason = "a failed setup step in a test should fail the test on the spot"
 )]
 mod tests {
-    use super::{
-        AnnexError, AnnexFields, KeyStorage, ReceiptAnnex, SiteScope, ANNEX_PREFIX, NO_APPROVER,
-    };
-    use crate::codes::counter::{CounterNote, CounterOverride};
+    use super::{AnnexError, AnnexFields, KeyStorage, ReceiptAnnex, SiteScope, ANNEX_PREFIX};
     use crate::codes::tests::fixtures;
 
-    fn annex(note: CounterNote, approval: Option<&CounterOverride>) -> ReceiptAnnex {
+    fn annex() -> ReceiptAnnex {
         let world = fixtures::world();
         ReceiptAnnex::new(AnnexFields {
             ticket: world.ticket.ticket(),
             organisation_id: "acme",
             key_storage: KeyStorage::Token,
-            counter_note: note,
-            approval,
             site_scope: SiteScope::Checked,
-            history_depth: 3,
         })
         .unwrap()
     }
 
     #[test]
     fn an_annex_survives_a_round_trip() {
-        let original = annex(CounterNote::Advanced, None);
+        let original = annex();
         assert_eq!(ReceiptAnnex::parse(&original.to_wire()), Ok(original));
-    }
-
-    #[test]
-    fn an_override_survives_a_round_trip_with_its_approver() {
-        let decision = CounterOverride::by("op-7", "op-42").unwrap();
-        let original = annex(CounterNote::Overridden, Some(&decision));
-        assert_eq!(original.approver(), Some("op-7"));
-        assert_eq!(ReceiptAnnex::parse(&original.to_wire()), Ok(original));
-    }
-
-    #[test]
-    fn the_storage_of_the_key_is_recorded_and_read_back() {
-        let world = fixtures::world();
-        let software = ReceiptAnnex::new(AnnexFields {
-            ticket: world.ticket.ticket(),
-            organisation_id: "acme",
-            key_storage: KeyStorage::Software,
-            counter_note: CounterNote::Advanced,
-            approval: None,
-            site_scope: SiteScope::Undeclared,
-            history_depth: 0,
-        })
-        .unwrap();
-        let read_back = ReceiptAnnex::parse(&software.to_wire()).unwrap();
-        assert_eq!(read_back.key_storage(), KeyStorage::Software);
-        assert_eq!(read_back.site_scope(), SiteScope::Undeclared);
-    }
-
-    #[test]
-    fn an_override_without_an_approver_cannot_be_assembled() {
-        let world = fixtures::world();
-        assert_eq!(
-            ReceiptAnnex::new(AnnexFields {
-                ticket: world.ticket.ticket(),
-                organisation_id: "acme",
-                key_storage: KeyStorage::Token,
-                counter_note: CounterNote::Overridden,
-                approval: None,
-                site_scope: SiteScope::Checked,
-                history_depth: 0,
-            }),
-            Err(AnnexError::OverrideMismatch)
-        );
-    }
-
-    #[test]
-    fn an_approver_without_an_override_cannot_be_assembled() {
-        let world = fixtures::world();
-        let decision = CounterOverride::by("op-7", "op-42").unwrap();
-        assert_eq!(
-            ReceiptAnnex::new(AnnexFields {
-                ticket: world.ticket.ticket(),
-                organisation_id: "acme",
-                key_storage: KeyStorage::Token,
-                counter_note: CounterNote::Advanced,
-                approval: Some(&decision),
-                site_scope: SiteScope::Checked,
-                history_depth: 0,
-            }),
-            Err(AnnexError::OverrideMismatch)
-        );
-    }
-
-    #[test]
-    fn an_override_edited_out_of_a_written_annex_no_longer_parses() {
-        let decision = CounterOverride::by("op-7", "op-42").unwrap();
-        let text = annex(CounterNote::Overridden, Some(&decision)).to_wire();
-        let edited = text.replace("approver=op-7", &format!("approver={NO_APPROVER}"));
-        assert_eq!(
-            ReceiptAnnex::parse(&edited),
-            Err(AnnexError::OverrideMismatch)
-        );
     }
 
     #[test]
@@ -529,7 +355,7 @@ mod tests {
 
     #[test]
     fn an_empty_value_is_refused() {
-        let text = annex(CounterNote::Advanced, None)
+        let text = annex()
             .to_wire()
             .replace("organisation=acme", "organisation=");
         assert_eq!(
@@ -542,7 +368,7 @@ mod tests {
 
     #[test]
     fn a_token_no_variant_is_written_under_is_refused() {
-        let text = annex(CounterNote::Advanced, None)
+        let text = annex()
             .to_wire()
             .replace("key_storage=token", "key_storage=smartcard");
         assert_eq!(
@@ -555,10 +381,26 @@ mod tests {
 
     #[test]
     fn a_trailing_field_is_refused() {
-        let text = format!("{};extra=1", annex(CounterNote::Advanced, None).to_wire());
+        let text = format!("{};extra=1", annex().to_wire());
         assert_eq!(
             ReceiptAnnex::parse(&text),
-            Err(AnnexError::FieldCount { got: 9 })
+            Err(AnnexError::FieldCount { got: 6 })
+        );
+    }
+
+    #[test]
+    fn the_site_scope_travels_as_written() {
+        let world = fixtures::world();
+        let undeclared = ReceiptAnnex::new(AnnexFields {
+            ticket: world.ticket.ticket(),
+            organisation_id: "acme",
+            key_storage: KeyStorage::Software,
+            site_scope: SiteScope::Undeclared,
+        })
+        .unwrap();
+        assert_eq!(
+            ReceiptAnnex::parse(&undeclared.to_wire()).map(|parsed| parsed.site_scope()),
+            Ok(SiteScope::Undeclared)
         );
     }
 }

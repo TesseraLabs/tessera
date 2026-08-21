@@ -307,10 +307,10 @@ impl TicketStore {
     /// and a refusal that names neither cannot be paired with the receipt of
     /// the call it belongs to.
     #[must_use]
-    pub fn ticket_number_of(&self, operator_id: &str) -> Option<&str> {
+    pub fn ticket_number_of(&self, server_id: &str) -> Option<&str> {
         self.tickets
             .iter()
-            .find(|signed| signed.ticket().operator_id() == operator_id)
+            .find(|signed| signed.ticket().server_id() == server_id)
             .map(|signed| signed.ticket().number().as_str())
     }
 
@@ -339,7 +339,7 @@ impl TicketStore {
         let signed = self
             .tickets
             .iter()
-            .find(|signed| signed.ticket().operator_id() == request.operator_id)
+            .find(|signed| signed.ticket().server_id() == request.server_id)
             .ok_or(TicketRejection::Unknown)?;
 
         // Signature first: the term, the revocation state and the scope of a
@@ -460,7 +460,7 @@ pub(crate) mod tests {
     use tessera_codes_contract::canon::Level;
     use tessera_codes_contract::signature::{PublicKey, Signature};
     use tessera_codes_contract::ticket::{
-        OperatorTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput, ALL_ROLES,
+        ServerTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput, ALL_ROLES,
     };
     use tessera_codes_contract::time::ClaimedTime;
 
@@ -497,7 +497,7 @@ pub(crate) mod tests {
             TicketAnchor::from_key(PKey::public_key_from_der(&der).unwrap())
         }
 
-        pub(crate) fn sign(&self, ticket: OperatorTicket) -> SignedTicket {
+        pub(crate) fn sign(&self, ticket: ServerTicket) -> SignedTicket {
             let message = ticket.encode().unwrap();
             let mut signer = openssl::sign::Signer::new_without_digest(&self.key).unwrap();
             let raw = signer.sign_oneshot_to_vec(&message).unwrap();
@@ -509,7 +509,7 @@ pub(crate) mod tests {
         PublicKey::new(vec![0x04, 0x11, 0x22]).unwrap()
     }
 
-    pub(crate) fn ticket(operator: &str, max_level: u32, number: &str) -> OperatorTicket {
+    pub(crate) fn ticket(operator: &str, max_level: u32, number: &str) -> ServerTicket {
         ticket_for_roles(operator, &[ROLE], max_level, number)
     }
 
@@ -519,8 +519,8 @@ pub(crate) mod tests {
         roles: &[&str],
         max_level: u32,
         number: &str,
-    ) -> OperatorTicket {
-        OperatorTicket::new(
+    ) -> ServerTicket {
+        ServerTicket::new(
             operator,
             operator_key(),
             TicketScope::new(TicketScopeInput {
@@ -552,7 +552,8 @@ pub(crate) mod tests {
         AttemptRequest {
             role_id: role,
             level: Level::new(level),
-            operator_id: operator,
+            server_id: operator,
+            engineer_id: "eng-1",
             now: now(),
         }
     }

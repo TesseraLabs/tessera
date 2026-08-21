@@ -1,26 +1,26 @@
-//! The lock that makes the nonce state a transaction.
+//! The lock that gives a device one attempt at a time.
 //!
 //! `pam_tessera` is a shared object loaded into somebody else's process. `sshd`
 //! forks per connection, a console login is a process of its own, and a device
 //! reachable both ways runs them at the same time. Every one of them opens the
 //! same state directory.
 //!
-//! Without a lock the read-modify-write of that state is not a transaction, and
-//! the consequences are not bookkeeping ones:
+//! Without a lock the consequences are not bookkeeping ones:
 //!
-//! - process **B** loads the state, process **A** spends the whole attempt
-//!   budget of a nonce, **B** writes back the snapshot it took before any of
-//!   that happened, and the budget is `0` again. Repeat and the budget is
-//!   unbounded, which is the only thing standing between a code and a guesser;
-//! - the spent-nonce set is lost the same way, and a one-time nonce that
-//!   forgets it was used is not one-time;
-//! - two processes read the same counter and issue the same nonce, and the
-//!   pending attempts — keyed on the counter alone — overwrite each other.
+//! - a second login starts a second attempt while the first is being answered,
+//!   and a device that is supposed to hold one attempt holds two — twice the
+//!   target for a guesser, and two ephemeral pairs where the specification
+//!   allows one;
+//! - the read-modify-write of the throttle is not a transaction: process **B**
+//!   loads it, process **A** records a run of failures, **B** writes back the
+//!   snapshot it took before any of that happened, and the lockout is gone.
+//!   Repeat, and a limit that can be reset is not a limit.
 //!
-//! So the lock covers the **whole transaction**, load through save, not the
-//! individual writes. Atomic renames were never the missing piece: each write
-//! was already atomic, and that is precisely why the corruption is invisible —
-//! nothing is torn, the state is simply the wrong one.
+//! So the hold is taken when an attempt begins and released when the attempt is
+//! dropped — see [`super::StartedAttempt`] — rather than around the individual
+//! writes. Atomic renames were never the missing piece: each write was already
+//! atomic, and that is precisely why the corruption is invisible — nothing is
+//! torn, the state is simply the wrong one.
 //!
 //! # Why a hold on a handle, and not a lock file
 //!

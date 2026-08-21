@@ -50,11 +50,9 @@ pub const REASON_TICKET_SCOPE_ROLE: &str = "ticket_scope_role";
 pub const REASON_TICKET_SCOPE_LEVEL: &str = "ticket_scope_level";
 /// Refusal detail: this device does not define the role that was asked for.
 pub const REASON_ROLE_UNKNOWN: &str = "role_unknown";
-/// Refusal detail: no attempt is pending for that nonce — it was never issued,
-/// it was already spent, or it did not survive a reboot.
-pub const REASON_NO_PENDING_ATTEMPT: &str = "no_pending_attempt";
-/// Refusal detail: the nonce was already consumed.
-pub const REASON_NONCE_CONSUMED: &str = "nonce_consumed";
+/// Refusal detail: the attempt is no longer open — its code was already
+/// accepted, or its budget of wrong codes ran out.
+pub const REASON_ATTEMPT_SPENT: &str = "attempt_spent";
 /// Refusal detail: the local lifetime of the code has passed.
 pub const REASON_TTL: &str = "ttl";
 /// Refusal detail: the code did not meet the one the device computed.
@@ -64,7 +62,7 @@ pub const REASON_KEY_MATERIAL: &str = "key_material";
 /// Refusal detail: the device has issued its budget of challenges for now.
 ///
 /// Not a verdict about the caller: it is what stops a stream of challenge
-/// requests from spending the nonce counter of the device to exhaustion.
+/// requests from keeping the one attempt slot of the device busy.
 pub const REASON_ISSUANCE_THROTTLED: &str = "issuance_throttled";
 /// Refusal detail: a run of failed attempts has locked this role for a while.
 pub const REASON_ROLE_LOCKED: &str = "role_locked";
@@ -108,6 +106,7 @@ pub fn emit_success(
     level: u32,
     epoch: u32,
     ticket_number: &str,
+    claimed_engineer_no: &str,
 ) -> Result<(), AuditError> {
     tracing::info!(
         target: "codes.audit",
@@ -117,6 +116,7 @@ pub fn emit_success(
         level,
         epoch,
         ticket_no = ticket_number,
+        claimed_engineer_no,
         outcome = OUTCOME_SUCCESS,
     );
     record_required(&Mirrored {
@@ -125,6 +125,7 @@ pub fn emit_success(
         level,
         epoch,
         ticket_number,
+        claimed_engineer_no,
         outcome: OUTCOME_SUCCESS,
         reason: None,
     })
@@ -134,34 +135,58 @@ pub fn emit_success(
 ///
 /// `reason` is one of the `REASON_*` constants of this module; it is the field
 /// the caller never receives, and the only place the refusal is spelled out.
-pub fn emit_denied(
-    nonce: Option<&str>,
-    role_id: &str,
-    level: u32,
-    epoch: u32,
-    ticket_number: Option<&str>,
-    reason: &str,
-) {
+pub fn emit_denied(denial: &Denial<'_>) {
     tracing::warn!(
         target: "codes.audit",
         event = EVENT_QR_CODE_LOGIN,
-        nonce_ref = nonce.unwrap_or("-"),
-        role_id,
-        level,
-        epoch,
-        ticket_no = ticket_number.unwrap_or("-"),
+        nonce_ref = denial.nonce.unwrap_or(UNKNOWN),
+        role_id = denial.role_id,
+        level = denial.level,
+        epoch = denial.epoch,
+        ticket_no = denial.ticket_number.unwrap_or(UNKNOWN),
+        claimed_engineer_no = denial.claimed_engineer_no.unwrap_or(UNKNOWN),
         outcome = OUTCOME_DENIED,
-        reason,
+        reason = denial.reason,
     );
     mirror(&Mirrored {
-        nonce: nonce.unwrap_or("-"),
-        role_id,
-        level,
-        epoch,
-        ticket_number: ticket_number.unwrap_or("-"),
+        nonce: denial.nonce.unwrap_or(UNKNOWN),
+        role_id: denial.role_id,
+        level: denial.level,
+        epoch: denial.epoch,
+        ticket_number: denial.ticket_number.unwrap_or(UNKNOWN),
+        claimed_engineer_no: denial.claimed_engineer_no.unwrap_or(UNKNOWN),
         outcome: OUTCOME_DENIED,
-        reason: Some(reason),
+        reason: Some(denial.reason),
     });
+}
+
+/// What the journal says when a field is not known at all.
+pub const UNKNOWN: &str = "-";
+
+/// One refused attempt, as the journal names it.
+///
+/// A struct rather than a row of arguments, and for the reason the rest of this
+/// module is careful about: the fields are two optional strings beside each
+/// other, and a call site that swapped them would write a ticket number into
+/// the place of an engineer and be caught by nobody — both are strings, both
+/// are optional, and the record would read as ordinary.
+#[derive(Debug, Clone, Copy)]
+pub struct Denial<'a> {
+    /// Nonce of the attempt, when there was one.
+    pub nonce: Option<&'a str>,
+    /// Role account that was asked for.
+    pub role_id: &'a str,
+    /// Level that was asked for.
+    pub level: u32,
+    /// Key epoch of the device.
+    pub epoch: u32,
+    /// Number of the ticket, when one was admitted.
+    pub ticket_number: Option<&'a str>,
+    /// Personal number of the engineer as they gave it, when they had been
+    /// asked for it at all. Claimed, never established — see [`Mirrored`].
+    pub claimed_engineer_no: Option<&'a str>,
+    /// One of the `REASON_*` constants.
+    pub reason: &'a str,
 }
 
 /// `codes_artefacts_applied` — a consignment of Codes artefacts was installed.
@@ -173,15 +198,13 @@ pub const EVENT_ARTEFACTS_WIPED: &str = "codes_artefacts_wiped";
 /// Emit `codes_artefacts_applied` for an import or a courier rotation.
 ///
 /// The epoch is the field an owner reconciles against the registry record of
-/// the device, and `counter_reset` is what tells them whether the nonces of the
-/// previous key were retired or carried on.
+/// the device.
 pub fn emit_artefacts_applied(applied: &super::artefacts::Applied) {
     tracing::info!(
         target: "codes.audit",
         event = EVENT_ARTEFACTS_APPLIED,
         epoch = applied.epoch.map_or(0, tessera_codes_contract::key::Epoch::get),
         key_replaced = applied.key_replaced,
-        counter_reset = applied.counter_reset,
         tickets = applied.tickets_applied,
         revocations = applied.revocations_applied,
     );
@@ -208,6 +231,7 @@ pub fn emit_attempts_exhausted(
     level: u32,
     epoch: u32,
     ticket_number: &str,
+    claimed_engineer_no: &str,
 ) {
     tracing::error!(
         target: "codes.audit",
@@ -217,6 +241,7 @@ pub fn emit_attempts_exhausted(
         level,
         epoch,
         ticket_no = ticket_number,
+        claimed_engineer_no,
         outcome = OUTCOME_ATTEMPTS_EXHAUSTED,
     );
     mirror(&Mirrored {
@@ -225,6 +250,7 @@ pub fn emit_attempts_exhausted(
         level,
         epoch,
         ticket_number,
+        claimed_engineer_no,
         outcome: OUTCOME_ATTEMPTS_EXHAUSTED,
         reason: None,
     });
@@ -248,6 +274,9 @@ struct Mirrored<'a> {
     epoch: u32,
     /// Number of the operator ticket, or `-` when none was admitted.
     ticket_number: &'a str,
+    /// Personal number of the engineer as they gave it, or `-` when the attempt
+    /// was refused before they were asked. Claimed, never established.
+    claimed_engineer_no: &'a str,
     /// One of the `OUTCOME_*` constants.
     outcome: &'a str,
     /// One of the `REASON_*` constants, for a refusal.
@@ -289,6 +318,7 @@ fn chain_record(attempt: &Mirrored<'_>) -> crate::audit::AuditRecord {
         level: attempt.level,
         epoch: attempt.epoch,
         ticket_no: attempt.ticket_number.to_owned(),
+        claimed_engineer_no: attempt.claimed_engineer_no.to_owned(),
         outcome: attempt.outcome.to_owned(),
         reason: attempt.reason.map(str::to_owned),
     }

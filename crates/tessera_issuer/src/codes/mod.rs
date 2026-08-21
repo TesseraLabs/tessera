@@ -11,15 +11,14 @@
 //! The modules are split by what they are allowed to touch, so that the browser
 //! cabinet and the command line run the same checks:
 //!
-//! - [`scope`], [`counter`], [`annex`], [`reconcile`], [`trust`] and
+//! - [`scope`], [`annex`], [`reconcile`], [`trust`] and
 //!   [`agreement`] are pure: no clock, no filesystem, no environment. They build
 //!   for `wasm32-unknown-unknown` and are what the cabinet calls.
 //! - [`issue`] is the whole refusal ladder of one issuance, in one function, for
 //!   the same reason: a wrapper that assembled the steps in its own order would
 //!   be a second policy.
-//! - [`store`] and [`ledger`] are the only modules that read and write files,
-//!   and they exist only in a native build. The ledger is where the counter
-//!   history lives; the store is where the receipts do.
+//! - [`store`] is the only module that reads and writes files, and it exists
+//!   only in a native build: it is where the receipts live.
 //!
 //! # Refusals
 //!
@@ -31,10 +30,8 @@
 
 pub mod agreement;
 pub mod annex;
-pub mod counter;
 pub mod issue;
 #[cfg(feature = "native")]
-pub mod ledger;
 pub mod reconcile;
 pub mod scope;
 #[cfg(feature = "native")]
@@ -47,6 +44,7 @@ pub mod trust;
 pub(crate) mod tests;
 
 use tessera_codes_contract::canon::CanonError;
+use tessera_codes_contract::challenge::ChallengeError;
 use tessera_codes_contract::code::CodeError;
 use tessera_codes_contract::key::KeyAgreementError;
 use tessera_codes_contract::receipt::ReceiptError;
@@ -54,7 +52,6 @@ use tessera_codes_contract::registry::RecordError;
 use tessera_codes_contract::ticket::TicketError;
 
 use crate::codes::annex::AnnexError;
-use crate::codes::counter::CounterRefusal;
 
 /// Why an issuance was refused.
 ///
@@ -116,20 +113,17 @@ pub enum Refusal {
     /// No grounds were recorded for the issuance.
     #[error("the issuance records no grounds; a code handed out for no stated reason is a code nobody can answer for")]
     MissingReason,
-    /// The nonce counter of the challenge was refused.
-    #[error(transparent)]
-    Counter(#[from] CounterRefusal),
-    /// An override was supplied for a challenge the counter did not refuse.
-    ///
-    /// The refusal is not pedantry: a receipt carrying an override says two
-    /// people decided to answer a challenge that looked wrong, and an audit
-    /// reading it will go looking for what that was. Recording one where nothing
-    /// was overridden spends somebody's afternoon.
-    #[error("the counter did not refuse this challenge; there is nothing for a second operator to approve")]
-    OverrideNotNeeded,
     /// The device record did not verify.
     #[error("the device record was rejected: {0}")]
     Record(#[from] RecordError),
+    /// The challenge does not carry the signature of the device it names.
+    ///
+    /// Nobody is being kept from a code by this: a challenge whose ephemeral
+    /// point was rewritten yields a code the device refuses. What is being kept
+    /// out is a challenge nobody's device stated — values composed by a caller
+    /// and answered as if a device had asked.
+    #[error("the challenge was not signed by the device it names: {0}")]
+    ChallengeSignature(#[from] ChallengeError),
     /// The operator ticket did not verify, or its term has passed.
     #[error("the operator ticket was rejected: {0}")]
     Ticket(#[from] TicketError),
@@ -177,8 +171,6 @@ pub enum Refusal {
 pub enum RefusalGroup {
     /// The request fell outside the operator's ticket, on any of its axes.
     TicketScope,
-    /// The nonce counter of the challenge does not fit the receipts.
-    Counter,
     /// A signature, an anchor or a key did not hold.
     Trust,
     /// The issuance carried no grounds.
@@ -197,7 +189,6 @@ impl RefusalGroup {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TicketScope => "ticket_scope",
-            Self::Counter => "counter",
             Self::Trust => "trust",
             Self::Grounds => "grounds",
             Self::Other => "other",
@@ -226,22 +217,20 @@ impl Refusal {
             | Self::ScopeTags
             | Self::ScopeRole { .. }
             | Self::ScopeLevel { .. } => RefusalGroup::TicketScope,
-            Self::Counter(_) => RefusalGroup::Counter,
             // A point the profile rejects belongs here too: it is key material
             // that does not hold, which is a verdict about the documents.
             Self::Record(_)
             | Self::Ticket(_)
+            | Self::ChallengeSignature(_)
             | Self::OperatorKeyMismatch
             | Self::Agreement(KeyAgreementError::InvalidPublicPoint) => RefusalGroup::Trust,
             Self::MissingReason => RefusalGroup::Grounds,
             // A backend that failed for its own reason is the token not
             // answering, and that is not an answer about the request at all.
             Self::Agreement(KeyAgreementError::Backend(_)) => RefusalGroup::Environment,
-            Self::OverrideNotNeeded
-            | Self::Code(_)
-            | Self::Receipt(_)
-            | Self::Annex(_)
-            | Self::Canon(_) => RefusalGroup::Other,
+            Self::Code(_) | Self::Receipt(_) | Self::Annex(_) | Self::Canon(_) => {
+                RefusalGroup::Other
+            }
         }
     }
 
@@ -269,9 +258,8 @@ impl Refusal {
             Self::ScopeRole { .. } => "ticket_scope_role",
             Self::ScopeLevel { .. } => "ticket_scope_level",
             Self::MissingReason => "missing_reason",
-            Self::Counter(refusal) => refusal.class(),
-            Self::OverrideNotNeeded => "override_not_needed",
             Self::Record(_) => "device_record_rejected",
+            Self::ChallengeSignature(_) => "challenge_signature_rejected",
             Self::Ticket(_) => "ticket_rejected",
             Self::OperatorKeyMismatch => "operator_key_mismatch",
             Self::Agreement(_) => "key_agreement_failed",
@@ -286,7 +274,6 @@ impl Refusal {
 #[cfg(test)]
 mod class_tests {
     use super::Refusal;
-    use crate::codes::counter::CounterRefusal;
 
     #[test]
     fn the_axes_of_a_ticket_share_one_prefix_and_stay_distinct() {
@@ -319,22 +306,8 @@ mod class_tests {
         for class in [
             Refusal::MissingReason.class(),
             Refusal::OperatorKeyMismatch.class(),
-            Refusal::OverrideNotNeeded.class(),
-            Refusal::Counter(CounterRefusal::Ahead { known: 1, got: 5 }).class(),
         ] {
             assert!(!class.starts_with("ticket_scope_"));
         }
-    }
-
-    #[test]
-    fn the_counter_keeps_its_own_classes() {
-        assert_eq!(
-            Refusal::Counter(CounterRefusal::Ahead { known: 1, got: 5 }).class(),
-            "counter_ahead"
-        );
-        assert_eq!(
-            Refusal::Counter(CounterRefusal::Behind { known: 5, got: 1 }).class(),
-            "counter_behind"
-        );
     }
 }

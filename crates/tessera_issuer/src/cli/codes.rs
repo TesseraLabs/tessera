@@ -57,12 +57,12 @@ use clap::{Args, Subcommand, ValueEnum};
 use pkcs8::{EncryptedPrivateKeyInfo, PrivateKeyInfo};
 use zeroize::Zeroizing;
 
-use tessera_codes_contract::challenge::Challenge;
+use tessera_codes_contract::challenge::SignedChallenge;
 use tessera_codes_contract::code::Alphabet;
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
 use tessera_codes_contract::params::{
-    FleetParams, FleetParamsInput, DEFAULT_ATTEMPTS_PER_NONCE, DEFAULT_CODE_LEN,
-    DEFAULT_COUNTER_WIDTH, DEFAULT_TAIL_WIDTH,
+    FleetParams, FleetParamsInput, DEFAULT_ATTEMPTS_PER_NONCE, DEFAULT_ATTEMPT_TTL_SECS,
+    DEFAULT_CODE_LEN, DEFAULT_NONCE_WIDTH,
 };
 use tessera_codes_contract::profile::{AlgorithmProfile, UnconfirmedProfileRisk};
 use tessera_codes_contract::registry::DeviceRecord;
@@ -71,10 +71,7 @@ use tessera_codes_contract::time::ClaimedTime;
 
 use crate::codes::agreement::{OperatorKey, SoftwareOperatorKey};
 use crate::codes::annex::SiteScope;
-use crate::codes::counter::CounterOverride;
-use crate::codes::counter::KnownCounter;
 use crate::codes::issue::{issue, IssuanceRequest};
-use crate::codes::ledger::{Ledger, LedgerEntry, LEDGER_FILENAME};
 use crate::codes::reconcile::{read_journal, reconcile, JournalError, LoginEntry, Provenance};
 use crate::codes::scope::DeviceScope;
 use crate::codes::store;
@@ -87,12 +84,6 @@ use super::{decode_pem_or_der, now_unix, read_file, CliError};
 /// Separator between an organisation identifier and its anchor file, and
 /// between a device number and its journal.
 const PAIR_SEPARATOR: char = '=';
-
-/// The issuance ledger could not be opened, or its chain does not verify.
-///
-/// It is an environment class, not a verdict: a history that has been edited
-/// says nothing about the request, and the check simply did not happen.
-const CLASS_LEDGER_BROKEN: &str = "ledger_unusable";
 
 // Refusal classes of the documents this surface reads. A refused *issuance*
 // carries its own class from [`crate::codes::Refusal::class`]; these cover the
@@ -223,15 +214,15 @@ struct FleetArgs {
     /// Verification attempts allowed for one nonce.
     #[arg(long, default_value_t = DEFAULT_ATTEMPTS_PER_NONCE)]
     attempts_per_nonce: u8,
-    /// Alphabet of the code and of the nonce tail.
-    #[arg(long, value_enum, default_value_t = AlphabetArg::Decimal)]
+    /// Alphabet of the code and of the nonce.
+    #[arg(long, value_enum, default_value_t = AlphabetArg::CrockfordBase32)]
     alphabet: AlphabetArg,
-    /// Width of the decimal nonce counter.
-    #[arg(long, default_value_t = DEFAULT_COUNTER_WIDTH)]
-    counter_width: u8,
-    /// Width of the random nonce tail.
-    #[arg(long, default_value_t = DEFAULT_TAIL_WIDTH)]
-    tail_width: u8,
+    /// Width of the nonce, in characters.
+    #[arg(long, default_value_t = DEFAULT_NONCE_WIDTH)]
+    nonce_width: u8,
+    /// How long an attempt may stay open, in seconds.
+    #[arg(long, default_value_t = DEFAULT_ATTEMPT_TTL_SECS)]
+    attempt_ttl_secs: u64,
     /// Key agreement profile of the device pairs.
     #[arg(long, value_enum, default_value_t = ProfileArg::P256)]
     profile: ProfileArg,
@@ -250,8 +241,8 @@ impl FleetArgs {
                 AlphabetArg::Decimal => Alphabet::Decimal,
                 AlphabetArg::CrockfordBase32 => Alphabet::CrockfordBase32,
             },
-            counter_width: self.counter_width,
-            tail_width: self.tail_width,
+            nonce_width: self.nonce_width,
+            attempt_ttl_secs: self.attempt_ttl_secs,
             profile: self.profile(),
             unconfirmed_profile_risk: if self.accept_unconfirmed_profile {
                 UnconfirmedProfileRisk::AcceptedByFleetOwner
@@ -339,8 +330,7 @@ struct IssueArgs {
     /// fleet's own tracker. Required, and not satisfied by whitespace.
     #[arg(long)]
     reason: String,
-    /// Directory the receipts of this operator live in. It is read for the last
-    /// known counter of the device and written to with the new receipt.
+    /// Directory the receipts of this operator live in.
     #[arg(long)]
     receipts: PathBuf,
     /// Region the device stands in, from the fleet inventory.
@@ -349,21 +339,6 @@ struct IssueArgs {
     /// A site tag of the device (repeat for several).
     #[arg(long = "device-tag", requires = "device_region")]
     device_tags: Vec<String>,
-    /// Answer a challenge the counter refused. Requires the second operator who
-    /// approved it, and marks the receipt and the journal.
-    #[arg(long, requires = "approved_by")]
-    counter_override: bool,
-    /// The second operator approving a counter override.
-    #[arg(long, requires = "counter_override")]
-    approved_by: Option<String>,
-    /// Where the hash-chained issuance ledger lives. Defaults to
-    /// `<receipts>/ledger.ndjson`.
-    ///
-    /// The ledger is not optional — it is what the counter is checked against,
-    /// and a history the operator can rewrite is not a check. The flag only
-    /// moves it, for a fleet that keeps its ledgers apart from its receipts.
-    #[arg(long)]
-    ledger: Option<PathBuf>,
     /// The moment to work at, Unix seconds.
     ///
     /// Only test builds carry it. In a shipped build the term of the ticket and
@@ -444,6 +419,7 @@ fn run_issue(args: &IssueArgs, locale: Locale) -> Result<(), CliError> {
         &args.anchor_ticket_authority,
         &args.anchor_organisations,
         record.organisation_id(),
+        record.owner_id(),
     )?;
     let now = ClaimedTime::new(claimed_now(args)?);
 
@@ -455,15 +431,6 @@ fn run_issue(args: &IssueArgs, locale: Locale) -> Result<(), CliError> {
         _ => None,
     };
 
-    let override_decision = args
-        .approved_by
-        .as_deref()
-        .map(|approver| CounterOverride::by(approver, challenge.operator_id()))
-        .transpose()
-        .map_err(|error| CliError::Usage(error.to_string()))?;
-    let (mut ledger, known_counter, history_depth) =
-        open_history(args, params, challenge.device_number())?;
-
     let request = IssuanceRequest {
         challenge: &challenge,
         record: &record,
@@ -472,9 +439,6 @@ fn run_issue(args: &IssueArgs, locale: Locale) -> Result<(), CliError> {
         device_scope: device_scope.as_ref(),
         reason: &args.reason,
         now,
-        known_counter: known_counter.as_ref(),
-        history_depth,
-        override_decision: override_decision.as_ref(),
     };
 
     let issuance = with_operator_key(&args.key, args.fleet.profile(), locale, |key| {
@@ -486,23 +450,6 @@ fn run_issue(args: &IssueArgs, locale: Locale) -> Result<(), CliError> {
     })?;
 
     create_private_dir(&args.receipts)?;
-
-    // The ledger entry goes in before the receipt and before the code reaches
-    // the operator's screen. The order is the one that cannot lose a record: a
-    // failure after this point refuses the issuance and prints no code, so what
-    // remains is an entry with no receipt — a visible fact — rather than a code
-    // that was read out and never written down.
-    let receipt_name = issuance
-        .receipt
-        .file_name(ticket.ticket())
-        .map_err(|error| CliError::Codes {
-            class: CLASS_RECEIPT_MALFORMED,
-            group: RefusalGroup::Environment,
-            detail: error.to_string(),
-        })?;
-    ledger
-        .record(&ledger_entry(&issuance, &args.reason, &receipt_name), now)
-        .map_err(|error| CliError::Io(error.to_string()))?;
 
     let path = store::write(&args.receipts, &issuance, ticket.ticket())
         .map_err(|error| CliError::Io(error.to_string()))?;
@@ -524,17 +471,9 @@ fn run_issue(args: &IssueArgs, locale: Locale) -> Result<(), CliError> {
     );
     println!(
         "{} {}",
-        Msg::CodesCounterNote.text(locale),
-        issuance.annex.counter_note().as_str()
-    );
-    println!(
-        "{} {}",
         Msg::CodesKeyStorage.text(locale),
         issuance.annex.key_storage().as_str()
     );
-    if let Some(approver) = issuance.annex.approver() {
-        println!("{} {approver}", Msg::CodesOverrideApprover.text(locale));
-    }
     if issuance.annex.site_scope() == SiteScope::Undeclared {
         eprintln!("{}", Msg::CodesSiteUndeclared.text(locale));
     }
@@ -622,7 +561,7 @@ fn run_ticket_show(args: &TicketShowArgs, locale: Locale) -> Result<(), CliError
 
     let scope = ticket.ticket().scope();
     println!("number: {}", ticket.ticket().number());
-    println!("operator: {}", ticket.ticket().operator_id());
+    println!("operator: {}", ticket.ticket().server_id());
     println!("region: {}", scope.region());
     println!("tags: {}", scope.tags().join(","));
     println!("roles: {}", scope.roles().join(","));
@@ -728,8 +667,8 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Reads the challenge from the flag or the file that carries it.
-fn read_challenge(args: &IssueArgs, params: FleetParams) -> Result<Challenge, CliError> {
+/// Reads the signed challenge from the flag or the file that carries it.
+fn read_challenge(args: &IssueArgs, params: FleetParams) -> Result<SignedChallenge, CliError> {
     let text = match (args.challenge.as_deref(), args.challenge_file.as_deref()) {
         (Some(text), _) => text.to_owned(),
         (None, Some(path)) => String::from_utf8(read_file(path)?)
@@ -743,7 +682,7 @@ fn read_challenge(args: &IssueArgs, params: FleetParams) -> Result<Challenge, Cl
     // The check character of the device number is checked here, before anything
     // is derived or computed: a number typed wrong is a typo the operator hears
     // about, not a code that will not fit.
-    Challenge::parse(text.trim(), &params).map_err(|error| CliError::Codes {
+    SignedChallenge::parse(text.trim(), &params).map_err(|error| CliError::Codes {
         class: CLASS_CHALLENGE_MALFORMED,
         group: RefusalGroup::Other,
         detail: error.to_string(),
@@ -789,11 +728,18 @@ fn read_anchors(
     authority: &std::path::Path,
     organisations: &[String],
     organisation_of_record: &str,
+    owner_of_record: &str,
 ) -> Result<Anchors, CliError> {
     let mut anchors = Anchors::new(read_anchor_key(authority)?);
     for pair in organisations {
         let (id, path) = split_pair(pair, "--anchor-organisation")?;
         anchors = anchors.with_organisation(id, read_anchor_key(&PathBuf::from(path))?);
+    }
+    if !anchors.knows_organisation(owner_of_record) {
+        return Err(CliError::Usage(format!(
+            "the record was countersigned by the owner `{owner_of_record}`, which no \
+             --anchor-organisation names"
+        )));
     }
     if !anchors.knows_organisation(organisation_of_record) {
         return Err(CliError::Usage(format!(
@@ -810,83 +756,6 @@ fn split_pair<'a>(value: &'a str, flag: &str) -> Result<(&'a str, &'a str), CliE
         .split_once(PAIR_SEPARATOR)
         .filter(|(left, right)| !left.is_empty() && !right.is_empty())
         .ok_or_else(|| CliError::Usage(format!("{flag} takes `name{PAIR_SEPARATOR}path`")))
-}
-
-/// Builds the ledger entry of one issuance.
-fn ledger_entry(
-    issuance: &crate::codes::issue::Issuance,
-    reason: &str,
-    receipt_name: &str,
-) -> LedgerEntry {
-    LedgerEntry {
-        // The significant form, the same one the receipts and the counter
-        // control compare on: two spellings of one number must not read as two
-        // devices.
-        device_number: issuance.receipt.device_number().significant().to_owned(),
-        epoch: issuance.receipt.epoch().get(),
-        counter: issuance.receipt.nonce().counter(),
-        nonce: issuance.receipt.nonce().as_str().to_owned(),
-        role_id: issuance.receipt.role_id().to_owned(),
-        level: issuance.receipt.level().get(),
-        ticket_number: issuance.annex.ticket_number().as_str().to_owned(),
-        operator_id: issuance.annex.operator_id().to_owned(),
-        counter_note: issuance.annex.counter_note().as_str().to_owned(),
-        approver: issuance.annex.approver().map(str::to_owned),
-        reason: reason.to_owned(),
-        receipt: format!("{receipt_name}.{}", store::RECEIPT_EXTENSION),
-    }
-}
-
-/// Opens the counter history of a device: the ledger, the receipts beside it,
-/// and how deep the ledger goes.
-///
-/// Two stores, and the later of them wins. The ledger cannot be edited in the
-/// middle without breaking its chain; the receipts cannot be removed without
-/// leaving the gap visible in their names, since each is named after the device,
-/// the epoch and the counter it belongs to. Rolling a counter back means editing
-/// both.
-fn open_history(
-    args: &IssueArgs,
-    params: FleetParams,
-    device_number: &CheckedDeviceNumber,
-) -> Result<(Ledger, Option<KnownCounter>, u64), CliError> {
-    let path = args
-        .ledger
-        .clone()
-        .unwrap_or_else(|| args.receipts.join(LEDGER_FILENAME));
-    // A ledger that will not open is a refusal, never an empty history.
-    let ledger = Ledger::open(&path).map_err(|error| CliError::Codes {
-        class: CLASS_LEDGER_BROKEN,
-        group: RefusalGroup::Environment,
-        detail: error.to_string(),
-    })?;
-
-    let receipts = store::read_directory(&args.receipts, &params)
-        .map_err(|error| CliError::Io(error.to_string()))?;
-    let known = later_of(
-        ledger.last_known(device_number),
-        store::last_known_counter(&receipts, device_number),
-    );
-    let depth = ledger.depth(device_number);
-    Ok((ledger, known, depth))
-}
-
-/// Returns the later of two histories.
-///
-/// "Later" is by epoch first and counter second, not by which store answered:
-/// the two are read from different places precisely so that one of them being
-/// tampered with does not decide the question.
-fn later_of(ledger: Option<KnownCounter>, receipts: Option<KnownCounter>) -> Option<KnownCounter> {
-    match (ledger, receipts) {
-        (Some(left), Some(right)) => {
-            if (right.epoch, right.counter) > (left.epoch, left.counter) {
-                Some(right)
-            } else {
-                Some(left)
-            }
-        }
-        (some, None) | (None, some) => some,
-    }
 }
 
 /// The moment the operator's side claims.
@@ -1105,16 +974,16 @@ fn read_passphrase(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, CliErro
 mod tests {
     use super::{split_pair, AlphabetArg, FleetArgs, ProfileArg};
     use tessera_codes_contract::params::{
-        DEFAULT_ATTEMPTS_PER_NONCE, DEFAULT_CODE_LEN, DEFAULT_COUNTER_WIDTH, DEFAULT_TAIL_WIDTH,
+        DEFAULT_ATTEMPTS_PER_NONCE, DEFAULT_ATTEMPT_TTL_SECS, DEFAULT_CODE_LEN, DEFAULT_NONCE_WIDTH,
     };
 
     fn defaults() -> FleetArgs {
         FleetArgs {
             code_len: DEFAULT_CODE_LEN,
             attempts_per_nonce: DEFAULT_ATTEMPTS_PER_NONCE,
-            alphabet: AlphabetArg::Decimal,
-            counter_width: DEFAULT_COUNTER_WIDTH,
-            tail_width: DEFAULT_TAIL_WIDTH,
+            alphabet: AlphabetArg::CrockfordBase32,
+            nonce_width: DEFAULT_NONCE_WIDTH,
+            attempt_ttl_secs: DEFAULT_ATTEMPT_TTL_SECS,
             profile: ProfileArg::P256,
             accept_unconfirmed_profile: false,
         }
@@ -1130,8 +999,17 @@ mod tests {
 
     #[test]
     fn parameters_weaker_than_the_contract_do_not_parse() {
+        // Two characters are below the floor in every alphabet the contract
+        // holds; four are below it only in decimal, and a test that used four
+        // would be about the alphabet rather than the floor.
         let mut args = defaults();
-        args.code_len = 4;
+        args.code_len = 2;
+        assert!(args.params().is_err());
+
+        // And the ceiling on the attempt lifetime is the contract's, not a
+        // suggestion the flags may exceed.
+        let mut args = defaults();
+        args.attempt_ttl_secs = tessera_codes_contract::params::MAX_ATTEMPT_TTL_SECS + 1;
         assert!(args.params().is_err());
     }
 
@@ -1200,6 +1078,11 @@ mod tests {
                     fixtures::spki_of(fixtures::ORGANISATION_SEED),
                 )
                 .unwrap();
+                std::fs::write(
+                    root.path().join("owner.spki"),
+                    fixtures::spki_of(fixtures::OWNER_SEED),
+                )
+                .unwrap();
                 write_owner_only(
                     &root.path().join("operator.key"),
                     &fixtures::pkcs8_of(fixtures::OPERATOR_SEED),
@@ -1230,17 +1113,18 @@ mod tests {
                     device_record: self.path("record"),
                     ticket: self.path("ticket"),
                     anchor_ticket_authority: self.path("authority.spki"),
-                    anchor_organisations: vec![format!(
-                        "acme={}",
-                        self.path("acme.spki").display()
-                    )],
+                    anchor_organisations: vec![
+                        format!("acme={}", self.path("acme.spki").display()),
+                        format!(
+                            "{}={}",
+                            fixtures::OWNER_ID,
+                            self.path("owner.spki").display()
+                        ),
+                    ],
                     reason: "work order 42".to_owned(),
                     receipts: self.path("receipts"),
                     device_region: Some("ru-central".to_owned()),
                     device_tags: vec!["dc-1".to_owned()],
-                    counter_override: false,
-                    approved_by: None,
-                    ledger: None,
                     now: Some(fixtures::NOW.get()),
                     code_only: true,
                 }
@@ -1293,7 +1177,7 @@ mod tests {
         #[test]
         fn a_request_outside_the_ticket_is_told_apart_from_a_broken_stand() {
             let files = Files::new();
-            let outside = fixtures::challenge_with(|input| input.level = 9);
+            let outside = fixtures::signed_challenge_with(|input| input.level = 9);
             write(&files.path("challenge-level-9"), &outside.to_wire());
 
             let mut args = files.issue_args();
@@ -1318,7 +1202,8 @@ mod tests {
         #[test]
         fn each_axis_of_the_ticket_reports_its_own_class() {
             let files = Files::new();
-            let role = fixtures::challenge_with(|input| input.role_id = "ops.dc.root".to_owned());
+            let role =
+                fixtures::signed_challenge_with(|input| input.role_id = "ops.dc.root".to_owned());
             write(&files.path("challenge-role"), &role.to_wire());
             let mut args = files.issue_args();
             args.challenge_file = Some(files.path("challenge-role"));
@@ -1344,14 +1229,14 @@ mod tests {
         #[test]
         fn every_class_of_refusal_leaves_its_own_exit_code() {
             use crate::cli::{
-                EXIT_REFUSED_COUNTER, EXIT_REFUSED_GROUNDS, EXIT_REFUSED_TICKET_SCOPE,
-                EXIT_REFUSED_TRUST, EXIT_TOOL_FAILURE,
+                EXIT_REFUSED_GROUNDS, EXIT_REFUSED_TICKET_SCOPE, EXIT_REFUSED_TRUST,
+                EXIT_TOOL_FAILURE,
             };
 
             let files = Files::new();
 
             // Вне рамок билета.
-            let outside = fixtures::challenge_with(|input| input.level = 9);
+            let outside = fixtures::signed_challenge_with(|input| input.level = 9);
             write(&files.path("challenge-level-9"), &outside.to_wire());
             let mut args = files.issue_args();
             args.challenge_file = Some(files.path("challenge-level-9"));
@@ -1380,18 +1265,6 @@ mod tests {
                 EXIT_REFUSED_TRUST
             );
 
-            // Счётчик: первая выдача проходит, вторая приходит с опережением.
-            run_issue(&files.issue_args(), Locale::En).unwrap();
-            let ahead = fixtures::challenge_with(|input| input.counter = 9);
-            write(&files.path("challenge-ahead"), &ahead.to_wire());
-            let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-ahead"));
-            args.now = Some(fixtures::NOW.get() + 60);
-            assert_eq!(
-                run_issue(&args, Locale::En).unwrap_err().exit_code(),
-                EXIT_REFUSED_COUNTER
-            );
-
             // Сбой стенда: запись устройства — не запись устройства. Ни один
             // вердикт этот код не занимает.
             write(&files.path("record"), "not a device record");
@@ -1412,7 +1285,7 @@ mod tests {
                 store::read_directory(&files.path("receipts"), &FleetParams::defaults()).unwrap();
             let stored = receipts.first().unwrap();
             assert_eq!(stored.receipt.reason(), "work order 42");
-            assert_eq!(stored.annex.operator_id(), "op-42");
+            assert_eq!(stored.annex.server_id(), "op-42");
         }
 
         #[test]
@@ -1438,165 +1311,6 @@ mod tests {
                 run_issue(&args, Locale::En),
                 Err(CliError::Usage(_))
             ));
-        }
-
-        /// Спрятать квитанции больше не значит отмотать счётчик.
-        ///
-        /// Это тот самый обход, ради которого и заведён реестр: оператор,
-        /// желающий переиздать код по записанному разговору, убирает квитанции
-        /// в сторону и получает «обычный следующий звонок». Реестр помнит.
-        #[test]
-        fn moving_the_receipts_aside_does_not_roll_the_counter_back() {
-            let files = Files::new();
-            run_issue(&files.issue_args(), Locale::En).unwrap();
-
-            // Второй звонок: счётчик 2, обычная выдача.
-            let second = fixtures::challenge_with(|input| input.counter = 2);
-            write(&files.path("challenge-2"), &second.to_wire());
-            let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-2"));
-            args.now = Some(fixtures::NOW.get() + 60);
-            run_issue(&args, Locale::En).unwrap();
-
-            // Оператор убирает квитанции: расширение перестаёт читаться
-            // каталогом квитанций.
-            for entry in fs::read_dir(files.path("receipts")).unwrap() {
-                let path = entry.unwrap().path();
-                if path.extension().and_then(|ext| ext.to_str()) == Some("receipt") {
-                    fs::rename(&path, path.with_extension("receipt.bak")).unwrap();
-                }
-            }
-
-            // И повторяет первый разговор. Реестр всё ещё знает счётчик 2.
-            let mut replay = files.issue_args();
-            replay.now = Some(fixtures::NOW.get() + 120);
-            let refusal = run_issue(&replay, Locale::En).unwrap_err();
-            assert_eq!(refusal.refusal_class(), Some("counter_behind"));
-        }
-
-        /// Пустой каталог квитанций не открывает дверь: реестр там же.
-        #[test]
-        fn pointing_at_an_empty_directory_does_not_clear_the_history() {
-            let files = Files::new();
-            let second = fixtures::challenge_with(|input| input.counter = 2);
-            write(&files.path("challenge-2"), &second.to_wire());
-
-            run_issue(&files.issue_args(), Locale::En).unwrap();
-            let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-2"));
-            args.now = Some(fixtures::NOW.get() + 60);
-            run_issue(&args, Locale::En).unwrap();
-
-            // Свежий каталог — свежий реестр: он пуст, и потому допускает
-            // только первый счётчик эпохи. Повтор счётчика 2 не проходит.
-            let mut elsewhere = files.issue_args();
-            elsewhere.receipts = files.path("elsewhere");
-            elsewhere.challenge_file = Some(files.path("challenge-2"));
-            elsewhere.now = Some(fixtures::NOW.get() + 120);
-            let refusal = run_issue(&elsewhere, Locale::En).unwrap_err();
-            assert_eq!(refusal.refusal_class(), Some("counter_not_epoch_start"));
-        }
-
-        /// Реестр с изъятой строкой — отказ, а не «истории нет».
-        #[test]
-        fn an_edited_ledger_refuses_rather_than_reading_as_fresh() {
-            let files = Files::new();
-            run_issue(&files.issue_args(), Locale::En).unwrap();
-            let second = fixtures::challenge_with(|input| input.counter = 2);
-            write(&files.path("challenge-2"), &second.to_wire());
-            let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-2"));
-            args.now = Some(fixtures::NOW.get() + 60);
-            run_issue(&args, Locale::En).unwrap();
-
-            let ledger = files
-                .path("receipts")
-                .join(crate::codes::ledger::LEDGER_FILENAME);
-            let text = fs::read_to_string(&ledger).unwrap();
-            let kept: Vec<&str> = text.lines().skip(1).collect();
-            fs::write(&ledger, format!("{}\n", kept.join("\n"))).unwrap();
-
-            let failure = run_issue(&files.issue_args(), Locale::En).unwrap_err();
-            assert_eq!(failure.refusal_class(), Some("ledger_unusable"));
-            assert_eq!(failure.exit_code(), crate::cli::EXIT_TOOL_FAILURE);
-        }
-
-        /// Глубина истории уезжает в квитанцию и переживает сам реестр.
-        #[test]
-        fn the_receipt_records_how_deep_the_history_was() {
-            let files = Files::new();
-            run_issue(&files.issue_args(), Locale::En).unwrap();
-            let second = fixtures::challenge_with(|input| input.counter = 2);
-            write(&files.path("challenge-2"), &second.to_wire());
-            let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-2"));
-            args.now = Some(fixtures::NOW.get() + 60);
-            run_issue(&args, Locale::En).unwrap();
-
-            let receipts =
-                store::read_directory(&files.path("receipts"), &FleetParams::defaults()).unwrap();
-            let depths: Vec<u64> = receipts
-                .iter()
-                .map(|stored| stored.annex.history_depth())
-                .collect();
-            assert!(depths.contains(&0), "первая выдача идёт по пустой истории");
-            assert!(depths.contains(&1), "вторая знает про первую");
-        }
-
-        /// Ход выдачи попадает в реестр всегда, а не только когда оператор
-        /// попросил журнал: история, которую можно не вести, — не история.
-        #[test]
-        fn every_issuance_reaches_the_ledger_without_being_asked() {
-            let files = Files::new();
-            run_issue(&files.issue_args(), Locale::En).unwrap();
-
-            let ledger = files
-                .path("receipts")
-                .join(crate::codes::ledger::LEDGER_FILENAME);
-            let text = fs::read_to_string(&ledger).unwrap();
-            assert!(text.contains("\"kind\":\"codes.issue\""));
-            assert!(text.contains("\"counter\":1"));
-        }
-
-        #[test]
-        fn an_override_reaches_the_journal_as_well_as_the_receipt() {
-            let files = Files::new();
-            // A first issuance leaves the receipt the counter then measures
-            // against; the second call arrives with a counter running ahead.
-            run_issue(&files.issue_args(), Locale::En).unwrap();
-
-            let ahead = fixtures::challenge_with(|input| input.counter = 9);
-            write(&files.path("challenge-ahead"), &ahead.to_wire());
-            let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-ahead"));
-            args.now = Some(fixtures::NOW.get() + 60);
-
-            // Without the second operator the challenge is refused outright.
-            assert!(matches!(
-                run_issue(&args, Locale::En),
-                Err(CliError::Codes { .. })
-            ));
-
-            args.counter_override = true;
-            args.approved_by = Some("op-7".to_owned());
-            run_issue(&args, Locale::En).unwrap();
-
-            // Ledger and receipt both carry the override; the ledger is written
-            // whether or not anybody asked for one.
-            let ledger = fs::read_to_string(
-                files
-                    .path("receipts")
-                    .join(crate::codes::ledger::LEDGER_FILENAME),
-            )
-            .unwrap();
-            assert!(ledger.contains("\"approver\":\"op-7\""));
-            assert!(ledger.contains("\"counter_note\":\"overridden\""));
-
-            let receipts =
-                store::read_directory(&files.path("receipts"), &FleetParams::defaults()).unwrap();
-            assert!(receipts
-                .iter()
-                .any(|stored| stored.annex.approver() == Some("op-7")));
         }
 
         #[test]
@@ -1677,12 +1391,13 @@ mod tests {
             let device = files
                 .world
                 .challenge
+                .challenge()
                 .device_number()
                 .significant()
                 .to_owned();
             fs::write(
                 files.path("device.ndjson"),
-                device_chain_line(&files.world.challenge),
+                device_chain_line(files.world.challenge.challenge()),
             )
             .unwrap();
             let args = ReconcileArgs {

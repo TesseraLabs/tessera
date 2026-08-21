@@ -1,10 +1,22 @@
 //! Derivation of the shared key `K`.
 //!
 //! The crate performs no Diffie-Hellman of its own: on the device the shared
-//! secret `Z` is computed by a software library, in the cabinet by a token
+//! secret `Z` is computed by a software library, on the issuing side by a token
 //! behind an agent, and PKCS#11 cannot be carried into WebAssembly at all. What
 //! arrives here is `Z`; what leaves is
-//! `K = HKDF-SHA256(Z, № устройства ‖ эпоха ‖ hash(ticket))`.
+//! `K = HKDF-SHA256(Z, № устройства ‖ hash(ticket))`.
+//!
+//! # Which key pair `Z` comes from
+//!
+//! From an **ephemeral** pair of the device and the static key of the issuing
+//! side. The long-lived device key takes no part in it: while it did, anybody
+//! who held that key — a preparer, whoever lifted the disk, whoever kept a
+//! backup — computed codes for the device without the issuing side being
+//! involved at all, because everything else the derivation needs travels in the
+//! open. An ephemeral pair closes that: the private half of an attempt does not
+//! exist until the attempt begins, and it never reaches a disk. What the device
+//! key is still good for is signing the challenge, which says who produced the
+//! ephemeral point — not what the code is.
 //!
 //! Binding the ticket hash into the context gives a second line of defence
 //! behind the ticket signature: any edit of the signed ticket changes the
@@ -149,11 +161,11 @@ impl TicketHash {
     }
 }
 
-/// Context the key is bound to: device, epoch and the signed operator ticket.
+/// Context the key is bound to: the device and the signed ticket of the issuing
+/// side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyContext<'a> {
     device_number: &'a CheckedDeviceNumber,
-    epoch: Epoch,
     ticket_hash: TicketHash,
 }
 
@@ -162,17 +174,17 @@ impl<'a> KeyContext<'a> {
     ///
     /// The device number enters the context in its significant form, for the
     /// same reason it does in [`CodeInput`](crate::canon::CodeInput): the two
-    /// sides of a call read the number off different labels, and a key that
-    /// depended on the separators would not meet.
+    /// sides read the number off different labels, and a key that depended on
+    /// the separators would not meet.
+    ///
+    /// The key epoch is not part of the context. It names the long-lived device
+    /// key, and that key no longer enters `Z`, so an epoch here would separate
+    /// nothing; what separates one attempt from every other is the ephemeral
+    /// pair `Z` is computed on.
     #[must_use]
-    pub const fn new(
-        device_number: &'a CheckedDeviceNumber,
-        epoch: Epoch,
-        ticket_hash: TicketHash,
-    ) -> Self {
+    pub const fn new(device_number: &'a CheckedDeviceNumber, ticket_hash: TicketHash) -> Self {
         Self {
             device_number,
-            epoch,
             ticket_hash,
         }
     }
@@ -186,7 +198,6 @@ impl<'a> KeyContext<'a> {
     pub fn encode(&self) -> Result<Vec<u8>, CanonError> {
         let mut encoder = Encoder::default();
         encoder.push_text("device_number", self.device_number.significant())?;
-        encoder.push_u32("epoch", self.epoch.get())?;
         encoder.push_bytes("ticket_hash", self.ticket_hash.as_bytes())?;
         Ok(encoder.finish())
     }
@@ -208,12 +219,50 @@ pub fn derive_key(
     Ok(DerivedKey(hkdf_sha256(KDF_SALT, secret.expose(), &info)))
 }
 
+/// Public half of the ephemeral pair of one attempt.
+///
+/// The bytes are opaque to the contract, as every other public point is: they
+/// are in the encoding of the algorithm profile, and whoever performs the key
+/// agreement is the one that parses and validates them.
+///
+/// Only the public half has a type here. The private half never crosses this
+/// crate — it is generated, used and wiped inside the implementation of
+/// [`EphemeralKeyAgreement`], and a type that could carry it out of there would
+/// be an invitation to store it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EphemeralPublicPoint(Vec<u8>);
+
+impl EphemeralPublicPoint {
+    /// Wraps the encoded point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyError::EmptyPoint`] for an empty value: a challenge that
+    /// carries no point names no pair, and the issuing side would have nothing
+    /// to agree against.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, KeyError> {
+        if bytes.is_empty() {
+            return Err(KeyError::EmptyPoint);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the encoded point.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// Failure of the key material handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
     /// The supplied shared secret is empty.
     #[error("the shared secret is empty")]
     EmptySecret,
+    /// The supplied ephemeral public point is empty.
+    #[error("the ephemeral public point is empty")]
+    EmptyPoint,
 }
 
 /// Failure of an external key agreement.
@@ -254,6 +303,34 @@ pub trait KeyAgreement {
     fn agree(&self, peer_public: &[u8]) -> Result<SharedSecret, KeyAgreementError>;
 }
 
+/// Key agreement performed on a pair that exists for one attempt only.
+///
+/// This is what the device side implements. The distinction from a plain
+/// [`KeyAgreement`] is not the arithmetic — it is the lifetime of the private
+/// half, and that lifetime is the security property `K` now rests on.
+///
+/// # Obligations of the implementation
+///
+/// Beyond everything [`KeyAgreement`] asks of it:
+///
+/// - the pair **must** be generated afresh for every attempt, from the system
+///   generator, and never derived from anything stored;
+/// - the private half **must not** be written anywhere outside process memory —
+///   no file, no key container, no log — and **must** be wiped when the value
+///   is dropped, so that an attempt that ends leaves nothing behind that would
+///   recompute its code;
+/// - [`EphemeralKeyAgreement::public_point`] **must** return the public half of
+///   that same pair, because it is what travels in the challenge and what the
+///   issuing side computes `Z` against.
+///
+/// A backing implementation that reused one pair across attempts would hand
+/// back exactly the property the ephemeral pair exists to remove: a value that
+/// can be captured once and used later.
+pub trait EphemeralKeyAgreement: KeyAgreement {
+    /// Returns the public half of the pair, for the challenge to carry.
+    fn public_point(&self) -> &EphemeralPublicPoint;
+}
+
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -261,8 +338,8 @@ pub trait KeyAgreement {
 )]
 mod tests {
     use super::{
-        derive_key, Epoch, KeyAgreement, KeyAgreementError, KeyContext, KeyError, SharedSecret,
-        TicketHash,
+        derive_key, EphemeralKeyAgreement, EphemeralPublicPoint, KeyAgreement, KeyAgreementError,
+        KeyContext, KeyError, SharedSecret, TicketHash,
     };
     use crate::device_number::CheckedDeviceNumber;
 
@@ -300,28 +377,15 @@ mod tests {
         assert_eq!(format!("{secret:?}"), "SharedSecret(redacted)");
 
         let device = number("77-1");
-        let key = derive_key(
-            &secret,
-            &KeyContext::new(&device, Epoch::new(1), ticket_hash(b"t")),
-        )
-        .unwrap();
+        let key = derive_key(&secret, &KeyContext::new(&device, ticket_hash(b"t"))).unwrap();
         assert_eq!(format!("{key:?}"), "DerivedKey(redacted)");
-    }
-
-    #[test]
-    fn epoch_change_separates_keys() {
-        let hash = ticket_hash(b"signed ticket");
-        let device = number("77-1");
-        let first = derive_key(&secret(), &KeyContext::new(&device, Epoch::new(1), hash)).unwrap();
-        let second = derive_key(&secret(), &KeyContext::new(&device, Epoch::new(2), hash)).unwrap();
-        assert!(!first.ct_eq(&second));
     }
 
     #[test]
     fn edited_ticket_separates_keys() {
         let device = number("77-1");
-        let context = KeyContext::new(&device, Epoch::new(1), ticket_hash(b"scope=dc-1"));
-        let edited = KeyContext::new(&device, Epoch::new(1), ticket_hash(b"scope=dc-2"));
+        let context = KeyContext::new(&device, ticket_hash(b"scope=dc-1"));
+        let edited = KeyContext::new(&device, ticket_hash(b"scope=dc-2"));
         assert!(!derive_key(&secret(), &context)
             .unwrap()
             .ct_eq(&derive_key(&secret(), &edited).unwrap()));
@@ -332,16 +396,8 @@ mod tests {
         let hash = ticket_hash(b"signed ticket");
         let first_device = number("77-1");
         let second_device = number("77-2");
-        let first = derive_key(
-            &secret(),
-            &KeyContext::new(&first_device, Epoch::new(1), hash),
-        )
-        .unwrap();
-        let second = derive_key(
-            &secret(),
-            &KeyContext::new(&second_device, Epoch::new(1), hash),
-        )
-        .unwrap();
+        let first = derive_key(&secret(), &KeyContext::new(&first_device, hash)).unwrap();
+        let second = derive_key(&secret(), &KeyContext::new(&second_device, hash)).unwrap();
         assert!(!first.ct_eq(&second));
     }
 
@@ -351,9 +407,8 @@ mod tests {
         let printed = number("77-000123");
         let retyped =
             CheckedDeviceNumber::parse(&printed.as_str().replace('-', " ").to_lowercase()).unwrap();
-        let first = derive_key(&secret(), &KeyContext::new(&printed, Epoch::new(1), hash)).unwrap();
-        let second =
-            derive_key(&secret(), &KeyContext::new(&retyped, Epoch::new(1), hash)).unwrap();
+        let first = derive_key(&secret(), &KeyContext::new(&printed, hash)).unwrap();
+        let second = derive_key(&secret(), &KeyContext::new(&retyped, hash)).unwrap();
         assert!(first.ct_eq(&second));
     }
 
@@ -361,16 +416,45 @@ mod tests {
     fn derivation_is_deterministic() {
         let hash = ticket_hash(b"signed ticket");
         let device = number("77-1");
-        let context = KeyContext::new(&device, Epoch::new(1), hash);
+        let context = KeyContext::new(&device, hash);
         assert!(derive_key(&secret(), &context)
             .unwrap()
             .ct_eq(&derive_key(&secret(), &context).unwrap()));
     }
 
+    #[test]
+    fn one_context_over_two_exchanges_gives_two_keys() {
+        // The context of two attempts against one device under one ticket is
+        // the same bytes; what tells their keys apart is `Z`, and `Z` is what
+        // the ephemeral pair makes new every time. A derivation that ignored
+        // the secret would show up here and nowhere else.
+        let device = number("77-1");
+        let context = KeyContext::new(&device, ticket_hash(b"signed ticket"));
+        let first = derive_key(&SharedSecret::new(vec![0x11; 32]).unwrap(), &context).unwrap();
+        let second = derive_key(&SharedSecret::new(vec![0x12; 32]).unwrap(), &context).unwrap();
+        assert!(!first.ct_eq(&second));
+    }
+
+    #[test]
+    fn an_empty_ephemeral_point_is_refused() {
+        assert!(matches!(
+            EphemeralPublicPoint::new(Vec::new()),
+            Err(KeyError::EmptyPoint)
+        ));
+        assert_eq!(
+            EphemeralPublicPoint::new(vec![0x04, 0x01])
+                .unwrap()
+                .as_bytes(),
+            &[0x04, 0x01]
+        );
+    }
+
     /// Stand-in for a real backend: it demonstrates the shape the trait asks
-    /// for — reject the point first, derive second.
+    /// for — reject the point first, derive second — and carries a public point
+    /// of its own, as the device side does.
     struct ValidatingBackend {
         accepted_point: Vec<u8>,
+        public_point: EphemeralPublicPoint,
     }
 
     impl KeyAgreement for ValidatingBackend {
@@ -383,21 +467,34 @@ mod tests {
         }
     }
 
+    impl EphemeralKeyAgreement for ValidatingBackend {
+        fn public_point(&self) -> &EphemeralPublicPoint {
+            &self.public_point
+        }
+    }
+
+    fn backend() -> ValidatingBackend {
+        ValidatingBackend {
+            accepted_point: vec![0x04, 0x01, 0x02],
+            public_point: EphemeralPublicPoint::new(vec![0x04, 0x33, 0x44]).unwrap(),
+        }
+    }
+
     #[test]
     fn agreement_backend_rejects_before_deriving() {
-        let backend = ValidatingBackend {
-            accepted_point: vec![0x04, 0x01, 0x02],
-        };
+        let backend = backend();
         assert!(matches!(
             backend.agree(&[0x04, 0x09]),
             Err(KeyAgreementError::InvalidPublicPoint)
         ));
         let z = backend.agree(&[0x04, 0x01, 0x02]).unwrap();
         let device = number("77-1");
-        assert!(derive_key(
-            &z,
-            &KeyContext::new(&device, Epoch::new(1), ticket_hash(b"t"))
-        )
-        .is_ok());
+        assert!(derive_key(&z, &KeyContext::new(&device, ticket_hash(b"t"))).is_ok());
+    }
+
+    #[test]
+    fn the_point_the_backend_publishes_is_the_one_it_hands_out() {
+        let backend = backend();
+        assert_eq!(backend.public_point().as_bytes(), &[0x04, 0x33, 0x44]);
     }
 }

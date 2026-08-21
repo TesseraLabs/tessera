@@ -1,7 +1,7 @@
 //! Receipts on disk.
 //!
 //! One issuance, one file, named by the contract
-//! ([`IssuanceReceipt::file_name`]): the device, the epoch, the counter, the
+//! ([`IssuanceReceipt::file_name`]): the device, the epoch, the nonce, the
 //! ticket, the operator and a digest of the receipt. Two receipts of one channel
 //! therefore sort next to each other, and none of them can overwrite another —
 //! which is why the file is created exclusively and never truncated. A receipt
@@ -10,25 +10,22 @@
 //!
 //! A file carries two lines: the receipt in the format of the contract, and the
 //! annex beside it ([`crate::codes::annex`]). Both are required. A receipt
-//! without its annex would not say how the operator key was held or whether the
-//! counter refusal was overridden, and a reader cannot tell "the file predates
-//! the annex" from "somebody removed it".
+//! without its annex would not say how the operator key was held, and a reader
+//! cannot tell "the file predates the annex" from "somebody removed it".
 //!
 //! This is the only module of the operator side that touches a filesystem. What
-//! it hands back are values the pure modules work on: the last known counter of
-//! a device, and the receipt side of a reconciliation.
+//! it hands back is what the pure modules work on: the receipt side of a
+//! reconciliation.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use tessera_codes_contract::device_number::CheckedDeviceNumber;
 use tessera_codes_contract::params::FleetParams;
 use tessera_codes_contract::receipt::{IssuanceReceipt, ReceiptError};
-use tessera_codes_contract::ticket::OperatorTicket;
+use tessera_codes_contract::ticket::ServerTicket;
 
 use crate::codes::annex::{AnnexError, ReceiptAnnex};
-use crate::codes::counter::KnownCounter;
 use crate::codes::issue::Issuance;
 use crate::codes::reconcile::ReceiptEntry;
 
@@ -65,7 +62,7 @@ pub struct StoredReceipt {
 pub fn write(
     directory: &Path,
     issuance: &Issuance,
-    ticket: &OperatorTicket,
+    ticket: &ServerTicket,
 ) -> Result<PathBuf, StoreError> {
     let name = issuance
         .receipt
@@ -196,33 +193,6 @@ pub fn read_directory(
         .collect::<Result<Vec<_>, _>>()
 }
 
-/// Returns where the receipts say a device was left.
-///
-/// The latest receipt is the one of the highest epoch, and within it the one of
-/// the highest counter — not the newest file and not the latest claimed moment:
-/// both of those are written by the side whose work the receipt records.
-///
-/// This is the second of the two stores the counter control reads. The first is
-/// the hash-chained ledger ([`crate::codes::ledger`]); rolling a counter back
-/// means editing both, and the module documents what that buys.
-#[must_use]
-pub fn last_known_counter(
-    receipts: &[StoredReceipt],
-    device_number: &CheckedDeviceNumber,
-) -> Option<KnownCounter> {
-    receipts
-        .iter()
-        .filter(|stored| {
-            stored.receipt.device_number().significant() == device_number.significant()
-        })
-        .map(|stored| KnownCounter {
-            epoch: stored.receipt.epoch(),
-            counter: stored.receipt.nonce().counter(),
-            nonce: stored.receipt.nonce().as_str().to_owned(),
-        })
-        .max_by_key(|known| (known.epoch, known.counter))
-}
-
 /// Turns stored receipts into the receipt side of a reconciliation.
 #[must_use]
 pub fn entries(receipts: &[StoredReceipt]) -> Vec<ReceiptEntry> {
@@ -270,7 +240,7 @@ pub enum StoreError {
     reason = "a failed setup step in a test should fail the test on the spot"
 )]
 mod tests {
-    use super::{entries, last_known_counter, read_directory, read_file, write, StoreError};
+    use super::{entries, read_directory, read_file, write, StoreError};
     use crate::codes::issue::{issue, IssuanceRequest};
     use crate::codes::tests::fixtures;
     use tessera_codes_contract::params::FleetParams;
@@ -287,9 +257,6 @@ mod tests {
                 device_scope: Some(&world.device_scope),
                 reason: "work order 42",
                 now: fixtures::NOW,
-                known_counter: None,
-                history_depth: 0,
-                override_decision: None,
             },
             &world.anchors,
             &world.operator_key,
@@ -306,7 +273,7 @@ mod tests {
         let stored = read_file(&path, &FleetParams::defaults()).unwrap();
 
         assert_eq!(stored.receipt.reason(), "work order 42");
-        assert_eq!(stored.annex.operator_id(), "op-42");
+        assert_eq!(stored.annex.server_id(), "op-42");
         assert_eq!(stored.annex.ticket_number().as_str(), "tk-17");
     }
 
@@ -323,9 +290,6 @@ mod tests {
                 device_scope: Some(&world.device_scope),
                 reason: "work order 42",
                 now: fixtures::NOW,
-                known_counter: None,
-                history_depth: 0,
-                override_decision: None,
             },
             &world.anchors,
             &world.operator_key,
@@ -347,20 +311,6 @@ mod tests {
                 .len(),
             0
         );
-    }
-
-    #[test]
-    fn the_last_known_counter_comes_from_the_highest_epoch_and_counter() {
-        let world = fixtures::world();
-        let (directory, _path) = written(&world);
-        let receipts = read_directory(directory.path(), &FleetParams::defaults()).unwrap();
-
-        let known = last_known_counter(&receipts, world.challenge.device_number()).unwrap();
-        assert_eq!(known.epoch.get(), fixtures::EPOCH);
-        assert_eq!(known.counter, 1);
-
-        let other = fixtures::other_device_number();
-        assert_eq!(last_known_counter(&receipts, &other), None);
     }
 
     #[test]

@@ -600,9 +600,13 @@ fn a_repeated_import_of_the_same_package_is_a_no_op_for_the_key() {
             Some(&codes_import(&codes, Some(&pin))),
         )
         .unwrap();
-    // The device has been talking since.
-    crate::codes::counter::write_issued(&codes.state_dir, 17).unwrap();
-
+    // The device has been talking since: its throttle has something to
+    // remember, which is what "not a fresh device" looks like on disk now.
+    std::fs::write(
+        codes.state_dir.join(crate::codes::state::STATE_FILENAME),
+        "tessera-codes/state/v2\nboot=boot-a\nwindow=10,1\n",
+    )
+    .unwrap();
     // The medium is presented again. The container was shredded by the first
     // import, so the operator re-stages it — the same bytes, the same epoch.
     fixture.write(package.path());
@@ -617,15 +621,15 @@ fn a_repeated_import_of_the_same_package_is_a_no_op_for_the_key() {
         .unwrap()
         .codes
         .unwrap();
+    assert!(applied.key_replaced);
 
-    assert!(!applied.counter_reset);
-    assert_eq!(
-        crate::codes::counter::read_issued(&codes.state_dir)
+    // The medium presented twice leaves the throttle of the device alone: a
+    // lockout a delivered medium could clear would be no lockout at all.
+    assert!(
+        std::fs::read_to_string(codes.state_dir.join(crate::codes::state::STATE_FILENAME))
             .unwrap()
-            .unwrap()
-            .get(),
-        17,
-        "a second run of the same medium must not resurrect consumed nonces"
+            .contains("window=10,1"),
+        "a second run of the same medium must not clear the throttle"
     );
 }
 

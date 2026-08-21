@@ -1,48 +1,46 @@
-//! Persisted state of the code method: which nonces are alive, which are spent.
+//! Persisted state of the code method: what a flood has already cost this
+//! device.
 //!
-//! Three things have to survive a power cut on a device nobody can reach:
+//! One thing survives a power cut here, and it is not the attempt. It is the
+//! throttle — how much of the issuance window this device has spent, and which
+//! roles are locked after a run of wrong codes. That has to outlive a process
+//! because every login is a process of its own: a limit kept in memory would be
+//! reset by the next call, which is exactly the call it exists to refuse.
 //!
-//! - **which nonces were already spent**, because a one-time nonce that forgets
-//!   it was used is not one-time. This is the whole of the offline replay
-//!   defence, and it is why the state is written to disk rather than kept in
-//!   the process that printed the challenge;
-//! - **how many wrong codes each pending nonce has taken**, because the budget
-//!   is per nonce and a restart between two guesses must not refill it;
-//! - **which boot the pending attempts belong to**, because an attempt cannot
-//!   outlive the running system it was started on.
+//! # What deliberately does not live here
 //!
-//! The last point is what closes the loss of trusted time. A pending attempt
-//! carries the boot identifier it was started under and the whole seconds since
-//! that boot. A reboot changes the identifier and every pending attempt is
-//! dropped; a monotonic clock dragged backwards leaves a pending attempt that
-//! claims to have started later than the present moment, and every pending
-//! attempt is dropped as well. Neither case is repaired: an attempt whose
-//! lifetime cannot be measured is refused, not extended.
+//! The attempt. Not its nonce, not its ephemeral private key, not the count of
+//! wrong codes it has taken. All of it lives in the memory of the process
+//! holding the attempt open, from the moment the challenge is printed to the
+//! moment the code is accepted or refused, and it dies with that process.
 //!
-//! The consumed set is *not* dropped on a reboot. That is the asymmetry the
-//! design rests on: pending attempts are cheap to redo and dangerous to keep,
-//! spent nonces are the opposite.
+//! That is the whole replay defence, and it is stronger than the file it
+//! replaces. A device restored from a snapshot without memory has no attempt at
+//! all: a code cut for the nonce of the snapshot meets nothing, because nothing
+//! is holding that nonce open. The file this module used to keep — spent
+//! nonces, pending attempts, a monotonic counter — came back with the snapshot
+//! together with the counter that was supposed to detect it, so the rollback
+//! check compared two values that were rolled back as one. Removing the file
+//! removes the thing that was being rolled back.
 //!
-//! # Rollback
+//! What it does not cover is a snapshot taken *with* memory: that restores the
+//! attempt itself. Nothing on a device without a hardware monotonic anchor
+//! detects it, and the specification states that as a premise of the
+//! environment rather than a property of the product.
 //!
-//! The counter file and this file are written together, counter first. A device
-//! restored from a snapshot brings both back, and a counter that reads smaller
-//! than the highest value this file has seen means nonces already spoken aloud
-//! are about to be issued again. The load refuses, and the fleet owes the
-//! device a key epoch rotation — which is what the recovery procedure of a
-//! fleet has to include anyway.
+//! # Time
 //!
-//! The reverse order is survivable and is allowed: a crash between the two
-//! writes leaves a counter ahead of this file, which burns a nonce and repeats
-//! none.
+//! Whole seconds since boot, from the markers the rest of the method uses. A
+//! reboot restarts that scale, so the throttle is re-armed against the new boot
+//! rather than believed — see [`Throttle::rebase_to_new_boot`]. Clearing it
+//! instead would make a power cycle the way out of a lockout.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use super::boot::BootMarkers;
-use super::counter::{self, IssuedCounter};
 use super::throttle::{RoleLedger, Throttle, MAX_TRACKED_ROLES};
 
 /// Name of the state file inside the state directory.
@@ -52,41 +50,14 @@ pub const STATE_FILENAME: &str = "nonce.state";
 const STATE_MODE: u32 = 0o600;
 
 /// Marker that opens the file and pins the version of its format.
-const STATE_PREFIX: &str = "tessera-codes/state/v1";
-
-/// Largest number of attempts kept alive at once — the grace window.
-///
-/// The window is a security parameter, not a comfort one: every nonce alive at
-/// the same moment is another target a guesser may hit, so the bound is small
-/// and the oldest attempt is spent rather than kept when a new one arrives.
-pub const MAX_PENDING_ATTEMPTS: usize = 8;
-
-/// Largest number of individually remembered spent nonces.
-///
-/// Beyond this the lowest values are folded into a floor: everything at or
-/// below the floor counts as spent. Folding can only refuse more, never less.
-pub const MAX_CONSUMED_NONCES: usize = 64;
+const STATE_PREFIX: &str = "tessera-codes/state/v2";
 
 /// Longest state file accepted, in bytes.
 const MAX_STATE_BYTES: usize = 64 * 1024;
 
-/// An attempt that has been issued and not yet finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingAttempt {
-    /// Counter half of the nonce that was issued.
-    pub counter: u64,
-    /// Whole seconds since boot at the moment the challenge was printed.
-    pub started_since_boot: u64,
-    /// Wrong codes this nonce has already taken.
-    pub attempts_used: u8,
-}
-
 /// Failure of the persisted state.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
-    /// The state moved backwards against the counter file.
-    #[error("the persisted nonce counter is behind the state file")]
-    Rollback,
     /// The state file does not hold what the format describes.
     #[error("the persisted code state is malformed: {reason}")]
     Corrupt {
@@ -102,10 +73,6 @@ pub enum StateError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeState {
     boot_id: String,
-    issued: u64,
-    consumed_floor: u64,
-    consumed: BTreeSet<u64>,
-    pending: Vec<PendingAttempt>,
     throttle: Throttle,
 }
 
@@ -114,183 +81,46 @@ impl CodeState {
     /// running system.
     ///
     /// Reconciliation is part of loading rather than a step a caller may skip:
-    /// a caller holding an unreconciled state would be holding pending attempts
-    /// from before a reboot.
+    /// a caller holding an unreconciled state would be measuring the throttle
+    /// against a since-boot scale that no longer runs.
     ///
     /// # Errors
     ///
-    /// [`StateError::Rollback`] when the counter file is behind this file,
     /// [`StateError::Corrupt`] for a file that does not parse, and
-    /// [`StateError::Io`] for a read that failed.
+    /// [`StateError::Io`] for a read that failed. A file that is not there is
+    /// not a failure: a device that has never refused anything has nothing to
+    /// remember.
     pub fn load(state_dir: &Path, markers: &BootMarkers) -> Result<Self, StateError> {
-        let counter_issued = counter::read_issued(state_dir)?.map_or(0, IssuedCounter::get);
         let mut state = match fs::read_to_string(state_path(state_dir)) {
             Ok(text) => Self::parse(&text)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Self {
                 boot_id: markers.boot_id().to_owned(),
-                issued: 0,
-                consumed_floor: 0,
-                consumed: BTreeSet::new(),
-                pending: Vec::new(),
                 throttle: Throttle::default(),
             },
             Err(error) => return Err(StateError::Io(error)),
         };
 
-        if counter_issued < state.issued {
-            return Err(StateError::Rollback);
-        }
-        state.issued = counter_issued.max(state.issued);
-
-        let rebooted = state.boot_id != markers.boot_id();
-        let clock_moved_back = state
-            .pending
-            .iter()
-            .any(|attempt| attempt.started_since_boot > markers.since_boot_secs());
-        if rebooted || clock_moved_back {
-            // The nonces of the dropped attempts are spent, not merely
-            // forgotten: a challenge that was printed was read aloud, and the
-            // only safe assumption about a value spoken into a telephone is
-            // that somebody wrote it down.
-            let dropped: Vec<u64> = state
-                .pending
-                .iter()
-                .map(|attempt| attempt.counter)
-                .collect();
-            state.pending.clear();
-            for counter in dropped {
-                state.mark_consumed(counter);
-            }
+        if state.boot_id != markers.boot_id() {
             markers.boot_id().clone_into(&mut state.boot_id);
-            // The since-boot scale the throttle measures against has restarted,
-            // so its timers are re-armed rather than believed. Clearing them
-            // instead would make a power cycle the way out of a lockout.
             state.throttle.rebase_to_new_boot();
         }
 
         Ok(state)
     }
 
-    /// Returns the counter the next challenge should carry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateError::Corrupt`] only when the counter has reached the
-    /// end of `u64`; the narrower limit of the fleet parameters is enforced
-    /// where the nonce itself is built.
-    pub fn next_counter(&self) -> Result<u64, StateError> {
-        self.issued.checked_add(1).ok_or(StateError::Corrupt {
-            reason: "the nonce counter reached the end of its representation".to_owned(),
-        })
-    }
-
-    /// Records that `counter` was issued at `since_boot`.
-    ///
-    /// When the grace window is full the oldest attempt is spent to make room:
-    /// keeping it alive would widen the window a guesser works against, and
-    /// silently dropping it without marking it spent would let its nonce be
-    /// used later.
-    pub fn record_issued(&mut self, counter: u64, since_boot: u64) {
-        self.issued = self.issued.max(counter);
-        if self.pending.len() >= MAX_PENDING_ATTEMPTS {
-            if let Some(position) = self
-                .pending
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, attempt)| attempt.counter)
-                .map(|(position, _)| position)
-            {
-                let oldest = self.pending.remove(position);
-                self.mark_consumed(oldest.counter);
-            }
-        }
-        self.pending.push(PendingAttempt {
-            counter,
-            started_since_boot: since_boot,
-            attempts_used: 0,
-        });
-    }
-
-    /// Returns the pending attempt carrying `counter`, if it is still alive.
-    #[must_use]
-    pub fn pending(&self, counter: u64) -> Option<PendingAttempt> {
-        self.pending
-            .iter()
-            .find(|attempt| attempt.counter == counter)
-            .copied()
-    }
-
-    /// Reports whether `counter` has been spent.
-    #[must_use]
-    pub fn is_consumed(&self, counter: u64) -> bool {
-        (self.consumed_floor > 0 && counter <= self.consumed_floor)
-            || self.consumed.contains(&counter)
-    }
-
-    /// Takes one attempt from the budget of `counter` and returns how many it
-    /// has now taken.
-    ///
-    /// Charged *before* the code is compared, not after: the comparison and the
-    /// write that records it are two steps, and a process that ends between
-    /// them would hand the next caller a budget that never moved. There is no
-    /// lockout anywhere else in this method to catch that.
-    ///
-    /// Returns `None` when no attempt with that counter is pending.
-    pub fn charge_attempt(&mut self, counter: u64) -> Option<u8> {
-        let attempt = self
-            .pending
-            .iter_mut()
-            .find(|attempt| attempt.counter == counter)?;
-        attempt.attempts_used = attempt.attempts_used.saturating_add(1);
-        Some(attempt.attempts_used)
-    }
-
-    /// Gives back an attempt charged for something that was not an answer.
-    ///
-    /// The device failing to assemble a key is not an engineer guessing wrong,
-    /// and the budget exists to bound guessing. The charge still happens first
-    /// — a refund that does not reach the disk costs one attempt, which is the
-    /// direction this has to fail in.
-    pub fn refund_attempt(&mut self, counter: u64) {
-        if let Some(attempt) = self
-            .pending
-            .iter_mut()
-            .find(|attempt| attempt.counter == counter)
-        {
-            attempt.attempts_used = attempt.attempts_used.saturating_sub(1);
-        }
-    }
-
-    /// Returns the issuance budget and the failure ledgers of this device.
+    /// Returns the throttle.
     #[must_use]
     pub const fn throttle(&self) -> &Throttle {
         &self.throttle
     }
 
-    /// Returns the throttle for a caller about to record something in it.
+    /// Returns the throttle for modification.
+    #[must_use]
     pub const fn throttle_mut(&mut self) -> &mut Throttle {
         &mut self.throttle
     }
 
-    /// Spends `counter`: it leaves the grace window and is refused from now on.
-    pub fn consume(&mut self, counter: u64) {
-        self.pending.retain(|attempt| attempt.counter != counter);
-        self.mark_consumed(counter);
-    }
-
-    /// Returns the highest counter this device has issued.
-    #[must_use]
-    pub const fn issued(&self) -> u64 {
-        self.issued
-    }
-
-    /// Returns the attempts currently inside the grace window.
-    #[must_use]
-    pub fn pending_attempts(&self) -> &[PendingAttempt] {
-        &self.pending
-    }
-
-    /// Writes the state to `state_dir`, atomically.
+    /// Writes the state durably.
     ///
     /// # Errors
     ///
@@ -305,9 +135,9 @@ impl CodeState {
             file.sync_all()?;
             crate::fs_mode::pin_mode(&tmp, STATE_MODE)?;
             fs::rename(&tmp, &path)?;
-            // The rename has to be durable too, not only the bytes it names:
-            // a spent nonce whose record was lost with the directory entry is
-            // a nonce that forgets it was spoken aloud.
+            // The rename has to be durable too, not only the bytes it names: a
+            // lockout whose record was lost with the directory entry is a
+            // lockout the next power cycle lifts.
             crate::fs_mode::sync_dir(state_dir)
         })();
         if result.is_err() {
@@ -325,46 +155,15 @@ impl CodeState {
         result.map_err(StateError::Io)
     }
 
-    /// Adds `counter` to the spent set, folding the oldest values into the
-    /// floor once the set outgrows its bound.
-    fn mark_consumed(&mut self, counter: u64) {
-        self.consumed.insert(counter);
-        while self.consumed.len() > MAX_CONSUMED_NONCES {
-            let Some(lowest) = self.consumed.iter().next().copied() else {
-                break;
-            };
-            self.consumed_floor = self.consumed_floor.max(lowest);
-            self.consumed.retain(|value| *value > self.consumed_floor);
-        }
-    }
-
     /// Renders the file.
     fn render(&self) -> String {
-        let consumed = self
-            .consumed
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut lines = vec![
-            STATE_PREFIX.to_owned(),
-            format!("boot={}", self.boot_id),
-            format!("issued={}", self.issued),
-            format!("floor={}", self.consumed_floor),
-            format!("consumed={consumed}"),
-        ];
+        let mut lines = vec![STATE_PREFIX.to_owned(), format!("boot={}", self.boot_id)];
         let (window_started, issued_in_window) = self.throttle.window();
         lines.push(format!("window={window_started},{issued_in_window}"));
         lines.extend(self.throttle.ledgers().iter().map(|(role, ledger)| {
             format!(
                 "role={role},{},{}",
                 ledger.consecutive_failures, ledger.locked_until
-            )
-        }));
-        lines.extend(self.pending.iter().map(|attempt| {
-            format!(
-                "pending={},{},{}",
-                attempt.counter, attempt.started_since_boot, attempt.attempts_used
             )
         }));
         let mut text = lines.join("\n");
@@ -377,6 +176,8 @@ impl CodeState {
     /// Nothing is repaired and nothing is skipped: a line the format does not
     /// describe means the file was written by something other than this code,
     /// and a state of unknown provenance is not a state to keep counting from.
+    /// A file left by the format that persisted attempts carries fields this
+    /// one does not know, so it is refused rather than half-read.
     fn parse(text: &str) -> Result<Self, StateError> {
         if text.len() > MAX_STATE_BYTES {
             return Err(StateError::Corrupt {
@@ -391,11 +192,6 @@ impl CodeState {
         }
 
         let mut boot_id = None;
-        let mut issued = None;
-        let mut floor = None;
-        let mut consumed = BTreeSet::new();
-        let mut seen_consumed = false;
-        let mut pending = Vec::new();
         let mut window = None;
         let mut ledgers = BTreeMap::new();
 
@@ -411,14 +207,6 @@ impl CodeState {
                 "boot" if boot_id.is_none() && !value.is_empty() => {
                     boot_id = Some(value.to_owned());
                 }
-                "issued" if issued.is_none() => issued = Some(parse_u64("issued", value)?),
-                "floor" if floor.is_none() => floor = Some(parse_u64("floor", value)?),
-                "consumed" if !seen_consumed => {
-                    seen_consumed = true;
-                    for item in value.split(',').filter(|item| !item.is_empty()) {
-                        consumed.insert(parse_u64("consumed", item)?);
-                    }
-                }
                 "window" if window.is_none() => window = Some(parse_window(value)?),
                 "role" => {
                     if ledgers.len() == MAX_TRACKED_ROLES {
@@ -429,16 +217,6 @@ impl CodeState {
                     }
                     let (role, ledger) = parse_ledger(value)?;
                     ledgers.insert(role, ledger);
-                }
-                "pending" => {
-                    if pending.len() == MAX_PENDING_ATTEMPTS {
-                        return Err(StateError::Corrupt {
-                            reason: "the state file holds more pending attempts than the grace \
-                                     window allows"
-                                .to_owned(),
-                        });
-                    }
-                    pending.push(parse_pending(value)?);
                 }
                 other => {
                     return Err(StateError::Corrupt {
@@ -452,14 +230,6 @@ impl CodeState {
             boot_id: boot_id.ok_or_else(|| StateError::Corrupt {
                 reason: "the state file names no boot".to_owned(),
             })?,
-            issued: issued.ok_or_else(|| StateError::Corrupt {
-                reason: "the state file names no issued counter".to_owned(),
-            })?,
-            consumed_floor: floor.ok_or_else(|| StateError::Corrupt {
-                reason: "the state file names no consumed floor".to_owned(),
-            })?,
-            consumed,
-            pending,
             throttle: {
                 let (started, issued_in_window) = window.unwrap_or((0, 0));
                 Throttle::restore(started, issued_in_window, ledgers)
@@ -477,33 +247,6 @@ fn state_path(state_dir: &Path) -> PathBuf {
 fn parse_u64(field: &str, value: &str) -> Result<u64, StateError> {
     value.parse::<u64>().map_err(|_| StateError::Corrupt {
         reason: format!("the field `{field}` of the state file is not a decimal number"),
-    })
-}
-
-/// Parses one `pending` record.
-fn parse_pending(value: &str) -> Result<PendingAttempt, StateError> {
-    let mut fields = value.split(',');
-    let counter = parse_u64("pending.counter", fields.next().unwrap_or_default())?;
-    let started_since_boot = parse_u64(
-        "pending.started_since_boot",
-        fields.next().unwrap_or_default(),
-    )?;
-    let attempts_used = fields
-        .next()
-        .unwrap_or_default()
-        .parse::<u8>()
-        .map_err(|_| StateError::Corrupt {
-            reason: "the attempt count of a pending record is not a small number".to_owned(),
-        })?;
-    if fields.next().is_some() {
-        return Err(StateError::Corrupt {
-            reason: "a pending record of the state file carries too many fields".to_owned(),
-        });
-    }
-    Ok(PendingAttempt {
-        counter,
-        started_since_boot,
-        attempts_used,
     })
 }
 
@@ -570,7 +313,7 @@ fn parse_ledger(value: &str) -> Result<(String, RoleLedger), StateError> {
 mod tests {
     use std::time::Duration;
 
-    use super::{CodeState, MAX_PENDING_ATTEMPTS};
+    use super::{CodeState, STATE_FILENAME};
     use crate::codes::boot::BootMarkers;
 
     fn markers(boot: &str, since_boot: u64) -> BootMarkers {
@@ -578,200 +321,90 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_device_starts_at_the_first_counter() {
+    fn a_device_with_no_file_starts_with_an_empty_throttle() {
         let dir = tempfile::tempdir().unwrap();
         let state = CodeState::load(dir.path(), &markers("boot-a", 10)).unwrap();
-        assert_eq!(state.next_counter().unwrap(), 1);
-        assert!(state.pending_attempts().is_empty());
+        assert_eq!(state.throttle().window(), (0, 0));
+        assert!(state.throttle().ledgers().is_empty());
     }
 
     #[test]
-    fn the_grace_window_spends_the_oldest_attempt() {
+    fn the_throttle_survives_a_restart_of_the_process() {
+        // The reason this file exists at all: every login is a new process, so
+        // a budget that lived in memory would be refilled by the caller it is
+        // meant to refuse.
         let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 10);
+        let boot = markers("boot-a", 100);
         let mut state = CodeState::load(dir.path(), &boot).unwrap();
-        for counter in 1..=(MAX_PENDING_ATTEMPTS as u64 + 1) {
-            state.record_issued(counter, 10);
-        }
-        assert_eq!(state.pending_attempts().len(), MAX_PENDING_ATTEMPTS);
-        assert!(state.pending(1).is_none());
-        assert!(state.is_consumed(1));
+        state.throttle_mut().note_issued(100);
+        state.throttle_mut().note_failure("oper", 100);
+        state.save(dir.path()).unwrap();
+
+        let reloaded = CodeState::load(dir.path(), &boot).unwrap();
+        assert_eq!(reloaded.throttle().window().1, 1);
+        assert_eq!(
+            reloaded
+                .throttle()
+                .ledgers()
+                .get("oper")
+                .map(|ledger| ledger.consecutive_failures),
+            Some(1)
+        );
     }
 
-    /// Tests that write the persisted state of the device.
-    ///
-    /// They need a platform whose file permissions can be checked, and that is a
-    /// property of the method rather than of the harness: the device key is kept
-    /// **without a password**, because codes have to be verified after a reboot
-    /// with nobody there to type one, so what protects it is the mode of the
-    /// files beside it. Outside Unix there is no mode word — the equivalent is a
-    /// DACL, and none is written here — so the writes below refuse by design.
-    /// See `codes::store`, `codes::lock` and the storage of `tessera_hashchain`,
-    /// where the same boundary is stated, and `platform_offers_the_method`,
-    /// which is where the product answers it.
-    ///
-    /// Reading the same state stays outside this group: a device that cannot
-    /// write a counter can still parse one, and those tests keep running
-    /// everywhere.
-    #[cfg(unix)]
-    mod persisted {
-        use super::super::{StateError, MAX_CONSUMED_NONCES, STATE_FILENAME};
-        use super::*;
-        use crate::codes::counter;
-        use tempfile::TempDir;
+    #[test]
+    fn a_reboot_rearms_the_throttle_rather_than_clearing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = CodeState::load(dir.path(), &markers("boot-a", 100)).unwrap();
+        state.throttle_mut().note_failure("oper", 100);
+        state.save(dir.path()).unwrap();
 
-        /// Issues one nonce and persists both files, the way the method does.
-        fn issue(dir: &TempDir, markers: &BootMarkers) -> u64 {
-            let mut state = CodeState::load(dir.path(), markers).unwrap();
-            let counter = state.next_counter().unwrap();
-            counter::write_issued(dir.path(), counter).unwrap();
-            state.record_issued(counter, markers.since_boot_secs());
-            state.save(dir.path()).unwrap();
-            counter
-        }
+        let after_reboot = CodeState::load(dir.path(), &markers("boot-b", 1)).unwrap();
+        assert_eq!(
+            after_reboot
+                .throttle()
+                .ledgers()
+                .get("oper")
+                .map(|ledger| ledger.consecutive_failures),
+            Some(1),
+            "a power cycle must not be the way out of a lockout"
+        );
+    }
 
-        #[test]
-        fn the_counter_only_moves_forward_across_restarts() {
-            let dir = tempfile::tempdir().unwrap();
-            let boot = markers("boot-a", 10);
-            assert_eq!(issue(&dir, &boot), 1);
-            assert_eq!(issue(&dir, &boot), 2);
-            // A new process on the same boot keeps counting where the last left off.
-            let state = CodeState::load(dir.path(), &boot).unwrap();
-            assert_eq!(state.next_counter().unwrap(), 3);
-            assert_eq!(state.pending_attempts().len(), 2);
-        }
+    #[test]
+    fn a_state_file_of_the_format_that_persisted_attempts_does_not_load() {
+        // The old format carried `issued`, `consumed` and `pending` lines. A
+        // device upgraded in place must refuse that file rather than read the
+        // half of it this format still recognises: what those lines meant is
+        // gone, and a state of unknown provenance is not a state to count from.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(STATE_FILENAME),
+            "tessera-codes/state/v1\nboot=boot-a\nissued=7\nfloor=0\nconsumed=1,2\n",
+        )
+        .unwrap();
+        assert!(CodeState::load(dir.path(), &markers("boot-a", 10)).is_err());
+    }
 
-        #[test]
-        fn a_reboot_drops_pending_attempts_and_spends_their_nonces() {
-            let dir = tempfile::tempdir().unwrap();
-            let counter = issue(&dir, &markers("boot-a", 10));
+    #[test]
+    fn a_state_file_of_unknown_shape_does_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(STATE_FILENAME),
+            "tessera-codes/state/v2\nboot=boot-a\nsomething=else\n",
+        )
+        .unwrap();
+        assert!(CodeState::load(dir.path(), &markers("boot-a", 10)).is_err());
+    }
 
-            let state = CodeState::load(dir.path(), &markers("boot-b", 3)).unwrap();
-            assert!(state.pending(counter).is_none());
-            assert!(state.is_consumed(counter));
-            // The counter itself survives: the nonce is spent, not re-issuable.
-            assert_eq!(state.next_counter().unwrap(), counter + 1);
-        }
-
-        #[test]
-        fn a_monotonic_clock_dragged_backwards_drops_pending_attempts() {
-            let dir = tempfile::tempdir().unwrap();
-            let counter = issue(&dir, &markers("boot-a", 500));
-
-            let state = CodeState::load(dir.path(), &markers("boot-a", 499)).unwrap();
-            assert!(state.pending(counter).is_none());
-            assert!(state.is_consumed(counter));
-        }
-
-        #[test]
-        fn a_spent_nonce_stays_spent_across_a_reboot() {
-            let dir = tempfile::tempdir().unwrap();
-            let counter = issue(&dir, &markers("boot-a", 10));
-            let mut state = CodeState::load(dir.path(), &markers("boot-a", 20)).unwrap();
-            state.consume(counter);
-            state.save(dir.path()).unwrap();
-
-            let reloaded = CodeState::load(dir.path(), &markers("boot-b", 5)).unwrap();
-            assert!(reloaded.is_consumed(counter));
-            assert!(reloaded.pending(counter).is_none());
-        }
-
-        #[test]
-        fn wrong_codes_accumulate_across_restarts() {
-            let dir = tempfile::tempdir().unwrap();
-            let boot = markers("boot-a", 10);
-            let counter = issue(&dir, &boot);
-
-            let mut state = CodeState::load(dir.path(), &boot).unwrap();
-            assert_eq!(state.charge_attempt(counter), Some(1));
-            state.save(dir.path()).unwrap();
-
-            let mut reloaded = CodeState::load(dir.path(), &boot).unwrap();
-            assert_eq!(reloaded.pending(counter).unwrap().attempts_used, 1);
-            assert_eq!(reloaded.charge_attempt(counter), Some(2));
-            assert_eq!(reloaded.charge_attempt(u64::MAX), None);
-        }
-
-        #[test]
-        fn a_counter_file_behind_the_state_is_a_rollback() {
-            let dir = tempfile::tempdir().unwrap();
-            let boot = markers("boot-a", 10);
-            issue(&dir, &boot);
-            issue(&dir, &boot);
-            // The snapshot brought an older counter back while the state file kept
-            // the value the device really reached.
-            counter::write_issued(dir.path(), 1).unwrap();
-            assert!(matches!(
-                CodeState::load(dir.path(), &boot),
-                Err(StateError::Rollback)
-            ));
-        }
-
-        #[test]
-        fn a_counter_file_ahead_of_the_state_is_survivable() {
-            let dir = tempfile::tempdir().unwrap();
-            let boot = markers("boot-a", 10);
-            issue(&dir, &boot);
-            // A crash between the two writes: the counter advanced, the state file
-            // did not. The nonce is burned and none is repeated.
-            counter::write_issued(dir.path(), 9).unwrap();
-            let state = CodeState::load(dir.path(), &boot).unwrap();
-            assert_eq!(state.next_counter().unwrap(), 10);
-        }
-
-        #[test]
-        fn the_spent_set_folds_into_a_floor_without_forgetting_anything() {
-            let dir = tempfile::tempdir().unwrap();
-            let boot = markers("boot-a", 10);
-            let mut state = CodeState::load(dir.path(), &boot).unwrap();
-            let last = MAX_CONSUMED_NONCES as u64 + 20;
-            for counter in 1..=last {
-                state.consume(counter);
-            }
-            for counter in 1..=last {
-                assert!(state.is_consumed(counter), "{counter} was forgotten");
-            }
-            assert!(!state.is_consumed(last + 1));
-
-            state.save(dir.path()).unwrap();
-            let reloaded = CodeState::load(dir.path(), &boot).unwrap();
-            assert!(reloaded.is_consumed(1));
-            assert!(!reloaded.is_consumed(last + 1));
-        }
-
-        #[test]
-        fn a_state_file_of_unknown_shape_does_not_load() {
-            let dir = tempfile::tempdir().unwrap();
-            let boot = markers("boot-a", 10);
-            issue(&dir, &boot);
-            let path = dir.path().join(STATE_FILENAME);
-
-            let good = std::fs::read_to_string(&path).unwrap();
-            for damaged in [
-                good.replace("tessera-codes/state/v1", "tessera-codes/state/v2"),
-                format!("{good}surprise=1\n"),
-                good.replace("issued=", "issued=x"),
-                good.replacen("boot=", "", 1),
-            ] {
-                std::fs::write(&path, damaged.as_bytes()).unwrap();
-                assert!(matches!(
-                    CodeState::load(dir.path(), &boot),
-                    Err(StateError::Corrupt { .. })
-                ));
-            }
-        }
-
-        #[test]
-        fn the_state_round_trips_through_the_file() {
-            let dir = tempfile::tempdir().unwrap();
-            let boot = markers("boot-a", 10);
-            let counter = issue(&dir, &boot);
-            let mut state = CodeState::load(dir.path(), &boot).unwrap();
-            state.charge_attempt(counter);
-            state.consume(2);
-            state.save(dir.path()).unwrap();
-            assert_eq!(CodeState::load(dir.path(), &boot).unwrap(), state);
-        }
+    #[test]
+    fn the_state_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot = markers("boot-a", 50);
+        let mut state = CodeState::load(dir.path(), &boot).unwrap();
+        state.throttle_mut().note_issued(50);
+        state.throttle_mut().note_failure("oper", 50);
+        state.save(dir.path()).unwrap();
+        assert_eq!(CodeState::load(dir.path(), &boot).unwrap(), state);
     }
 }

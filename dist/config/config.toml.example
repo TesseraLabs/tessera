@@ -398,17 +398,33 @@ enabled = false
 # ticket, so an empty list is rejected rather than silently refusing every code.
 # region = "ru-central"
 # tags = ["dc-1", "hq"]
-# Local lifetime of a printed challenge, in seconds. Device policy, not part of
-# the agreed code. Default 300.
+# Lifetime of an attempt, in seconds. Fleet parameter, not part of the agreed
+# code, and bounded at both ends by the contract: it may not be zero and may not
+# exceed 600. Without an upper bound "only stricter" would bound nothing upward,
+# and the window a status answer stands for would stretch with the attempt.
+# Default 300.
 # code_ttl_seconds = 300
 # Parameters BOTH sides must agree on. They are fleet-wide: a device and the
-# cabinet computing its codes have to carry the same values, and a device may
-# only be stricter than the contract, never weaker. Defaults shown.
-# code_len = 8
+# side computing its codes have to carry the same values, and a device may only
+# be stricter than the contract, never weaker. Defaults shown.
+#
+# The contract bounds the CODE by strength rather than by length: at least
+# twenty bits of guesswork, which is where ten attempts against a million values
+# leave less than one chance in a hundred thousand. Six characters of Crockford
+# base32 carry thirty bits and are the default; a fleet that chooses the decimal
+# alphabet has to raise the length with it — SEVEN digits is the shortest that
+# clears the floor, six carry 19.9 bits and are refused when the file is loaded.
+# The same rule applies to the nonce, with its own floor of a hundred and
+# twenty-eight bits: twenty-six base32 characters, or thirty-nine decimal ones.
+# code_len = 6
 # attempts_per_nonce = 5
-# alphabet = "decimal"        # decimal | crockford-base32
-# counter_width = 6
-# tail_width = 4
+# alphabet = "crockford-base32"   # crockford-base32 | decimal
+# nonce_width = 26
+#
+# The same fleet on the decimal alphabet:
+# code_len = 7
+# alphabet = "decimal"
+# nonce_width = 39
 # Key agreement of the device pairs. The only value this device can actually
 # perform today is "p256", and naming any other is refused when the file is
 # loaded rather than at the keyboard: a configuration that loads says the method

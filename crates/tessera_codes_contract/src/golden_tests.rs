@@ -22,7 +22,7 @@ use crate::canon::{canon, CodeInput, Level};
 use crate::code::{compute_code, verify_code, Alphabet};
 use crate::device_number::CheckedDeviceNumber;
 use crate::key::{derive_key, Epoch, KeyContext, SharedSecret};
-use crate::nonce::{Nonce, NonceError};
+use crate::nonce::Nonce;
 use crate::params::{FleetParams, FleetParamsInput};
 use crate::ticket::SignedTicket;
 
@@ -34,23 +34,17 @@ struct Vector {
     role_id: String,
     level: u32,
     epoch: u32,
+    engineer_id: String,
     ticket: String,
     shared_secret: Vec<u8>,
     alphabet: Alphabet,
     code_len: u8,
-    counter_width: u8,
-    tail_width: u8,
+    nonce_width: u8,
     canon_hex: String,
     ticket_hex: String,
     context_hex: String,
     key_hex: String,
     code: String,
-    /// Counter the nonce of the vector must parse back to, when the vector
-    /// exercises the nonce as well as the code.
-    nonce_counter: Option<u64>,
-    /// Whether that counter is the last one its width holds, so that the next
-    /// nonce must overflow instead of wrapping.
-    nonce_counter_is_last: bool,
 }
 
 fn golden_dir() -> PathBuf {
@@ -101,19 +95,17 @@ fn parse(name: &str, text: &str) -> Vector {
         role_id,
         level: field(&lines, "level").unwrap().parse().unwrap(),
         epoch: field(&lines, "epoch").unwrap().parse().unwrap(),
+        engineer_id: field(&lines, "engineer_id").unwrap().to_owned(),
         ticket: field(&lines, "ticket").unwrap().to_owned(),
         shared_secret: hex::decode(field(&lines, "z_hex").unwrap()).unwrap(),
         alphabet,
         code_len: field(&lines, "code_len").unwrap().parse().unwrap(),
-        counter_width: field(&lines, "counter_width").unwrap().parse().unwrap(),
-        tail_width: field(&lines, "tail_width").unwrap().parse().unwrap(),
+        nonce_width: field(&lines, "nonce_width").unwrap().parse().unwrap(),
         canon_hex: field(&lines, "canon_hex").unwrap().to_owned(),
         ticket_hex: field(&lines, "ticket_hex").unwrap().to_owned(),
         context_hex: field(&lines, "context_hex").unwrap().to_owned(),
         key_hex: field(&lines, "k_hex").unwrap().to_owned(),
         code: field(&lines, "code").unwrap().to_owned(),
-        nonce_counter: field(&lines, "nonce_counter").map(|value| value.parse().unwrap()),
-        nonce_counter_is_last: field(&lines, "nonce_counter_is_last") == Some("true"),
     }
 }
 
@@ -125,8 +117,7 @@ fn replay(vector: &Vector) {
     let params = FleetParams::parse(FleetParamsInput {
         alphabet: vector.alphabet,
         code_len: vector.code_len,
-        counter_width: vector.counter_width,
-        tail_width: vector.tail_width,
+        nonce_width: vector.nonce_width,
         ..FleetParamsInput::defaults()
     })
     .unwrap();
@@ -137,6 +128,8 @@ fn replay(vector: &Vector) {
         nonce: &vector.nonce,
         role_id: &vector.role_id,
         level: Level::new(vector.level),
+        epoch: Epoch::new(vector.epoch),
+        engineer_id: &vector.engineer_id,
     };
 
     let canonical = canon(&input).unwrap();
@@ -156,7 +149,7 @@ fn replay(vector: &Vector) {
     );
 
     let hash = ticket.context_hash().unwrap();
-    let context = KeyContext::new(&device_number, Epoch::new(vector.epoch), hash);
+    let context = KeyContext::new(&device_number, hash);
     assert_eq!(
         hex::encode(context.encode().unwrap()),
         vector.context_hex,
@@ -187,25 +180,14 @@ fn replay(vector: &Vector) {
         vector.name
     );
 
-    if let Some(counter) = vector.nonce_counter {
-        let nonce = Nonce::parse(&vector.nonce, &params).unwrap();
-        assert_eq!(
-            nonce.counter(),
-            counter,
-            "nonce counter changed in vector `{}`",
-            vector.name
-        );
-        if vector.nonce_counter_is_last {
-            assert!(
-                matches!(
-                    nonce.next_with_tail(nonce.tail(), &params),
-                    Err(NonceError::CounterOverflow { .. })
-                ),
-                "the counter of vector `{}` no longer stops at the end of its width",
-                vector.name
-            );
-        }
-    }
+    // The nonce of a vector is a document of the channel too: a width or an
+    // alphabet the parser stopped accepting would leave these bytes reachable
+    // only through a nonce nobody could present.
+    assert!(
+        Nonce::parse(&vector.nonce, &params).is_ok(),
+        "the nonce of vector `{}` no longer parses",
+        vector.name
+    );
 }
 
 #[test]

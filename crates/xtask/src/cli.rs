@@ -22,6 +22,24 @@ pub enum Command {
     E2eCoverage(CoverageArgs),
     /// Пересборка фикстур телефонного канала (сюита `27-codes-phone`).
     CodesFixtures(CodesFixturesArgs),
+    /// Подпись challenge ключом устройства — инструмент стенда для CODE-014.
+    CodesSignChallenge(CodesSignChallengeArgs),
+}
+
+/// Аргументы подписи challenge ключом устройства.
+#[derive(Debug, Clone, clap::Args)]
+pub struct CodesSignChallengeArgs {
+    /// Проводная форма challenge БЕЗ подписи.
+    #[arg(long, conflicts_with = "challenge_file")]
+    pub challenge: Option<String>,
+
+    /// Файл с проводной формой challenge БЕЗ подписи.
+    #[arg(long)]
+    pub challenge_file: Option<PathBuf>,
+
+    /// Приватный ключ устройства в PKCS#8 PEM (`device-key.pem` комплекта).
+    #[arg(long)]
+    pub key: PathBuf,
 }
 
 /// Аргументы генератора фикстур телефонного канала.

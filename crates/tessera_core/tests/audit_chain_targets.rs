@@ -79,16 +79,17 @@ fn emit_all() -> Vec<Captured> {
         // The successful login is the one emitter that can refuse: the chains
         // installed here take the record, so it never does, and the tracing
         // event it emits first is what this file is checking either way.
-        codes_audit::emit_success("0000014711", "ops.dc.senior", 1, 7, "tk-17").unwrap();
-        codes_audit::emit_denied(
-            Some("0000020815"),
-            "ops.dc.senior",
-            1,
-            7,
-            Some("tk-17"),
-            codes_audit::REASON_CODE_MISMATCH,
-        );
-        codes_audit::emit_attempts_exhausted("0000031234", "ops.dc.senior", 1, 7, "tk-17");
+        codes_audit::emit_success("0000014711", "ops.dc.senior", 1, 7, "tk-17", "eng-1").unwrap();
+        codes_audit::emit_denied(&codes_audit::Denial {
+            nonce: Some("0000020815"),
+            role_id: "ops.dc.senior",
+            level: 1,
+            epoch: 7,
+            ticket_number: Some("tk-17"),
+            claimed_engineer_no: Some("eng-1"),
+            reason: codes_audit::REASON_CODE_MISMATCH,
+        });
+        codes_audit::emit_attempts_exhausted("0000031234", "ops.dc.senior", 1, 7, "tk-17", "eng-1");
         enrollment_audit::emit_device_enrolled(enrollment_audit::MODE_STANDALONE, 0);
         enrollment_audit::emit_enrollment_rejected(enrollment_audit::REASON_MANIFEST);
     });
@@ -109,6 +110,9 @@ fn expected() -> Vec<Captured> {
             ("role_id".to_owned(), "ops.dc.senior".to_owned()),
             ("level".to_owned(), "1".to_owned()),
             ("epoch".to_owned(), "7".to_owned()),
+            // Claimed, never established: the device checks nothing about the
+            // number, and the field name is what says so to whoever greps.
+            ("claimed_engineer_no".to_owned(), "eng-1".to_owned()),
             ("outcome".to_owned(), outcome.to_owned()),
         ]);
         if !ticket.is_empty() {

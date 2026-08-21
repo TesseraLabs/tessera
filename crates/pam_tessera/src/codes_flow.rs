@@ -63,11 +63,16 @@ use tessera_core::role::{AccountCheck, RoleDenyReason, RoleStore, SessionRolePay
 
 use crate::codes_level::{LevelError, LevelSource};
 
-/// Longest operator identifier a person may type.
+/// Longest identifier of an issuing side a person may type.
 ///
-/// The operator names themselves on the telephone and the engineer retypes it;
-/// a value past this is a paste, not a name.
-const MAX_OPERATOR_ID_LEN: usize = 64;
+/// It is a short name off a label — a value past this is a paste, not a name.
+const MAX_SERVER_ID_LEN: usize = 64;
+
+/// Longest personal number of an engineer a person may type.
+///
+/// The same bound as the operator identifier, and for the same reason: it is a
+/// number off a badge, not a paste.
+const MAX_ENGINEER_ID_LEN: usize = 64;
 
 /// Longest code a person may type.
 ///
@@ -91,8 +96,11 @@ const REASON_BOOT_MARKERS: &str = "boot_markers";
 /// Refusal detail: an answer to a prompt was empty or over the bound.
 const REASON_INPUT: &str = "input";
 
-/// Prompt naming the operator on the telephone.
-const OPERATOR_PROMPT: &str = "Оператор: ";
+/// Prompt naming the issuing side this attempt is addressed to.
+const SERVER_PROMPT: &str = "Сервер выдачи: ";
+
+/// Prompt naming the engineer standing at the device.
+const ENGINEER_PROMPT: &str = "Личный номер: ";
 
 /// Prompt for the code the operator read back.
 const CODE_PROMPT: &str = "Код: ";
@@ -190,7 +198,7 @@ pub trait CodeMethodApi {
     /// [`CodeLoginError`] — see [`CodeMethod::verify_with_markers`].
     fn verify(
         &self,
-        attempt: &Self::Attempt,
+        attempt: &mut Self::Attempt,
         presented: &str,
         markers: &BootMarkers,
     ) -> Result<Accepted, CodeLoginError>;
@@ -217,7 +225,7 @@ impl CodeMethodApi for CodeMethod {
 
     fn verify(
         &self,
-        attempt: &Self::Attempt,
+        attempt: &mut Self::Attempt,
         presented: &str,
         markers: &BootMarkers,
     ) -> Result<Accepted, CodeLoginError> {
@@ -561,7 +569,18 @@ where
             pam_user = %pam_user,
             "the integrity level of this session could not be read; refusing the code login",
         );
-        audit::emit_denied(None, pam_user, 0, epoch, None, REASON_LEVEL_UNREADABLE);
+        // Before the engineer has been asked for anything: there is no number
+        // to record, and the journal says it does not know rather than
+        // inventing one.
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: 0,
+            epoch,
+            ticket_number: None,
+            claimed_engineer_no: None,
+            reason: REASON_LEVEL_UNREADABLE,
+        });
         CodeFlowError::Level(error)
     })?;
 
@@ -571,9 +590,20 @@ where
     let role_id = requested_role(pam_user, level, epoch)?;
     ensure_role_account(pam_user, deps.accounts, level, epoch)?;
 
-    let operator_id = bounded_answer(
-        &conv.prompt_visible(OPERATOR_PROMPT)?,
-        MAX_OPERATOR_ID_LEN,
+    let server_id = bounded_answer(
+        &conv.prompt_visible(SERVER_PROMPT)?,
+        MAX_SERVER_ID_LEN,
+        pam_user,
+        level,
+        epoch,
+    )?;
+    // Who is at the keyboard, as opposed to which side answers the request. It
+    // goes into the code, so a code cut for one engineer is useless to the next
+    // person to walk up to this device — and it is what the journal of this
+    // device names, which is otherwise a role account and nothing else.
+    let engineer_id = bounded_answer(
+        &conv.prompt_visible(ENGINEER_PROMPT)?,
+        MAX_ENGINEER_ID_LEN,
         pam_user,
         level,
         epoch,
@@ -581,17 +611,18 @@ where
     let request = AttemptRequest {
         role_id: role_id.as_str(),
         level,
-        operator_id: &operator_id,
+        server_id: &server_id,
+        engineer_id: &engineer_id,
         now: claimed_time(login.now),
     };
 
     let markers = read_markers(probe, pam_user, level, epoch)?;
-    let attempt = method
+    let mut attempt = method
         .begin(&request, &markers)
         .map_err(|error| flow_error(error, epoch))?;
 
     conv.show_info(&format!(
-        "Продиктуйте оператору:\n{}",
+        "Передайте выдающей стороне:\n{}",
         method.spoken_form(&attempt)
     ));
 
@@ -628,7 +659,7 @@ where
         // not survive a reboot must be refused by the reboot, not by whatever
         // the branch remembered from before it.
         let markers = read_markers(probe, pam_user, level, epoch)?;
-        match method.verify(&attempt, &code, &markers) {
+        match method.verify(&mut attempt, &code, &markers) {
             Ok(value) => {
                 accepted = Some(value);
                 break;
@@ -679,6 +710,7 @@ where
             accepted.level.get(),
             epoch,
             &accepted.ticket_number,
+            &accepted.claimed_engineer_no,
         )
     })?;
 
@@ -712,14 +744,15 @@ fn confirm_level_unchanged<P: DeviceProbe>(
             pam_user = %pam_user,
             "the integrity level became unreadable after a code was accepted",
         );
-        audit::emit_denied(
-            None,
-            pam_user,
-            granted,
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: granted,
             epoch,
-            Some(&accepted.ticket_number),
-            REASON_LEVEL_UNREADABLE,
-        );
+            ticket_number: Some(&accepted.ticket_number),
+            claimed_engineer_no: Some(&accepted.claimed_engineer_no),
+            reason: REASON_LEVEL_UNREADABLE,
+        });
         CodeFlowError::Level(error)
     })?;
     if observed.get() == granted {
@@ -733,14 +766,15 @@ fn confirm_level_unchanged<P: DeviceProbe>(
         observed = observed.get(),
         "the integrity level changed during the attempt; refusing the code login",
     );
-    audit::emit_denied(
-        None,
-        pam_user,
-        granted,
+    audit::emit_denied(&audit::Denial {
+        nonce: None,
+        role_id: pam_user,
+        level: granted,
         epoch,
-        Some(&accepted.ticket_number),
-        REASON_LEVEL_CHANGED,
-    );
+        ticket_number: Some(&accepted.ticket_number),
+        claimed_engineer_no: Some(&accepted.claimed_engineer_no),
+        reason: REASON_LEVEL_CHANGED,
+    });
     Err(CodeFlowError::LevelChanged {
         granted,
         observed: observed.get(),
@@ -779,7 +813,15 @@ fn bounded_answer(
 ) -> Result<String, CodeFlowError> {
     let trimmed = answer.trim();
     if trimmed.is_empty() || trimmed.chars().count() > limit {
-        audit::emit_denied(None, pam_user, level.get(), epoch, None, REASON_INPUT);
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: level.get(),
+            epoch,
+            ticket_number: None,
+            claimed_engineer_no: None,
+            reason: REASON_INPUT,
+        });
         return Err(CodeFlowError::Input { limit });
     }
     Ok(trimmed.to_owned())
@@ -799,14 +841,15 @@ fn read_markers<P: DeviceProbe>(
             pam_user = %pam_user,
             "the boot markers of this device are unreadable; refusing the code login",
         );
-        audit::emit_denied(
-            None,
-            pam_user,
-            level.get(),
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: level.get(),
             epoch,
-            None,
-            REASON_BOOT_MARKERS,
-        );
+            ticket_number: None,
+            claimed_engineer_no: None,
+            reason: REASON_BOOT_MARKERS,
+        });
         CodeFlowError::DeviceState(CodeLoginError::BootMarkers {
             reason: error.to_string(),
         })
@@ -884,14 +927,15 @@ fn requested_role(
             pam_user,
             RoleDenyReason::Syntax.as_str(),
         );
-        audit::emit_denied(
-            None,
-            pam_user,
-            level.get(),
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: level.get(),
             epoch,
-            None,
-            REASON_ROLE_ACCOUNT,
-        );
+            ticket_number: None,
+            claimed_engineer_no: None,
+            reason: REASON_ROLE_ACCOUNT,
+        });
         CodeFlowError::RoleDenied(RoleDenyReason::Syntax)
     })
 }
@@ -920,14 +964,15 @@ fn ensure_role_account(
             "login account is not a role account; refused before any artefact is touched",
         );
         tessera_core::role::audit::emit_role_deny(pam_user, pam_user, reason.as_str());
-        audit::emit_denied(
-            None,
-            pam_user,
-            level.get(),
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: level.get(),
             epoch,
-            None,
-            REASON_ROLE_ACCOUNT,
-        );
+            ticket_number: None,
+            claimed_engineer_no: None,
+            reason: REASON_ROLE_ACCOUNT,
+        });
         CodeFlowError::RoleDenied(reason)
     })
 }

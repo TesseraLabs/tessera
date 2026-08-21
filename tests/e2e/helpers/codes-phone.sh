@@ -12,17 +12,19 @@
 #   codes-phone.sh prepare <fixtures>/codes [--without-codes-url]
 #   codes-phone.sh authenticate <user> --level N
 #   codes-phone.sh authenticate-with-code <user> --level N --code <код>
+#   codes-phone.sh authenticate-with-device-key <user> --level N
+#   codes-phone.sh expect-issue-refused-under-another-name <user> --level N
 #   codes-phone.sh expect-issue-refused <user> --level N
 #   codes-phone.sh exhaust-attempts <user>
+#   codes-phone.sh replay-in-new-conversation <user>
 #   codes-phone.sh replay-after-restart <user>
-#   codes-phone.sh snapshot-counter
-#   codes-phone.sh restore-counter
 #   codes-phone.sh authenticate-without-code <user>
 #   codes-phone.sh revoke-ticket
 #   codes-phone.sh cleanup
 #
-# Разговор состоит из трёх ответов подряд («Оператор: », PIN контейнера, «Код: »), и
-# третий вычисляется по тому, что модуль напечатал между вторым и первым. Поэтому
+# Разговор состоит из четырёх ответов подряд («Оператор: », «Личный номер: », PIN
+# контейнера, «Код: »), и последний вычисляется по тому, что модуль напечатал перед
+# промптом кода. Поэтому
 # ответы не подаются одним куском: драйвер запускается с `--answers-per-prompt`, его
 # stdin — FIFO, и код кладётся туда уже после того, как challenge снят со stderr.
 #
@@ -86,6 +88,18 @@ ATTEMPTS_PER_NONCE="${TESSERA_E2E_CODE_ATTEMPTS:-5}"
 # не сходится ни с каким общим ключом. Секретом не является.
 WRONG_CODE="00000000"
 
+# Личный номер инженера, которым хелпер представляется на промпте «Личный номер: ».
+# Сверять его не с чем: реестра людей на офлайн-устройстве нет, — но в байты кода
+# он входит, поэтому значение обязано быть ОДНО на обе стороны: устройство берёт
+# его из ответа на промпт, выдача — из challenge, куда его положило устройство.
+# В device.env не вынесен намеренно: фикстуры о нём ничего не знают и знать не
+# должны, иначе комплект пришлось бы пересобирать ради строки.
+ENGINEER_ID="${TESSERA_E2E_ENGINEER_ID:-eng-1}"
+
+# Личный номер ДРУГОГО инженера — того, кому код не выдавался. Используется
+# только режимом authenticate-under-another-name.
+OTHER_ENGINEER_ID="${TESSERA_E2E_OTHER_ENGINEER_ID:-eng-2}"
+
 die() {
     echo "codes-phone: $*" >&2
     exit "$EXIT_INTERNAL"
@@ -121,16 +135,25 @@ usage: codes-phone.sh <command> [args]
   authenticate-with-code <user> --level N --code <код>
                         то же, но код задан снаружи и подаётся как есть;
                         выдача не вызывается вовсе
+  authenticate-with-device-key <user> --level N
+                        код считается по ПРЕЖНЕЙ схеме — из статического ключа
+                        устройства, без участия эфемерной пары попытки;
+                        подменённый challenge подписывается тем же ключом
+                        устройства (у снявшего диск он есть), ожидается отказ
+                        сверки на устройстве
+  expect-issue-refused-under-another-name <user> --level N
+                        выдаче называют ЧУЖОЙ личный номер инженера;
+                        0 только на отказ по подписи устройства
   expect-issue-refused <user> --level N
                         проверить, что выдача НЕ считает код на уровень вне
                         рамок билета; 0 только на отказ по рамкам
   exhaust-attempts <user>
                         исчерпать бюджет попыток ввода кода в одном прогоне
+  replay-in-new-conversation <user>
+                        успешный вход, затем тот же код во втором разговоре —
+                        без перезапуска
   replay-after-restart <user>
                         успешный вход, перезапуск устройства, тот же код снова
-  snapshot-counter      снять копию файла счётчика nonce (как копия машины)
-  restore-counter       вернуть снятую копию на место и перезапустить устройство;
-                        0 только если счётчик успел уйти вперёд
   authenticate-without-code <user>
                         разговор, в котором код не подаётся вовсе: устройство
                         обязано отказать раньше, чем его спросит
@@ -183,6 +206,10 @@ require_tool() {
 #   ORGANISATION_ID=... идентификатор организации, подписавшей запись устройства;
 #                       выдача получает его как `--anchor-organisation <id>=<файл>`
 #                       и обязана видеть ровно тот же id, что стоит в записи.
+#   OWNER_ID=...        идентификатор владельца, заверившего запись третьей
+#                       подписью. Передаётся выдаче тем же флагом: владелец —
+#                       такой же именованный подписант, отличает их сообщение,
+#                       а не механизм якорей.
 #
 # Сторона устройства (кладётся в `[codes].dir` подкомандой prepare):
 #
@@ -192,7 +219,7 @@ require_tool() {
 #                          берётся только ключ.
 #   tickets.txt            действующие билеты операторов, по одному документу
 #                          контракта в строке — строка вида
-#                          `tessera-codes/v1/ticket;operator=...;key=<hex SEC1>;
+#                          `tessera-codes/v1/ticket;server=...;key=<hex SEC1>;
 #                          tags=...;roles=...;region=...;max_level=...;
 #                          not_after=...;number=...;signature=<hex DER>`.
 #                          Среди них — билет оператора OPERATOR_ID.
@@ -226,15 +253,21 @@ require_tool() {
 #                          подошёл». Софт-хранилище задаётся самим `--soft-key`,
 #                          отдельного включающего флага нет; хелпер работает не
 #                          с этим файлом, а с его копией под правами 0600.
+#   owner-anchor.pem       SubjectPublicKeyInfo (PEM или DER) владельца OWNER_ID —
+#                          им проверяется третья подпись записи устройства.
 #   device-record.txt      запись устройства, одна строка вида
 #                          `tessera-codes/v1/device-record;device=<номер с
 #                          контрольным символом>;key=<hex SEC1 открытого ключа
 #                          устройства>;epoch=<u32>;organisation=<ORGANISATION_ID>;
+#                          serials=<вид:номер,…>;key_protection=<ступень>;
+#                          anchor=<none|tpm|carrier>;batch=…;baseline=<hex>;
+#                          organisation=…;owner=…;possession_signature=<hex DER>;
 #                          organisation_signature=<hex DER>;
-#                          possession_signature=<hex DER>`. Обе подписи — ECDSA
-#                          (P-256 или P-384) над SHA-256: организация подписывает
-#                          канонические байты тела, PoP делается приватным ключом
-#                          устройства над теми же байтами с доменным префиксом.
+#                          owner_signature=<hex DER>`. ТРИ подписи в том порядке,
+#                          в котором их ставят: PoP ключом устройства по телу,
+#                          организация — по телу вместе с PoP, владелец — по
+#                          digest всего предыдущего. Порядок — свойство формата:
+#                          переставленные подписи не разбираются и не сходятся.
 #                          `key=` — открытая половина ключа из device.p12,
 #                          `epoch` — EPOCH, `device` — DEVICE_NUMBER.
 #   organisation-anchor.pem  SubjectPublicKeyInfo (PEM или DER) организации
@@ -248,10 +281,11 @@ require_tool() {
 # ----------------------------------------------------------------------------
 
 MANIFEST_VARS=(DEVICE_NUMBER EPOCH REGION TAGS OPERATOR_ID TICKET_NUMBER DEVICE_KEY_PIN
-    ORGANISATION_ID)
+    ORGANISATION_ID OWNER_ID)
 
 DEVICE_FILES=(device.p12 tickets.txt ticket-authority.pem)
-OPERATOR_FILES=(operator-ticket.txt operator-key.pem device-record.txt organisation-anchor.pem)
+OPERATOR_FILES=(operator-ticket.txt operator-key.pem device-record.txt organisation-anchor.pem
+    owner-anchor.pem)
 
 load_manifest() {
     local dir="$1" name
@@ -285,6 +319,7 @@ save_prepared() {
         printf 'TICKET_NUMBER=%q\n' "$TICKET_NUMBER"
         printf 'DEVICE_KEY_PIN=%q\n' "$DEVICE_KEY_PIN"
         printf 'ORGANISATION_ID=%q\n' "$ORGANISATION_ID"
+        printf 'OWNER_ID=%q\n' "$OWNER_ID"
         printf 'WITHOUT_CODES_URL=%q\n' "$WITHOUT_CODES_URL"
     } > "$PREPARED"
     chmod 0600 "$PREPARED"
@@ -449,24 +484,43 @@ cmd_prepare() {
 # Оператор: выдача кода консольной командой
 # ----------------------------------------------------------------------------
 
-# Устройство печатает challenge в форме для диктовки — шесть полей через « / »,
-# номер и nonce разбиты на группы по три символа, потому что длинный прогон цифр
-# человек перевирает. Оператор набирает у себя ровно то, что услышал; здесь
-# набор и происходит: пробелы внутри групп убираются, поля раскладываются по
-# ключам проводной формы контракта в её единственном порядке.
+# Устройство печатает challenge полями через « / »: номер, эпоха, nonce, роль,
+# уровень, оператор, личный номер инженера, эфемерная точка попытки и подпись
+# устройства. Номер и nonce разбиты на группы по три символа, потому что длинный
+# прогон цифр человек перевирает; точка и подпись идут одним прогоном
+# шестнадцатеричного — их не диктуют, их переносят. Выдача набирает у себя ровно
+# то, что получила; здесь набор и происходит: пробелы внутри групп убираются,
+# поля раскладываются по ключам проводной формы контракта в её единственном
+# порядке.
 #
-# Второй аргумент — уровень, которым перебивается услышанное поле. Он нужен
+# ВАЖНО про перебивку полей ниже: подпись устройства покрывает все восемь полей,
+# поэтому challenge с перебитым полем выдача отвергает по подписи. Своей подписи
+# у хелпера нет и быть не может — канонические байты сообщения собирает крейт
+# контракта, а второе их написание на языке оболочки разошлось бы с первым
+# молча. Перебивка поэтому годится ровно там, где проверяется отказ, наступающий
+# РАНЬШЕ проверки подписи (рамки билета), или сам отказ по подписи.
+#
+# Второй аргумент — уровень, которым перебивается полученное поле. Он нужен
 # ровно одному кейсу: проверке, что выдача не считает код за пределами рамок
 # билета. Метку процесса на системе без мандатного механизма не поднять, а для
-# выдачи challenge — это строка, которую ей продиктовали, и рамки она проверяет
+# выдачи challenge — это строка, которую ей передали, и рамки она проверяет
 # по ней. Подмена уровня здесь и есть проверяемый ввод; на устройство этот
 # challenge не возвращается.
+#
+# Третий — эфемерная точка, которой перебивается полученная. Нужен кейсу про
+# код, посчитанный из одного статического ключа устройства (см. run_conversation,
+# источник device-key).
+#
+# Четвёртый — личный номер инженера, которым перебивается полученный. Нужен кейсу
+# про код под чужим именем (источник other-name): устройство ждёт код на номер,
+# который ему назвали на промпте, а выдаче называют другой.
 wire_from_spoken() {
-    local spoken="$1" level_override="${2:-}"
+    local spoken="$1" level_override="${2:-}" ephemeral_override="${3:-}" \
+        engineer_override="${4:-}"
     local IFS='/'
     # shellcheck disable=SC2206  # разбиение по разделителю полей — здесь оно и нужно
     local fields=($spoken)
-    [ "${#fields[@]}" -eq 6 ] || die "challenge не разобрался в шесть полей: $spoken"
+    [ "${#fields[@]}" -eq 9 ] || die "challenge не разобрался в девять полей: $spoken"
     local trimmed=() field
     for field in "${fields[@]}"; do
         # Пробелы группировки и обрамления снимаются целиком; внутри значений
@@ -474,9 +528,54 @@ wire_from_spoken() {
         trimmed+=("$(printf '%s' "$field" | tr -d '[:space:]')")
     done
     [ -z "$level_override" ] || trimmed[4]="$level_override"
-    printf 'tessera-codes/v1/challenge;device=%s;epoch=%s;nonce=%s;role=%s;level=%s;operator=%s' \
+    [ -z "$engineer_override" ] || trimmed[6]="$engineer_override"
+    [ -z "$ephemeral_override" ] || trimmed[7]="$ephemeral_override"
+    printf 'tessera-codes/v1/signed-challenge;device=%s;epoch=%s;nonce=%s;role=%s;level=%s;server=%s;engineer=%s;ephemeral=%s;signature=%s' \
         "${trimmed[0]}" "${trimmed[1]}" "${trimmed[2]}" \
-        "${trimmed[3]}" "${trimmed[4]}" "${trimmed[5]}"
+        "${trimmed[3]}" "${trimmed[4]}" "${trimmed[5]}" \
+        "${trimmed[6]}" "${trimmed[7]}" "${trimmed[8]}"
+}
+
+# Инструмент стенда, подписывающий challenge ключом устройства.
+#
+# Зовётся ровно в одном месте: там, где моделируется снятый диск и подменённый
+# challenge надо подписать так, как подписал бы атакующий с ключом на руках.
+# Своей подписи у хелпера нет и быть не может — канонические байты сообщения
+# собирает крейт контракта, а второе их написание на языке оболочки разошлось бы
+# с первым молча, и кейс проверял бы сходство двух написаний.
+#
+# Бинарь доставляет раннер, как и `issuer`: секция `[[artifacts]]` в stand.toml.
+# Отсутствие инструмента — сбой стенда, а не отказ продукта, и говорится об этом
+# именно так.
+SIGN_TOOL="${TESSERA_E2E_XTASK:-tessera-xtask}"
+
+sign_challenge() {
+    local signed="$1"
+    command -v "$SIGN_TOOL" >/dev/null 2>&1 || die \
+        "не найден $SIGN_TOOL — подписать подменённый challenge нечем; бинарь доставляет раннер ([[artifacts]] в stand.toml)"
+
+    # Инструмент подписывает НЕподписанную форму, а у хелпера на руках
+    # подписанная: снимается хвост с подписью и возвращается исходный префикс.
+    # Порядок и написание полей при этом не повторяются нигде — строку собрал
+    # wire_from_spoken, здесь у неё только отрезан хвост.
+    local unsigned="${signed%;signature=*}"
+    unsigned="tessera-codes/v1/challenge${unsigned#tessera-codes/v1/signed-challenge}"
+
+    "$SIGN_TOOL" codes-sign-challenge \
+        --challenge "$unsigned" \
+        --key "$FIXTURES_CODES_DIR/device-key.pem" \
+        || die "$SIGN_TOOL не подписал challenge"
+}
+
+# Открытая половина СТАТИЧЕСКОГО ключа устройства — та, что записана в реестре
+# устройства (`key=` в device-record.txt). Именно её знает всякий, кто снял с
+# устройства диск: приватную половину он берёт из device.p12.
+device_static_point() {
+    local record="$FIXTURES_CODES_DIR/device-record.txt"
+    local point
+    point="$(sed -n 's/.*;key=\([0-9a-fA-F]*\);.*/\1/p' "$record")"
+    [ -n "$point" ] || die "в $record не нашлось поля key= с открытым ключом устройства"
+    printf '%s' "$point"
 }
 
 # Единственное место, где хелпер обращается к выдаче. Если интерфейс CLI
@@ -499,6 +598,7 @@ run_issue() {
         --ticket "$FIXTURES_CODES_DIR/operator-ticket.txt" \
         --anchor-ticket-authority "$FIXTURES_CODES_DIR/ticket-authority.pem" \
         --anchor-organisation "$ORGANISATION_ID=$FIXTURES_CODES_DIR/organisation-anchor.pem" \
+        --anchor-organisation "$OWNER_ID=$FIXTURES_CODES_DIR/owner-anchor.pem" \
         --soft-key "$OPERATOR_KEY" \
         --receipts "$RECEIPTS_DIR" \
         --reason "e2e $PAM_SERVICE_NAME" \
@@ -578,8 +678,10 @@ level_prefix() {
 # для того и умеет `--answers-per-prompt`.
 #
 # $1 — учётная запись, $2 — уровень, $3 — как получить коды: `issue` (спросить
-# оператора), `wrong` (заведомо неверный), либо `fixed:<код>`; $4 — сколько раз
-# отвечать на промпт кода.
+# оператора), `device-key` (посчитать по прежней схеме, из статического ключа
+# устройства), `other-name` (посчитать на чужой личный номер), `wrong`
+# (заведомо неверный), либо `fixed:<код>`; $4 — сколько раз отвечать на промпт
+# кода.
 run_conversation() {
     local user="$1" level="$2" source="$3" code_answers="$4"
     local prefix
@@ -603,6 +705,7 @@ run_conversation() {
     # считает ошибкой разговора.
     exec 3> "$fifo"
     printf '%s\n' "$OPERATOR_ID" >&3
+    printf '%s\n' "$ENGINEER_ID" >&3
     printf '%s\n' "$DEVICE_KEY_PIN" >&3
 
     local code=""
@@ -613,6 +716,36 @@ run_conversation() {
             code="$(issue_code "$(wire_from_spoken "$spoken")")"
             [ -n "$code" ] || die "выдача не вернула код (см. $err)"
             printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            ;;
+        device-key)
+            # Код по ПРЕЖНЕЙ схеме: из статического ключа устройства, без
+            # эфемерной пары попытки. Именно его считает тот, у кого на руках
+            # содержимое диска и билет, — и больше ничего.
+            #
+            # Своей формулы у хелпера по-прежнему нет: считает всё та же
+            # `issuer codes issue`, ей лишь подменяется эфемерная точка на
+            # открытую половину статического ключа устройства. Обмен ключами
+            # симметричен, поэтому выдача своим ключом против статической точки
+            # приходит ровно к тому `Z`, к которому атакующий приходит
+            # статическим ключом устройства против ключа билета.
+            #
+            # Подменённая строка ПОДПИСЫВАЕТСЯ ЗАНОВО ключом устройства, и это
+            # не поблажка стенду: у моделируемого атакующего ключ есть по
+            # условию задачи — он снял диск. Кейс, где отказ приходил бы по
+            # подписи, проверял бы не ту гарантию: настоящий атакующий этого
+            # класса подписал бы законно. Отказ обязан прийти из сверки кода.
+            #
+            # Подписывает инструмент стенда — теми же байтами, что и продукт,
+            # через тот же крейт контракта (см. sign_challenge).
+            local spoken
+            spoken="$(await_challenge "$err" "$driver")"
+            code="$(issue_code "$(sign_challenge \
+                "$(wire_from_spoken "$spoken" "" "$(device_static_point)")")")"
+            [ -n "$code" ] || die "выдача не вернула код (см. $err)"
+            printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            ;;
+        other-name)
+            die "режим other-name недоступен: подмена личного номера ломает подпись устройства, и проверяется теперь отказом выдачи — см. expect-issue-refused-under-another-name"
             ;;
         wrong) code="$WRONG_CODE" ;;
         fixed:*) code="${source#fixed:}" ;;
@@ -660,6 +793,7 @@ capture_challenge() {
 
     exec 3> "$fifo"
     printf '%s\n' "$OPERATOR_ID" >&3
+    printf '%s\n' "$ENGINEER_ID" >&3
     printf '%s\n' "$DEVICE_KEY_PIN" >&3
 
     local spoken
@@ -673,15 +807,17 @@ capture_challenge() {
 }
 
 # Ждёт напечатанный challenge на stderr драйвера. Строка приходит внутри
-# PAM_TEXT_INFO, следом за строкой «Продиктуйте оператору:», и содержит шесть
-# полей через « / ». Ожидание ограничено: разговор, застрявший до промпта кода,
-# обязан кончиться диагностикой, а не висеть до таймаута кейса.
+# PAM_TEXT_INFO, следом за строкой «Передайте выдающей стороне:», и содержит восемь
+# полей через « / » (седьмое — личный номер инженера, восьмое — эфемерная точка
+# попытки). Ожидание ограничено:
+# разговор, застрявший до промпта кода, обязан кончиться диагностикой, а не
+# висеть до таймаута кейса.
 await_challenge() {
     local err="$1" driver="$2" waited=0
     local limit="${TESSERA_E2E_CHALLENGE_TIMEOUT:-30}"
     while :; do
         local line
-        line="$(grep -m1 -E ' / .* / .* / .* / .* / ' "$err" 2>/dev/null || true)"
+        line="$(grep -m1 -E ' / .* / .* / .* / .* / .* / .* / ' "$err" 2>/dev/null || true)"
         if [ -n "$line" ]; then
             printf '%s' "$line"
             return 0
@@ -747,6 +883,102 @@ cmd_authenticate_with_code() {
     run_conversation "$user" "$level" "fixed:$code" "$ATTEMPTS_PER_NONCE"
 }
 
+# Вход кодом, посчитанным из одного статического ключа устройства.
+#
+# Моделируется изъятие носителя: подготовитель снял диск, восстановлен бэкап,
+# устройство украдено. Атакующему доступно всё, что лежит на устройстве, ключ
+# устройства включительно, — но не приватная половина эфемерной пары попытки: на
+# момент снятия образа её не существует. Устройство обязано отказать сверкой
+# кода — и именно сверкой: подменённый challenge подписывается тем же ключом
+# устройства, поэтому выдача проходит и до сверки дело доходит.
+#
+# Код подаётся на весь бюджет попыток, как и в authenticate-with-code, и по той
+# же причине: цикл переспроса живёт в модуле, а одна строка оборвала бы разговор
+# на втором промпте ошибкой драйвера.
+cmd_authenticate_with_device_key() {
+    local user="${1:-}" level=""
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --level)
+                level="${2:-}"
+                shift 2 || usage_error "--level без значения"
+                ;;
+            *) usage_error "неизвестный аргумент authenticate-with-device-key: $1" ;;
+        esac
+    done
+    [ -n "$user" ] && [ -n "$level" ] \
+        || usage_error "usage: codes-phone.sh authenticate-with-device-key <user> --level N"
+
+    load_prepared
+    run_conversation "$user" "$level" device-key "$ATTEMPTS_PER_NONCE"
+}
+
+# Выдача под чужим личным номером: у устройства стоит один инженер и называет
+# свой номер, а выдаче называют номер другого.
+#
+# Проверяется отказ ВЫДАЧИ, а не сверка на устройстве. Личный номер стоит в
+# подписанном challenge, подпись устройства покрывает его, и подменивший номер
+# не может подписать заново — ключа устройства у него нет. Поэтому разговор до
+# ввода кода не доходит вовсе: выдача не считает ничего.
+#
+# То, что номер входит и в БАЙТЫ кода — гарантия отдельная и живая; её держат
+# юнит-тесты ядра, где код на чужой номер считается настоящей формулой и не
+# сходится. Здесь снаружи наблюдается более ранний рубеж.
+#
+# Ноль возвращается ТОЛЬКО на отказ по подписи. Выданный код — провал гарантии;
+# отказ по любой другой причине — сбой стенда.
+cmd_expect_issue_refused_under_another_name() {
+    local user="${1:-}" level=""
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --level)
+                level="${2:-}"
+                shift 2 || usage_error "--level без значения"
+                ;;
+            *) usage_error "неизвестный аргумент expect-issue-refused-under-another-name: $1" ;;
+        esac
+    done
+    [ -n "$user" ] && [ -n "$level" ] \
+        || usage_error \
+            "usage: codes-phone.sh expect-issue-refused-under-another-name <user> --level N"
+
+    load_prepared
+    capture_challenge "$user"
+
+    local wire
+    wire="$(wire_from_spoken "$(cat "$CHALLENGE_FILE")" "" "" "$OTHER_ENGINEER_ID")"
+
+    local err="$RUN_DIR/issue.err" rc=0
+    run_issue "$err" "$wire" > /dev/null || rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        echo "codes-phone: выдача посчитала код на чужой личный номер $OTHER_ENGINEER_ID" >&2
+        return 1
+    fi
+
+    local class outcome
+    class="$(issue_refusal_class "$err")"
+    outcome="$(issue_outcome "$rc")"
+    if [ "$outcome" = tool ]; then
+        cat "$err" >&2
+        die "выдача не дошла до ответа ($class, код $rc) — сбой стенда, а не проверенная гарантия"
+    fi
+    case "$class" in
+        challenge_signature_rejected)
+            [ "$rc" = "$ISSUE_EXIT_TRUST" ] || die \
+                "класс отказа $class, а код возврата $rc вместо $ISSUE_EXIT_TRUST — выдача противоречит сама себе"
+            echo "выдача отказала по подписи устройства: $class"
+            return 0
+            ;;
+        *)
+            cat "$err" >&2
+            die "выдача отказала классом $class — это не отказ по подписи, гарантия не проверена"
+            ;;
+    esac
+}
+
 # Класс отказа выдачи. Отделяет «запрос вне рамок билета» — единственный отказ,
 # который для кейса означает работающую гарантию, — от всех прочих: нет файла,
 # битая подпись, ключ оператора не тот, что в билете, кривой challenge. Без
@@ -777,6 +1009,7 @@ cmd_authenticate_with_code() {
 # перестала бы называть причину («реестр порван» превратилось бы в «не дошло»).
 ISSUE_EXIT_TOOL_FAILURE=1
 ISSUE_EXIT_TICKET_SCOPE=10
+ISSUE_EXIT_TRUST=12
 
 issue_outcome() {
     local rc="$1"
@@ -901,6 +1134,31 @@ restart_device() {
     [ -w /proc/sys/vm/drop_caches ] && echo 3 > /proc/sys/vm/drop_caches || true
 }
 
+# Тот же код во ВТОРОМ разговоре, без всякого перезапуска.
+#
+# Попытка, чей код приняли, кончилась вместе с ответом; следующий разговор
+# заводит новую попытку с новым nonce, и код от прошлой не сходится по MAC. На
+# устройстве не осталось ни файла потреблённых nonce, ни счётчика — гарантию
+# держит то, что живой попытки с прежним nonce больше нет.
+cmd_replay_in_new_conversation() {
+    local user="${1:-}"
+    [ -n "$user" ] || usage_error "usage: codes-phone.sh replay-in-new-conversation <user>"
+    load_prepared
+
+    local level
+    level="$(current_level)"
+    run_conversation "$user" "$level" issue 1 \
+        || die "первый вход по коду не прошёл — повторять нечего"
+
+    local code
+    code="$(cat "$RUN_DIR/last-code")"
+    [ -n "$code" ] || die "код первого входа не сохранился"
+
+    # Код повторяется на весь бюджет попыток по той же причине, что в
+    # authenticate-with-code: цикл переспроса живёт в модуле.
+    run_conversation "$user" "$level" "fixed:$code" "$ATTEMPTS_PER_NONCE"
+}
+
 cmd_replay_after_restart() {
     local user="${1:-}"
     [ -n "$user" ] || usage_error "usage: codes-phone.sh replay-after-restart <user>"
@@ -924,68 +1182,11 @@ cmd_replay_after_restart() {
 }
 
 # ----------------------------------------------------------------------------
-# Откат персистированного состояния
+# Разговор без кода
 # ----------------------------------------------------------------------------
 #
-# Счётчик выданных значений и состояние с потреблёнными nonce лежат РАЗНЫМИ
-# файлами и пишутся раздельно, счётчик первым. Отсюда и наблюдаемость отката:
-# счётчик, оказавшийся ПОЗАДИ состояния, означает, что вот-вот будут выданы
-# значения, уже произнесённые вслух, — устройство обязано отказать целиком, а
-# парк обязан провести смену эпохи ключа.
-#
-# Согласованный снимок (оба файла из одной копии) не детектируется ничем — так
-# записано в модели угроз, и хелпер такого сценария не изображает: команда,
-# «проверяющая» недетектируемое, зеленела бы по неверной причине.
-COUNTER_FILE="$STATE_DIR/nonce.counter"
-COUNTER_COPY="$RUN_DIR/nonce.counter.copy"
-
-read_counter() {
-    [ -f "$COUNTER_FILE" ] || { printf '0'; return 0; }
-    tr -d '[:space:]' < "$COUNTER_FILE"
-}
-
-cmd_snapshot_counter() {
-    require_root
-    load_prepared
-    [ -f "$COUNTER_FILE" ] || die \
-        "нет $COUNTER_FILE — устройство не выдало ни одного challenge, откатывать будет нечего"
-    install -d -m 0700 "$RUN_DIR"
-    install -m 0600 -o root -g root "$COUNTER_FILE" "$COUNTER_COPY"
-    echo "counter snapshot: $(read_counter)"
-}
-
-cmd_restore_counter() {
-    require_root
-    load_prepared
-    [ -f "$COUNTER_COPY" ] || die "снимок не снят — нужен snapshot-counter"
-
-    local before after
-    before="$(tr -d '[:space:]' < "$COUNTER_COPY")"
-    after="$(read_counter)"
-    # Счётчик, не сдвинувшийся с момента снимка, — это не откат, а тот же файл:
-    # устройство ничего не заметит и пустит, а кейс зазеленеет, ничего не
-    # проверив. Разница между копией и текущим значением и есть предмет кейса.
-    [ "$after" -gt "$before" ] || die \
-        "счётчик не ушёл вперёд с момента снимка ($before → $after) — откатывать нечего"
-
-    # Права те же, что ставит само устройство (0600, root): восстановленная из
-    # копии машина не должна отличаться от настоящей ничем, кроме значения.
-    install -m 0600 -o root -g root "$COUNTER_COPY" "$COUNTER_FILE"
-    # Перезапуск — часть восстановления, а не украшение: владелец парка вернул
-    # копию и поднял машину. Он же снимает вопрос о том, не держится ли отказ на
-    # чём-то, что осталось в памяти процесса.
-    restart_device
-    echo "counter rolled back: $after -> $before"
-}
-
-# Разговор, в котором код не подаётся вовсе. Нужен там, где устройство обязано
-# отказать ДО промпта кода: подавать ответы в разговор, которого не будет,
-# нечем, а `authenticate` в таком прогоне упёрся бы в ненапечатанный challenge и
-# отдал сбой стенда (70) вместо вердикта продукта.
-#
-# Ответы кладутся в FIFO с ограничением по времени и без проверки исхода записи:
-# оборванная труба здесь — ожидаемый ход событий, а не сбой. Кейсу отдаётся код
-# возврата драйвера как есть.
+# Устройство обязано отказать раньше, чем спросит код. Разговор обрывается на
+# промпте, и это ожидаемый исход: кейс читает код возврата драйвера как есть.
 cmd_authenticate_without_code() {
     local user="${1:-}"
     [ -n "$user" ] || usage_error "usage: codes-phone.sh authenticate-without-code <user>"
@@ -1005,8 +1206,8 @@ cmd_authenticate_without_code() {
 
     # `timeout` не даёт открытию FIFO повиснуть навсегда, если драйвер успел
     # закончиться до записи: читателя у трубы тогда нет вовсе.
-    timeout 15 sh -c 'printf "%s\n%s\n" "$1" "$2" > "$3"' sh \
-        "$OPERATOR_ID" "$DEVICE_KEY_PIN" "$fifo" 2>/dev/null || true
+    timeout 15 sh -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" > "$4"' sh \
+        "$OPERATOR_ID" "$ENGINEER_ID" "$DEVICE_KEY_PIN" "$fifo" 2>/dev/null || true
 
     local rc=0
     wait "$driver" || rc=$?
@@ -1125,11 +1326,12 @@ main() {
         prepare)              cmd_prepare "$@" ;;
         authenticate)         cmd_authenticate "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
+        authenticate-with-device-key) cmd_authenticate_with_device_key "$@" ;;
+        expect-issue-refused-under-another-name) cmd_expect_issue_refused_under_another_name "$@" ;;
         expect-issue-refused) cmd_expect_issue_refused "$@" ;;
         exhaust-attempts)     cmd_exhaust_attempts "$@" ;;
+        replay-in-new-conversation) cmd_replay_in_new_conversation "$@" ;;
         replay-after-restart) cmd_replay_after_restart "$@" ;;
-        snapshot-counter)     cmd_snapshot_counter "$@" ;;
-        restore-counter)      cmd_restore_counter "$@" ;;
         authenticate-without-code) cmd_authenticate_without_code "$@" ;;
         issue-storm)          cmd_issue_storm "$@" ;;
         revoke-ticket)        cmd_revoke_ticket "$@" ;;

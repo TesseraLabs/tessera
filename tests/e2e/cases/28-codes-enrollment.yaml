@@ -57,13 +57,13 @@ cases:
       - run: helpers/codes-enroll.sh cleanup
 
   - id: ENRC-003
-    title: Пакет с новой эпохой заменяет ключ и обнуляет счётчик nonce
+    title: Пакет с новой эпохой заменяет ключ устройства
     requirement: openspec/specs/device-enrollment/spec.md
     requires: [service-manager]
-    # Счётчик уникален внутри одной эпохи, и новый ключ не потратил из него
-    # ничего. Чтобы обнуление было наблюдаемым, счётчик сперва двигают настоящим
-    # разговором: устройство, не выдавшее ни одного challenge, ничего бы здесь
-    # не проверило — хелпер откажется работать с нулевым запомненным значением.
+    # Эпоха — единственное, что импорт двигает вперёд: попытки на устройстве не
+    # персистятся, обнулять нечего. Настоящий разговор перед вторым пакетом
+    # оставлен намеренно — устройство, которое уже работало, отличается от
+    # свежего, и импорт обязан пройти на нём так же.
     steps:
       # Подготовка телефонного канала идёт ПЕРЕД импортом: она приводит устройство
       # к чистому состоянию (включая state/), и после импорта затёрла бы ровно ту
@@ -76,14 +76,11 @@ cases:
       - run: helpers/codes-phone.sh authenticate {{user}} --level 0
         expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
         timeout: 60
-      - run: helpers/codes-enroll.sh note-counter
       - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 2
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
       - expect_file: { path: /var/lib/tessera/codes/state/key.epoch, matches: "^2$" }
-      - run: helpers/codes-enroll.sh assert-counter-reset
-        expect: { exit_code: 0 }
     teardown:
       - run: helpers/codes-phone.sh cleanup
       - run: helpers/codes-enroll.sh cleanup
@@ -109,13 +106,12 @@ cases:
       - run: helpers/codes-enroll.sh cleanup
 
   - id: ENRC-005
-    title: Повторный импорт той же эпохи не воскрешает потреблённые nonce
+    title: Повторный импорт той же эпохи проходит и оставляет эпоху на месте
     requirement: openspec/specs/device-enrollment/spec.md
     requires: [service-manager]
-    # Самая дорогая гарантия этого suite: если повтор носителя обнулит счётчик,
-    # каждый уже произнесённый по телефону код станет действительным заново.
-    # Поэтому счётчик сначала двигают настоящим входом, а потом подают тот же
-    # пакет второй раз.
+    # Повтор носителя — обычная процедура ремонта: тот же пакет подают второй
+    # раз, и он обязан пройти, не сдвинув эпоху и не тронув состояние
+    # устройства. До входа по коду и после него результат один и тот же.
     steps:
       # Порядок тот же, что в ENRC-003, и по той же причине.
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
@@ -126,12 +122,9 @@ cases:
       - run: helpers/codes-phone.sh authenticate {{user}} --level 0
         expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
         timeout: 60
-      - run: helpers/codes-enroll.sh note-counter
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      - run: helpers/codes-enroll.sh assert-counter-kept
-        expect: { exit_code: 0 }
     teardown:
       - run: helpers/codes-phone.sh cleanup
       - run: helpers/codes-enroll.sh cleanup
@@ -178,7 +171,6 @@ cases:
         timeout: 120
       - expect_file: { path: /var/lib/tessera/codes/device.p12, exists: false }
       - expect_file: { path: /var/lib/tessera/codes/tickets.txt, exists: false }
-      - expect_file: { path: /var/lib/tessera/codes/state/nonce.counter, exists: false }
       # Каталог состояния обязан опустеть ЦЕЛИКОМ, а не по списку имён: в нём
       # лежит ещё и файл межпроцессной блокировки, который устройство создаёт
       # само. Перечисление имён — список, который однажды расширят, а тут

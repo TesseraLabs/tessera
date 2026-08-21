@@ -29,13 +29,13 @@
 //! `bundle_version`: greater replaces, smaller is refused, and equal moves
 //! nothing forward — the artefacts of an equal epoch are written back as
 //! delivered, which is what makes presenting a medium twice a repair rather
-//! than a no-op that leaves a half-applied store as it was. The one asymmetry
-//! worth stating is the nonce counter. A greater
-//! epoch resets it to zero, because the nonces of the previous key were spoken
-//! against a key that no longer exists. Re-importing the *same* epoch must not
-//! reset it — the same medium presented twice would otherwise resurrect every
-//! nonce the device had already consumed, which is the one thing the counter
-//! exists to prevent.
+//! than a no-op that leaves a half-applied store as it was.
+//!
+//! Nothing about an attempt is reset here, because nothing about an attempt is
+//! stored: an attempt lives in the memory of the process holding it and dies
+//! with it. What the state directory does hold — the throttle — is deliberately
+//! left alone by an import: a lockout that a delivered medium could clear would
+//! be a lockout anyone who can reach the device could clear.
 //!
 //! # The revocation list only grows
 //!
@@ -73,7 +73,7 @@ use tessera_codes_contract::key::Epoch;
 use super::store::{CodesPaths, DeviceKeyError};
 use super::tickets::{TicketStore, TicketStoreError};
 use super::{
-    audit, counter, epoch,
+    audit, epoch,
     lock::{StateLock, LOCK_FILENAME},
     state::STATE_FILENAME,
 };
@@ -150,22 +150,11 @@ impl CodesDelivery {
 
 /// What an application of a consignment changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the four answers are what the audit record of an import states, \
-              and folding them into one enum would either lose a combination \
-              that really occurs or invent states that do not"
-)]
 pub struct Applied {
     /// Epoch the device is on afterwards, if it carries a key at all.
     pub epoch: Option<Epoch>,
     /// Whether the stored key was replaced.
     pub key_replaced: bool,
-    /// Whether the nonce counter and the spent set were reset.
-    ///
-    /// True only for a greater epoch. A re-import of the same epoch leaves both
-    /// alone — see the module documentation.
-    pub counter_reset: bool,
     /// Whether a ticket set was published.
     pub tickets_applied: bool,
     /// Whether a revocation list was published.
@@ -284,7 +273,6 @@ pub fn apply(
         return Ok(Applied {
             epoch: read_epoch(paths)?,
             key_replaced: false,
-            counter_reset: false,
             tickets_applied: false,
             revocations_applied: false,
         });
@@ -351,18 +339,6 @@ pub fn apply(
     if let Some(bytes) = &stored_key {
         write_atomic(&paths.device_key_container, bytes, KEY_MODE)?;
     }
-    if plan.reset_counter {
-        // The spent-nonce record goes first and the counter second: a crash
-        // between them leaves a counter ahead of an absent state, which the
-        // load treats as a fresh device, while the reverse order would leave a
-        // zero counter behind a state that remembers higher values — a
-        // rollback the device would refuse to start from.
-        remove_if_present(&paths.state_dir.join(STATE_FILENAME))?;
-        counter::write_issued(&paths.state_dir, 0).map_err(|error| ArtefactError::Io {
-            path: paths.state_dir.display().to_string(),
-            reason: error.to_string(),
-        })?;
-    }
     if let Some(new_epoch) = plan.persist_epoch {
         epoch::write(&paths.state_dir, new_epoch).map_err(|error| ArtefactError::Io {
             path: paths.state_dir.display().to_string(),
@@ -373,7 +349,6 @@ pub fn apply(
     let applied = Applied {
         epoch: plan.persist_epoch.or(persisted),
         key_replaced: stored_key.is_some(),
-        counter_reset: plan.reset_counter,
         tickets_applied: delivery.tickets.is_some(),
         revocations_applied: delivery.revocations.is_some(),
     };
@@ -424,7 +399,6 @@ pub fn wipe(paths: &CodesPaths) -> Result<Wiped, ArtefactError> {
         &paths.ticket_revocations,
         &paths.ticket_authority,
         &paths.state_dir.join(STATE_FILENAME),
-        &paths.state_dir.join(counter::COUNTER_FILENAME),
         &paths.state_dir.join(epoch::EPOCH_FILENAME),
     ] {
         if remove_if_present(path)? {
@@ -460,22 +434,19 @@ pub fn wipe(paths: &CodesPaths) -> Result<Wiped, ArtefactError> {
 struct KeyPlan {
     /// Whether the stored key is to be written.
     write_key: bool,
-    /// Whether the nonce counter and the spent set are to be reset.
-    reset_counter: bool,
     /// The epoch to persist, when it moves.
     persist_epoch: Option<Epoch>,
 }
 
 /// Decides what the delivered key does to the store, or refuses it.
 ///
-/// `has_spoken` says whether this device has already issued nonces — the
-/// counter or the spent-nonce record is on disk. It is asked separately from
-/// the epoch because the two can disagree: a fleet whose artefacts were placed
-/// by hand runs against the epoch in `config.toml` and has no epoch file at
-/// all, which [`super::epoch::effective`] supports on purpose. Reading "no
-/// epoch file" as "this device has never issued anything" would reset the
-/// counter of exactly that fleet, and every code it had already read out down
-/// the telephone would become valid a second time.
+/// `has_spoken` says whether this device has already been through a
+/// conversation — its state directory holds a throttle record. It is asked
+/// separately from the epoch because the two can disagree: a fleet whose
+/// artefacts were placed by hand runs against the epoch in `config.toml` and
+/// has no epoch file at all, which [`super::epoch::effective`] supports on
+/// purpose. Such a device is not a fresh one, and the delivery is not moving it
+/// anywhere: what it gets is the epoch written down explicitly.
 fn plan_key(
     key: Option<&DeliveredKey>,
     persisted: Option<Epoch>,
@@ -484,19 +455,13 @@ fn plan_key(
     let Some(key) = key else {
         return Ok(KeyPlan {
             write_key: false,
-            reset_counter: false,
             persist_epoch: None,
         });
     };
 
-    // A device with no epoch file that has nonetheless been issuing nonces is
-    // running against the configured epoch, and the delivery is not moving it
-    // anywhere: write the key, record the epoch the store is now explicit
-    // about, and leave the counter exactly where the conversations left it.
     if persisted.is_none() && has_spoken {
         return Ok(KeyPlan {
             write_key: true,
-            reset_counter: false,
             persist_epoch: Some(key.epoch),
         });
     }
@@ -507,8 +472,7 @@ fn plan_key(
             persisted: current.get(),
         }),
         // The same epoch again: the key is written back whenever the medium
-        // carries one, and the counter is never reset — the same medium
-        // presented twice must not resurrect consumed nonces.
+        // carries one.
         //
         // Writing the key back unconditionally is what makes a repeat of the
         // medium a real repair. Writing it only when the store has lost the
@@ -520,27 +484,22 @@ fn plan_key(
         // computes is refused with nothing on the device to explain it.
         Some(current) if key.epoch == current => Ok(KeyPlan {
             write_key: true,
-            reset_counter: false,
             persist_epoch: None,
         }),
         _ => Ok(KeyPlan {
             write_key: true,
-            reset_counter: true,
             persist_epoch: Some(key.epoch),
         }),
     }
 }
 
-/// Reports whether this device has already issued nonces against its key.
+/// Reports whether this device has already been through a conversation.
 ///
-/// The question is asked of the files rather than of their contents: either one
-/// being there means somebody has been through a conversation with this device,
-/// and a counter that will not parse is the strongest possible reason not to
-/// zero it. Both are consulted because they are written apart — a crash between
-/// the two leaves one of them alone, and either is enough of an answer.
+/// The question is asked of the file rather than of its contents: it being
+/// there means the throttle of this device has something to remember, which
+/// only happens after a challenge has left it.
 fn has_spoken(paths: &CodesPaths) -> bool {
-    paths.state_dir.join(counter::COUNTER_FILENAME).exists()
-        || paths.state_dir.join(STATE_FILENAME).exists()
+    paths.state_dir.join(STATE_FILENAME).exists()
 }
 
 /// Parses the delivered ticket artefacts and checks the revocation list against

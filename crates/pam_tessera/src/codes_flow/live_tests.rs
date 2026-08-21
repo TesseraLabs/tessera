@@ -85,13 +85,15 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use tessera_codes_contract::canon::Level;
 #[cfg(unix)]
-use tessera_codes_contract::challenge::Challenge;
+use tessera_codes_contract::challenge::{Challenge, ChallengeFields, SignedChallenge};
 #[cfg(unix)]
 use tessera_codes_contract::code::compute_code;
 #[cfg(unix)]
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
 #[cfg(unix)]
-use tessera_codes_contract::key::{derive_key, Epoch, KeyAgreement as _, KeyContext};
+use tessera_codes_contract::key::{
+    derive_key, EphemeralPublicPoint, Epoch, KeyAgreement as _, KeyContext,
+};
 #[cfg(unix)]
 use tessera_codes_contract::nonce::Nonce;
 #[cfg(unix)]
@@ -102,12 +104,12 @@ use tessera_codes_contract::profile::AlgorithmProfile;
 use tessera_codes_contract::signature::{PublicKey, Signature};
 #[cfg(unix)]
 use tessera_codes_contract::ticket::{
-    OperatorTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
+    ServerTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
 };
 #[cfg(unix)]
 use tessera_codes_contract::time::ClaimedTime;
 #[cfg(unix)]
-use tessera_core::codes::agreement::DeviceKeyAgreement;
+use tessera_core::codes::agreement::StaticKeyAgreement;
 #[cfg(unix)]
 use tessera_core::codes::{CodeMethod, CodesConfig, CodesPaths, DeviceScope, LocalRoles};
 #[cfg(unix)]
@@ -133,9 +135,13 @@ const STORED_CONTAINER_PASSWORD: &str = "";
 #[cfg(unix)]
 const ROLE: &str = "oper";
 
-/// The operator on the telephone.
+/// The issuing side the fixture is addressed to.
 #[cfg(unix)]
-const OPERATOR: &str = "op-42";
+const SERVER: &str = "op-42";
+
+/// The personal number the engineer gives at the device.
+#[cfg(unix)]
+const ENGINEER: &str = "eng-1";
 
 /// The level the fixture logs in at.
 #[cfg(unix)]
@@ -202,7 +208,6 @@ struct LiveFixture {
     store: RoleStore,
     config: CodesConfig,
     operator_key: PKey<Private>,
-    device_point: Vec<u8>,
     ticket: SignedTicket,
     /// A daemon that accepts every registration, so nothing in these tests
     /// fails for a reason other than the channel itself.
@@ -218,7 +223,7 @@ impl LiveFixture {
         let paths = CodesPaths::under(dir.path());
         std::fs::create_dir_all(&paths.state_dir).unwrap();
 
-        let (device_key, device_point) = p256_pair();
+        let (device_key, _device_point) = p256_pair();
         std::fs::write(&paths.device_key_container, container(&device_key)).unwrap();
 
         let (operator_key, operator_point) = p256_pair();
@@ -273,7 +278,6 @@ impl LiveFixture {
             store,
             config,
             operator_key,
-            device_point,
             ticket,
             monitor: StubClient,
         }
@@ -311,15 +315,18 @@ impl LiveFixture {
         }
     }
 
-    /// What the operator's cabinet computes for a challenge it was read.
+    /// What the issuing side computes for a challenge it was given.
+    ///
+    /// Against the ephemeral point of that challenge: the code belongs to the
+    /// attempt the device is holding open, and the long-lived key of the device
+    /// takes no part in it.
     fn cabinet_code(&self, challenge: &Challenge) -> String {
-        let secret = DeviceKeyAgreement::new(&self.operator_key, AlgorithmProfile::P256)
+        let secret = StaticKeyAgreement::new(&self.operator_key, AlgorithmProfile::P256)
             .unwrap()
-            .agree(&self.device_point)
+            .agree(challenge.ephemeral_point().as_bytes())
             .unwrap();
         let context = KeyContext::new(
             &self.config.device_number,
-            self.config.epoch,
             self.ticket.context_hash().unwrap(),
         );
         let key = derive_key(&secret, &context).unwrap();
@@ -333,8 +340,8 @@ impl LiveFixture {
 /// Signs an operator ticket the way the fleet authority would.
 #[cfg(unix)]
 fn sign_ticket(authority: &PKey<Private>, operator_point: Vec<u8>) -> SignedTicket {
-    let ticket = OperatorTicket::new(
-        OPERATOR,
+    let ticket = ServerTicket::new(
+        SERVER,
         PublicKey::new(operator_point).unwrap(),
         TicketScope::new(TicketScopeInput {
             tags: vec!["dc-1".to_owned()],
@@ -356,29 +363,40 @@ fn sign_ticket(authority: &PKey<Private>, operator_point: Vec<u8>) -> SignedTick
     SignedTicket::new(ticket, Signature::new(raw).unwrap())
 }
 
-/// Rebuilds a challenge out of the text the branch printed.
+/// Rebuilds a signed challenge out of the text the branch printed.
 ///
-/// The spoken form is six fields separated by ` / `, with the device number and
-/// the nonce broken into groups of three for reading aloud. Everything an
-/// operator needs is in there and nothing else is: this function is the whole
-/// of what the cabinet — or an e2e helper scraping `PAM_TEXT_INFO` — has to do.
+/// The spoken form is nine fields separated by ` / `, with the device number
+/// and the nonce broken into groups of three for reading aloud, and the
+/// ephemeral point of the attempt and the signature of the device each in one
+/// run of hexadecimal. Everything the issuing side needs is in there and
+/// nothing else is: this function is the whole of what the cabinet — or an e2e
+/// helper scraping `PAM_TEXT_INFO` — has to do.
 #[cfg(unix)]
-fn challenge_from_spoken(spoken: &str, params: FleetParams) -> Challenge {
+fn challenge_from_spoken(spoken: &str, params: FleetParams) -> SignedChallenge {
     let line = spoken.lines().next_back().unwrap_or(spoken);
     let fields: Vec<&str> = line.split(" / ").collect();
-    let [device, epoch, nonce, role, level, operator] = <[&str; 6]>::try_from(fields.as_slice())
-        .unwrap_or_else(|_| panic!("unexpected spoken form: {line}"));
+    let [device, epoch, nonce, role, level, operator, engineer, ephemeral, signature] =
+        <[&str; 9]>::try_from(fields.as_slice())
+            .unwrap_or_else(|_| panic!("unexpected spoken form: {line}"));
     let ungrouped = |text: &str| text.replace(' ', "");
 
-    Challenge::new(
-        CheckedDeviceNumber::parse(&ungrouped(device)).unwrap(),
-        Epoch::new(epoch.parse().unwrap()),
-        Nonce::parse(&ungrouped(nonce), &params).unwrap(),
-        role,
-        Level::new(level.parse().unwrap()),
-        operator,
+    let challenge = Challenge::new(ChallengeFields {
+        device_number: CheckedDeviceNumber::parse(&ungrouped(device)).unwrap(),
+        epoch: Epoch::new(epoch.parse().unwrap()),
+        nonce: Nonce::parse(&ungrouped(nonce), &params).unwrap(),
+        role_id: role,
+        level: Level::new(level.parse().unwrap()),
+        server_id: operator,
+        engineer_id: engineer,
+        ephemeral_point: EphemeralPublicPoint::new(hex::decode(ungrouped(ephemeral)).unwrap())
+            .unwrap(),
+    })
+    .unwrap();
+
+    SignedChallenge::new(
+        challenge,
+        Signature::new(hex::decode(ungrouped(signature)).unwrap()).unwrap(),
     )
-    .unwrap()
 }
 
 /// A device standing at [`LEVEL`] whose boot markers never move.
@@ -418,7 +436,7 @@ struct Engineer<'a> {
     /// One entry per code prompt, in order.
     script: RefCell<std::collections::VecDeque<Typed>>,
     /// The challenge that was printed, once it has been.
-    printed: RefCell<Option<Challenge>>,
+    printed: RefCell<Option<SignedChallenge>>,
     /// Whether the branch asked for anything in secret. It must not: the
     /// device opens its own key, and an engineer has no secret to give.
     asked_secret: RefCell<bool>,
@@ -441,7 +459,8 @@ impl<'a> Engineer<'a> {
 impl CodeConversation for Engineer<'_> {
     #[cfg(unix)]
     fn show_info(&mut self, message: &str) {
-        if let Some(rest) = message.strip_prefix("Продиктуйте оператору:\n") {
+        if let Some(rest) = message.strip_prefix("Передайте выдающей стороне:\n")
+        {
             *self.printed.borrow_mut() =
                 Some(challenge_from_spoken(rest, self.fixture.config.params));
         }
@@ -449,8 +468,11 @@ impl CodeConversation for Engineer<'_> {
 
     #[cfg(unix)]
     fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
-        if prompt == super::OPERATOR_PROMPT {
-            return Ok(OPERATOR.to_owned());
+        if prompt == super::SERVER_PROMPT {
+            return Ok(SERVER.to_owned());
+        }
+        if prompt == super::ENGINEER_PROMPT {
+            return Ok(ENGINEER.to_owned());
         }
         let Some(next) = self.script.borrow_mut().pop_front() else {
             // The engineer gave up rather than keep typing.
@@ -463,7 +485,7 @@ impl CodeConversation for Engineer<'_> {
                 let challenge = printed
                     .as_ref()
                     .expect("the challenge is printed before the code is asked for");
-                let code = self.fixture.cabinet_code(challenge);
+                let code = self.fixture.cabinet_code(challenge.challenge());
                 if matches!(next, Typed::RightInGroups) {
                     // What an engineer actually writes on the pad in front of
                     // them, and then types.
@@ -494,8 +516,11 @@ impl CodeConversation for Replay {
 
     #[cfg(unix)]
     fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
-        if prompt == super::OPERATOR_PROMPT {
-            return Ok(OPERATOR.to_owned());
+        if prompt == super::SERVER_PROMPT {
+            return Ok(SERVER.to_owned());
+        }
+        if prompt == super::ENGINEER_PROMPT {
+            return Ok(ENGINEER.to_owned());
         }
         Ok(self.0.clone())
     }
@@ -869,13 +894,17 @@ fn a_wrong_code_short_of_the_budget_is_not_an_exhausted_budget() {
 fn refusals_that_cost_no_attempt_never_read_as_an_exhausted_budget() {
     // A key container that will not open is the device's failure, not a wrong
     // code, and the method charges the nonce nothing for it. The branch must
-    // pass that through: reporting PAM_MAXTRIES here would tell the engineer
-    // to stop trying about a device fault they cannot do anything about, and
-    // send an administrator looking for a spent nonce that is still untouched.
+    // pass that through: reporting PAM_MAXTRIES here would tell the engineer to
+    // stop trying about a device fault they cannot do anything about, and send
+    // an administrator looking for a spent nonce that is still untouched.
     //
-    // This is the test that fails if the branch ever starts deciding
-    // exhaustion by counting its own prompts instead of reporting what the
-    // method said.
+    // The fault is met before a challenge exists, so what comes back is the
+    // state of the device — PAM_SYSTEM_ERR, the refusal a stack may not step
+    // over — and not a wrong code. An engineer typing at a machine in this
+    // condition is not going to type their way out of it.
+    //
+    // This is the test that fails if the branch ever starts deciding exhaustion
+    // by counting its own prompts instead of reporting what the method said.
     let fixture = LiveFixture::with_attempts(2).with_unopenable_key_container();
     let engineer = Engineer::new(&fixture, [Typed::Wrong, Typed::Wrong]);
 
@@ -884,10 +913,14 @@ fn refusals_that_cost_no_attempt_never_read_as_an_exhausted_budget() {
     };
 
     assert!(
-        matches!(error, CodeFlowError::Denied),
+        !matches!(error, CodeFlowError::AttemptsExhausted),
+        "a refusal that costs no attempt was reported as an exhausted budget",
+    );
+    assert!(
+        matches!(error, CodeFlowError::DeviceState(_)),
         "a refusal that costs no attempt was reported as {error:?}",
     );
-    assert_eq!(error.pam_code(), 7);
+    assert_eq!(error.pam_code(), 4);
 }
 
 // Stands up a real store: Unix-only, see the module docs.
@@ -922,7 +955,7 @@ fn a_second_conversation_cannot_replay_the_first_code() {
 
     // A fresh conversation raises a new challenge; the engineer types the code
     // of the old one.
-    let mut replay = Replay(fixture.cabinet_code(&spent));
+    let mut replay = Replay(fixture.cabinet_code(spent.challenge()));
     let outcome = drive_conversation(&fixture, &mut replay);
 
     assert!(

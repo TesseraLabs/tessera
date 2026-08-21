@@ -25,13 +25,13 @@ use tempfile::TempDir;
 use tessera_codes_contract::canon::Level;
 use tessera_codes_contract::key::Epoch;
 use tessera_codes_contract::signature::PublicKey;
-use tessera_codes_contract::ticket::{OperatorTicket, TicketNumber, TicketScope, TicketScopeInput};
+use tessera_codes_contract::ticket::{ServerTicket, TicketNumber, TicketScope, TicketScopeInput};
 use tessera_codes_contract::time::ClaimedTime;
 
 use crate::codes::agreement::tests::p256_pair;
+use crate::codes::epoch;
 use crate::codes::store::{load_device_key, CodesPaths};
 use crate::codes::tickets::tests::Authority;
-use crate::codes::{counter, epoch};
 
 use super::{apply, wipe, ArtefactError, CodesDelivery, DeliveredKey, StoreCheck};
 
@@ -60,7 +60,7 @@ impl Delivery {
     /// A ticket set naming `operator`.
     fn tickets(&self, operator: &str) -> Vec<u8> {
         let signed = self.authority.sign(
-            OperatorTicket::new(
+            ServerTicket::new(
                 operator,
                 PublicKey::new(p256_pair().1).unwrap(),
                 TicketScope::new(TicketScopeInput {
@@ -157,7 +157,6 @@ fn a_delivery_without_a_codes_part_changes_nothing() {
     let applied = apply(&paths, &CodesDelivery::default(), None, StoreCheck::Skipped).unwrap();
     assert_eq!(applied.epoch, None);
     assert!(!applied.key_replaced);
-    assert!(!applied.counter_reset);
     // Not even the store directory is created: an Access-only fleet leaves no
     // trace of a method it never enabled.
     assert!(!paths.state_dir.exists());
@@ -172,16 +171,8 @@ fn a_full_consignment_makes_the_device_ready() {
     let applied = apply(&paths, &delivery.full(3), None, StoreCheck::Skipped).unwrap();
     assert_eq!(applied.epoch, Some(Epoch::new(3)));
     assert!(applied.key_replaced);
-    assert!(applied.counter_reset);
     assert!(paths.artefacts_present());
     assert_eq!(epoch::read(&paths.state_dir).unwrap(), Some(Epoch::new(3)));
-    assert_eq!(
-        counter::read_issued(&paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        0
-    );
 }
 
 #[test]
@@ -224,26 +215,15 @@ fn the_store_is_root_only_after_the_import() {
 }
 
 #[test]
-fn a_greater_epoch_replaces_the_key_and_retires_the_nonces() {
+fn a_greater_epoch_replaces_the_key() {
     let (_dir, paths) = store();
     let first = Delivery::new();
     apply(&paths, &first.full(1), None, StoreCheck::Skipped).unwrap();
 
-    // The device has been talking: the counter has moved on.
-    counter::write_issued(&paths.state_dir, 42).unwrap();
-
     let second = Delivery::new();
     let applied = apply(&paths, &second.full(2), None, StoreCheck::Skipped).unwrap();
     assert!(applied.key_replaced);
-    assert!(applied.counter_reset);
     assert_eq!(applied.epoch, Some(Epoch::new(2)));
-    assert_eq!(
-        counter::read_issued(&paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        0
-    );
 
     let stored = load_device_key(&paths.device_key_container, None).unwrap();
     assert!(stored.public_eq(&second.key));
@@ -255,7 +235,6 @@ fn a_smaller_epoch_is_refused_and_changes_nothing() {
     let (_dir, paths) = store();
     let current = Delivery::new();
     apply(&paths, &current.full(5), None, StoreCheck::Skipped).unwrap();
-    counter::write_issued(&paths.state_dir, 9).unwrap();
 
     let old = Delivery::new();
     assert!(matches!(
@@ -267,39 +246,22 @@ fn a_smaller_epoch_is_refused_and_changes_nothing() {
     ));
 
     assert_eq!(epoch::read(&paths.state_dir).unwrap(), Some(Epoch::new(5)));
-    assert_eq!(
-        counter::read_issued(&paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        9
-    );
     let stored = load_device_key(&paths.device_key_container, None).unwrap();
     assert!(stored.public_eq(&current.key));
 }
 
 #[test]
-fn the_same_epoch_again_does_not_resurrect_consumed_nonces() {
+fn the_same_epoch_again_writes_the_key_back() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
     apply(&paths, &delivery.full(7), None, StoreCheck::Skipped).unwrap();
-    counter::write_issued(&paths.state_dir, 31).unwrap();
 
     // The same medium presented a second time.
     let applied = apply(&paths, &delivery.full(7), None, StoreCheck::Skipped).unwrap();
     // The key is written back — see the test below for why that is the point of
-    // presenting a medium twice — and the counter is what must not move.
+    // presenting a medium twice.
     assert!(applied.key_replaced);
-    assert!(!applied.counter_reset);
     assert_eq!(applied.epoch, Some(Epoch::new(7)));
-    assert_eq!(
-        counter::read_issued(&paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        31,
-        "a repeated import must not re-issue the nonces already spoken aloud"
-    );
 }
 
 #[test]
@@ -307,20 +269,10 @@ fn a_repeated_epoch_restores_a_key_the_store_has_lost() {
     let (_dir, paths) = store();
     let delivery = Delivery::new();
     apply(&paths, &delivery.full(7), None, StoreCheck::Skipped).unwrap();
-    counter::write_issued(&paths.state_dir, 12).unwrap();
     std::fs::remove_file(&paths.device_key_container).unwrap();
 
     let applied = apply(&paths, &delivery.full(7), None, StoreCheck::Skipped).unwrap();
     assert!(applied.key_replaced);
-    // Still no reset: the counter records what this key has already issued.
-    assert!(!applied.counter_reset);
-    assert_eq!(
-        counter::read_issued(&paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        12
-    );
 }
 
 #[test]
@@ -334,78 +286,38 @@ fn a_repeated_epoch_replaces_a_key_that_does_not_belong_to_it() {
     let (_dir, paths) = store();
     let first = Delivery::new();
     apply(&paths, &first.full(7), None, StoreCheck::Skipped).unwrap();
-    counter::write_issued(&paths.state_dir, 12).unwrap();
 
     // The fleet re-cut the container of the same epoch around a different key.
     let recut = Delivery::new();
     let applied = apply(&paths, &recut.full(7), None, StoreCheck::Skipped).unwrap();
 
     assert!(applied.key_replaced);
-    assert!(!applied.counter_reset);
     let stored = load_device_key(&paths.device_key_container, None).unwrap();
     assert!(
         stored.public_eq(&recut.key),
         "the delivered key of the epoch has to be the one on the device"
     );
     assert!(!stored.public_eq(&first.key));
-    assert_eq!(
-        counter::read_issued(&paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        12,
-        "repairing the key must not resurrect consumed nonces"
-    );
 }
 
 #[test]
-fn a_first_delivery_to_a_device_that_has_been_talking_keeps_its_counter() {
+fn a_first_delivery_to_a_device_that_has_been_talking_writes_its_epoch_down() {
     // The fleet whose artefacts were placed by hand: it runs against the epoch
     // in `config.toml`, so it carries no epoch file, and it has been handing out
-    // codes for months. A delivery arriving at such a device must not read the
-    // absent epoch file as "never issued anything" — zeroing the counter would
-    // make every code already read down the telephone valid a second time.
+    // codes for months. A delivery arriving at such a device writes down the
+    // epoch it was implicitly on, so the next delivery has a floor.
     let (_dir, paths) = store();
     let delivery = Delivery::new();
     std::fs::create_dir_all(&paths.state_dir).unwrap();
-    counter::write_issued(&paths.state_dir, 50).unwrap();
     assert!(epoch::read(&paths.state_dir).unwrap().is_none());
 
     let applied = apply(&paths, &delivery.full(3), None, StoreCheck::Skipped).unwrap();
 
     assert!(applied.key_replaced);
-    assert!(
-        !applied.counter_reset,
-        "a device that has already spoken keeps every nonce it has spent"
-    );
-    assert_eq!(
-        counter::read_issued(&paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        50
-    );
     // The epoch the store was implicitly on is now written down, so the next
     // delivery has a floor to be measured against.
     assert_eq!(applied.epoch, Some(Epoch::new(3)));
     assert_eq!(epoch::read(&paths.state_dir).unwrap(), Some(Epoch::new(3)));
-}
-
-#[test]
-fn a_fresh_device_still_starts_its_counter_at_zero() {
-    // The other half of the rule above: a device that has issued nothing has no
-    // spent nonces to protect, and the first delivery is its baseline.
-    let (_dir, paths) = store();
-    let applied = apply(&paths, &Delivery::new().full(3), None, StoreCheck::Skipped).unwrap();
-
-    assert!(applied.counter_reset);
-    assert_eq!(
-        counter::read_issued(&paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        0
-    );
 }
 
 #[test]
@@ -525,7 +437,6 @@ fn a_store_that_fails_the_check_receives_nothing() {
     assert!(!paths.tickets.exists());
     assert!(!paths.ticket_authority.exists());
     assert!(epoch::read(&paths.state_dir).unwrap().is_none());
-    assert!(counter::read_issued(&paths.state_dir).unwrap().is_none());
 }
 
 #[test]
@@ -643,7 +554,6 @@ fn a_wipe_removes_every_artefact_and_reports_the_last_epoch() {
         ..CodesDelivery::default()
     };
     apply(&paths, &revocations, None, StoreCheck::Skipped).unwrap();
-    counter::write_issued(&paths.state_dir, 8).unwrap();
 
     let wiped = wipe(&paths).unwrap();
     assert_eq!(wiped.last_epoch, Some(Epoch::new(4)));
@@ -652,7 +562,6 @@ fn a_wipe_removes_every_artefact_and_reports_the_last_epoch() {
     assert!(!paths.tickets.exists());
     assert!(!paths.ticket_revocations.exists());
     assert!(!paths.ticket_authority.exists());
-    assert!(counter::read_issued(&paths.state_dir).unwrap().is_none());
     assert!(epoch::read(&paths.state_dir).unwrap().is_none());
     assert!(!paths.artefacts_present());
     // Nothing at all is left in the state directory — including the lock file

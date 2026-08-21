@@ -2,7 +2,7 @@
 //!
 //! The epoch names which device key pair the codes of a fleet are computed
 //! against. It arrives with the artefacts — in the enrolment package or in a
-//! courier payload — and it is persisted here beside the nonce counter, in the
+//! courier payload — and it is persisted here beside the throttle, in the
 //! same shape and with the same durability: one number, one root-only file,
 //! written through a temporary file, `fsync` and a rename.
 //!

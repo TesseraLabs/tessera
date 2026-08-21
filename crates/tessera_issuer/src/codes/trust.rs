@@ -4,7 +4,8 @@
 //! it knows which bytes were signed and which signer a document names, and asks
 //! a [`SignatureVerifier`] supplied here whether that signer is trusted. This
 //! module is that answer for the operator side — the authority that issues
-//! operator tickets, and the organisations that sign device records.
+//! operator tickets, the organisations that sign device records, and the owner
+//! that countersigns them.
 //!
 //! Two properties are worth stating, because both are easy to lose:
 //!
@@ -148,6 +149,18 @@ impl Anchors {
     pub fn with_organisation(mut self, organisation_id: &str, key: AnchorKey) -> Self {
         self.organisations.insert(organisation_id.to_owned(), key);
         self
+    }
+
+    /// Anchors the owner who countersigns registry records.
+    ///
+    /// The owner is a named signer like an organisation and is resolved through
+    /// the same map: what makes the two different is the message each of them
+    /// signs, and that difference lives in the document, not here. An owner the
+    /// anchors do not carry is an unknown signer, exactly as an unanchored
+    /// organisation is.
+    #[must_use]
+    pub fn with_owner(self, owner_id: &str, key: AnchorKey) -> Self {
+        self.with_organisation(owner_id, key)
     }
 
     /// Reports whether an organisation is anchored.

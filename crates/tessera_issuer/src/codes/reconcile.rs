@@ -11,12 +11,10 @@
 //!   down, which is what a code handed out off the books looks like;
 //! - a **receipt without a login**: a code was issued and never used, which is
 //!   ordinary once and a pattern of stockpiling when it repeats;
-//! - a **series on one counter**: one device, one epoch, one counter, and more
-//!   than one issuance on it — whether the nonces differ or not. A repeat with
-//!   the same nonce is the legitimate dropped call, and it is *still* reported:
-//!   a repetition that is ordinary once is a pattern when it is not, and a
-//!   report that only counted distinct nonces would stay silent through a run
-//!   of codes issued on one counter;
+//! - a **series on one nonce**: one device, one epoch, one nonce, and more than
+//!   one issuance or more than one login on it. A nonce belongs to one attempt
+//!   and an attempt is answered once, so a repetition is either a call that was
+//!   answered twice or a device that is not the device it claims to be;
 //! - a **disagreement**: the two sides paired on device, epoch and nonce, and
 //!   then said different things about the role, the level or the ticket.
 //!
@@ -117,23 +115,18 @@ pub struct ReceiptEntry {
     pub source: String,
 }
 
-/// A device, an epoch and a counter that carry more than one issuance.
+/// A device, an epoch and a nonce that carry more than one issuance.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CounterSeries {
+pub struct NonceSeries {
     /// Device the series is on.
     pub device_number: String,
     /// Key epoch of the series.
     pub epoch: u32,
-    /// Counter that repeated.
-    pub counter: u64,
-    /// The nonces seen on that counter, receipts and logins together.
-    ///
-    /// One nonce with several receipts is a repeated call; several nonces are a
-    /// device that drew a new challenge on a counter it had already used.
-    pub nonces: Vec<String>,
-    /// How many receipts sit on this counter.
+    /// Nonce that repeated.
+    pub nonce: String,
+    /// How many receipts sit on this nonce.
     pub receipts: u64,
-    /// How many logins sit on this counter.
+    /// How many logins sit on this nonce.
     pub logins: u64,
 }
 
@@ -176,7 +169,7 @@ pub struct Report {
     /// Receipts no login accounts for.
     pub receipts_without_login: Vec<ReceiptEntry>,
     /// Counters carrying more than one challenge.
-    pub series_on_one_counter: Vec<CounterSeries>,
+    pub series_on_one_nonce: Vec<NonceSeries>,
     /// Pairs that met and then disagreed.
     pub disagreements: Vec<Disagreement>,
     /// Whether the device side was present at all.
@@ -211,7 +204,7 @@ impl Report {
     pub fn has_findings(&self) -> bool {
         !self.logins_without_receipt.is_empty()
             || !self.receipts_without_login.is_empty()
-            || !self.series_on_one_counter.is_empty()
+            || !self.series_on_one_nonce.is_empty()
             || !self.disagreements.is_empty()
     }
 }
@@ -270,16 +263,11 @@ impl fmt::Display for Report {
                 receipt.source
             )?;
         }
-        for series in &self.series_on_one_counter {
+        for series in &self.series_on_one_nonce {
             writeln!(
                 f,
-                "series-on-one-counter device={} epoch={} counter={} receipts={} logins={} nonces={}",
-                series.device_number,
-                series.epoch,
-                series.counter,
-                series.receipts,
-                series.logins,
-                series.nonces.join(",")
+                "series-on-one-nonce device={} epoch={} nonce={} receipts={} logins={}",
+                series.device_number, series.epoch, series.nonce, series.receipts, series.logins
             )?;
         }
         for disagreement in &self.disagreements {
@@ -318,7 +306,7 @@ pub fn reconcile(
     let mut report = Report {
         logins_without_receipt: Vec::new(),
         receipts_without_login: Vec::new(),
-        series_on_one_counter: series(receipts, logins.unwrap_or_default()),
+        series_on_one_nonce: series(receipts, logins.unwrap_or_default()),
         disagreements: Vec::new(),
         device_side: logins.is_some(),
         chain_verified: logins.is_some() && provenance.chain_verified,
@@ -361,13 +349,15 @@ pub fn reconcile(
     report
 }
 
-/// Collects the counters that carry more than one issuance.
+/// Collects the nonces that carry more than one issuance.
 ///
-/// The alarm is on the *count*, not on how many distinct nonces were seen: two
-/// receipts on one counter are two codes handed out for one challenge, and that
-/// is the finding whether the second one repeated the nonce or not.
-fn series(receipts: &[ReceiptEntry], logins: &[LoginEntry]) -> Vec<CounterSeries> {
-    let mut seen: BTreeMap<(String, u32, u64), Bucket> = BTreeMap::new();
+/// A nonce belongs to one attempt, and an attempt is answered once. Two
+/// receipts on one nonce are two codes handed out for one challenge; two logins
+/// on one nonce are two admissions on an attempt that only ever had one code to
+/// give. Neither can happen on a device that is behaving, so either is worth a
+/// line of the report.
+fn series(receipts: &[ReceiptEntry], logins: &[LoginEntry]) -> Vec<NonceSeries> {
+    let mut seen: BTreeMap<(String, u32, String), Bucket> = BTreeMap::new();
     for receipt in receipts {
         seen.entry(key_of(
             &receipt.device_number,
@@ -375,21 +365,20 @@ fn series(receipts: &[ReceiptEntry], logins: &[LoginEntry]) -> Vec<CounterSeries
             &receipt.nonce,
         ))
         .or_default()
-        .add(&receipt.nonce, Side::Receipt);
+        .add(Side::Receipt);
     }
     for login in logins {
         seen.entry(key_of(&login.device_number, login.epoch, &login.nonce))
             .or_default()
-            .add(&login.nonce, Side::Login);
+            .add(Side::Login);
     }
 
     seen.into_iter()
         .filter(|(_, bucket)| bucket.is_a_series())
-        .map(|((device_number, epoch, counter), bucket)| CounterSeries {
+        .map(|((device_number, epoch, nonce), bucket)| NonceSeries {
             device_number,
             epoch,
-            counter,
-            nonces: bucket.nonces,
+            nonce,
             receipts: bucket.receipts,
             logins: bucket.logins,
         })
@@ -408,8 +397,6 @@ enum Side {
 /// What one counter of one device and epoch carries.
 #[derive(Debug, Default)]
 struct Bucket {
-    /// Distinct nonces seen on it.
-    nonces: Vec<String>,
     /// Receipts counted on it.
     receipts: u64,
     /// Logins counted on it.
@@ -418,30 +405,22 @@ struct Bucket {
 
 impl Bucket {
     /// Records one entry.
-    fn add(&mut self, nonce: &Nonce, side: Side) {
-        let value = nonce.as_str().to_owned();
-        if !self.nonces.contains(&value) {
-            self.nonces.push(value);
-        }
+    fn add(&mut self, side: Side) {
         match side {
             Side::Receipt => self.receipts = self.receipts.saturating_add(1),
             Side::Login => self.logins = self.logins.saturating_add(1),
         }
     }
 
-    /// Reports whether this counter carries more than one issuance.
-    ///
-    /// Several receipts is the operator side handing out more than one code on
-    /// a counter. Several nonces is the device side making more than one
-    /// challenge on it. Either is the invariant the counter exists to hold.
+    /// Reports whether this nonce carries more than one issuance.
     const fn is_a_series(&self) -> bool {
-        self.receipts > 1 || self.logins > 1 || self.nonces.len() > 1
+        self.receipts > 1 || self.logins > 1
     }
 }
 
-/// The key a counter bucket sits under.
-fn key_of(device_number: &str, epoch: u32, nonce: &Nonce) -> (String, u32, u64) {
-    (device_number.to_owned(), epoch, nonce.counter())
+/// The key a bucket sits under.
+fn key_of(device_number: &str, epoch: u32, nonce: &Nonce) -> (String, u32, String) {
+    (device_number.to_owned(), epoch, nonce.as_str().to_owned())
 }
 
 /// Names the fields a paired receipt and login disagree on.
@@ -718,27 +697,35 @@ mod tests {
         }
     }
 
-    fn nonce(counter: u64, tail: &str) -> Nonce {
-        Nonce::new(counter, tail, &FleetParams::defaults()).unwrap()
+    /// A nonce of the default width, distinguished by the digit it repeats.
+    ///
+    /// The tests care about which entries share a nonce and which do not, and
+    /// nothing else about the value.
+    fn nonce(mark: u8) -> Nonce {
+        let params = FleetParams::defaults();
+        let text = char::from(b'0' + mark % 10)
+            .to_string()
+            .repeat(usize::from(params.nonce_width()));
+        Nonce::parse(&text, &params).unwrap()
     }
 
-    fn receipt(counter: u64, tail: &str) -> ReceiptEntry {
+    fn receipt(mark: u8) -> ReceiptEntry {
         ReceiptEntry {
             device_number: "77000123".to_owned(),
             epoch: 7,
-            nonce: nonce(counter, tail),
+            nonce: nonce(mark),
             role_id: "ops.dc.senior".to_owned(),
             level: 2,
             ticket_number: "tk-17".to_owned(),
-            source: format!("receipt-{counter}"),
+            source: format!("receipt-{mark}"),
         }
     }
 
-    fn login(counter: u64, tail: &str) -> LoginEntry {
+    fn login(mark: u8) -> LoginEntry {
         LoginEntry {
             device_number: "77000123".to_owned(),
             epoch: 7,
-            nonce: nonce(counter, tail),
+            nonce: nonce(mark),
             role_id: "ops.dc.senior".to_owned(),
             level: 2,
             ticket_number: Some("tk-17".to_owned()),
@@ -748,7 +735,7 @@ mod tests {
 
     #[test]
     fn a_matching_pair_raises_nothing() {
-        let report = reconcile(&[receipt(1, "4711")], Some(&[login(1, "4711")]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[login(1)]), verified());
         assert!(report.is_complete());
         assert!(!report.has_findings());
         assert!(report.to_string().contains("no findings"));
@@ -756,66 +743,62 @@ mod tests {
 
     #[test]
     fn a_login_nobody_wrote_a_receipt_for_is_reported() {
-        let report = reconcile(&[], Some(&[login(1, "4711")]), verified());
+        let report = reconcile(&[], Some(&[login(1)]), verified());
         assert_eq!(report.logins_without_receipt.len(), 1);
         assert!(report.to_string().contains("login-without-receipt"));
     }
 
     #[test]
     fn a_receipt_no_device_saw_is_reported() {
-        let report = reconcile(&[receipt(1, "4711")], Some(&[]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[]), verified());
         assert_eq!(report.receipts_without_login.len(), 1);
         assert!(report.to_string().contains("receipt-without-login"));
     }
 
+    /// Две выдачи на один nonce — два кода на одну попытку, и это находка
+    /// независимо от того, чем они отличаются в остальном.
     #[test]
-    fn two_challenges_on_one_counter_are_reported() {
-        let report = reconcile(
-            &[receipt(1, "4711"), receipt(1, "0815")],
-            Some(&[login(1, "4711")]),
-            verified(),
-        );
-        assert_eq!(report.series_on_one_counter.len(), 1);
-        let series = report.series_on_one_counter.first().unwrap();
-        assert_eq!(series.counter, 1);
-        assert_eq!(series.nonces.len(), 2);
+    fn two_issuances_on_one_nonce_are_reported() {
+        let report = reconcile(&[receipt(1), receipt(1)], Some(&[login(1)]), verified());
+        assert_eq!(report.series_on_one_nonce.len(), 1);
+        let series = report.series_on_one_nonce.first().unwrap();
         assert_eq!(series.receipts, 2);
-    }
-
-    /// Повтор с тем же nonce — законный сорванный звонок, и он всё равно виден.
-    /// Отчёт, считавший только различные nonce, здесь молчал.
-    #[test]
-    fn a_repeat_on_one_counter_with_the_same_nonce_is_reported() {
-        let report = reconcile(
-            &[receipt(1, "4711"), receipt(1, "4711")],
-            Some(&[login(1, "4711")]),
-            verified(),
-        );
-        assert_eq!(report.series_on_one_counter.len(), 1);
-        let series = report.series_on_one_counter.first().unwrap();
-        assert_eq!(series.receipts, 2);
-        assert_eq!(series.nonces.len(), 1);
         assert!(report.to_string().contains("receipts=2"));
     }
 
     #[test]
+    fn two_logins_on_one_nonce_are_reported() {
+        // Попытка отвечается один раз: два входа на один nonce значат, что одна
+        // из сторон не та, за кого себя выдаёт.
+        let report = reconcile(&[receipt(1)], Some(&[login(1), login(1)]), verified());
+        assert_eq!(report.series_on_one_nonce.len(), 1);
+        assert_eq!(
+            report
+                .series_on_one_nonce
+                .first()
+                .map(|series| series.logins),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn one_receipt_and_its_login_are_not_a_series() {
-        let report = reconcile(&[receipt(1, "4711")], Some(&[login(1, "4711")]), verified());
-        assert!(report.series_on_one_counter.is_empty());
+        let report = reconcile(&[receipt(1)], Some(&[login(1)]), verified());
+        assert!(report.series_on_one_nonce.is_empty());
     }
 
     #[test]
     fn a_pair_that_disagrees_about_the_role_is_reported() {
-        let mut login = login(1, "4711");
+        let mut login = login(1);
         login.role_id = "ops.dc.root".to_owned();
-        let report = reconcile(&[receipt(1, "4711")], Some(&[login]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[login]), verified());
         assert_eq!(report.disagreements.len(), 1);
         assert_eq!(report.disagreements.first().unwrap().fields, vec!["role"]);
     }
 
     #[test]
     fn a_report_without_the_device_side_says_so() {
-        let report = reconcile(&[receipt(1, "4711")], None, verified());
+        let report = reconcile(&[receipt(1)], None, verified());
         assert!(!report.is_complete());
         assert!(report.to_string().contains("incomplete"));
         assert!(report.logins_without_receipt.is_empty());
@@ -860,11 +843,12 @@ mod tests {
     /// входов выходило пустым — и отчёт объявлялся полным.
     #[test]
     fn the_form_the_device_actually_writes_is_read() {
-        let text = device_chain(&[device_login("0000014711", "success")]);
+        let value = nonce(1).as_str().to_owned();
+        let text = device_chain(&[device_login(&value, "success")]);
         let journal = read_journal("77000123", &text, &FleetParams::defaults()).unwrap();
 
         assert_eq!(journal.entries.len(), 1, "строка входа не найдена: {text}");
-        assert_eq!(journal.entries.first().unwrap().nonce.counter(), 1);
+        assert_eq!(journal.entries.first().unwrap().nonce.as_str(), value);
         assert_eq!(journal.entries.first().unwrap().outcome, "success");
         assert!(journal.chain_verified);
     }
@@ -911,11 +895,14 @@ mod tests {
     /// неё удаляют без следа.
     #[test]
     fn an_export_without_a_chain_is_read_and_marked_unverified() {
-        let text = concat!(
-            r#"{"event":"qr_code_login","nonce_ref":"0000014711","role_id":"ops.dc.senior","level":2,"epoch":7,"ticket_no":"tk-17","outcome":"success"}"#,
-            "\n"
+        let text = format!(
+            concat!(
+                r#"{{"event":"qr_code_login","nonce_ref":"{nonce}","role_id":"ops.dc.senior","level":2,"epoch":7,"ticket_no":"tk-17","outcome":"success"}}"#,
+                "\n"
+            ),
+            nonce = nonce(1).as_str()
         );
-        let journal = read_journal("77000123", text, &FleetParams::defaults()).unwrap();
+        let journal = read_journal("77000123", &text, &FleetParams::defaults()).unwrap();
         assert_eq!(journal.entries.len(), 1);
         assert!(!journal.chain_verified);
 
@@ -934,7 +921,8 @@ mod tests {
     /// заверения, а после него строку можно уронить, оставив валидный префикс.
     #[test]
     fn an_unsigned_tail_is_named_in_the_report() {
-        let text = device_chain(&[device_login("0000014711", "success")]);
+        let value = nonce(1).as_str().to_owned();
+        let text = device_chain(&[device_login(&value, "success")]);
         let journal = read_journal("77000123", &text, &FleetParams::defaults()).unwrap();
         assert_eq!(journal.unsigned_from_seq, Some(0));
 
@@ -951,17 +939,21 @@ mod tests {
 
     #[test]
     fn a_journal_yields_its_code_login_lines_only() {
-        let text = concat!(
-            r#"{"event":"session_open","user":"root"}"#,
-            "\n",
-            r#"{"event":"qr_code_login","nonce_ref":"0000014711","role_id":"ops.dc.senior","level":2,"epoch":7,"ticket_no":"tk-17","outcome":"success"}"#,
-            "\n",
-            r#"{"event":"qr_code_login","nonce_ref":"-","role_id":"ops.dc.senior","level":2,"epoch":7,"outcome":"denied","reason":"no_ticket"}"#,
-            "\n"
+        let value = nonce(1).as_str().to_owned();
+        let text = format!(
+            concat!(
+                r#"{{"event":"session_open","user":"root"}}"#,
+                "\n",
+                r#"{{"event":"qr_code_login","nonce_ref":"{nonce}","role_id":"ops.dc.senior","level":2,"epoch":7,"ticket_no":"tk-17","outcome":"success"}}"#,
+                "\n",
+                r#"{{"event":"qr_code_login","nonce_ref":"-","role_id":"ops.dc.senior","level":2,"epoch":7,"outcome":"denied","reason":"no_ticket"}}"#,
+                "\n"
+            ),
+            nonce = value
         );
-        let journal = read_journal("77000123", text, &FleetParams::defaults()).unwrap();
+        let journal = read_journal("77000123", &text, &FleetParams::defaults()).unwrap();
         assert_eq!(journal.entries.len(), 1);
-        assert_eq!(journal.entries.first().unwrap().nonce.counter(), 1);
+        assert_eq!(journal.entries.first().unwrap().nonce.as_str(), value);
     }
 
     #[test]
@@ -974,9 +966,12 @@ mod tests {
 
     #[test]
     fn a_code_login_line_missing_a_pairing_field_is_refused() {
-        let text = r#"{"event":"qr_code_login","nonce_ref":"0000014711","level":2,"epoch":7,"outcome":"success"}"#;
+        let text = format!(
+            r#"{{"event":"qr_code_login","nonce_ref":"{nonce}","level":2,"epoch":7,"outcome":"success"}}"#,
+            nonce = nonce(1).as_str()
+        );
         assert_eq!(
-            read_journal("77000123", text, &FleetParams::defaults()),
+            read_journal("77000123", &text, &FleetParams::defaults()),
             Err(JournalError::MissingField {
                 line: 1,
                 field: "role_id"

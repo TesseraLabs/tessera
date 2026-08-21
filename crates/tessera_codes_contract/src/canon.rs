@@ -21,9 +21,10 @@
 use unicode_normalization::UnicodeNormalization;
 
 use crate::device_number::CheckedDeviceNumber;
+use crate::key::Epoch;
 
 /// Number of fields in the canonical MAC input.
-pub const CANON_FIELD_COUNT: usize = 4;
+pub const CANON_FIELD_COUNT: usize = 6;
 
 /// Access level of the role the code is issued for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,10 +64,25 @@ pub struct CodeInput<'a> {
     // field table, and this makes that visible instead of merely stated.
     /// Identifier of the role the code grants.
     pub role_id: &'a str,
-    /// Rendered hybrid nonce; see [`crate::nonce::Nonce::as_str`].
+    /// Nonce of the attempt; see [`crate::nonce::Nonce::as_str`].
     pub nonce: &'a str,
     /// Access level of that role.
     pub level: Level,
+    /// Key epoch of the device.
+    ///
+    /// It says which long-lived key the device is registered under. That key
+    /// derives nothing any more, so unless the epoch is in these bytes it binds
+    /// nothing at all: a code cut under one epoch would meet under the next,
+    /// and a device that has just rotated its key would keep accepting what was
+    /// computed for the device it used to be.
+    pub epoch: Epoch,
+    /// Personal number of the engineer the code is for.
+    ///
+    /// The code is issued to a person, not to a machine, and this is the field
+    /// that says so: a code cut for one engineer does not meet when another
+    /// presents it, and the device can name who came in without waiting for
+    /// anybody's server logs.
+    pub engineer_id: &'a str,
 }
 
 /// Failure of the canonical encoding.
@@ -112,11 +128,23 @@ fn read_level(input: &CodeInput<'_>) -> CanonValue<'static> {
     CanonValue::U32(input.level.get())
 }
 
+fn read_epoch(input: &CodeInput<'_>) -> CanonValue<'static> {
+    CanonValue::U32(input.epoch.get())
+}
+
+fn read_engineer_id<'a>(input: &CodeInput<'a>) -> CanonValue<'a> {
+    CanonValue::Text(input.engineer_id)
+}
+
 /// The field table — the single place the canonical order is written down.
 const CANON_FIELDS: [CanonField; CANON_FIELD_COUNT] = [
     CanonField {
         name: "device_number",
         read: read_device_number,
+    },
+    CanonField {
+        name: "epoch",
+        read: read_epoch,
     },
     CanonField {
         name: "nonce",
@@ -129,6 +157,10 @@ const CANON_FIELDS: [CanonField; CANON_FIELD_COUNT] = [
     CanonField {
         name: "level",
         read: read_level,
+    },
+    CanonField {
+        name: "engineer_id",
+        read: read_engineer_id,
     },
 ];
 
@@ -216,6 +248,7 @@ impl Encoder {
 mod tests {
     use super::{canon, canon_field_order, CodeInput, Level};
     use crate::device_number::CheckedDeviceNumber;
+    use crate::key::Epoch;
 
     fn number(body: &str) -> CheckedDeviceNumber {
         CheckedDeviceNumber::from_body(body).unwrap()
@@ -225,7 +258,14 @@ mod tests {
     fn field_order_is_the_contract_order() {
         assert_eq!(
             canon_field_order(),
-            ["device_number", "nonce", "role_id", "level"]
+            [
+                "device_number",
+                "epoch",
+                "nonce",
+                "role_id",
+                "level",
+                "engineer_id"
+            ]
         );
     }
 
@@ -239,15 +279,19 @@ mod tests {
             nonce: "1",
             role_id: "r",
             level: Level::new(3),
+            epoch: Epoch::new(5),
+            engineer_id: "e",
         };
         let encoded = canon(&input).unwrap_or_default();
         assert_eq!(
             hex::encode(encoded),
             concat!(
                 "00000002", "4148", // device number "AH"
+                "00000004", "00000005", // epoch 5
                 "00000001", "31", // nonce "1"
                 "00000001", "72", // role id "r"
                 "00000004", "00000003", // level 3
+                "00000001", "65", // engineer "e"
             )
         );
     }
@@ -260,6 +304,8 @@ mod tests {
             nonce: "1",
             role_id: "ro\u{0302}le",
             level: Level::new(0),
+            epoch: Epoch::new(1),
+            engineer_id: "eng-1",
         };
         let composed = CodeInput {
             role_id: "r\u{00f4}le",
@@ -280,6 +326,8 @@ mod tests {
             nonce: "0004200713",
             role_id: "ops.dc.senior",
             level: Level::new(2),
+            epoch: Epoch::new(7),
+            engineer_id: "eng-1",
         };
         let right = CodeInput {
             device_number: &retyped,
@@ -297,12 +345,76 @@ mod tests {
             nonce: "C",
             role_id: "r",
             level: Level::new(0),
+            epoch: Epoch::new(0),
+            engineer_id: "e",
         };
         let right = CodeInput {
             device_number: &short,
             nonce: "BC",
-            role_id: "r",
-            level: Level::new(0),
+            ..left
+        };
+        assert_ne!(canon(&left), canon(&right));
+    }
+
+    #[test]
+    fn a_different_engineer_gives_different_bytes() {
+        // The field that makes a code useless under somebody else's name: two
+        // inputs alike in every other respect must not encode alike.
+        let device_number = number("77-000123");
+        let mine = CodeInput {
+            device_number: &device_number,
+            nonce: "0004200713",
+            role_id: "ops.dc.senior",
+            level: Level::new(2),
+            epoch: Epoch::new(7),
+            engineer_id: "eng-1",
+        };
+        let theirs = CodeInput {
+            engineer_id: "eng-2",
+            ..mine
+        };
+        assert_ne!(canon(&mine), canon(&theirs));
+    }
+
+    #[test]
+    fn a_different_epoch_gives_different_bytes() {
+        // The epoch stopped binding anything when the long-lived device key
+        // left the key derivation; it binds here instead, and this is the test
+        // that says so.
+        let device_number = number("77-000123");
+        let before = CodeInput {
+            device_number: &device_number,
+            nonce: "0004200713",
+            role_id: "ops.dc.senior",
+            level: Level::new(2),
+            epoch: Epoch::new(7),
+            engineer_id: "eng-1",
+        };
+        let after = CodeInput {
+            epoch: Epoch::new(8),
+            ..before
+        };
+        assert_ne!(canon(&before), canon(&after));
+    }
+
+    #[test]
+    fn the_engineer_and_the_role_do_not_run_together() {
+        // Adjacent text fields with the length prefix removed would be one
+        // string, and "ops" + "eng-1" would encode like "opse" + "ng-1". The
+        // framing is what keeps them apart; this is what fails if it goes.
+        let device_number = number("77-000123");
+        let left = CodeInput {
+            device_number: &device_number,
+            nonce: "0004200713",
+            role_id: "ops",
+            level: Level::new(2),
+            epoch: Epoch::new(7),
+            engineer_id: "eng-1",
+        };
+        let right = CodeInput {
+            role_id: "opse",
+            engineer_id: "ng-1",
+            ..left
         };
         assert_ne!(canon(&left), canon(&right));
     }

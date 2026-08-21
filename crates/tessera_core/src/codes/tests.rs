@@ -22,26 +22,26 @@ use openssl::x509::{X509Builder, X509NameBuilder};
 use tempfile::TempDir;
 
 use tessera_codes_contract::canon::Level;
-use tessera_codes_contract::challenge::Challenge;
+use tessera_codes_contract::challenge::{Challenge, ChallengeFields};
 use tessera_codes_contract::code::compute_code;
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
 use tessera_codes_contract::key::{derive_key, Epoch, KeyAgreement as _, KeyContext};
-use tessera_codes_contract::params::{FleetParams, FleetParamsInput};
+use tessera_codes_contract::params::FleetParams;
 use tessera_codes_contract::profile::AlgorithmProfile;
 use tessera_codes_contract::signature::PublicKey;
 use tessera_codes_contract::ticket::{
-    OperatorTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
+    ServerTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
 };
 use tessera_codes_contract::time::ClaimedTime;
 
 use super::agreement::tests::p256_pair;
-use super::agreement::DeviceKeyAgreement;
+use super::agreement::StaticKeyAgreement;
 use super::boot::BootMarkers;
 use super::throttle;
 use super::tickets::tests::Authority;
 use super::tickets::DeviceScope;
 use super::{
-    artefacts, counter, epoch, AttemptRequest, CodeLoginError, CodeMethod, CodesConfig, CodesPaths,
+    artefacts, epoch, AttemptRequest, CodeLoginError, CodeMethod, CodesConfig, CodesPaths,
     LocalRoles, StartedAttempt, DEFAULT_CODE_TTL,
 };
 
@@ -53,8 +53,11 @@ const STORED_CONTAINER_PASSWORD: &str = "";
 /// Role the fixture logs into.
 const ROLE: &str = "oper";
 
-/// Operator the fixture ticket belongs to.
-const OPERATOR: &str = "op-42";
+/// Issuing side the fixture ticket belongs to.
+const SERVER: &str = "op-42";
+
+/// Personal number the engineer of the fixture gives at the device.
+const ENGINEER: &str = "eng-1";
 
 /// The whole channel, on disk.
 struct Fixture {
@@ -62,6 +65,13 @@ struct Fixture {
     config: CodesConfig,
     roles: LocalRoles,
     operator_key: PKey<Private>,
+    /// The long-lived key of the device, as the container on disk holds it.
+    ///
+    /// Kept so a test can play the one who lifted that container: it is what
+    /// the code used to be derived from, and what must not derive one now.
+    device_key: PKey<Private>,
+    /// The public half of that key, as the registry record of the device
+    /// carries it — the value the issuing side checks the challenge against.
     device_point: Vec<u8>,
     ticket: SignedTicket,
 }
@@ -80,8 +90,8 @@ impl Fixture {
         let (operator_key, operator_point) = p256_pair();
         let authority = Authority::new();
         let ticket = authority.sign(
-            OperatorTicket::new(
-                OPERATOR,
+            ServerTicket::new(
+                SERVER,
                 PublicKey::new(operator_point).unwrap(),
                 TicketScope::new(TicketScopeInput {
                     tags: vec!["dc-1".to_owned(), "hq".to_owned()],
@@ -120,6 +130,7 @@ impl Fixture {
             config,
             roles: LocalRoles::from_ids(local_roles.iter().copied()),
             operator_key,
+            device_key,
             device_point,
             ticket,
         }
@@ -139,44 +150,33 @@ impl Fixture {
         AttemptRequest {
             role_id: ROLE,
             level: Level::new(level),
-            operator_id: OPERATOR,
+            server_id: SERVER,
+            engineer_id: ENGINEER,
             now: ClaimedTime::new(1_700_000_000),
         }
     }
 
-    /// What the operator's cabinet computes for a challenge it was read, using
-    /// the device key registered for the epoch that challenge announces.
+    /// What the issuing side computes for a challenge it was given.
     ///
-    /// The epoch is taken from the challenge rather than from the fixture's
-    /// configuration because that is what an operator has: the number was read
-    /// to them over the telephone, and it is what they look the device key up
-    /// by.
-    fn cabinet_code_for(&self, challenge: &Challenge, device_point: &[u8]) -> String {
-        let secret = DeviceKeyAgreement::new(&self.operator_key, AlgorithmProfile::P256)
-            .unwrap()
-            .agree(device_point)
-            .unwrap();
-        let context = KeyContext::new(
-            &self.config.device_number,
-            challenge.epoch(),
-            self.ticket.context_hash().unwrap(),
-        );
-        let key = derive_key(&secret, &context).unwrap();
-        compute_code(&key, &challenge.code_input(), &self.config.params)
-            .unwrap()
-            .as_str()
-            .to_owned()
+    /// Its key against the ephemeral point of that challenge — the pair of this
+    /// attempt and no other. Nothing about the device key of the fixture enters
+    /// it, which is the whole change: what the issuing side answers is bound to
+    /// an attempt that the device has to be running for the point to exist.
+    fn cabinet_code(&self, challenge: &Challenge) -> String {
+        self.code_agreed_with(challenge, challenge.ephemeral_point().as_bytes())
     }
 
-    /// What the operator's cabinet computes for a challenge it was read.
-    fn cabinet_code(&self, challenge: &Challenge) -> String {
-        let secret = DeviceKeyAgreement::new(&self.operator_key, AlgorithmProfile::P256)
+    /// The code that comes out of agreeing the issuing key against `point`.
+    ///
+    /// Split out so a test can put a point there that no honest issuance would
+    /// have used.
+    fn code_agreed_with(&self, challenge: &Challenge, point: &[u8]) -> String {
+        let secret = StaticKeyAgreement::new(&self.operator_key, AlgorithmProfile::P256)
             .unwrap()
-            .agree(&self.device_point)
+            .agree(point)
             .unwrap();
         let context = KeyContext::new(
             &self.config.device_number,
-            self.config.epoch,
             self.ticket.context_hash().unwrap(),
         );
         let key = derive_key(&secret, &context).unwrap();
@@ -256,7 +256,7 @@ fn start(fixture: &Fixture, level: u32, at: &BootMarkers) -> (CodeMethod, Starte
 fn a_dictated_code_admits_the_engineer() {
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
 
     // What the engineer reads out, and what the operator reads back.
     assert!(attempt.spoken_form().contains(' '));
@@ -264,7 +264,7 @@ fn a_dictated_code_admits_the_engineer() {
     let code = fixture.cabinet_code(attempt.challenge());
 
     let accepted = method
-        .verify_with_markers(&attempt, &code, &markers("boot-a", 140))
+        .verify_with_markers(&mut attempt, &code, &markers("boot-a", 140))
         .unwrap();
     assert_eq!(accepted.role_id, ROLE);
     assert_eq!(accepted.level, Level::new(1));
@@ -274,6 +274,180 @@ fn a_dictated_code_admits_the_engineer() {
     assert_eq!(accepted.level_ceiling, Level::new(1));
 }
 
+/// Retells the challenge of an attempt with one field changed.
+///
+/// What somebody standing in front of the device can do without the device's
+/// help: take what it printed and hand the issuing side a version that says
+/// something else. Everything the two sides agree on is in these bytes, so a
+/// field that does not reach the MAC input can be changed here without the
+/// code changing — which is exactly what these tests are for.
+fn retold(challenge: &Challenge, edit: impl FnOnce(&mut ChallengeFields<'_>)) -> Challenge {
+    let mut fields = ChallengeFields {
+        device_number: challenge.device_number().clone(),
+        epoch: challenge.epoch(),
+        nonce: challenge.nonce().clone(),
+        role_id: challenge.role_id(),
+        level: challenge.level(),
+        server_id: challenge.server_id(),
+        engineer_id: challenge.engineer_id(),
+        ephemeral_point: challenge.ephemeral_point().clone(),
+    };
+    edit(&mut fields);
+    Challenge::new(fields).unwrap()
+}
+
+#[test]
+fn a_code_cut_for_one_engineer_does_not_admit_another() {
+    // One attempt, one nonce, one ephemeral pair — and two names. The engineer
+    // who started the attempt gave their number; somebody retells the same
+    // challenge to the issuing side under another number and brings the code
+    // back. Nothing about the nonce or the timing refuses that; the personal
+    // number in the MAC input is the only thing that does.
+    let fixture = Fixture::new();
+    let boot = markers("boot-a", 100);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
+    assert_eq!(attempt.challenge().engineer_id(), ENGINEER);
+
+    let under_another_name = retold(attempt.challenge(), |fields| {
+        fields.engineer_id = "eng-2";
+    });
+    let code_for_them = fixture.cabinet_code(&under_another_name);
+
+    assert!(
+        matches!(
+            method.verify_with_markers(&mut attempt, &code_for_them, &boot),
+            Err(CodeLoginError::Denied)
+        ),
+        "a code cut under another engineer's number must not admit this attempt"
+    );
+
+    // The attempt is otherwise sound: the code cut under the number the
+    // engineer actually gave is accepted. Without this half the test would go
+    // green on any refusal at all.
+    let code_for_me = fixture.cabinet_code(attempt.challenge());
+    assert!(
+        method
+            .verify_with_markers(&mut attempt, &code_for_me, &boot)
+            .is_ok(),
+        "the code cut under the engineer's own number must be accepted"
+    );
+}
+
+#[test]
+fn a_code_cut_under_one_epoch_does_not_survive_a_key_rotation() {
+    // The epoch used to reach the code through the key it named; it does not
+    // any more — the long-lived key left the derivation — so unless the epoch
+    // is in the MAC input, a code cut under one epoch would meet under the
+    // next. Same attempt, same everything, one number of epoch apart.
+    let fixture = Fixture::new();
+    let boot = markers("boot-a", 100);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
+
+    let under_the_next_epoch = retold(attempt.challenge(), |fields| {
+        fields.epoch = Epoch::new(fields.epoch.get() + 1);
+    });
+    let code_of_another_epoch = fixture.cabinet_code(&under_the_next_epoch);
+
+    assert!(
+        matches!(
+            method.verify_with_markers(&mut attempt, &code_of_another_epoch, &boot),
+            Err(CodeLoginError::Denied)
+        ),
+        "a code cut under another epoch must not admit this attempt"
+    );
+
+    let code_of_this_epoch = fixture.cabinet_code(attempt.challenge());
+    assert!(
+        method
+            .verify_with_markers(&mut attempt, &code_of_this_epoch, &boot)
+            .is_ok(),
+        "the code cut under the epoch of the challenge must be accepted"
+    );
+}
+
+#[test]
+fn the_challenge_carries_a_signature_the_device_record_verifies() {
+    // What the issuing side does with a challenge it receives, done here with
+    // the other library: the device signs through OpenSSL, this checks through
+    // the `p256` crate. Two implementations agreeing is worth more than one
+    // implementation agreeing with itself — and this is the only place in the
+    // workspace where the signature the device actually makes meets the key the
+    // registry actually holds.
+    use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+    use sha2::{Digest as _, Sha256};
+
+    let fixture = Fixture::new();
+    let boot = markers("boot-a", 100);
+    let (_method, attempt) = start(&fixture, 1, &boot);
+    let signed = attempt.signed_challenge();
+
+    let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&fixture.device_point).unwrap();
+    let signature = p256::ecdsa::Signature::from_der(signed.signature().as_bytes()).unwrap();
+    let digest = Sha256::digest(signed.challenge().signing_message().unwrap());
+
+    assert!(
+        verifying.verify_prehash(&digest, &signature).is_ok(),
+        "the signature of the device must hold over the message of its own challenge"
+    );
+
+    // And it holds over that message only: the same signature against the
+    // canonical bytes without the label verifies against nothing.
+    let bare = Sha256::digest(signed.challenge().encode().unwrap());
+    assert!(verifying.verify_prehash(&bare, &signature).is_err());
+}
+
+#[test]
+fn the_long_lived_device_key_does_not_compute_a_code() {
+    // The disk was lifted: a preparer kept a copy, a backup was restored
+    // somewhere else, the machine was stolen. Everything the device stores is
+    // in the attacker's hands, the key container included, and the ticket they
+    // need travels in the open. What they cannot have is the private half of
+    // the pair this attempt agreed on — it was made when the attempt started
+    // and it never left the memory of the process.
+    let fixture = Fixture::new();
+    let boot = markers("boot-a", 100);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
+
+    // The exchange the code used to come out of: the long-lived device key
+    // against the key the ticket carries. Nothing here needs the device to be
+    // running.
+    let secret = StaticKeyAgreement::new(&fixture.device_key, AlgorithmProfile::P256)
+        .unwrap()
+        .agree(fixture.ticket.ticket().public_key().as_bytes())
+        .unwrap();
+    let context = KeyContext::new(
+        &fixture.config.device_number,
+        fixture.ticket.context_hash().unwrap(),
+    );
+    let key = derive_key(&secret, &context).unwrap();
+    let forged = compute_code(
+        &key,
+        &attempt.challenge().code_input(),
+        &fixture.config.params,
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            method.verify_with_markers(&mut attempt, forged.as_str(), &boot),
+            Err(CodeLoginError::Denied)
+        ),
+        "a code derived from the stored device key must not open the attempt"
+    );
+
+    // The attempt was otherwise sound: the code the issuing side computes for
+    // the same challenge is still accepted here. Without this half the test
+    // would go green on any refusal at all — a broken fixture, a spent budget,
+    // an attempt nobody was holding — and would stop guarding anything.
+    let honest = fixture.cabinet_code(attempt.challenge());
+    assert!(
+        method
+            .verify_with_markers(&mut attempt, &honest, &boot)
+            .is_ok(),
+        "the code of the issuing side must still be accepted"
+    );
+}
+
 #[test]
 fn the_ceiling_of_the_verdict_is_the_ceiling_of_the_ticket() {
     // A ticket that reaches level 3, used for a login at level 1: the level of
@@ -281,10 +455,12 @@ fn the_ceiling_of_the_verdict_is_the_ceiling_of_the_ticket() {
     // and are reported as such.
     let fixture = Fixture::build(FleetParams::defaults(), 3, &[ROLE]);
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
     let code = fixture.cabinet_code(attempt.challenge());
 
-    let accepted = method.verify_with_markers(&attempt, &code, &boot).unwrap();
+    let accepted = method
+        .verify_with_markers(&mut attempt, &code, &boot)
+        .unwrap();
     assert_eq!(accepted.level, Level::new(1));
     assert_eq!(accepted.level_ceiling, Level::new(3));
 }
@@ -293,10 +469,12 @@ fn the_ceiling_of_the_verdict_is_the_ceiling_of_the_ticket() {
 fn a_level_equal_to_the_ceiling_of_the_ticket_is_admitted() {
     let fixture = Fixture::build(FleetParams::defaults(), 2, &[ROLE]);
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 2, &boot);
+    let (method, mut attempt) = start(&fixture, 2, &boot);
     let code = fixture.cabinet_code(attempt.challenge());
 
-    let accepted = method.verify_with_markers(&attempt, &code, &boot).unwrap();
+    let accepted = method
+        .verify_with_markers(&mut attempt, &code, &boot)
+        .unwrap();
     assert_eq!(accepted.level, Level::new(2));
     assert_eq!(accepted.level_ceiling, Level::new(2));
 }
@@ -307,52 +485,57 @@ fn the_method_needs_no_server_configuration_of_any_kind() {
     // the dictation mode is complete without a site to point at.
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
     let code = fixture.cabinet_code(attempt.challenge());
-    assert!(method.verify_with_markers(&attempt, &code, &boot).is_ok());
+    assert!(method
+        .verify_with_markers(&mut attempt, &code, &boot)
+        .is_ok());
 }
 
 #[test]
 fn a_wrong_code_does_not_admit_anybody() {
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
 
     assert!(matches!(
-        method.verify_with_markers(&attempt, "00000000", &boot),
+        method.verify_with_markers(&mut attempt, "00000000", &boot),
         Err(CodeLoginError::Denied)
     ));
     // The attempt survives one wrong code: the budget is larger than one.
     let code = fixture.cabinet_code(attempt.challenge());
-    assert!(method.verify_with_markers(&attempt, &code, &boot).is_ok());
+    assert!(method
+        .verify_with_markers(&mut attempt, &code, &boot)
+        .is_ok());
 }
 
 #[test]
 fn the_attempt_budget_of_a_nonce_runs_out() {
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
     let budget = fixture.config.params.attempts_per_nonce();
 
     for guess in 1..budget {
         assert!(
             matches!(
-                method.verify_with_markers(&attempt, "00000000", &boot),
+                method.verify_with_markers(&mut attempt, "00000000", &boot),
                 Err(CodeLoginError::Denied)
             ),
             "guess {guess} should still be inside the budget"
         );
     }
     assert!(matches!(
-        method.verify_with_markers(&attempt, "00000000", &boot),
+        method.verify_with_markers(&mut attempt, "00000000", &boot),
         Err(CodeLoginError::AttemptsExhausted)
     ));
 
-    // The nonce is spent with the budget: the right code no longer helps.
+    // The attempt is over with the budget: the right code no longer helps, and
+    // what comes back keeps saying the budget is what ended it.
     let code = fixture.cabinet_code(attempt.challenge());
     assert!(matches!(
-        method.verify_with_markers(&attempt, &code, &boot),
-        Err(CodeLoginError::Denied)
+        method.verify_with_markers(&mut attempt, &code, &boot),
+        Err(CodeLoginError::AttemptsExhausted)
     ));
 }
 
@@ -360,18 +543,18 @@ fn the_attempt_budget_of_a_nonce_runs_out() {
 fn the_budget_is_not_refilled_by_a_new_process() {
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
     let budget = fixture.config.params.attempts_per_nonce();
 
     for _ in 1..budget {
         assert!(method
-            .verify_with_markers(&attempt, "00000000", &boot)
+            .verify_with_markers(&mut attempt, "00000000", &boot)
             .is_err());
     }
     // A second process opens the method afresh and meets the same budget.
     let reopened = fixture.method().unwrap();
     assert!(matches!(
-        reopened.verify_with_markers(&attempt, "00000000", &boot),
+        reopened.verify_with_markers(&mut attempt, "00000000", &boot),
         Err(CodeLoginError::AttemptsExhausted)
     ));
 }
@@ -380,18 +563,20 @@ fn the_budget_is_not_refilled_by_a_new_process() {
 fn a_spent_nonce_is_refused_when_it_comes_back() {
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
     let code = fixture.cabinet_code(attempt.challenge());
-    assert!(method.verify_with_markers(&attempt, &code, &boot).is_ok());
+    assert!(method
+        .verify_with_markers(&mut attempt, &code, &boot)
+        .is_ok());
 
     // The same code, in the same process and then in a new one after a reboot.
     assert!(matches!(
-        method.verify_with_markers(&attempt, &code, &boot),
+        method.verify_with_markers(&mut attempt, &code, &boot),
         Err(CodeLoginError::Denied)
     ));
     let after_reboot = fixture.method().unwrap();
     assert!(matches!(
-        after_reboot.verify_with_markers(&attempt, &code, &markers("boot-b", 5)),
+        after_reboot.verify_with_markers(&mut attempt, &code, &markers("boot-b", 5)),
         Err(CodeLoginError::Denied)
     ));
 }
@@ -399,13 +584,13 @@ fn a_spent_nonce_is_refused_when_it_comes_back() {
 #[test]
 fn a_reboot_puts_out_a_pending_attempt() {
     let fixture = Fixture::new();
-    let (method, attempt) = start(&fixture, 1, &markers("boot-a", 100));
+    let (method, mut attempt) = start(&fixture, 1, &markers("boot-a", 100));
     let code = fixture.cabinet_code(attempt.challenge());
 
     // The code was never used, and it still does not work: the attempt it
     // belongs to did not survive the restart.
     assert!(matches!(
-        method.verify_with_markers(&attempt, &code, &markers("boot-b", 5)),
+        method.verify_with_markers(&mut attempt, &code, &markers("boot-b", 5)),
         Err(CodeLoginError::Denied)
     ));
 }
@@ -413,11 +598,11 @@ fn a_reboot_puts_out_a_pending_attempt() {
 #[test]
 fn a_monotonic_clock_dragged_backwards_puts_out_a_pending_attempt() {
     let fixture = Fixture::new();
-    let (method, attempt) = start(&fixture, 1, &markers("boot-a", 500));
+    let (method, mut attempt) = start(&fixture, 1, &markers("boot-a", 500));
     let code = fixture.cabinet_code(attempt.challenge());
 
     assert!(matches!(
-        method.verify_with_markers(&attempt, &code, &markers("boot-a", 499)),
+        method.verify_with_markers(&mut attempt, &code, &markers("boot-a", 499)),
         Err(CodeLoginError::Denied)
     ));
 }
@@ -426,12 +611,12 @@ fn a_monotonic_clock_dragged_backwards_puts_out_a_pending_attempt() {
 fn a_code_past_its_local_lifetime_is_refused() {
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
     let code = fixture.cabinet_code(attempt.challenge());
 
     let too_late = markers("boot-a", 100 + DEFAULT_CODE_TTL.as_secs() + 1);
     assert!(matches!(
-        method.verify_with_markers(&attempt, &code, &too_late),
+        method.verify_with_markers(&mut attempt, &code, &too_late),
         Err(CodeLoginError::Denied)
     ));
 }
@@ -512,9 +697,11 @@ fn a_revoked_ticket_closes_the_method_for_that_operator() {
 fn a_revocation_that_arrives_between_two_logins_takes_effect() {
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
     let code = fixture.cabinet_code(attempt.challenge());
-    assert!(method.verify_with_markers(&attempt, &code, &boot).is_ok());
+    assert!(method
+        .verify_with_markers(&mut attempt, &code, &boot)
+        .is_ok());
 
     fixture.revoke_the_ticket();
     let next = fixture.method().unwrap();
@@ -529,7 +716,7 @@ fn an_unknown_operator_is_refused() {
     let fixture = Fixture::new();
     let method = fixture.method().unwrap();
     let request = AttemptRequest {
-        operator_id: "op-99",
+        server_id: "op-99",
         ..Fixture::request(1)
     };
     assert!(matches!(
@@ -561,90 +748,34 @@ fn a_device_without_artefacts_does_not_offer_the_method() {
 }
 
 #[test]
-fn a_container_that_will_not_open_does_not_spend_an_attempt() {
+fn a_container_that_will_not_open_stops_the_attempt_before_it_starts() {
     // A container the device cannot open is the device's own failure — an
     // enrolment that went wrong, a store damaged after it — and never the
-    // engineer's mistake. Either way it must not be charged to the budget they
-    // are working against.
+    // engineer's mistake. It is answered before a challenge exists: no counter
+    // value is spent, nothing is read out, and the refusal says the device is
+    // in a bad state rather than that the engineer got something wrong.
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
-    let code = fixture.cabinet_code(attempt.challenge());
+    let method = fixture.method().unwrap();
 
     let container = &fixture.config.paths.device_key_container;
     let intact = std::fs::read(container).unwrap();
     std::fs::write(container, b"not a container at all").unwrap();
-    for _ in 0..(u32::from(fixture.config.params.attempts_per_nonce()) + 3) {
-        assert!(matches!(
-            method.verify_with_markers(&attempt, &code, &boot),
-            Err(CodeLoginError::Denied)
-        ));
-    }
+    assert!(matches!(
+        method.begin_with_markers(&Fixture::request(1), &boot),
+        Err(CodeLoginError::State { .. })
+    ));
 
-    // The device's own failure cost the engineer nothing: with the container
-    // back, the same code on the same nonce is still accepted.
+    // Nothing was taken from the device while the container was broken: with it
+    // back, an attempt starts and its code is accepted.
     std::fs::write(container, &intact).unwrap();
-    assert!(method.verify_with_markers(&attempt, &code, &boot).is_ok());
-}
-
-#[test]
-fn the_nonce_counter_is_exhausted_rather_than_wrapped() {
-    let params = FleetParams::parse(FleetParamsInput {
-        counter_width: 1,
-        ..FleetParamsInput::defaults()
-    })
-    .unwrap();
-    let fixture = Fixture::build(params, 1, &[ROLE]);
-    let method = fixture.method().unwrap();
-
-    // The width holds the counters 0..=9, and the first challenge takes 1.
-    // Each challenge is asked for in a window of its own: the issuance limit is
-    // what an attacker meets, and this test is about what an operator meets at
-    // the end of the counter — see `a_storm_of_challenge_requests_...` for the
-    // other half.
-    let mut issued = Vec::new();
-    for step in 1..=9u64 {
-        let attempt = method
-            .begin_with_markers(&Fixture::request(1), &after_a_window(step))
-            .unwrap();
-        issued.push(attempt.challenge().nonce().counter());
-    }
-    assert_eq!(issued, (1..=9).collect::<Vec<_>>());
-
-    assert!(matches!(
-        method.begin_with_markers(&Fixture::request(1), &after_a_window(10)),
-        Err(CodeLoginError::CounterExhausted)
-    ));
-    // And it stays exhausted: nothing wrapped round to a counter already spoken.
-    assert!(matches!(
-        fixture
-            .method()
-            .unwrap()
-            .begin_with_markers(&Fixture::request(1), &after_a_window(11)),
-        Err(CodeLoginError::CounterExhausted)
-    ));
-}
-
-#[test]
-fn a_rolled_back_counter_refuses_until_the_epoch_is_rotated() {
-    let fixture = Fixture::new();
-    let boot = markers("boot-a", 100);
-    let method = fixture.method().unwrap();
-    for _ in 0..3 {
-        method
-            .begin_with_markers(&Fixture::request(1), &boot)
-            .unwrap();
-    }
-
-    // The device came back from a snapshot with an older counter.
-    counter::write_issued(&fixture.config.paths.state_dir, 1).unwrap();
-    assert!(matches!(
-        fixture
-            .method()
-            .unwrap()
-            .begin_with_markers(&Fixture::request(1), &boot),
-        Err(CodeLoginError::StateRollback)
-    ));
+    let mut attempt = method
+        .begin_with_markers(&Fixture::request(1), &boot)
+        .unwrap();
+    let code = fixture.cabinet_code(attempt.challenge());
+    assert!(method
+        .verify_with_markers(&mut attempt, &code, &boot)
+        .is_ok());
 }
 
 #[test]
@@ -653,27 +784,53 @@ fn every_attempt_takes_a_nonce_of_its_own() {
     let boot = markers("boot-a", 100);
     let method = fixture.method().unwrap();
 
+    // One attempt at a time, so the first is finished before the second begins.
     let first = method
         .begin_with_markers(&Fixture::request(1), &boot)
         .unwrap();
-    let second = method
-        .begin_with_markers(&Fixture::request(0), &boot)
+    let first_nonce = first.challenge().nonce().as_str().to_owned();
+    let code = fixture.cabinet_code(first.challenge());
+    drop(first);
+
+    let mut second = method
+        .begin_with_markers(&Fixture::request(0), &after_a_window(1))
         .unwrap();
-    assert_ne!(
-        first.challenge().nonce().as_str(),
-        second.challenge().nonce().as_str()
-    );
-    assert_ne!(
-        first.challenge().nonce().counter(),
-        second.challenge().nonce().counter()
-    );
+    assert_ne!(second.challenge().nonce().as_str(), first_nonce);
 
     // A code cut for one attempt does not open the other.
-    let code = fixture.cabinet_code(first.challenge());
     assert!(matches!(
-        method.verify_with_markers(&second, &code, &boot),
+        method.verify_with_markers(&mut second, &code, &after_a_window(1)),
         Err(CodeLoginError::Denied)
     ));
+}
+
+#[test]
+fn a_device_holds_one_attempt_at_a_time() {
+    // The lock of the state directory lives as long as the attempt, so a second
+    // login arriving while the first is being answered is refused rather than
+    // given an attempt of its own. Eight attempts alive at once used to be the
+    // grace window; there is no window now, because there is nothing on disk
+    // for a second attempt to live in.
+    let fixture = Fixture::new();
+    let boot = markers("boot-a", 100);
+    let method = fixture.method().unwrap();
+
+    let held = method
+        .begin_with_markers(&Fixture::request(1), &boot)
+        .unwrap();
+    assert!(
+        matches!(
+            method.begin_with_markers(&Fixture::request(1), &after_a_window(1)),
+            Err(CodeLoginError::State { .. })
+        ),
+        "a second attempt must not start while one is open"
+    );
+
+    // And the device is not stuck: the attempt ends, the next one starts.
+    drop(held);
+    assert!(method
+        .begin_with_markers(&Fixture::request(1), &after_a_window(2))
+        .is_ok());
 }
 
 #[test]
@@ -774,7 +931,7 @@ fn a_code_that_meets_emits_no_success_event_of_its_own() {
     // pair a receipt with a login that never happened.
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
     let code = fixture.cabinet_code(attempt.challenge());
 
     // Read from the journal, not from a `tracing` subscriber. An assertion that
@@ -783,7 +940,9 @@ fn a_code_that_meets_emits_no_success_event_of_its_own() {
     // that was never offered an event reports the same emptiness as a method
     // that never emitted one, and the test passes without checking anything.
     let records = crate::audit::testing::capture_records(|| {
-        method.verify_with_markers(&attempt, &code, &boot).unwrap();
+        method
+            .verify_with_markers(&mut attempt, &code, &boot)
+            .unwrap();
     });
 
     assert!(
@@ -802,17 +961,17 @@ fn a_key_delivered_under_a_new_epoch_is_the_one_the_login_computes_with() {
     // old key pair, and refuse every code the operator computed — on the one
     // channel that reaches a device nobody can visit.
     //
-    // The operator here does what an operator does: takes the epoch from the
-    // challenge that was read to them, looks up the device key registered for
-    // that epoch, and computes with it. That is what makes the wrong epoch
-    // fatal rather than cosmetic — the two sides end up on different key pairs.
+    // The epoch no longer picks the key the code is derived from — that is the
+    // ephemeral pair of the attempt — so what a wrong epoch costs is the
+    // record: every event of this login, and every register the issuing side
+    // reconciles them against, names a key the device does not hold.
     let fixture = Fixture::new();
     let configured = fixture.config.epoch;
     epoch::write(&fixture.config.paths.state_dir, configured).unwrap();
 
     // The fleet rotates the key: a new pair, delivered under the next epoch.
     let rotated = Epoch::new(configured.get() + 1);
-    let (rotated_key, rotated_point) = p256_pair();
+    let (rotated_key, _rotated_point) = p256_pair();
     artefacts::apply(
         &fixture.config.paths,
         &artefacts::CodesDelivery {
@@ -833,7 +992,7 @@ fn a_key_delivered_under_a_new_epoch_is_the_one_the_login_computes_with() {
 
     let method = fixture.method().unwrap();
     let boot = markers("boot-a", 100);
-    let attempt = method
+    let mut attempt = method
         .begin_with_markers(&Fixture::request(1), &boot)
         .unwrap();
     assert_eq!(
@@ -842,10 +1001,12 @@ fn a_key_delivered_under_a_new_epoch_is_the_one_the_login_computes_with() {
         "the challenge must announce the epoch of the key the device actually holds"
     );
 
-    let code = fixture.cabinet_code_for(attempt.challenge(), &rotated_point);
+    let code = fixture.cabinet_code(attempt.challenge());
     assert!(
-        method.verify_with_markers(&attempt, &code, &boot).is_ok(),
-        "a code computed against the delivered key must be accepted"
+        method
+            .verify_with_markers(&mut attempt, &code, &boot)
+            .is_ok(),
+        "a code computed for the challenge the device printed must be accepted"
     );
 }
 
@@ -854,13 +1015,13 @@ fn a_key_delivered_under_a_new_epoch_is_the_one_the_login_computes_with() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_storm_of_challenge_requests_cannot_spend_the_counter_to_exhaustion() {
-    // The worst outcome this method has: a challenge is printed before any code
-    // is presented, so anyone who reaches the PAM stack with the name of a role
-    // account spends one value of a counter that never wraps — and a device
-    // whose counter is spent stops offering the method until somebody carries a
-    // new key epoch to it. On a machine nobody can reach any other way, that is
-    // a permanent outage bought with a shell loop.
+fn a_storm_of_challenge_requests_runs_into_the_issuance_budget() {
+    // A challenge is printed before any code is presented, so anyone who
+    // reaches the PAM stack with the name of a role account makes this device
+    // draw an ephemeral pair and take its only attempt slot. Nothing about that
+    // is permanent any more — there is no counter left to spend — but a caller
+    // who can keep the slot busy keeps an engineer out, so the budget bounds
+    // how often it can be asked for.
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
     let method = fixture.method().unwrap();
@@ -874,23 +1035,14 @@ fn a_storm_of_challenge_requests_cannot_spend_the_counter_to_exhaustion() {
         );
     }
 
-    // Everything past the budget is refused, and refusing costs nothing: a
-    // hundred further attempts leave the counter exactly where the budget left
-    // it. Without the limit this loop would burn a hundred values, and a longer
-    // one would burn the counter dead.
+    // Everything past the budget is refused, and the refusal is temporary: it
+    // says "wait", not "this device is finished".
     for _ in 0..100 {
         assert!(matches!(
             method.begin_with_markers(&Fixture::request(1), &boot),
             Err(CodeLoginError::TemporarilyLocked { .. })
         ));
     }
-    assert_eq!(
-        counter::read_issued(&fixture.config.paths.state_dir)
-            .unwrap()
-            .unwrap()
-            .get(),
-        u64::from(throttle::MAX_CHALLENGES_PER_WINDOW)
-    );
 }
 
 #[test]
@@ -912,13 +1064,13 @@ fn the_refusal_to_issue_ends_by_itself() {
     ));
 
     let after = 100 + throttle::CHALLENGE_WINDOW.as_secs();
-    let attempt = method
+    let mut attempt = method
         .begin_with_markers(&Fixture::request(1), &markers("boot-a", after))
         .unwrap();
     // And the challenge that comes out of the far side is a working one.
     let code = fixture.cabinet_code(attempt.challenge());
     assert!(method
-        .verify_with_markers(&attempt, &code, &markers("boot-a", after))
+        .verify_with_markers(&mut attempt, &code, &markers("boot-a", after))
         .is_ok());
 }
 
@@ -951,11 +1103,11 @@ fn a_run_of_spent_budgets_locks_the_role_and_the_lock_ends() {
 
     for round in 0..throttle::LOCKOUT_AFTER_FAILURES {
         let at = after_a_window(u64::from(round));
-        let attempt = method
+        let mut attempt = method
             .begin_with_markers(&Fixture::request(1), &at)
             .unwrap();
         for _ in 0..fixture.config.params.attempts_per_nonce() {
-            let _refused = method.verify_with_markers(&attempt, "00000000", &at);
+            let _refused = method.verify_with_markers(&mut attempt, "00000000", &at);
         }
     }
 
@@ -973,11 +1125,13 @@ fn a_run_of_spent_budgets_locks_the_role_and_the_lock_ends() {
         "boot-a",
         locked_at.since_boot_secs() + throttle::LOCKOUT_BASE.as_secs(),
     );
-    let attempt = method
+    let mut attempt = method
         .begin_with_markers(&Fixture::request(1), &freed)
         .unwrap();
     let code = fixture.cabinet_code(attempt.challenge());
-    assert!(method.verify_with_markers(&attempt, &code, &freed).is_ok());
+    assert!(method
+        .verify_with_markers(&mut attempt, &code, &freed)
+        .is_ok());
 }
 
 #[test]
@@ -987,19 +1141,19 @@ fn the_lock_leaves_the_tries_the_budget_grants_alone() {
     // the rest of them away from the engineer they were granted to.
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
 
     for guess in 1..fixture.config.params.attempts_per_nonce() {
         assert!(
             matches!(
-                method.verify_with_markers(&attempt, "00000000", &boot),
+                method.verify_with_markers(&mut attempt, "00000000", &boot),
                 Err(CodeLoginError::Denied)
             ),
             "try {guess} is one the budget grants"
         );
     }
     assert!(matches!(
-        method.verify_with_markers(&attempt, "00000000", &boot),
+        method.verify_with_markers(&mut attempt, "00000000", &boot),
         Err(CodeLoginError::AttemptsExhausted)
     ));
 }
@@ -1012,31 +1166,35 @@ fn a_login_clears_the_run_of_failures_behind_it() {
     // Two spent budgets — one short of the lock.
     for round in 0..(throttle::LOCKOUT_AFTER_FAILURES - 1) {
         let at = after_a_window(u64::from(round));
-        let attempt = method
+        let mut attempt = method
             .begin_with_markers(&Fixture::request(1), &at)
             .unwrap();
         for _ in 0..fixture.config.params.attempts_per_nonce() {
-            let _refused = method.verify_with_markers(&attempt, "00000000", &at);
+            let _refused = method.verify_with_markers(&mut attempt, "00000000", &at);
         }
     }
 
     let at = after_a_window(u64::from(throttle::LOCKOUT_AFTER_FAILURES));
-    let attempt = method
-        .begin_with_markers(&Fixture::request(1), &at)
-        .unwrap();
-    let code = fixture.cabinet_code(attempt.challenge());
-    assert!(method.verify_with_markers(&attempt, &code, &at).is_ok());
+    {
+        let mut attempt = method
+            .begin_with_markers(&Fixture::request(1), &at)
+            .unwrap();
+        let code = fixture.cabinet_code(attempt.challenge());
+        assert!(method.verify_with_markers(&mut attempt, &code, &at).is_ok());
+    }
 
     // The engineer who got in does not carry the earlier fumbling forward: one
     // more spent budget is the first of a new run, not the third of the old
     // one. Checked at the moment it ends — had the run continued, the role
     // would be locked right here.
     let later = after_a_window(u64::from(throttle::LOCKOUT_AFTER_FAILURES) + 1);
-    let attempt = method
-        .begin_with_markers(&Fixture::request(1), &later)
-        .unwrap();
-    for _ in 0..fixture.config.params.attempts_per_nonce() {
-        let _refused = method.verify_with_markers(&attempt, "00000000", &later);
+    {
+        let mut attempt = method
+            .begin_with_markers(&Fixture::request(1), &later)
+            .unwrap();
+        for _ in 0..fixture.config.params.attempts_per_nonce() {
+            let _refused = method.verify_with_markers(&mut attempt, "00000000", &later);
+        }
     }
     assert!(method
         .begin_with_markers(&Fixture::request(1), &later)
@@ -1056,10 +1214,10 @@ fn a_refused_code_names_the_ticket_it_was_refused_under() {
     // are both alarms.
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
 
     let records = crate::audit::testing::capture_records(|| {
-        let _refused = method.verify_with_markers(&attempt, "00000000", &boot);
+        let _refused = method.verify_with_markers(&mut attempt, "00000000", &boot);
     });
     // Narrowed by this attempt's own nonce: the journal sink is process-wide,
     // so a parallel test can have written its own refusal into the same file.
@@ -1078,14 +1236,52 @@ fn a_refused_code_names_the_ticket_it_was_refused_under() {
 }
 
 #[test]
+fn every_decided_attempt_names_the_engineer_who_claimed_it() {
+    // The reconciliation this field exists for pairs the logins a fleet saw
+    // with the grants its server issued, and the number is what names the
+    // person on the device side. A journal without it can say a role account
+    // was let in and nothing about who was standing there.
+    //
+    // Both outcomes, because both are reconciled: a refusal that named nobody
+    // would leave exactly the attempts an audit cares about anonymous.
+    let fixture = Fixture::new();
+    let boot = markers("boot-a", 100);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
+    let nonce = attempt.challenge().nonce().to_string();
+
+    let refused = crate::audit::testing::capture_records(|| {
+        let _refused = method.verify_with_markers(&mut attempt, "00000000", &boot);
+    });
+    let refusals = crate::audit::testing::matching(
+        &refused,
+        &[
+            ("outcome", crate::codes::audit::OUTCOME_DENIED),
+            ("nonce_ref", &nonce),
+        ],
+    );
+    let refusal = refusals
+        .first()
+        .unwrap_or_else(|| panic!("a refusal is written down; saw {refused:#?}"));
+    assert_eq!(refusal["claimed_engineer_no"], ENGINEER, "{refusal}");
+
+    let code = fixture.cabinet_code(attempt.challenge());
+    let accepted = method
+        .verify_with_markers(&mut attempt, &code, &boot)
+        .unwrap();
+    // The verdict carries the number out to the caller, which is what emits the
+    // success event once nothing is left that can refuse.
+    assert_eq!(accepted.claimed_engineer_no, ENGINEER);
+}
+
+#[test]
 fn a_spent_budget_names_the_ticket_it_was_spent_under() {
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
-    let (method, attempt) = start(&fixture, 1, &boot);
+    let (method, mut attempt) = start(&fixture, 1, &boot);
 
     let records = crate::audit::testing::capture_records(|| {
         for _ in 0..=fixture.config.params.attempts_per_nonce() {
-            let _refused = method.verify_with_markers(&attempt, "00000000", &boot);
+            let _refused = method.verify_with_markers(&mut attempt, "00000000", &boot);
         }
     });
     let nonce = attempt.challenge().nonce().to_string();

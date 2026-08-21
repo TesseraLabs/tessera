@@ -466,11 +466,8 @@ fn codes_summary(outcome: &ImportOutcome) -> String {
         .epoch
         .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string());
     format!(
-        "epoch={epoch} key_replaced={} counter_reset={} tickets={} revocations={}",
-        applied.key_replaced,
-        applied.counter_reset,
-        applied.tickets_applied,
-        applied.revocations_applied
+        "epoch={epoch} key_replaced={} tickets={} revocations={}",
+        applied.key_replaced, applied.tickets_applied, applied.revocations_applied
     )
 }
 
@@ -1270,7 +1267,6 @@ mod tests {
             .as_ref()
             .expect("the codes part was applied");
         assert!(!applied.key_replaced);
-        assert!(!applied.counter_reset);
         assert_eq!(
             fs::read(&codes.paths.ticket_authority).unwrap(),
             anchor,

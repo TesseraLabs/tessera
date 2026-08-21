@@ -13,6 +13,7 @@ mod artifacts;
 mod baseline;
 mod cli;
 mod codes_fixtures;
+mod codes_sign;
 mod coverage;
 mod driver;
 mod exec;
@@ -46,6 +47,7 @@ fn main() -> std::process::ExitCode {
     let outcome = match &cli.command {
         cli::Command::E2e(args) => run::e2e(args),
         cli::Command::E2eCoverage(args) => coverage::e2e_coverage(args),
+        cli::Command::CodesSignChallenge(args) => codes_sign::codes_sign_challenge(args),
         cli::Command::CodesFixtures(args) => {
             // Путь по умолчанию задан от корня репозитория, а `cargo xtask`
             // запускают откуда угодно внутри дерева.

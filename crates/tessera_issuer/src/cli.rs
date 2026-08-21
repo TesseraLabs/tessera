@@ -556,10 +556,6 @@ pub const EXIT_TOOL_FAILURE: u8 = 1;
 /// axes — device, epoch, operator, region, tags, role, level.
 pub const EXIT_REFUSED_TICKET_SCOPE: u8 = 10;
 
-/// Exit code of a challenge whose nonce counter does not fit the receipts:
-/// running ahead, falling behind, or arriving with no history at all.
-pub const EXIT_REFUSED_COUNTER: u8 = 11;
-
 /// Exit code of a refusal by signature, anchor or key: the organisation
 /// signature, the proof of possession, an unanchored signer, an expired or
 /// forged ticket, an operator key the ticket does not name.
@@ -587,7 +583,6 @@ pub const EXIT_REFUSED_OTHER: u8 = 14;
 pub const fn exit_code_for(group: RefusalGroup) -> u8 {
     match group {
         RefusalGroup::TicketScope => EXIT_REFUSED_TICKET_SCOPE,
-        RefusalGroup::Counter => EXIT_REFUSED_COUNTER,
         RefusalGroup::Trust => EXIT_REFUSED_TRUST,
         RefusalGroup::Grounds => EXIT_REFUSED_GROUNDS,
         RefusalGroup::Other => EXIT_REFUSED_OTHER,
@@ -630,7 +625,7 @@ pub fn main() -> ExitCode {
 #[cfg(test)]
 mod exit_code_tests {
     use super::{
-        exit_code_for, CliError, EXIT_REFUSED_COUNTER, EXIT_REFUSED_GROUNDS, EXIT_REFUSED_OTHER,
+        exit_code_for, CliError, EXIT_REFUSED_GROUNDS, EXIT_REFUSED_OTHER,
         EXIT_REFUSED_TICKET_SCOPE, EXIT_REFUSED_TRUST, EXIT_TOOL_FAILURE,
     };
     use crate::codes::RefusalGroup;
@@ -644,9 +639,8 @@ mod exit_code_tests {
     const RESERVED: [u8; 7] = [0, 1, 2, 64, 70, 126, 127];
 
     /// Все группы — чтобы таблица проверялась целиком, а не выборочно.
-    const GROUPS: [RefusalGroup; 6] = [
+    const GROUPS: [RefusalGroup; 5] = [
         RefusalGroup::TicketScope,
-        RefusalGroup::Counter,
         RefusalGroup::Trust,
         RefusalGroup::Grounds,
         RefusalGroup::Other,
@@ -704,7 +698,6 @@ mod exit_code_tests {
         // Значения зафиксированы числами: их знают хелпер e2e и спека, и
         // молчаливая смена сломала бы обоих.
         assert_eq!(EXIT_REFUSED_TICKET_SCOPE, 10);
-        assert_eq!(EXIT_REFUSED_COUNTER, 11);
         assert_eq!(EXIT_REFUSED_TRUST, 12);
         assert_eq!(EXIT_REFUSED_GROUNDS, 13);
         assert_eq!(EXIT_REFUSED_OTHER, 14);

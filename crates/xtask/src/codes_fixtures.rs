@@ -42,10 +42,13 @@ use zeroize::Zeroizing;
 
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
 use tessera_codes_contract::key::Epoch;
-use tessera_codes_contract::registry::DeviceRecord;
+use tessera_codes_contract::registry::{
+    DeviceRecord, KeyProtection, MonotonicAnchor, PayloadFields, RecordFields, RecordPayload,
+    SerialNumber,
+};
 use tessera_codes_contract::signature::{PublicKey, Signature};
 use tessera_codes_contract::ticket::{
-    OperatorTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
+    ServerTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
 };
 use tessera_codes_contract::time::ClaimedTime;
 use tessera_ext::delegation::DelegationConstraints;
@@ -78,6 +81,9 @@ const TICKET_NUMBER: &str = "tk-e2e-1";
 
 /// Идентификатор организации, подписывающей запись устройства.
 const ORGANISATION_ID: &str = "acme";
+
+/// Идентификатор владельца, который заверяет запись реестра.
+const OWNER_ID: &str = "owner-e2e";
 
 /// PIN контейнера ключа устройства.
 ///
@@ -134,10 +140,20 @@ mod names {
     pub(super) const OPERATOR_TICKET: &str = "operator-ticket.txt";
     /// Приватный ключ оператора.
     pub(super) const OPERATOR_KEY: &str = "operator-key.pem";
+    /// Приватный ключ устройства — тот же, что лежит в контейнере.
+    ///
+    /// Отдельным файлом он нужен единственному кейсу: тому, где моделируется
+    /// снятый диск. У такого атакующего ключ устройства есть по условию задачи,
+    /// и стенд обязан уметь подписать его ключом challenge — иначе выдача
+    /// отвергнет подменённую строку по подписи, и кейс проверит не то, что
+    /// проверяет. Пароль контейнера и так напечатан в манифесте: комплект
+    /// целиком фиктивен, скрывать здесь нечего.
+    pub(super) const DEVICE_KEY: &str = "device-key.pem";
     /// Запись устройства.
     pub(super) const DEVICE_RECORD: &str = "device-record.txt";
     /// Якорь организации, подписавшей запись.
     pub(super) const ORGANISATION_ANCHOR: &str = "organisation-anchor.pem";
+    pub(super) const OWNER_ANCHOR: &str = "owner-anchor.pem";
     /// Описание комплекта.
     pub(super) const README: &str = "README.md";
 }
@@ -215,6 +231,17 @@ struct Bundle {
     files: Vec<FixtureFile>,
     /// Номер устройства с контрольным символом — он же в манифесте.
     device_number: String,
+    /// Ключ устройства комплекта.
+    ///
+    /// В файлы он уходит только внутри контейнера PKCS#12; здесь он остаётся
+    /// потому, что challenge подписывается им — тест связности собирает
+    /// challenge сам и обязан подписать его тем же ключом, что стоит в записи
+    /// реестра, иначе выдача откажет по подписи, а не по проверяемому месту.
+    ///
+    /// Только в тестовой сборке: в самой команде ключ не нужен нигде, кроме
+    /// контейнера и записи, и держать его дольше незачем.
+    #[cfg(test)]
+    device_key: FixtureKey,
 }
 
 /// Ключ фикстуры: генерируется здесь, подписывает документы контракта.
@@ -360,13 +387,17 @@ fn build(roles: &[String]) -> Result<Bundle> {
     let epoch = Epoch::new(EPOCH_VALUE);
 
     let ticket = signed_ticket(&authority, &operator, roles)?;
-    let record = signed_record(&organisation, &device, &device_number, epoch)?;
+    let owner = FixtureKey::generate();
+    let record = signed_record(&organisation, &device, &owner, &device_number, epoch)?;
     let container = device_container(&device, &device_number)?;
 
+    let device_key_pem = device.pkcs8_pem()?;
     let manifest = manifest(&device_number);
     let readme = readme(roles, &device_number);
 
     Ok(Bundle {
+        #[cfg(test)]
+        device_key: device,
         device_number: device_number.as_str().to_owned(),
         files: vec![
             FixtureFile {
@@ -400,6 +431,11 @@ fn build(roles: &[String]) -> Result<Bundle> {
                 owner_only: true,
             },
             FixtureFile {
+                name: names::DEVICE_KEY,
+                bytes: device_key_pem.as_bytes().to_vec(),
+                owner_only: true,
+            },
+            FixtureFile {
                 name: names::DEVICE_RECORD,
                 bytes: format!("{}\n", record.to_wire()).into_bytes(),
                 owner_only: false,
@@ -407,6 +443,11 @@ fn build(roles: &[String]) -> Result<Bundle> {
             FixtureFile {
                 name: names::ORGANISATION_ANCHOR,
                 bytes: organisation.spki_pem()?.into_bytes(),
+                owner_only: false,
+            },
+            FixtureFile {
+                name: names::OWNER_ANCHOR,
+                bytes: owner.spki_pem()?.into_bytes(),
                 owner_only: false,
             },
             FixtureFile {
@@ -434,7 +475,7 @@ fn signed_ticket(
     })
     .context("рамки билета оператора")?;
 
-    let ticket = OperatorTicket::new(
+    let ticket = ServerTicket::new(
         OPERATOR_ID,
         PublicKey::new(operator.sec1_point())?,
         scope,
@@ -447,43 +488,89 @@ fn signed_ticket(
     Ok(SignedTicket::new(ticket, signature))
 }
 
-/// Собирает запись устройства: подпись организации и `PoP` ключом устройства.
+/// Собирает запись устройства: три подписи в том порядке, в котором их ставят.
 ///
-/// Запись собирается дважды: обе подписи снимаются с канонических байт тела, а
-/// тело умеет кодировать только сама запись.
+/// Порядок здесь не соглашение: каждое сообщение накрывает подписи, стоящие до
+/// него, поэтому запись собирается по шагам — иначе подписать нечего.
 fn signed_record(
     organisation: &FixtureKey,
     device: &FixtureKey,
+    owner: &FixtureKey,
     device_number: &CheckedDeviceNumber,
     epoch: Epoch,
 ) -> Result<DeviceRecord> {
     let placeholder = Signature::new(vec![0x00])?;
-    let draft = DeviceRecord::new(
-        device_number.clone(),
-        PublicKey::new(device.sec1_point())?,
-        epoch,
-        ORGANISATION_ID,
-        placeholder.clone(),
-        placeholder,
-    )
-    .context("черновик записи устройства")?;
+    let payload = |device: &FixtureKey| -> Result<RecordPayload> {
+        RecordPayload::new(PayloadFields {
+            device_number: device_number.clone(),
+            public_key: PublicKey::new(device.sec1_point())?,
+            epoch,
+            // Серийник у фикстуры один и постоянный: комплект обязан собираться
+            // одинаково от прогона к прогону.
+            serials: vec![
+                SerialNumber::new("chassis", "SN-E2E-1").context("серийный номер фикстуры")?
+            ],
+            key_protection: KeyProtection::Pkcs12Envelope,
+            anchor: MonotonicAnchor::None,
+            batch: "batch-e2e",
+            baseline: [0x55; 32],
+        })
+        .context("тело записи устройства")
+    };
 
-    let organisation_signature =
-        organisation.sign(&draft.encode().context("канонические байты записи")?)?;
+    let draft = DeviceRecord::new(RecordFields {
+        payload: payload(device)?,
+        organisation_id: ORGANISATION_ID,
+        owner_id: OWNER_ID,
+        possession_signature: placeholder.clone(),
+        organisation_signature: placeholder.clone(),
+        owner_signature: placeholder,
+    })
+    .context("черновик записи устройства")?;
     let possession_signature = device.sign(
         &draft
             .possession_message()
             .context("сообщение доказательства владения")?,
     )?;
 
-    DeviceRecord::new(
-        device_number.clone(),
-        PublicKey::new(device.sec1_point())?,
-        epoch,
-        ORGANISATION_ID,
-        organisation_signature,
+    let with_possession = DeviceRecord::new(RecordFields {
+        payload: payload(device)?,
+        organisation_id: ORGANISATION_ID,
+        owner_id: OWNER_ID,
+        possession_signature: possession_signature.clone(),
+        organisation_signature: Signature::new(vec![0x00])?,
+        owner_signature: Signature::new(vec![0x00])?,
+    })
+    .context("запись с доказательством владения")?;
+    let organisation_signature = organisation.sign(
+        &with_possession
+            .organisation_message()
+            .context("сообщение подписи организации")?,
+    )?;
+
+    let with_organisation = DeviceRecord::new(RecordFields {
+        payload: payload(device)?,
+        organisation_id: ORGANISATION_ID,
+        owner_id: OWNER_ID,
+        possession_signature: possession_signature.clone(),
+        organisation_signature: organisation_signature.clone(),
+        owner_signature: Signature::new(vec![0x00])?,
+    })
+    .context("запись с подписью организации")?;
+    let owner_signature = owner.sign(
+        &with_organisation
+            .owner_message()
+            .context("сообщение подписи владельца")?,
+    )?;
+
+    DeviceRecord::new(RecordFields {
+        payload: payload(device)?,
+        organisation_id: ORGANISATION_ID,
+        owner_id: OWNER_ID,
         possession_signature,
-    )
+        organisation_signature,
+        owner_signature,
+    })
     .context("сборка записи устройства")
 }
 
@@ -552,7 +639,8 @@ fn manifest(device_number: &CheckedDeviceNumber) -> String {
          OPERATOR_ID={OPERATOR_ID}\n\
          TICKET_NUMBER={TICKET_NUMBER}\n\
          DEVICE_KEY_PIN={DEVICE_KEY_PIN}\n\
-         ORGANISATION_ID={ORGANISATION_ID}\n",
+         ORGANISATION_ID={ORGANISATION_ID}\n\
+         OWNER_ID={OWNER_ID}\n",
         device_number.as_str(),
         TAGS.join(" "),
     )
@@ -610,6 +698,11 @@ fn readme(roles: &[String], device_number: &CheckedDeviceNumber) -> String {
          (устройство держит список, оператор предъявляет выдаче отдельный файл). Подписан\n\
          ключом, чей якорь — `{authority}`.\n\
          - `{operator_key}` — приватный ключ оператора, парный открытому в билете.\n\
+         - `{device_key}` — приватный ключ устройства в PKCS#8 PEM: тот же ключ, что в\n\
+         `{device_container}`, только без контейнера. Нужен кейсу CODE-014, где моделируется\n\
+         снятый диск: у такого атакующего ключ устройства есть, и стенд подписывает им\n\
+         подменённый challenge через `xtask codes-sign-challenge`. Без подписи выдача\n\
+         отвергла бы строку раньше вычисления, и кейс проверял бы не ту гарантию.\n\
          \n\
          Рамки билета: регион `{REGION}`, тег `{tag}`, роли {roles}, потолок уровня\n\
          {TICKET_MAX_LEVEL}. Потолок держит кейс CODE-006: запрос уровня 2 обязан получить\n\
@@ -639,6 +732,7 @@ fn readme(roles: &[String], device_number: &CheckedDeviceNumber) -> String {
          учётной записью, комплект нужно перевыпустить с её именем, иначе билет не допустит\n\
          роль и кейс упадёт с `codes-refusal: ticket_scope_role`.\n",
         device_container = names::DEVICE_CONTAINER,
+        device_key = names::DEVICE_KEY,
         manifest = names::MANIFEST,
         record = names::DEVICE_RECORD,
         organisation_anchor = names::ORGANISATION_ANCHOR,
@@ -769,6 +863,7 @@ mod tests {
             names::OPERATOR_KEY,
             names::DEVICE_RECORD,
             names::ORGANISATION_ANCHOR,
+            names::OWNER_ANCHOR,
             names::README,
         ] {
             assert!(names.contains(&expected), "нет файла {expected}");
@@ -784,13 +879,18 @@ mod tests {
     /// именно эта повторяет то, что делает стенд.
     #[test]
     fn the_bundle_computes_a_code_through_the_product() {
+        // Личный номер инженера у стенда фиксирован: сверять его не с чем —
+        // реестра людей на офлайн-устройстве нет, — но в байты кода он входит,
+        // поэтому обе стороны обязаны взять одно значение.
+        const ENGINEER_ID: &str = "eng-1";
+
         use base64::Engine as _;
-        use tessera_codes_contract::challenge::Challenge;
+        use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+        use tessera_codes_contract::challenge::{Challenge, SignedChallenge};
         use tessera_codes_contract::params::FleetParams;
         use tessera_codes_contract::registry::DeviceRecord;
         use tessera_codes_contract::ticket::SignedTicket;
         use tessera_issuer::codes::agreement::SoftwareOperatorKey;
-        use tessera_issuer::codes::counter::EPOCH_INITIAL_COUNTER;
         use tessera_issuer::codes::issue::{issue, IssuanceRequest};
         use tessera_issuer::codes::scope::DeviceScope;
         use tessera_issuer::codes::trust::{AnchorKey, Anchors};
@@ -828,6 +928,10 @@ mod tests {
                 .with_organisation(
                     super::ORGANISATION_ID,
                     AnchorKey::from_spki_der(&pem(names::ORGANISATION_ANCHOR)).unwrap(),
+                )
+                .with_owner(
+                    super::OWNER_ID,
+                    AnchorKey::from_spki_der(&pem(names::OWNER_ANCHOR)).unwrap(),
                 );
         let key = SoftwareOperatorKey::from_pkcs8_der(
             &pem(names::OPERATOR_KEY),
@@ -841,20 +945,43 @@ mod tests {
         // Момент внутри срока билета: часы стенда сюда не приходят.
         let now = tessera_codes_contract::time::ClaimedTime::new(super::CERT_NOT_BEFORE);
 
+        // Точка попытки: пара, которую устройство порождает на каждый вход.
+        // Здесь она берётся из фиксированного ключа — комплект обязан
+        // собираться одинаково от прогона к прогону, а проверяется связность
+        // документов, а не случайность.
+        // Nonce фиксирован по той же причине, что и ключ попытки: комплект
+        // обязан собираться одинаково от прогона к прогону.
+        let attempt_nonce = "4".repeat(usize::from(params.nonce_width()));
+        let attempt_key = p256::SecretKey::from_slice(&[0x55; 32]).unwrap();
+        let attempt_point =
+            hex::encode(attempt_key.public_key().to_encoded_point(false).as_bytes());
         let challenge = Challenge::parse(
             &format!(
-                "tessera-codes/v1/challenge;device={};epoch={};nonce={:0>6}4711;role={};level=1;\
-                 operator={}",
+                "tessera-codes/v1/challenge;device={};epoch={};nonce={};role={};level=1;\
+                 server={};engineer={};ephemeral={attempt_point}",
                 bundle.device_number,
                 super::EPOCH_VALUE,
-                EPOCH_INITIAL_COUNTER,
+                attempt_nonce,
                 super::DEFAULT_ROLES[0],
                 super::OPERATOR_ID,
+                ENGINEER_ID,
             ),
             &params,
         )
         .unwrap();
 
+        // Подписывается ключом устройства — тем самым, чью открытую половину
+        // несёт запись реестра. Собранный руками challenge без подписи выдача
+        // не отличила бы от сочинённого и отказала бы раньше проверяемого здесь.
+        let sign = |challenge: Challenge| {
+            let signature = bundle
+                .device_key
+                .sign(&challenge.signing_message().unwrap())
+                .unwrap();
+            SignedChallenge::new(challenge, signature)
+        };
+
+        let challenge = sign(challenge);
         let request = IssuanceRequest {
             challenge: &challenge,
             record: &record,
@@ -863,9 +990,6 @@ mod tests {
             device_scope: Some(&scope),
             reason: "проверка связности комплекта",
             now,
-            known_counter: None,
-            history_depth: 0,
-            override_decision: None,
         };
         let issuance = issue(&request, &anchors, &key).unwrap();
         assert_eq!(issuance.code.as_str().len(), usize::from(params.code_len()));
@@ -874,17 +998,19 @@ mod tests {
         // получить отказ именно по рамкам, а не по чему-то ещё.
         let above = Challenge::parse(
             &format!(
-                "tessera-codes/v1/challenge;device={};epoch={};nonce={:0>6}4711;role={};level=2;\
-                 operator={}",
+                "tessera-codes/v1/challenge;device={};epoch={};nonce={};role={};level=2;\
+                 server={};engineer={};ephemeral={attempt_point}",
                 bundle.device_number,
                 super::EPOCH_VALUE,
-                EPOCH_INITIAL_COUNTER,
+                attempt_nonce,
                 super::DEFAULT_ROLES[0],
                 super::OPERATOR_ID,
+                ENGINEER_ID,
             ),
             &params,
         )
         .unwrap();
+        let above = sign(above);
         let refused = issue(
             &IssuanceRequest {
                 challenge: &above,

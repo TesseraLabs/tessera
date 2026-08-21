@@ -289,7 +289,6 @@ mod tests {
         let secret = SharedSecret::new(vec![0x11; 32]).unwrap();
         let context = KeyContext::new(
             &DEVICE,
-            Epoch::new(7),
             TicketHash::of_canonical_signed_ticket(b"signed ticket"),
         );
         derive_key(&secret, &context).unwrap()
@@ -301,15 +300,87 @@ mod tests {
             nonce: "0004200713",
             role_id: "ops.dc.senior",
             level: Level::new(2),
+            epoch: Epoch::new(7),
+            engineer_id: "eng-7",
         }
     }
 
     #[test]
+    fn a_code_cut_for_one_engineer_does_not_meet_for_another() {
+        // The guarantee the personal number is in the input for: a code read
+        // out to one engineer must be useless in the hands of another, even
+        // with the same device, nonce, role and level.
+        let params = FleetParams::defaults();
+        let mine = compute_code(&key(), &input(), &params).unwrap();
+        let theirs = CodeInput {
+            engineer_id: "eng-8",
+            ..input()
+        };
+
+        assert_eq!(
+            verify_code(&key(), &input(), &params, mine.as_str()),
+            Ok(())
+        );
+        assert_eq!(
+            verify_code(&key(), &theirs, &params, mine.as_str()),
+            Err(CodeMismatch)
+        );
+        assert_ne!(
+            compute_code(&key(), &theirs, &params).unwrap().as_str(),
+            mine.as_str()
+        );
+    }
+
+    #[test]
+    fn a_code_cut_under_one_epoch_does_not_meet_under_the_next() {
+        // The device rotated its key: the same nonce, role, level and engineer
+        // under a new epoch is a different code. Nothing else separates the two
+        // any more — the long-lived key left the derivation, so if the epoch
+        // were not in the MAC input, a code cut before the rotation would still
+        // be accepted after it.
+        let params = FleetParams::defaults();
+        let before = compute_code(&key(), &input(), &params).unwrap();
+        let after = CodeInput {
+            epoch: Epoch::new(8),
+            ..input()
+        };
+
+        assert_eq!(
+            verify_code(&key(), &after, &params, before.as_str()),
+            Err(CodeMismatch)
+        );
+        assert_ne!(
+            compute_code(&key(), &after, &params).unwrap().as_str(),
+            before.as_str()
+        );
+    }
+
+    #[test]
     fn a_code_has_the_configured_length_and_alphabet() {
+        // The default fleet is base32 now: every character has to be one this
+        // alphabet holds, and the excluded letters are part of that.
         let params = FleetParams::defaults();
         let code = compute_code(&key(), &input(), &params).unwrap();
         assert_eq!(code.as_str().len(), usize::from(params.code_len()));
-        assert!(code.as_str().bytes().all(|b| b.is_ascii_digit()));
+        let allowed = params.alphabet().symbols();
+        assert!(
+            code.as_str()
+                .bytes()
+                .all(|symbol| allowed.contains(&symbol)),
+            "{code}"
+        );
+
+        // And a decimal fleet still produces digits and nothing else.
+        let decimal = FleetParams::parse(FleetParamsInput {
+            alphabet: Alphabet::Decimal,
+            code_len: 8,
+            nonce_width: 39,
+            ..FleetParamsInput::defaults()
+        })
+        .unwrap();
+        let code = compute_code(&key(), &input(), &decimal).unwrap();
+        assert_eq!(code.as_str().len(), 8);
+        assert!(code.as_str().bytes().all(|byte| byte.is_ascii_digit()));
     }
 
     #[test]
@@ -357,13 +428,20 @@ mod tests {
             nonce: "0004200714",
             ..input()
         };
+        let wrong_engineer = CodeInput {
+            engineer_id: "eng-8",
+            ..input()
+        };
+        let wrong_epoch = CodeInput {
+            epoch: Epoch::new(8),
+            ..input()
+        };
         let wrong_key = {
             let secret = SharedSecret::new(vec![0x99; 32]).unwrap();
             derive_key(
                 &secret,
                 &KeyContext::new(
                     &DEVICE,
-                    Epoch::new(7),
                     TicketHash::of_canonical_signed_ticket(b"signed ticket"),
                 ),
             )
@@ -376,6 +454,14 @@ mod tests {
         );
         assert_eq!(
             verify_code(&key(), &wrong_nonce, &params, code.as_str()),
+            Err(CodeMismatch)
+        );
+        assert_eq!(
+            verify_code(&key(), &wrong_engineer, &params, code.as_str()),
+            Err(CodeMismatch)
+        );
+        assert_eq!(
+            verify_code(&key(), &wrong_epoch, &params, code.as_str()),
             Err(CodeMismatch)
         );
         assert_eq!(

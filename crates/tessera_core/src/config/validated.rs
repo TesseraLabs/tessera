@@ -760,9 +760,6 @@ fn validate_tags(raw: &RawTags, roles: &RawRoles) -> Result<TagsSection, Error> 
     })
 }
 
-/// Default local lifetime of a printed challenge, in seconds.
-const DEFAULT_CODE_TTL_SECONDS: u64 = crate::codes::DEFAULT_CODE_TTL.as_secs();
-
 /// Longest `[codes]` free-text value accepted: the device number, the region,
 /// and each tag. They are read aloud or matched against a ticket scope, and a
 /// value longer than this is a paste accident rather than a configuration.
@@ -861,17 +858,12 @@ fn validate_codes(
         None => None,
     };
 
+    // The lifetime of an attempt is a fleet parameter and is checked where the
+    // rest of them are: the contract bounds it from both ends, and a second
+    // copy of it beside the parameters would be a second answer to the same
+    // question.
     let params = validate_code_params(raw)?;
-
-    let code_ttl = match raw.code_ttl_seconds {
-        Some(0) => {
-            return Err(Error::ConfigInvalid {
-                reason: "[codes].code_ttl_seconds must be > 0".into(),
-            })
-        }
-        Some(seconds) => Duration::from_secs(seconds),
-        None => Duration::from_secs(DEFAULT_CODE_TTL_SECONDS),
-    };
+    let code_ttl = Duration::from_secs(params.attempt_ttl_secs());
 
     if let Some(region) = raw.region.as_deref() {
         codes_text("[codes].region", region)?;
@@ -970,8 +962,8 @@ fn validate_code_params(
             RawCodeAlphabet::Decimal => Alphabet::Decimal,
             RawCodeAlphabet::CrockfordBase32 => Alphabet::CrockfordBase32,
         },
-        counter_width: raw.counter_width.unwrap_or(defaults.counter_width),
-        tail_width: raw.tail_width.unwrap_or(defaults.tail_width),
+        nonce_width: raw.nonce_width.unwrap_or(defaults.nonce_width),
+        attempt_ttl_secs: raw.code_ttl_seconds.unwrap_or(defaults.attempt_ttl_secs),
         profile: profile_of(raw.profile),
         unconfirmed_profile_risk: if raw.accept_unconfirmed_profile {
             UnconfirmedProfileRisk::AcceptedByFleetOwner
@@ -2390,7 +2382,7 @@ mod tests {
         assert_eq!(method.device_scope.region, "ru-south");
         assert_eq!(
             method.code_ttl,
-            Duration::from_secs(DEFAULT_CODE_TTL_SECONDS)
+            Duration::from_secs(tessera_codes_contract::params::DEFAULT_ATTEMPT_TTL_SECS)
         );
         assert!(method
             .paths
@@ -2445,11 +2437,35 @@ mod tests {
 
     #[test]
     fn parameters_weaker_than_the_contract_are_refused() {
+        // Two characters of any alphabet this contract holds are below the
+        // floor; a length that passed in one alphabet and failed in another
+        // would be testing the alphabet rather than the floor.
         let raw = RawCodes {
-            code_len: Some(4),
+            code_len: Some(2),
             ..enabled_codes()
         };
         assert!(validate_codes(&raw, None).is_err());
+    }
+
+    #[test]
+    fn a_decimal_fleet_keeps_the_length_its_alphabet_needs() {
+        // The calibration is in bits, so a fleet that asks for decimal has to
+        // ask for the length decimal needs: the default length belongs to the
+        // default alphabet, and taking one without the other is what would
+        // weaken a code silently.
+        let short_decimal = RawCodes {
+            alphabet: RawCodeAlphabet::Decimal,
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&short_decimal, None).is_err());
+
+        let calibrated = RawCodes {
+            alphabet: RawCodeAlphabet::Decimal,
+            code_len: Some(8),
+            nonce_width: Some(39),
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&calibrated, None).is_ok());
     }
 
     #[test]
@@ -2654,12 +2670,16 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_code_ttl_is_refused() {
-        let raw = RawCodes {
-            code_ttl_seconds: Some(0),
-            ..enabled_codes()
-        };
-        assert!(validate_codes(&raw, None).is_err());
+    fn a_code_ttl_outside_the_contract_ceiling_is_refused() {
+        // Both ends, and both from the contract: zero is not "no limit", and a
+        // fleet cannot stretch the lifetime past the normative ceiling.
+        for seconds in [0, tessera_codes_contract::params::MAX_ATTEMPT_TTL_SECS + 1] {
+            let raw = RawCodes {
+                code_ttl_seconds: Some(seconds),
+                ..enabled_codes()
+            };
+            assert!(validate_codes(&raw, None).is_err(), "{seconds} s");
+        }
     }
 
     #[test]

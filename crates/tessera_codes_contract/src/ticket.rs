@@ -1,6 +1,7 @@
-//! The operator ticket.
+//! The ticket of the issuing side.
 //!
-//! A ticket is what an operator holds while working a call: who they are, the
+//! A ticket is what the issuing server holds while it answers requests: who it
+//! is, the
 //! public key their side of the key agreement uses, the scope they may act in,
 //! how long the ticket lasts and which number identifies it. It is signed by
 //! the authority of the fleet, and its canonical bytes are hashed into the
@@ -23,7 +24,7 @@
 //! The role list is a bound of its own, checked apart from the highest level:
 //! a role identifier and an integrity level are orthogonal axes, so a ceiling
 //! on the level says nothing about which rights a role carries at it. Without
-//! the list, an operator scoped to "region south, level at most 1" could hand
+//! the list, an issuing side scoped to "region south, level at most 1" could hand
 //! out a code for any role of that level, including one whose sudo grants are
 //! wide.
 //!
@@ -48,7 +49,7 @@ pub const TICKET_FIELD_COUNT: usize = 9;
 
 /// Field keys of the wire form, in the only order the parser accepts.
 const WIRE_KEYS: [&str; TICKET_FIELD_COUNT] = [
-    "operator",
+    "server",
     "key",
     "tags",
     "roles",
@@ -238,33 +239,33 @@ impl TicketScope {
     }
 }
 
-/// An operator ticket, without its signature.
+/// The ticket of an issuing side, without its signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperatorTicket {
-    operator_id: String,
+pub struct ServerTicket {
+    server_id: String,
     public_key: PublicKey,
     scope: TicketScope,
     not_after: ClaimedTime,
     number: TicketNumber,
 }
 
-impl OperatorTicket {
+impl ServerTicket {
     /// Assembles a ticket.
     ///
     /// # Errors
     ///
-    /// Returns the wire errors when the operator identifier is empty or carries
+    /// Returns the wire errors when the server identifier is empty or carries
     /// a character the format cannot hold.
     pub fn new(
-        operator_id: &str,
+        server_id: &str,
         public_key: PublicKey,
         scope: TicketScope,
         not_after: ClaimedTime,
         number: TicketNumber,
     ) -> Result<Self, TicketError> {
-        wire::check_free_text("operator", operator_id)?;
+        wire::check_free_text("server", server_id)?;
         Ok(Self {
-            operator_id: operator_id.to_owned(),
+            server_id: server_id.to_owned(),
             public_key,
             scope,
             not_after,
@@ -272,13 +273,13 @@ impl OperatorTicket {
         })
     }
 
-    /// Returns the identifier of the operator the ticket belongs to.
+    /// Returns the identifier of the issuing side the ticket belongs to.
     #[must_use]
-    pub fn operator_id(&self) -> &str {
-        &self.operator_id
+    pub fn server_id(&self) -> &str {
+        &self.server_id
     }
 
-    /// Returns the public key of the operator side of the key agreement.
+    /// Returns the public key of the issuing side of the key agreement.
     #[must_use]
     pub const fn public_key(&self) -> &PublicKey {
         &self.public_key
@@ -322,7 +323,7 @@ impl OperatorTicket {
 
     /// Writes the body fields into an encoder, in the canonical order.
     fn encode_into(&self, encoder: &mut Encoder) -> Result<(), CanonError> {
-        encoder.push_text("operator_id", &self.operator_id)?;
+        encoder.push_text("server_id", &self.server_id)?;
         encoder.push_bytes("public_key", self.public_key.as_bytes())?;
         let tag_count = u32::try_from(self.scope.tags.len())
             .map_err(|_| CanonError::FieldTooLong { field: "tag_count" })?;
@@ -358,17 +359,17 @@ impl OperatorTicket {
     }
 }
 
-/// An operator ticket with the signature of the issuing authority.
+/// A server ticket with the signature of the issuing authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedTicket {
-    ticket: OperatorTicket,
+    ticket: ServerTicket,
     signature: Signature,
 }
 
 impl SignedTicket {
     /// Pairs a ticket with the signature over its canonical bytes.
     #[must_use]
-    pub const fn new(ticket: OperatorTicket, signature: Signature) -> Self {
+    pub const fn new(ticket: ServerTicket, signature: Signature) -> Self {
         Self { ticket, signature }
     }
 
@@ -378,7 +379,7 @@ impl SignedTicket {
     /// checking it is [`SignedTicket::verify`], and a consumer that reads the
     /// fields without calling it is reading an unauthenticated document.
     #[must_use]
-    pub const fn ticket(&self) -> &OperatorTicket {
+    pub const fn ticket(&self) -> &ServerTicket {
         &self.ticket
     }
 
@@ -437,7 +438,7 @@ impl SignedTicket {
     #[must_use]
     pub fn to_wire(&self) -> String {
         let fields = [
-            ("operator", self.ticket.operator_id.clone()),
+            ("server", self.ticket.server_id.clone()),
             ("key", hex::encode(self.ticket.public_key.as_bytes())),
             (
                 "tags",
@@ -479,7 +480,7 @@ impl SignedTicket {
         })?;
         let not_after = ClaimedTime::new(wire::parse_u64("not_after", wire::value(&values, 6))?);
         let number = TicketNumber::parse(wire::value(&values, 7))?;
-        let ticket = OperatorTicket::new(
+        let ticket = ServerTicket::new(
             wire::value(&values, 0),
             public_key,
             scope,
@@ -554,7 +555,7 @@ pub enum TicketError {
 )]
 pub(crate) mod tests {
     use super::{
-        OperatorTicket, SignedTicket, TicketError, TicketNumber, TicketScope, TicketScopeInput,
+        ServerTicket, SignedTicket, TicketError, TicketNumber, TicketScope, TicketScopeInput,
         ALL_ROLES, TICKET_PREFIX,
     };
     use crate::canon::Level;
@@ -591,7 +592,7 @@ pub(crate) mod tests {
             max_level: Level::new(3),
         })
         .unwrap();
-        let ticket = OperatorTicket::new(
+        let ticket = ServerTicket::new(
             "op-42",
             PublicKey::new(vec![0x04, 0x11, 0x22]).unwrap(),
             scope,
@@ -615,7 +616,7 @@ pub(crate) mod tests {
             hex::encode(encoded),
             concat!(
                 "00000005",
-                "6f702d3432", // operator id "op-42"
+                "6f702d3432", // server id "op-42"
                 "00000003",
                 "041122", // public key
                 "00000004",
@@ -659,8 +660,8 @@ pub(crate) mod tests {
     fn an_edited_field_moves_the_context_hash() {
         let ticket = signed_ticket();
         let widened = SignedTicket::new(
-            OperatorTicket::new(
-                ticket.ticket().operator_id(),
+            ServerTicket::new(
+                ticket.ticket().server_id(),
                 ticket.ticket().public_key().clone(),
                 TicketScope::new(TicketScopeInput {
                     tags: ticket.ticket().scope().tags().to_vec(),
