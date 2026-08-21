@@ -833,7 +833,27 @@ mod platform_tests {
         reason = "a failed setup step in a test should fail the test on the spot"
     )]
 
+    use std::path::PathBuf;
+
     use super::{apply, CodesDelivery, CodesPaths, StoreCheck};
+
+    /// A store rooted at a directory that does not exist yet.
+    ///
+    /// The nesting is the whole point. `CodesPaths::under(dir.path())` would put
+    /// the store root *at* the temporary directory, which the harness has just
+    /// created — and then "the import created no store" could never be asserted,
+    /// because the directory is there either way. The root returned here is
+    /// created by nothing but `ensure_store_dirs`.
+    fn store_under_a_fresh_root() -> (tempfile::TempDir, PathBuf, CodesPaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codes");
+        let paths = CodesPaths::under(&root);
+        assert!(
+            !root.exists(),
+            "the fixture is wrong if the store root exists before the import"
+        );
+        (dir, root, paths)
+    }
 
     /// A package with no Codes part, applied on any platform whatsoever.
     ///
@@ -842,8 +862,7 @@ mod platform_tests {
     /// must leave no store behind on its way through.
     #[test]
     fn an_empty_delivery_changes_nothing_on_any_platform() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = CodesPaths::under(dir.path());
+        let (_dir, root, paths) = store_under_a_fresh_root();
 
         let applied = apply(
             &paths,
@@ -856,22 +875,21 @@ mod platform_tests {
         assert_eq!(applied.epoch, None);
         assert!(!applied.key_replaced);
         assert!(
-            !paths.state_dir.exists() && !paths.device_key_container.exists(),
+            !root.exists(),
             "an import that carries no Codes part leaves no trace of the method"
         );
     }
 
     /// A consignment that arrives where the method cannot run.
     ///
-    /// The refusal has to come before the store is made. The import that
-    /// created its directories and then failed on their permissions left litter
-    /// from an operation that could never have finished, and told the operator
-    /// about an I/O fault rather than about the platform.
+    /// The refusal has to come before the store is made. The import that created
+    /// its directories and then failed on their permissions left litter from an
+    /// operation that could never have finished, and told the operator about an
+    /// I/O fault rather than about the platform.
     #[test]
     #[cfg(not(unix))]
     fn a_consignment_is_refused_before_the_store_is_created() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = CodesPaths::under(dir.path());
+        let (_dir, root, paths) = store_under_a_fresh_root();
         let delivery = CodesDelivery {
             tickets: Some(b"anything at all".to_vec()),
             ..CodesDelivery::default()
@@ -884,15 +902,12 @@ mod platform_tests {
             "the platform is the reason, and it is not an I/O fault: {error:?}"
         );
         assert!(
-            !paths.state_dir.exists(),
-            "a refused import creates no state directory"
+            !root.exists(),
+            "a refused import creates no store directory"
         );
         assert!(
-            !paths
-                .device_key_container
-                .parent()
-                .is_some_and(std::path::Path::exists),
-            "a refused import creates no store directory"
+            !paths.state_dir.exists(),
+            "a refused import creates no state directory"
         );
     }
 }

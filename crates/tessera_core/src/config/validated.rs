@@ -2601,18 +2601,20 @@ mod tests {
         // later reads the configured one — and the delivery container is
         // shredded from the medium by the same import, so the only copy of the
         // key would be in the wrong place.
+        // The directory goes through `absolute`: what counts as an absolute
+        // path is a property of the platform, and a POSIX literal is a
+        // *relative* path on Windows, where the validator would then refuse the
+        // fixture for a reason that has nothing to do with what is under test.
+        let dir = crate::test_support::absolute("/srv/tessera/codes");
         let raw = RawCodes {
             enabled: false,
-            dir: Some(PathBuf::from("/srv/tessera/codes")),
+            dir: Some(PathBuf::from(&dir)),
             ..RawCodes::default()
         };
         let section = validate_codes(&raw, None).unwrap();
         assert!(section.method.is_none(), "the method is not offered yet");
         assert!(
-            section
-                .paths
-                .device_key_container
-                .starts_with("/srv/tessera/codes"),
+            section.paths.device_key_container.starts_with(&dir),
             "the store is the configured one, not the default: {}",
             section.paths.device_key_container.display()
         );
@@ -2622,12 +2624,24 @@ mod tests {
     fn the_enabled_section_and_the_store_it_reports_are_the_same_paths() {
         // Two answers to "where do the artefacts live" is one answer too many.
         let raw = RawCodes {
-            dir: Some(PathBuf::from("/srv/tessera/codes")),
+            dir: Some(PathBuf::from(crate::test_support::absolute(
+                "/srv/tessera/codes",
+            ))),
             ..enabled_codes()
         };
         let section = validate_codes(&raw, None).unwrap();
         let method = section.method.expect("the method is offered");
         assert_eq!(method.paths, section.paths);
+    }
+
+    #[test]
+    fn no_fixture_here_hands_a_validator_a_posix_path_literal() {
+        // The guard for a class of failure this host cannot otherwise show: a
+        // POSIX literal is a *relative* path on Windows, so a fixture that
+        // spells one is refused there for a reason that has nothing to do with
+        // what the test is about. Twice already that arrived as a Windows-only
+        // red and was read as a product regression.
+        crate::test_support::assert_no_posix_path_fixtures(include_str!("validated.rs"));
     }
 
     #[test]
