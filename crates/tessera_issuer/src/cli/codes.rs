@@ -72,7 +72,9 @@ use tessera_codes_contract::time::ClaimedTime;
 use crate::codes::agreement::{OperatorKey, SoftwareOperatorKey};
 use crate::codes::annex::SiteScope;
 use crate::codes::issue::{issue, IssuanceRequest};
-use crate::codes::reconcile::{read_journal, reconcile, JournalError, LoginEntry, Provenance};
+use crate::codes::reconcile::{
+    read_journal, reconcile, JournalError, LoginEntry, Provenance, Report, Verdict,
+};
 use crate::codes::scope::DeviceScope;
 use crate::codes::store;
 use crate::codes::trust::{AnchorKey, Anchors};
@@ -598,7 +600,7 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
         chain_verified: true,
         unsigned_from_seq: None,
         refusals_without_nonce: 0,
-        unaccounted_without_nonce: std::collections::BTreeSet::new(),
+        unpairable_lines: Vec::new(),
     };
     let logins = if args.device_journals.is_empty() {
         None
@@ -637,9 +639,7 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
             provenance.refusals_without_nonce = provenance
                 .refusals_without_nonce
                 .saturating_add(journal.refusals_without_nonce);
-            provenance
-                .unaccounted_without_nonce
-                .extend(journal.unaccounted_without_nonce);
+            provenance.unpairable_lines.extend(journal.unpairable_lines);
             // The earliest unsigned tail across the journals: the weakest of
             // them is what the report may claim for all of them.
             provenance.unsigned_from_seq =
@@ -669,13 +669,8 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
     // tail no signature covers — and a reader who met "the two sides agree"
     // first would carry that sentence over the caveat that qualifies it.
     print!("{report}");
-    // And the verdict only over a report that was able to look. "No
-    // disagreements" printed under a journal whose lines this build could not
-    // account for is the sentence the incompleteness exists to prevent, and a
-    // consumer reading exit code and last line — which is what a script does —
-    // would take the fleet for clean.
-    if !report.has_findings() && report.is_complete() {
-        println!("{}", Msg::CodesReconcileClean.text(locale));
+    if let Some(verdict) = clean_verdict(&report, locale) {
+        println!("{verdict}");
     }
     Ok(())
 }
@@ -700,6 +695,18 @@ fn read_challenge(args: &IssueArgs, params: FleetParams) -> Result<SignedChallen
         group: RefusalGroup::Other,
         detail: error.to_string(),
     })
+}
+
+/// The sentence printed under a report that found nothing, or [`None`].
+///
+/// A function rather than a condition at the print, because the decision is
+/// what has to be testable: printing it is a `println!` nobody can assert
+/// about without capturing a stream. One verdict, read off the report as a
+/// whole — two predicates over parts of it, one for the last line of the
+/// report and one for the sentence under it, is how "no disagreements" came to
+/// be printed over a journal whose lines this build could not read.
+fn clean_verdict(report: &Report, locale: Locale) -> Option<&'static str> {
+    (report.verdict() == Verdict::Clean).then(|| Msg::CodesReconcileClean.text(locale))
 }
 
 /// Reads a signed device record.
@@ -1422,6 +1429,55 @@ mod tests {
                 )],
             };
             run_reconcile(&args, Locale::En).unwrap();
+        }
+
+        /// Вердикт «чисто» печатается только над отчётом, который смог
+        /// посмотреть.
+        ///
+        /// Проверяется решение, а не печать: до этой правки условие стояло
+        /// прямо в `println!`, и его откат оставлял весь набор зелёным.
+        #[test]
+        fn the_clean_verdict_is_withheld_from_a_report_that_could_not_look() {
+            use crate::codes::reconcile::{reconcile, Provenance};
+
+            let complete = reconcile(
+                &[],
+                Some(&[]),
+                &Provenance {
+                    chain_verified: true,
+                    unsigned_from_seq: None,
+                    refusals_without_nonce: 0,
+                    unpairable_lines: Vec::new(),
+                },
+            );
+            assert!(crate::cli::codes::clean_verdict(&complete, Locale::En).is_some());
+
+            // Устройства не было вовсе.
+            let absent = reconcile(&[], None, &Provenance::absent());
+            assert!(
+                crate::cli::codes::clean_verdict(&absent, Locale::En).is_none(),
+                "вердикт «чисто» над отчётом без устройства"
+            );
+
+            // Устройство было, но журнал нёс слово, которого сборка не знает.
+            let unreadable = reconcile(
+                &[],
+                Some(&[]),
+                &Provenance {
+                    chain_verified: true,
+                    unsigned_from_seq: None,
+                    refusals_without_nonce: 0,
+                    unpairable_lines: vec![crate::codes::reconcile::UnpairableLine {
+                        device_number: "77000123".to_owned(),
+                        line: 3,
+                        outcome: "granted".to_owned(),
+                    }],
+                },
+            );
+            assert!(
+                crate::cli::codes::clean_verdict(&unreadable, Locale::En).is_none(),
+                "вердикт «чисто» над непрочитанной строкой"
+            );
         }
     }
 }

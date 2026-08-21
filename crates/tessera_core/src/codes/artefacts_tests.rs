@@ -355,6 +355,40 @@ fn a_fresh_device_takes_a_delivery_at_the_configured_epoch() {
     assert_eq!(applied.epoch, Some(Epoch::new(7)));
 }
 
+/// Доставка между принятой эпохой и настроенной тоже запирает прибор.
+///
+/// Ветка, которой прежние починки не касались: файл эпохи ЕСТЬ, в нём 5,
+/// конфигурация называет 7, доставка несёт 6. Отката нет (6 > 5), поэтому
+/// прежняя проверка её пропускала, эпоха 6 записывалась — и `epoch::effective`
+/// отказывал на каждом входе. Одно условие вместо трёх веток закрывает и это.
+#[test]
+fn a_delivery_between_the_persisted_and_the_configured_epoch_is_refused() {
+    let (_dir, paths) = store();
+    apply(
+        &paths,
+        &Delivery::new().full(5),
+        None,
+        StoreCheck::Skipped,
+        Some(Epoch::new(5)),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        apply(
+            &paths,
+            &Delivery::new().full(6),
+            None,
+            StoreCheck::Skipped,
+            Some(Epoch::new(7)),
+        ),
+        Err(ArtefactError::EpochBehindConfigured {
+            delivered: 6,
+            configured: 7
+        })
+    ));
+    assert_eq!(epoch::read(&paths.state_dir).unwrap(), Some(Epoch::new(5)));
+}
+
 /// Эпоха доставки, равная настроенной или новее, на том же приборе проходит.
 ///
 /// Обратная сторона проверки выше: она не должна превращаться в отказ от

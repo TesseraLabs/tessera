@@ -482,26 +482,23 @@ fn plan_key(
         });
     };
 
-    // Asked of every device with no epoch file, whether or not it has spoken.
-    // With no file there is nothing to compare the delivery against except the
-    // configuration, and the delivery is about to create the file: an older
-    // epoch is written down happily, and every login afterwards refuses —
-    // `epoch::effective` finds the configuration ahead of the store and says
-    // so. That is a device taken out of service by a careful administrator
-    // applying a stale package, with no attack anywhere in the story, and the
-    // way back is editing files on the machine.
+    // The one question, asked of the delivery rather than of the shape of the
+    // branch it arrives in: would this device be able to log in after applying
+    // it? `epoch::effective` is what every login asks, so asking it here with
+    // the epoch this delivery would leave behind is the same question, put
+    // before the writing instead of after it.
     //
-    // It used to be asked only of a device that had spoken, which left the
-    // case this floor matters most in — first provisioning, no state file at
-    // all — with no floor whatsoever.
-    if persisted.is_none() {
-        if let Some(configured) = configured {
-            if key.epoch < configured {
-                return Err(ArtefactError::EpochBehindConfigured {
-                    delivered: key.epoch.get(),
-                    configured: configured.get(),
-                });
-            }
+    // It was three conditions before, glued to branch shapes — `persisted.is_none()`,
+    // then `&& has_spoken` — and each round removed one conjunct and left the
+    // next branch without a floor. A device with a persisted epoch below the
+    // configured one takes a delivery between the two and refuses every login
+    // afterwards: same story, branch nobody had reached yet.
+    if let Some(configured) = configured {
+        if epoch::effective(configured, Some(key.epoch)).is_err() {
+            return Err(ArtefactError::EpochBehindConfigured {
+                delivered: key.epoch.get(),
+                configured: configured.get(),
+            });
         }
     }
 
