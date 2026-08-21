@@ -175,12 +175,19 @@ impl AuditRecord {
     #[must_use]
     pub fn write_discipline(&self) -> WriteDiscipline {
         match self {
-            // Asked of the vocabulary rather than compared against one word:
-            // a fourth word meaning an opened session must land on the
-            // fail-closed side without an edit here.
+            // Asked of the vocabulary rather than compared against one word,
+            // and an outcome the vocabulary does not carry lands on the
+            // fail-closed side too. A word this build cannot classify may name
+            // an opened session, and the cost of the two mistakes is not
+            // symmetric: writing a settled refusal fail-closed costs a refused
+            // login on a device whose journal is broken, while writing an
+            // opened session best-effort costs a session nothing can account
+            // for.
             AuditRecord::CodeLogin { outcome, .. }
-                if tessera_codes_contract::outcome::classify(outcome)
-                    == tessera_codes_contract::outcome::Outcome::Admission =>
+                if !matches!(
+                    tessera_codes_contract::outcome::classify(outcome),
+                    tessera_codes_contract::outcome::Outcome::Refusal
+                ) =>
             {
                 WriteDiscipline::FailClosed
             }
@@ -265,6 +272,23 @@ mod tests {
             .write_discipline(),
             WriteDiscipline::EscalateAfterTheFact
         );
+    }
+
+    /// An outcome this build cannot classify is written fail-closed.
+    ///
+    /// The two mistakes do not cost the same. Writing a settled refusal
+    /// fail-closed costs a refused login on a device whose journal is broken;
+    /// writing an opened session best-effort costs a session nothing can
+    /// account for. A word that may mean either belongs on the first side.
+    #[test]
+    fn an_outcome_this_build_cannot_classify_is_fail_closed() {
+        for word in ["granted", "success_after_retry", ""] {
+            assert_eq!(
+                login(word).write_discipline(),
+                WriteDiscipline::FailClosed,
+                "outcome: {word:?}"
+            );
+        }
     }
 
     /// The fixed records are supposed to be safe by construction. This is what

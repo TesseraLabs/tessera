@@ -598,6 +598,7 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
         chain_verified: true,
         unsigned_from_seq: None,
         refusals_without_nonce: 0,
+        unaccounted_without_nonce: std::collections::BTreeSet::new(),
     };
     let logins = if args.device_journals.is_empty() {
         None
@@ -636,6 +637,9 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
             provenance.refusals_without_nonce = provenance
                 .refusals_without_nonce
                 .saturating_add(journal.refusals_without_nonce);
+            provenance
+                .unaccounted_without_nonce
+                .extend(journal.unaccounted_without_nonce);
             // The earliest unsigned tail across the journals: the weakest of
             // them is what the report may claim for all of them.
             provenance.unsigned_from_seq =
@@ -651,7 +655,7 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
     let report = reconcile(
         &entries,
         logins.as_deref(),
-        if logins.is_some() {
+        &if logins.is_some() {
             provenance
         } else {
             Provenance::absent()
@@ -665,7 +669,12 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
     // tail no signature covers — and a reader who met "the two sides agree"
     // first would carry that sentence over the caveat that qualifies it.
     print!("{report}");
-    if !report.has_findings() {
+    // And the verdict only over a report that was able to look. "No
+    // disagreements" printed under a journal whose lines this build could not
+    // account for is the sentence the incompleteness exists to prevent, and a
+    // consumer reading exit code and last line — which is what a script does —
+    // would take the fleet for clean.
+    if !report.has_findings() && report.is_complete() {
         println!("{}", Msg::CodesReconcileClean.text(locale));
     }
     Ok(())

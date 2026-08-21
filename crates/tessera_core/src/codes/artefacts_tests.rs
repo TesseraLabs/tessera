@@ -312,6 +312,49 @@ fn a_delivery_behind_the_configuration_is_refused_on_a_device_with_no_epoch_file
     assert_eq!(epoch::read(&paths.state_dir).unwrap(), None);
 }
 
+/// На чистом приборе пол эпохи действует так же.
+///
+/// Первичное развёртывание: нет ни файла эпохи, ни файла состояния. Первая
+/// версия проверки стояла внутри ветки «разговоры были», и случай, ради
+/// которого пол вообще нужен, оставался без пола вовсе: устаревший пакет
+/// записывал младшую эпоху, и прибор отказывал на каждом входе — при том, что
+/// это его ПЕРВАЯ раскладка.
+#[test]
+fn a_delivery_behind_the_configuration_is_refused_on_a_fresh_device() {
+    let (_dir, paths) = store();
+
+    let stale = Delivery::new();
+    assert!(matches!(
+        apply(
+            &paths,
+            &stale.full(3),
+            None,
+            StoreCheck::Skipped,
+            Some(Epoch::new(7)),
+        ),
+        Err(ArtefactError::EpochBehindConfigured {
+            delivered: 3,
+            configured: 7
+        })
+    ));
+    assert_eq!(epoch::read(&paths.state_dir).unwrap(), None);
+}
+
+/// И на чистом приборе доставка вровень с конфигурацией проходит.
+#[test]
+fn a_fresh_device_takes_a_delivery_at_the_configured_epoch() {
+    let (_dir, paths) = store();
+    let applied = apply(
+        &paths,
+        &Delivery::new().full(7),
+        None,
+        StoreCheck::Skipped,
+        Some(Epoch::new(7)),
+    )
+    .unwrap();
+    assert_eq!(applied.epoch, Some(Epoch::new(7)));
+}
+
 /// Эпоха доставки, равная настроенной или новее, на том же приборе проходит.
 ///
 /// Обратная сторона проверки выше: она не должна превращаться в отказ от

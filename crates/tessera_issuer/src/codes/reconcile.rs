@@ -202,7 +202,7 @@ pub struct Disagreement {
 }
 
 /// What could be established about the device side of a reconciliation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
     /// Whether every journal carried a hash chain that verified.
     pub chain_verified: bool,
@@ -216,7 +216,22 @@ pub struct Provenance {
     /// [`LoginEntry`] at all; it is counted here instead, because the report
     /// promises to say how many refusals were read, and a promise kept for some
     /// of them is not kept.
+    ///
+    /// Refusals, counted by their outcome and not by the missing nonce: what a
+    /// line without a nonce records is what its outcome says, and everything
+    /// else about it is inference.
     pub refusals_without_nonce: u64,
+    /// Outcome words of lines with no nonce that record something other than a
+    /// refusal.
+    ///
+    /// Two kinds land here, and both mean the same thing for a report: the
+    /// reader cannot account for the line. One is a word this build does not
+    /// know. The other is an admission with no nonce — a device saying it let
+    /// somebody in without naming the attempt, which pairs with no receipt and
+    /// is not a refusal to be counted away.
+    ///
+    /// Non-empty makes the report incomplete.
+    pub unaccounted_without_nonce: BTreeSet<String>,
 }
 
 impl Provenance {
@@ -227,6 +242,7 @@ impl Provenance {
             chain_verified: false,
             unsigned_from_seq: None,
             refusals_without_nonce: 0,
+            unaccounted_without_nonce: BTreeSet::new(),
         }
     }
 }
@@ -316,34 +332,45 @@ impl fmt::Display for Report {
     /// locale; a consumer that heads the report with a caption localizes the
     /// caption.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The caveats are independent statements about one report, so they are
+        // printed independently: a journal can carry a word this build cannot
+        // read *and* no chain to hold its lines in place, and an auditor who
+        // was told only the first of those has been told the smaller half.
+        // They used to be a chain of `else if`, where the first true one
+        // silenced the rest.
+        //
+        // The absence of a device side is the exception, and it is not a
+        // caveat but the absence of the thing the others qualify: there is no
+        // journal to say anything about.
         if !self.device_side {
             writeln!(
                 f,
                 "incomplete: no device journal was supplied; only receipts were read"
             )?;
-        } else if !self.unknown_outcomes.is_empty() {
-            // Ahead of the chain caveat on purpose: a journal whose outcomes
-            // this build cannot read is one whose findings were not computed at
-            // all, which is a stronger statement than "they were computed over
-            // lines that could have been removed".
+            return self.write_findings(f);
+        }
+
+        if !self.unknown_outcomes.is_empty() {
             writeln!(
                 f,
-                "incomplete: the device journal carries outcomes this build does not know ({}); \
-                 lines with them counted as neither logins nor refusals, so the classes above \
-                 were not computed for them",
+                "incomplete: the device journal carries outcomes this build cannot account for \
+                 ({}); lines with them counted as neither logins nor refusals, so the classes \
+                 above were not computed for them",
                 self.unknown_outcomes
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join(", ")
             )?;
-        } else if !self.chain_verified {
+        }
+        if !self.chain_verified {
             writeln!(
                 f,
                 "unverified: a device journal carried no hash chain; lines could have been \
                  removed from it without a trace"
             )?;
-        } else if let Some(seq) = self.unsigned_from_seq {
+        }
+        if let Some(seq) = self.unsigned_from_seq {
             // The chain held, which settles everything before the last head
             // signature. After it, a dropped line leaves a valid prefix — so the
             // absence of a finding in that range says less than it appears to.
@@ -354,6 +381,16 @@ impl fmt::Display for Report {
                  itself is not checked here"
             )?;
         }
+        self.write_findings(f)
+    }
+}
+
+impl Report {
+    /// Writes the findings and the counts that follow the caveats.
+    ///
+    /// Split out so the one case that ends the report early — no device side at
+    /// all — can reach them without repeating the body.
+    fn write_findings(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for login in &self.logins_without_receipt {
             writeln!(
                 f,
@@ -425,7 +462,7 @@ impl fmt::Display for Report {
 pub fn reconcile(
     receipts: &[ReceiptEntry],
     logins: Option<&[LoginEntry]>,
-    provenance: Provenance,
+    provenance: &Provenance,
 ) -> Report {
     // Only the lines that record an admission take part in the four classes:
     // a refusal is an attempt the device turned away, and reading it as a login
@@ -446,6 +483,10 @@ pub fn reconcile(
         }
     }
     let refusals_read = refusals.saturating_add(provenance.refusals_without_nonce);
+    // Lines with no nonce that the reader could not account for join the words
+    // it could not classify: for a report they mean one thing — something in
+    // this journal was not understood, so the journal was not read clean.
+    unknown_outcomes.extend(provenance.unaccounted_without_nonce.iter().cloned());
 
     let mut report = Report {
         logins_without_receipt: Vec::new(),
@@ -672,6 +713,12 @@ pub struct DeviceJournal {
     /// them among the refusals it says it read. See
     /// [`Provenance::refusals_without_nonce`].
     pub refusals_without_nonce: u64,
+    /// Outcome words of lines with no nonce that are not refusals.
+    ///
+    /// A line saying a session was opened but naming no attempt, or one
+    /// carrying a word this build does not know. Neither can be paired and
+    /// neither is a refusal — see [`Provenance::unaccounted_without_nonce`].
+    pub unaccounted_without_nonce: BTreeSet<String>,
 }
 
 /// Reads the code-login lines of one device journal.
@@ -720,6 +767,7 @@ pub fn read_journal(
 
     let mut entries = Vec::new();
     let mut refusals_without_nonce = 0_u64;
+    let mut unaccounted_without_nonce: BTreeSet<String> = BTreeSet::new();
     for (index, line) in lines.iter().enumerate() {
         let number = index + 1;
         let value: serde_json::Value =
@@ -736,24 +784,22 @@ pub fn read_journal(
         };
         let number_field = |name: &str| value.get(name).and_then(serde_json::Value::as_u64);
 
+        // Every field a code-login line owes, read before anything is decided
+        // about the line. The doctrine of this parser is that nothing is
+        // repaired and nothing is skipped, and a line with no nonce used to
+        // leave through a shortcut that read none of them.
         let nonce_text = text_field("nonce_ref").ok_or(JournalError::MissingField {
             line: number,
             field: "nonce_ref",
         })?;
-        if nonce_text == ABSENT {
-            // A refusal that happened before the device drew a nonce: no
-            // ticket, a role it does not define, a throttle. It pairs with
-            // nothing, so it is not an entry — but it is counted, because the
-            // report says how many refusals it read and would otherwise be
-            // saying it about only some of them.
-            refusals_without_nonce = refusals_without_nonce.saturating_add(1);
-            continue;
-        }
-        let nonce = Nonce::parse(&nonce_text, params).map_err(|_| JournalError::UnusableField {
+        let outcome = text_field("outcome").ok_or(JournalError::MissingField {
             line: number,
-            field: "nonce_ref",
+            field: "outcome",
         })?;
-
+        let role_id = text_field("role_id").ok_or(JournalError::MissingField {
+            line: number,
+            field: "role_id",
+        })?;
         let epoch = number_field("epoch").ok_or(JournalError::MissingField {
             line: number,
             field: "epoch",
@@ -762,6 +808,34 @@ pub fn read_journal(
             line: number,
             field: "level",
         })?;
+
+        if nonce_text == ABSENT {
+            // The device refused before it drew a nonce: no ticket, a role it
+            // does not define, a throttle. Such a line pairs with nothing, so
+            // it is not an entry — but what it *is* has to be asked of the
+            // outcome, not assumed from the missing nonce.
+            //
+            // Assuming was the defect: a line saying `success` with no nonce,
+            // or one carrying a word this build does not know, was counted as a
+            // refusal and the report called itself complete. The reader accepts
+            // that a journal can come from a build whose vocabulary is wider
+            // than its own; accepting that for the lines with a nonce and
+            // refusing it for the lines beside them is not a position.
+            match outcome::classify(&outcome) {
+                Outcome::Refusal => {
+                    refusals_without_nonce = refusals_without_nonce.saturating_add(1);
+                }
+                Outcome::Admission | Outcome::Unknown => {
+                    unaccounted_without_nonce.insert(outcome);
+                }
+            }
+            continue;
+        }
+        let nonce = Nonce::parse(&nonce_text, params).map_err(|_| JournalError::UnusableField {
+            line: number,
+            field: "nonce_ref",
+        })?;
+
         entries.push(LoginEntry {
             device_number: device_number.to_owned(),
             epoch: u32::try_from(epoch).map_err(|_| JournalError::UnusableField {
@@ -769,23 +843,22 @@ pub fn read_journal(
                 field: "epoch",
             })?,
             nonce,
-            role_id: text_field("role_id").ok_or(JournalError::MissingField {
-                line: number,
-                field: "role_id",
-            })?,
+            role_id,
             level: u32::try_from(level).map_err(|_| JournalError::UnusableField {
                 line: number,
                 field: "level",
             })?,
             ticket_number: text_field("ticket_no").filter(|ticket| ticket != ABSENT),
-            outcome: text_field("outcome").ok_or(JournalError::MissingField {
-                line: number,
-                field: "outcome",
-            })?,
+            outcome,
         });
     }
 
-    if entries.is_empty() {
+    // A journal of nothing but refusals that never reached a nonce is a journal
+    // of a device that spent the period turning people away. It has no entries
+    // and it is not empty: refusing to read it fails the whole reconciliation
+    // on `?`, and the count this journal carries — the one the report promises
+    // to state — never reaches the report at all.
+    if entries.is_empty() && refusals_without_nonce == 0 && unaccounted_without_nonce.is_empty() {
         return Err(JournalError::NoLoginLines);
     }
     Ok(DeviceJournal {
@@ -793,6 +866,7 @@ pub fn read_journal(
         chain_verified,
         unsigned_from_seq,
         refusals_without_nonce,
+        unaccounted_without_nonce,
     })
 }
 
@@ -870,6 +944,8 @@ pub enum JournalError {
     reason = "a failed setup step in a test should fail the test on the spot"
 )]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{read_journal, reconcile, JournalError, LoginEntry, Provenance, ReceiptEntry};
     use tessera_codes_contract::nonce::Nonce;
     use tessera_codes_contract::outcome;
@@ -882,6 +958,7 @@ mod tests {
             chain_verified: true,
             unsigned_from_seq: None,
             refusals_without_nonce: 0,
+            unaccounted_without_nonce: BTreeSet::new(),
         }
     }
 
@@ -943,7 +1020,7 @@ mod tests {
     /// который себя выдаёт», и опечатка на клавиатуре не должна его поднимать.
     #[test]
     fn a_mistyped_code_is_not_a_series_on_one_nonce() {
-        let report = reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), &verified());
         assert!(
             !report.has_findings(),
             "штатная опечатка подняла находку: {report}"
@@ -961,7 +1038,7 @@ mod tests {
     /// класса «код выдан мимо книг» и утопить в них настоящую.
     #[test]
     fn refusals_do_not_become_logins_without_a_receipt() {
-        let report = reconcile(&[], Some(&[refused(1), refused(2)]), verified());
+        let report = reconcile(&[], Some(&[refused(1), refused(2)]), &verified());
         assert!(
             report.logins_without_receipt.is_empty(),
             "отказ прочитан как вход: {report}"
@@ -976,7 +1053,7 @@ mod tests {
         let report = reconcile(
             &[],
             Some(&[login_with(1, outcome::OUTCOME_ATTEMPTS_EXHAUSTED)]),
-            verified(),
+            &verified(),
         );
         assert!(report.logins_without_receipt.is_empty());
         assert_eq!(report.refusals_read(), 1);
@@ -990,13 +1067,92 @@ mod tests {
     /// ловится ничем. Ожидания кейсов цепляются за префикс и тоже молчат.
     #[test]
     fn no_line_of_the_report_carries_a_run_of_spaces() {
-        let report = reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), verified());
-        let text = report.to_string();
-        assert!(
-            text.contains("they are not logins and take part in no finding above"),
-            "фраза разорвана пробелами: {text}"
+        // Первая версия этого сторожа брала ОДИН отчёт, печатавший две строки
+        // из десяти возможных, — и мутация в соседнем литерале («unverified»)
+        // его не роняла. Сторож, зеленеющий на классе, который стережёт, хуже
+        // отсутствующего, поэтому здесь перебираются отчёты, покрывающие каждую
+        // ветку `Display`: обе оговорки, обе одновременно, все четыре класса
+        // находок, счётчик отказов и «no findings».
+        let mut odd = login(2);
+        odd.role_id = "ops.dc.junior".to_owned();
+
+        let unverified = Provenance {
+            chain_verified: false,
+            unsigned_from_seq: Some(4),
+            refusals_without_nonce: 1,
+            unaccounted_without_nonce: BTreeSet::from(["granted".to_owned()]),
+        };
+
+        let reports = [
+            (
+                "без устройства",
+                reconcile(&[receipt(1)], None, &verified()),
+            ),
+            (
+                "чисто",
+                reconcile(&[receipt(1)], Some(&[login(1)]), &verified()),
+            ),
+            (
+                "отказы",
+                reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), &verified()),
+            ),
+            (
+                "все оговорки сразу",
+                reconcile(&[receipt(1)], Some(&[login(1)]), &unverified),
+            ),
+            (
+                "все четыре класса",
+                reconcile(
+                    &[receipt(1), receipt(3)],
+                    Some(&[login(1), odd, login(2), login(4)]),
+                    &verified(),
+                ),
+            ),
+        ];
+
+        for (name, report) in reports {
+            let text = report.to_string();
+            assert!(
+                !text.contains("  "),
+                "{name}: в отчёте прогон пробелов: {text}"
+            );
+            if name == "отказы" {
+                // Проверка отсутствия прогона пробелов ловит разорванную
+                // фразу, но не всякую; фраза целиком сверяется отдельно.
+                assert!(
+                    text.contains("they are not logins and take part in no finding above"),
+                    "{name}: фраза собралась не так: {text}"
+                );
+            }
+            assert!(
+                !text.lines().any(str::is_empty),
+                "{name}: в отчёте пустая строка: {text}"
+            );
+        }
+    }
+
+    /// Все оговорки печатаются, а не первая сработавшая.
+    ///
+    /// Незнакомое слово и отсутствующая цепочка — независимые утверждения об
+    /// одном отчёте. Аудитор, которому сказали только первое, услышал меньшую
+    /// половину: строки могли быть удалены без следа, и об этом он не узнает.
+    #[test]
+    fn every_caveat_that_applies_is_printed() {
+        let report = reconcile(
+            &[],
+            Some(&[login_with(1, "granted")]),
+            &Provenance {
+                chain_verified: false,
+                unsigned_from_seq: Some(9),
+                refusals_without_nonce: 0,
+                unaccounted_without_nonce: BTreeSet::new(),
+            },
         );
-        assert!(!text.contains("  "), "в отчёте прогон пробелов: {text}");
+        let text = report.to_string();
+
+        assert!(text.contains("granted"), "{text}");
+        assert!(text.contains("unverified"), "{text}");
+        assert!(text.contains("unsigned-tail from=9"), "{text}");
     }
 
     /// Расхождение второго входа на том же nonce не теряется.
@@ -1017,7 +1173,7 @@ mod tests {
             ("расходящийся первым", vec![odd.clone(), login(1)]),
             ("расходящийся вторым", vec![login(1), odd.clone()]),
         ] {
-            let report = reconcile(&[receipt(1)], Some(&logins), verified());
+            let report = reconcile(&[receipt(1)], Some(&logins), &verified());
 
             assert_eq!(report.series_on_one_nonce.len(), 1, "{order}");
             assert_eq!(
@@ -1040,7 +1196,7 @@ mod tests {
     /// остаётся неотоваренной. Иначе отказ прятал бы находку.
     #[test]
     fn a_refusal_does_not_answer_a_receipt() {
-        let report = reconcile(&[receipt(1)], Some(&[refused(1)]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[refused(1)]), &verified());
         assert_eq!(report.receipts_without_login.len(), 1);
         assert!(report.disagreements.is_empty());
         assert_eq!(report.refusals_read(), 1);
@@ -1056,7 +1212,7 @@ mod tests {
     /// «no findings» над журналом, где всё как раз и произошло.
     #[test]
     fn an_outcome_this_reader_does_not_know_makes_the_report_incomplete() {
-        let report = reconcile(&[], Some(&[login_with(1, "granted")]), verified());
+        let report = reconcile(&[], Some(&[login_with(1, "granted")]), &verified());
 
         assert!(report.logins_without_receipt.is_empty());
         assert_eq!(
@@ -1083,10 +1239,95 @@ mod tests {
     /// повод усомниться в полноте, а не повод замолчать понятое.
     #[test]
     fn an_unknown_outcome_does_not_silence_the_lines_that_were_understood() {
-        let report = reconcile(&[], Some(&[login(1), login_with(2, "granted")]), verified());
+        let report = reconcile(
+            &[],
+            Some(&[login(1), login_with(2, "granted")]),
+            &verified(),
+        );
         assert_eq!(report.logins_without_receipt.len(), 1);
         assert!(report.has_findings());
         assert!(!report.is_complete());
+    }
+
+    /// Строка без nonce классифицируется по ИСХОДУ, а не по отсутствию nonce.
+    ///
+    /// Дефект, заведённый починкой предыдущего круга: для строк с nonce вопрос
+    /// «допуск или нет» был заменён тремя ответами, а для строк без nonce тот же
+    /// двоичный вопрос остался — всё, что не имело nonce, объявлялось отказом.
+    /// Слово `success` без nonce и слово, которого сборка не знает, оба уходили
+    /// в счётчик отказов, и отчёт называл себя полным.
+    #[test]
+    fn a_line_without_a_nonce_is_read_by_its_outcome() {
+        let text = device_chain(&[
+            device_login(nonce(1).as_str(), "success"),
+            device_login("-", "denied"),
+            device_login("-", "success"),
+            device_login("-", "granted"),
+        ]);
+        let journal = read_journal("77000123", &text, &FleetParams::defaults()).unwrap();
+
+        assert_eq!(journal.refusals_without_nonce, 1, "отказом считается отказ");
+        assert_eq!(
+            journal.unaccounted_without_nonce,
+            BTreeSet::from(["granted".to_owned(), "success".to_owned()]),
+            "допуск без nonce и незнакомое слово — не отказы"
+        );
+
+        let report = reconcile(
+            &[receipt(1)],
+            Some(&journal.entries),
+            &Provenance {
+                chain_verified: journal.chain_verified,
+                unsigned_from_seq: None,
+                refusals_without_nonce: journal.refusals_without_nonce,
+                unaccounted_without_nonce: journal.unaccounted_without_nonce.clone(),
+            },
+        );
+
+        assert_eq!(report.refusals_read(), 1);
+        assert!(
+            !report.is_complete(),
+            "отчёт объявил себя полным над строками, которых не понял: {report}"
+        );
+        assert!(report.to_string().contains("granted"));
+    }
+
+    /// Кривая строка без nonce — тоже кривая строка.
+    ///
+    /// Доктрина разбора: ничего не чинится и ничего не пропускается. Строка без
+    /// nonce уходила через сокращение, которое не читало ни одного из
+    /// обязательных полей.
+    #[test]
+    fn a_line_without_a_nonce_still_owes_its_fields() {
+        let text = device_chain(&[serde_json::json!({
+            "op": "code_login",
+            "nonce_ref": "-",
+            "role_id": "ops.dc.senior",
+            "level": 2,
+            "epoch": 7,
+            "ticket_no": "tk-17",
+        })]);
+        assert!(matches!(
+            read_journal("77000123", &text, &FleetParams::defaults()),
+            Err(JournalError::MissingField {
+                field: "outcome",
+                ..
+            })
+        ));
+    }
+
+    /// Журнал из одних дононсовых отказов читается, а не отвергается.
+    ///
+    /// Это журнал прибора, который за период отказал всем и ни разу не дошёл до
+    /// nonce. Отказ читателя роняет весь прогон сверки на `?`, а счётчик,
+    /// который отчёт обещает назвать, не доезжает до отчёта вовсе.
+    #[test]
+    fn a_journal_of_nothing_but_pre_nonce_refusals_is_read() {
+        let text = device_chain(&[device_login("-", "denied"), device_login("-", "denied")]);
+        let journal = read_journal("77000123", &text, &FleetParams::defaults()).unwrap();
+
+        assert!(journal.entries.is_empty());
+        assert_eq!(journal.refusals_without_nonce, 2);
     }
 
     /// Отказы, случившиеся до розыгрыша nonce, входят в счётчик прочитанных.
@@ -1110,10 +1351,11 @@ mod tests {
         let report = reconcile(
             &[receipt(1)],
             Some(&journal.entries),
-            Provenance {
+            &Provenance {
                 chain_verified: journal.chain_verified,
                 unsigned_from_seq: None,
                 refusals_without_nonce: journal.refusals_without_nonce,
+                unaccounted_without_nonce: journal.unaccounted_without_nonce.clone(),
             },
         );
         assert!(!report.has_findings());
@@ -1123,7 +1365,7 @@ mod tests {
 
     #[test]
     fn a_matching_pair_raises_nothing() {
-        let report = reconcile(&[receipt(1)], Some(&[login(1)]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[login(1)]), &verified());
         assert!(report.is_complete());
         assert!(!report.has_findings());
         assert!(report.to_string().contains("no findings"));
@@ -1131,14 +1373,14 @@ mod tests {
 
     #[test]
     fn a_login_nobody_wrote_a_receipt_for_is_reported() {
-        let report = reconcile(&[], Some(&[login(1)]), verified());
+        let report = reconcile(&[], Some(&[login(1)]), &verified());
         assert_eq!(report.logins_without_receipt.len(), 1);
         assert!(report.to_string().contains("login-without-receipt"));
     }
 
     #[test]
     fn a_receipt_no_device_saw_is_reported() {
-        let report = reconcile(&[receipt(1)], Some(&[]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[]), &verified());
         assert_eq!(report.receipts_without_login.len(), 1);
         assert!(report.to_string().contains("receipt-without-login"));
     }
@@ -1147,7 +1389,7 @@ mod tests {
     /// независимо от того, чем они отличаются в остальном.
     #[test]
     fn two_issuances_on_one_nonce_are_reported() {
-        let report = reconcile(&[receipt(1), receipt(1)], Some(&[login(1)]), verified());
+        let report = reconcile(&[receipt(1), receipt(1)], Some(&[login(1)]), &verified());
         assert_eq!(report.series_on_one_nonce.len(), 1);
         let series = report.series_on_one_nonce.first().unwrap();
         assert_eq!(series.receipts, 2);
@@ -1158,7 +1400,7 @@ mod tests {
     fn two_logins_on_one_nonce_are_reported() {
         // Попытка отвечается один раз: два входа на один nonce значат, что одна
         // из сторон не та, за кого себя выдаёт.
-        let report = reconcile(&[receipt(1)], Some(&[login(1), login(1)]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[login(1), login(1)]), &verified());
         assert_eq!(report.series_on_one_nonce.len(), 1);
         assert_eq!(
             report
@@ -1171,7 +1413,7 @@ mod tests {
 
     #[test]
     fn one_receipt_and_its_login_are_not_a_series() {
-        let report = reconcile(&[receipt(1)], Some(&[login(1)]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[login(1)]), &verified());
         assert!(report.series_on_one_nonce.is_empty());
     }
 
@@ -1179,14 +1421,14 @@ mod tests {
     fn a_pair_that_disagrees_about_the_role_is_reported() {
         let mut login = login(1);
         login.role_id = "ops.dc.root".to_owned();
-        let report = reconcile(&[receipt(1)], Some(&[login]), verified());
+        let report = reconcile(&[receipt(1)], Some(&[login]), &verified());
         assert_eq!(report.disagreements.len(), 1);
         assert_eq!(report.disagreements.first().unwrap().fields, vec!["role"]);
     }
 
     #[test]
     fn a_report_without_the_device_side_says_so() {
-        let report = reconcile(&[receipt(1)], None, verified());
+        let report = reconcile(&[receipt(1)], None, &verified());
         assert!(!report.is_complete());
         assert!(report.to_string().contains("incomplete"));
         assert!(report.logins_without_receipt.is_empty());
@@ -1330,10 +1572,11 @@ mod tests {
         let report = reconcile(
             &[],
             Some(&journal.entries),
-            Provenance {
+            &Provenance {
                 chain_verified: journal.chain_verified,
                 unsigned_from_seq: journal.unsigned_from_seq,
                 refusals_without_nonce: journal.refusals_without_nonce,
+                unaccounted_without_nonce: journal.unaccounted_without_nonce.clone(),
             },
         );
         assert!(report.to_string().contains("unverified"));
@@ -1351,10 +1594,11 @@ mod tests {
         let report = reconcile(
             &[],
             Some(&journal.entries),
-            Provenance {
+            &Provenance {
                 chain_verified: journal.chain_verified,
                 unsigned_from_seq: journal.unsigned_from_seq,
                 refusals_without_nonce: journal.refusals_without_nonce,
+                unaccounted_without_nonce: journal.unaccounted_without_nonce.clone(),
             },
         );
         assert!(report.to_string().contains("unsigned-tail from=0"));

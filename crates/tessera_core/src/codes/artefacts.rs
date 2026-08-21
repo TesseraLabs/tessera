@@ -482,15 +482,19 @@ fn plan_key(
         });
     };
 
-    if persisted.is_none() && has_spoken {
-        // The only floor such a device has is the epoch in its configuration:
-        // there is no epoch file to compare against, and the delivery is about
-        // to create one. Without this check an older epoch is written down
-        // happily, and every login afterwards refuses — `epoch::effective`
-        // finds the configuration ahead of the store and says so. That is a
-        // device taken out of service by a careful administrator applying a
-        // stale package, with no attack anywhere in the story, and the way back
-        // is editing files on the machine.
+    // Asked of every device with no epoch file, whether or not it has spoken.
+    // With no file there is nothing to compare the delivery against except the
+    // configuration, and the delivery is about to create the file: an older
+    // epoch is written down happily, and every login afterwards refuses —
+    // `epoch::effective` finds the configuration ahead of the store and says
+    // so. That is a device taken out of service by a careful administrator
+    // applying a stale package, with no attack anywhere in the story, and the
+    // way back is editing files on the machine.
+    //
+    // It used to be asked only of a device that had spoken, which left the
+    // case this floor matters most in — first provisioning, no state file at
+    // all — with no floor whatsoever.
+    if persisted.is_none() {
         if let Some(configured) = configured {
             if key.epoch < configured {
                 return Err(ArtefactError::EpochBehindConfigured {
@@ -499,6 +503,12 @@ fn plan_key(
                 });
             }
         }
+    }
+
+    if persisted.is_none() && has_spoken {
+        // A device provisioned by hand is not a fresh one, and the delivery is
+        // not moving it anywhere: what it gets is the epoch written down
+        // explicitly.
         return Ok(KeyPlan {
             write_key: true,
             persist_epoch: Some(key.epoch),
@@ -894,7 +904,7 @@ mod platform_tests {
             ..CodesDelivery::default()
         };
 
-        let error = apply(&paths, &delivery, None, StoreCheck::Enforced).unwrap_err();
+        let error = apply(&paths, &delivery, None, StoreCheck::Enforced, None).unwrap_err();
 
         assert!(
             matches!(error, super::ArtefactError::UnsupportedPlatform(_)),

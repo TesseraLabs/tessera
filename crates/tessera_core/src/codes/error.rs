@@ -58,11 +58,17 @@ pub enum CodeLoginError {
 
     /// The device refuses for now, and will stop refusing on its own.
     ///
-    /// Two limits produce this: the budget of challenges the device issues in a
-    /// window, which is what keeps a caller from making this device draw
-    /// ephemeral pairs all day, and the lock a run of failed attempts puts on
-    /// one role. Both expire without anybody clearing them — see
-    /// [`super::throttle`].
+    /// Three things produce this. Two are limits of the throttle: the budget of
+    /// challenges the device issues in a window, which is what keeps a caller
+    /// from making this device draw ephemeral pairs all day, and the lock a run
+    /// of failed attempts puts on one role — both expire without anybody
+    /// clearing them, see [`super::throttle`].
+    ///
+    /// The third is not a limit at all: another login holds the state of this
+    /// device while it is being answered. A device carries one live attempt by
+    /// design, so a console login arriving while an SSH session is on the
+    /// telephone waits — and waiting is what this error says. It clears when
+    /// the other attempt ends, which is the same promise the other two make.
     #[error("the code method is refusing for another {} second(s)", retry_after.as_secs())]
     TemporarilyLocked {
         /// How long the caller has to wait.
