@@ -399,7 +399,8 @@ impl fmt::Display for Report {
         if self.refusals_read > 0 {
             writeln!(
                 f,
-                "refusals-read count={}: attempts the devices refused; they are not logins and                  take part in no finding above",
+                "refusals-read count={}: attempts the devices refused; they are not logins \
+                 and take part in no finding above",
                 self.refusals_read
             )?;
         }
@@ -979,6 +980,23 @@ mod tests {
         );
         assert!(report.logins_without_receipt.is_empty());
         assert_eq!(report.refusals_read(), 1);
+    }
+
+    /// Строки отчёта читает человек, и лишних пробелов в них нет.
+    ///
+    /// Проверка дешёвая и неочевидно нужная: `rustfmt` содержимое строковых
+    /// литералов не трогает, поэтому перенос строки в исходнике, сделанный без
+    /// экранирования, уезжает в вывод прогоном пробелов посреди фразы и не
+    /// ловится ничем. Ожидания кейсов цепляются за префикс и тоже молчат.
+    #[test]
+    fn no_line_of_the_report_carries_a_run_of_spaces() {
+        let report = reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), verified());
+        let text = report.to_string();
+        assert!(
+            text.contains("they are not logins and take part in no finding above"),
+            "фраза разорвана пробелами: {text}"
+        );
+        assert!(!text.contains("  "), "в отчёте прогон пробелов: {text}");
     }
 
     /// Расхождение второго входа на том же nonce не теряется.
