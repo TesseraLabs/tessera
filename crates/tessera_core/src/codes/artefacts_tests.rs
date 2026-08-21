@@ -389,6 +389,41 @@ fn a_delivery_between_the_persisted_and_the_configured_epoch_is_refused() {
     assert_eq!(epoch::read(&paths.state_dir).unwrap(), Some(Epoch::new(5)));
 }
 
+/// Доставка ниже ОБОИХ полов называется откатом, а не отставанием.
+///
+/// Два отказа публичны и говорят оператору разное: «пакет старее того, что на
+/// приборе уже лежит» и «пакет старее конфигурации парка». Оператор, которому
+/// при обеих ошибках назвали вторую, пересоберёт носитель на настроенную эпоху
+/// и получит первую вторым заходом — диагноз в два круга вместо одного.
+#[test]
+fn a_delivery_below_both_floors_is_named_a_rollback() {
+    let (_dir, paths) = store();
+    apply(
+        &paths,
+        &Delivery::new().full(9),
+        None,
+        StoreCheck::Skipped,
+        Some(Epoch::new(9)),
+    )
+    .unwrap();
+
+    // Прибор на 9, конфигурация называет 5, доставка несёт 3: ниже обоих.
+    assert!(matches!(
+        apply(
+            &paths,
+            &Delivery::new().full(3),
+            None,
+            StoreCheck::Skipped,
+            Some(Epoch::new(5)),
+        ),
+        Err(ArtefactError::EpochRollback {
+            delivered: 3,
+            persisted: 9
+        })
+    ));
+    assert_eq!(epoch::read(&paths.state_dir).unwrap(), Some(Epoch::new(9)));
+}
+
 /// Эпоха доставки, равная настроенной или новее, на том же приборе проходит.
 ///
 /// Обратная сторона проверки выше: она не должна превращаться в отказ от

@@ -493,6 +493,22 @@ fn plan_key(
     // next branch without a floor. A device with a persisted epoch below the
     // configured one takes a delivery between the two and refuses every login
     // afterwards: same story, branch nobody had reached yet.
+    //
+    // Two floors, and the order between them is not an accident of the code: a
+    // delivery below both is refused by the one the operator can act on. "Older
+    // than what the device already holds" tells them the medium is stale;
+    // "older than the fleet configuration" tells them to cut a newer one — and
+    // an operator told the second when both are true cuts a medium at the
+    // configured epoch and meets the first on the next attempt. One diagnosis
+    // instead of two.
+    if let Some(current) = persisted {
+        if key.epoch < current {
+            return Err(ArtefactError::EpochRollback {
+                delivered: key.epoch.get(),
+                persisted: current.get(),
+            });
+        }
+    }
     if let Some(configured) = configured {
         if epoch::effective(configured, Some(key.epoch)).is_err() {
             return Err(ArtefactError::EpochBehindConfigured {
@@ -513,10 +529,6 @@ fn plan_key(
     }
 
     match persisted {
-        Some(current) if key.epoch < current => Err(ArtefactError::EpochRollback {
-            delivered: key.epoch.get(),
-            persisted: current.get(),
-        }),
         // The same epoch again: the key is written back whenever the medium
         // carries one.
         //

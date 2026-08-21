@@ -340,16 +340,22 @@ impl Report {
             unpairable_lines,
         } = self;
 
-        let mut said = Vec::new();
+        // Three lists rather than one, and the order between them is the
+        // structure rather than the order these lines happen to be written in:
+        // the caveats come first because what could not be established
+        // qualifies everything under it, and a reader who met a finding first
+        // would carry it over the sentence that limits it. Written as one list,
+        // the loop below — which produces a caveat and a finding from the same
+        // source — put a finding above two caveats.
+        let mut caveats = Vec::new();
+        let mut findings = Vec::new();
+        let mut notes = Vec::new();
 
-        // The caveats first: what could not be established qualifies
-        // everything under it, and a reader who met a finding first would carry
-        // it over the sentence that limits it.
         if !*device_side {
-            said.push(Statement::NoDeviceSide);
+            caveats.push(Statement::NoDeviceSide);
         }
         if !unknown_outcomes.is_empty() {
-            said.push(Statement::UnreadableOutcomes(unknown_outcomes));
+            caveats.push(Statement::UnreadableOutcomes(unknown_outcomes));
         }
         for line in unpairable_lines {
             // Classified here and nowhere else. An admission with no nonce is a
@@ -358,35 +364,39 @@ impl Report {
             // refusal cannot reach this list by construction; if one ever does,
             // it is something the reader did not expect, which is a caveat too.
             match outcome::classify(&line.outcome) {
-                Outcome::Admission => said.push(Statement::AdmissionWithoutNonce(line)),
-                Outcome::Unknown | Outcome::Refusal => said.push(Statement::UnreadableLine(line)),
+                Outcome::Admission => findings.push(Statement::AdmissionWithoutNonce(line)),
+                Outcome::Unknown | Outcome::Refusal => {
+                    caveats.push(Statement::UnreadableLine(line));
+                }
             }
         }
         if *device_side && !*chain_verified {
-            said.push(Statement::NoChain);
+            caveats.push(Statement::NoChain);
         }
         if let Some(seq) = *unsigned_from_seq {
-            said.push(Statement::UnsignedTail(seq));
+            caveats.push(Statement::UnsignedTail(seq));
         }
 
         for login in logins_without_receipt {
-            said.push(Statement::LoginWithoutReceipt(login));
+            findings.push(Statement::LoginWithoutReceipt(login));
         }
         for receipt in receipts_without_login {
-            said.push(Statement::ReceiptWithoutLogin(receipt));
+            findings.push(Statement::ReceiptWithoutLogin(receipt));
         }
         for series in series_on_one_nonce {
-            said.push(Statement::SeriesOnOneNonce(series));
+            findings.push(Statement::SeriesOnOneNonce(series));
         }
         for disagreement in disagreements {
-            said.push(Statement::Disagreement(disagreement));
+            findings.push(Statement::Disagreement(disagreement));
         }
 
         if *refusals_read > 0 {
-            said.push(Statement::RefusalsRead(*refusals_read));
+            notes.push(Statement::RefusalsRead(*refusals_read));
         }
 
-        said
+        caveats.extend(findings);
+        caveats.extend(notes);
+        caveats
     }
 
     /// What the report amounts to, as one answer.
@@ -411,8 +421,9 @@ impl Report {
 
     /// Reports whether the report was able to look at everything it names.
     ///
-    /// False when the device side was absent, when a journal carried words this
-    /// build cannot read, or when a line could not be accounted for at all.
+    /// False when it carries a caveat — whichever one. Listing the reasons here
+    /// was a fourth place that had to be kept in step with the others, and it
+    /// was already out of step: it named three of the five.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         !self
@@ -1312,6 +1323,124 @@ mod tests {
         }
     }
 
+    /// Каждое утверждение по одному, без соседей.
+    ///
+    /// Сетка, которая ловит НЕВЕРНУЮ классификацию, а не только пропущенную:
+    /// в отчёте ровно одно утверждение, поэтому вердикт целиком определяется
+    /// его видом. Оговорка, объявленная заметкой, перестаёт делать отчёт
+    /// неполным — и здесь это роняет тест, а не остаётся на прочтение
+    /// рецензентом. До этой сетки переворот `UnsignedTail` в заметку проходил
+    /// всю сюиту зелёным.
+    fn every_statement_alone() -> Vec<(&'static str, Report, Verdict)> {
+        let mut odd = login(1);
+        odd.role_id = "ops.dc.junior".to_owned();
+
+        let with = |chain_verified: bool,
+                    unsigned_from_seq: Option<u64>,
+                    refusals_without_nonce: u64,
+                    unpairable_lines: Vec<UnpairableLine>| Provenance {
+            chain_verified,
+            unsigned_from_seq,
+            refusals_without_nonce,
+            unpairable_lines,
+        };
+        let line = |outcome: &str| UnpairableLine {
+            device_number: "77000123".to_owned(),
+            line: 3,
+            outcome: outcome.to_owned(),
+        };
+
+        vec![
+            (
+                "no-device-side",
+                reconcile(&[], None, &Provenance::absent()),
+                Verdict::Incomplete,
+            ),
+            (
+                "unreadable-outcomes",
+                reconcile(&[], Some(&[login_with(1, "granted")]), &verified()),
+                Verdict::Incomplete,
+            ),
+            (
+                "unreadable-line",
+                reconcile(&[], Some(&[]), &with(true, None, 0, vec![line("granted")])),
+                Verdict::Incomplete,
+            ),
+            (
+                "admission-without-nonce",
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &with(true, None, 0, vec![line(outcome::OUTCOME_SUCCESS)]),
+                ),
+                Verdict::Findings,
+            ),
+            (
+                "no-chain",
+                reconcile(&[], Some(&[]), &with(false, None, 0, Vec::new())),
+                Verdict::Incomplete,
+            ),
+            (
+                "unsigned-tail",
+                reconcile(&[], Some(&[]), &with(true, Some(7), 0, Vec::new())),
+                Verdict::Incomplete,
+            ),
+            (
+                "login-without-receipt",
+                reconcile(&[], Some(&[login(1)]), &verified()),
+                Verdict::Findings,
+            ),
+            (
+                "receipt-without-login",
+                reconcile(&[receipt(1)], Some(&[]), &verified()),
+                Verdict::Findings,
+            ),
+            (
+                "series-on-one-nonce",
+                reconcile(&[receipt(1)], Some(&[login(1), login(1)]), &verified()),
+                Verdict::Findings,
+            ),
+            (
+                "disagreement",
+                reconcile(&[receipt(1)], Some(&[odd]), &verified()),
+                Verdict::Findings,
+            ),
+            (
+                "refusals-read",
+                reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), &verified()),
+                Verdict::Clean,
+            ),
+        ]
+    }
+
+    /// Вид утверждения решает вердикт, и это проверяется на каждом виде.
+    ///
+    /// Оговорка обязана давать `Incomplete`, находка — `Findings`, заметка —
+    /// `Clean`. Компилятор требует классифицировать новый вариант; потребовать
+    /// классифицировать ВЕРНО он не может, и вот эта проверка — то, что может.
+    #[test]
+    fn the_kind_of_a_statement_decides_the_verdict() {
+        // Ожидание написано рядом с фикстурой РУКАМИ и не выводится из
+        // `kind()`. Первая версия этого теста считала ожидаемый вердикт как раз
+        // из `kind()` — и переворот классификации переворачивал обе стороны
+        // сравнения разом: мутация «UnsignedTail — заметка» проходила всю сюиту
+        // зелёной. Тест, чьё ожидание вычислено из проверяемого, не проверяет
+        // ничего.
+        for (name, report, expected) in every_statement_alone() {
+            let statements = report.statements();
+            assert_eq!(
+                statements.len(),
+                1,
+                "{name}: фикстура одиночного утверждения породила не одно: {report}"
+            );
+            assert_eq!(
+                report.verdict(),
+                expected,
+                "{name}: вердикт не тот, который эта фикстура обязана давать: {report}"
+            );
+        }
+    }
+
     /// Отчёты, покрывающие все ветки печати.
     fn every_kind_of_report() -> Vec<(&'static str, Report)> {
         let mut odd = login(1);
@@ -1448,7 +1577,10 @@ mod tests {
     #[test]
     fn the_fixtures_cover_every_statement_a_report_can_make() {
         let mut seen = Seen::default();
-        for (_, report) in every_kind_of_report() {
+        let alone = every_statement_alone()
+            .into_iter()
+            .map(|(name, report, _)| (name, report));
+        for (_, report) in every_kind_of_report().into_iter().chain(alone) {
             for statement in report.statements() {
                 seen.mark(&statement);
             }
@@ -1482,6 +1614,34 @@ mod tests {
             ("refusals-read", refusals_read),
         ] {
             assert!(covered, "ни одна фикстура не порождает {name}");
+        }
+    }
+
+    /// Оговорки идут раньше находок, находки раньше заметок.
+    ///
+    /// Порядок — не украшение: оговорка ограничивает всё, что под ней, и
+    /// аудитор, прочитавший «устройство говорит, что сессия открыта» раньше
+    /// «журнал вообще без цепочки», унесёт первое без второго. До правки один
+    /// цикл клал находку между двумя оговорками, и заметить это можно было
+    /// только глазами на выводе.
+    #[test]
+    fn caveats_come_before_findings_and_findings_before_notes() {
+        let rank = |kind: super::StatementKind| match kind {
+            super::StatementKind::Caveat => 0_u8,
+            super::StatementKind::Finding => 1,
+            super::StatementKind::Note => 2,
+        };
+
+        for (name, report) in every_kind_of_report() {
+            let ranks: Vec<u8> = report
+                .statements()
+                .iter()
+                .map(|statement| rank(statement.kind()))
+                .collect();
+            assert!(
+                ranks.is_sorted(),
+                "{name}: порядок утверждений нарушен: {report}"
+            );
         }
     }
 
