@@ -337,49 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn the_throttle_survives_a_restart_of_the_process() {
-        // The reason this file exists at all: every login is a new process, so
-        // a budget that lived in memory would be refilled by the caller it is
-        // meant to refuse.
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 100);
-        let mut state = CodeState::load(dir.path(), &boot).unwrap();
-        state.throttle_mut().note_issued(100);
-        state.throttle_mut().note_failure("oper", 100);
-        state.save(dir.path()).unwrap();
-
-        let reloaded = CodeState::load(dir.path(), &boot).unwrap();
-        assert_eq!(reloaded.throttle().window().1, 1);
-        assert_eq!(
-            reloaded
-                .throttle()
-                .ledgers()
-                .get("oper")
-                .map(|ledger| ledger.consecutive_failures),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn a_reboot_rearms_the_throttle_rather_than_clearing_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = CodeState::load(dir.path(), &markers("boot-a", 100)).unwrap();
-        state.throttle_mut().note_failure("oper", 100);
-        state.save(dir.path()).unwrap();
-
-        let after_reboot = CodeState::load(dir.path(), &markers("boot-b", 1)).unwrap();
-        assert_eq!(
-            after_reboot
-                .throttle()
-                .ledgers()
-                .get("oper")
-                .map(|ledger| ledger.consecutive_failures),
-            Some(1),
-            "a power cycle must not be the way out of a lockout"
-        );
-    }
-
-    #[test]
     fn a_state_file_of_the_format_that_persisted_attempts_does_not_load() {
         // The old format carried `issued`, `consumed` and `pending` lines. A
         // device upgraded in place must refuse that file rather than read the
@@ -420,14 +377,77 @@ mod tests {
         assert!(CodeState::load(dir.path(), &markers("boot-a", 10)).is_err());
     }
 
-    #[test]
-    fn the_state_round_trips_through_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let boot = markers("boot-a", 50);
-        let mut state = CodeState::load(dir.path(), &boot).unwrap();
-        state.throttle_mut().note_issued(50);
-        state.throttle_mut().note_failure("oper", 50);
-        state.save(dir.path()).unwrap();
-        assert_eq!(CodeState::load(dir.path(), &boot).unwrap(), state);
+    /// Tests that WRITE the persisted state.
+    ///
+    /// They need a platform whose file permissions can be pinned, and that is a
+    /// property of the method rather than of the harness: the device key beside
+    /// this file is kept **without a password** — codes are verified after a
+    /// reboot with nobody there to type one — so what protects it is the mode of
+    /// the files around it. Outside Unix there is no mode word, the equivalent
+    /// is a DACL and none is written here, so `fs_mode` refuses and the write
+    /// fails closed. The product answers the same question earlier, in
+    /// `platform_offers_the_method`: a device that cannot carry the store is
+    /// refused the method, so nothing outside these tests reaches this path.
+    ///
+    /// Reading and parsing stay outside this group and keep running everywhere:
+    /// a platform that cannot write a state file can still be shown that a
+    /// malformed one is refused. The same split is in `codes::epoch`.
+    #[cfg(unix)]
+    mod persisted {
+        use super::*;
+
+        #[test]
+        fn the_throttle_survives_a_restart_of_the_process() {
+            // The reason this file exists at all: every login is a new process, so
+            // a budget that lived in memory would be refilled by the caller it is
+            // meant to refuse.
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 100);
+            let mut state = CodeState::load(dir.path(), &boot).unwrap();
+            state.throttle_mut().note_issued(100);
+            state.throttle_mut().note_failure("oper", 100);
+            state.save(dir.path()).unwrap();
+
+            let reloaded = CodeState::load(dir.path(), &boot).unwrap();
+            assert_eq!(reloaded.throttle().window().1, 1);
+            assert_eq!(
+                reloaded
+                    .throttle()
+                    .ledgers()
+                    .get("oper")
+                    .map(|ledger| ledger.consecutive_failures),
+                Some(1)
+            );
+        }
+
+        #[test]
+        fn a_reboot_rearms_the_throttle_rather_than_clearing_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = CodeState::load(dir.path(), &markers("boot-a", 100)).unwrap();
+            state.throttle_mut().note_failure("oper", 100);
+            state.save(dir.path()).unwrap();
+
+            let after_reboot = CodeState::load(dir.path(), &markers("boot-b", 1)).unwrap();
+            assert_eq!(
+                after_reboot
+                    .throttle()
+                    .ledgers()
+                    .get("oper")
+                    .map(|ledger| ledger.consecutive_failures),
+                Some(1),
+                "a power cycle must not be the way out of a lockout"
+            );
+        }
+
+        #[test]
+        fn the_state_round_trips_through_the_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let boot = markers("boot-a", 50);
+            let mut state = CodeState::load(dir.path(), &boot).unwrap();
+            state.throttle_mut().note_issued(50);
+            state.throttle_mut().note_failure("oper", 50);
+            state.save(dir.path()).unwrap();
+            assert_eq!(CodeState::load(dir.path(), &boot).unwrap(), state);
+        }
     }
 }
