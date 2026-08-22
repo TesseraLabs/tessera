@@ -14,7 +14,9 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::must_use_candidate)]
 
+pub mod audit;
 pub mod challenge;
+pub mod codes;
 pub mod config;
 pub mod crl;
 pub mod discovery;

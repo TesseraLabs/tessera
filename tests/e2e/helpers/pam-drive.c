@@ -7,13 +7,24 @@
  * от «auth отказала» — эти два исхода означают разные дефекты продукта.
  *
  * Использование:
- *     pam-drive [--show-creds] <service> <user> <phase> [<phase> ...]
+ *     pam-drive [--show-creds] [--answers-per-prompt] <service> <user> <phase> [<phase> ...]
  *     phase ∈ { authenticate, acct_mgmt, open_session, close_session }
  *
  * Пароль/PIN читается со stdin (одна строка). Терминала нет: conversation-функция
  * отвечает на PAM_PROMPT_ECHO_OFF/ON заранее прочитанным значением, а информационные
  * и сообщения об ошибке от модуля уходят в stderr — так вывод фаз в stdout остаётся
  * машиночитаемым и не смешивается с диагностикой модуля.
+ *
+ * Одна строка на все промпты — поведение по умолчанию, и оно проверяется кейсами:
+ * разговор, спрашивающий PIN трижды, получает один и тот же неверный PIN и упирается
+ * в бюджет попыток. Разговоры, где промпты означают разное (оператор, PIN, код),
+ * так не проехать — для них есть `--answers-per-prompt`: stdin читается построчно,
+ * i-й промпт получает i-ю строку. Строка читается В МОМЕНТ промпта, а не заранее:
+ * ответ на последний промпт разговора кодов вычисляется по challenge, который до
+ * первых двух ответов ещё не напечатан, и вызывающий подаёт его в тот же stdin позже.
+ * Кончившийся stdin — ошибка разговора, а не пустой ответ: сценарий, где промптов
+ * больше, чем ответов, обязан падать явно, иначе модуль получит пустую строку и кейс
+ * прочитает отказ продукта вместо ошибки стенда.
  *
  * Вывод: ровно одна строка на фазу в stdout, формат `<тег>: <PAM_КОНСТАНТА> (<код>)`,
  * например `auth: PAM_SUCCESS (0)`. Каждая строка — один смысл, чтобы ожидания кейса
@@ -49,6 +60,16 @@
  * ему буферы сам, поэтому копия отдаётся каждый раз заново, а оригинал остаётся
  * в этой переменной. */
 static char *g_secret = NULL;
+
+/* Режим `--answers-per-prompt`: строка со stdin читается на КАЖДЫЙ промпт, и
+ * читается в момент промпта, а не заранее. Разговор кодов иначе не проехать:
+ * код вычисляется по напечатанному challenge, то есть последний ответ ещё не
+ * существует, когда даются первые два. Вычитывание stdin до старта PAM встало
+ * бы в тупик — драйвер ждал бы EOF от того, кто ждёт challenge от драйвера.
+ * Отданные ответы остаются здесь, чтобы затереть их перед выходом. */
+static char **g_answers = NULL;
+static size_t g_answer_count = 0;
+static int g_per_prompt = 0;
 
 static const char *pam_code_name(int code)
 {
@@ -87,6 +108,45 @@ static const char *pam_code_name(int code)
     }
 }
 
+/* Читает одну строку со stdin без ограничения длины. Возвращает NULL,
+ * если stdin пуст, — это не ошибка: фазе может не понадобиться секрет. */
+static char *read_secret_line(void)
+{
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len = getline(&line, &cap, stdin);
+    if (len < 0) {
+        free(line);
+        return NULL;
+    }
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+        line[--len] = '\0';
+    }
+    return line;
+}
+
+/* Берёт очередной ответ построчного режима. Строка читается прямо сейчас —
+ * тот, кто ведёт разговор, мог ещё не знать её, когда давал предыдущую.
+ * Возвращает NULL на конце stdin и на нехватке памяти: и то, и другое означает,
+ * что отвечать нечем. Отданная строка остаётся во владении драйвера и живёт до
+ * `wipe_answers`, поэтому вызывающий её не освобождает. */
+static char *take_answer_line(void)
+{
+    char *line = read_secret_line();
+    if (line == NULL) {
+        return NULL;
+    }
+    char **grown = realloc(g_answers, (g_answer_count + 1) * sizeof(*g_answers));
+    if (grown == NULL) {
+        memset(line, 0, strlen(line));
+        free(line);
+        return NULL;
+    }
+    g_answers = grown;
+    g_answers[g_answer_count++] = line;
+    return line;
+}
+
 static int conv_fn(int num_msg, const struct pam_message **msg,
                    struct pam_response **resp, void *appdata)
 {
@@ -104,11 +164,30 @@ static int conv_fn(int num_msg, const struct pam_message **msg,
     for (int i = 0; i < num_msg; i++) {
         switch (msg[i]->msg_style) {
         case PAM_PROMPT_ECHO_OFF:
-        case PAM_PROMPT_ECHO_ON:
+        case PAM_PROMPT_ECHO_ON: {
             /* Промпт печатаем в stderr, а не в stdout: его текст не является
              * результатом фазы и не должен попадать под регекспы кейса. */
             fprintf(stderr, "prompt: %s\n", msg[i]->msg ? msg[i]->msg : "");
-            replies[i].resp = strdup(g_secret != NULL ? g_secret : "");
+            const char *answer = g_secret != NULL ? g_secret : "";
+            if (g_per_prompt) {
+                char *line = take_answer_line();
+                if (line == NULL) {
+                    /* stdin кончился раньше промптов. Отдать пустую строку
+                     * значило бы подсунуть модулю неверный ввод и выдать сбой
+                     * стенда за отказ продукта, поэтому разговор обрывается
+                     * ошибкой. */
+                    fprintf(stderr,
+                            "pam-drive: stdin кончился на промпте %zu — ответов меньше, чем промптов\n",
+                            g_answer_count + 1);
+                    for (int j = 0; j < i; j++) {
+                        free(replies[j].resp);
+                    }
+                    free(replies);
+                    return PAM_CONV_ERR;
+                }
+                answer = line;
+            }
+            replies[i].resp = strdup(answer);
             if (replies[i].resp == NULL) {
                 for (int j = 0; j < i; j++) {
                     free(replies[j].resp);
@@ -117,6 +196,7 @@ static int conv_fn(int num_msg, const struct pam_message **msg,
                 return PAM_BUF_ERR;
             }
             break;
+        }
         case PAM_ERROR_MSG:
         case PAM_TEXT_INFO:
             fprintf(stderr, "module: %s\n", msg[i]->msg ? msg[i]->msg : "");
@@ -136,32 +216,39 @@ static int conv_fn(int num_msg, const struct pam_message **msg,
     return PAM_SUCCESS;
 }
 
-/* Читает одну строку со stdin без ограничения длины. Возвращает NULL,
- * если stdin пуст, — это не ошибка: фазе может не понадобиться секрет. */
-static char *read_secret_line(void)
+/* Затирание ответов до free: процесс короткоживущий, но его память может попасть
+ * в core dump артефактов провалившегося кейса, а среди ответов есть PIN. */
+static void wipe_answers(void)
 {
-    char *line = NULL;
-    size_t cap = 0;
-    ssize_t len = getline(&line, &cap, stdin);
-    if (len < 0) {
-        free(line);
-        return NULL;
+    if (g_secret != NULL) {
+        memset(g_secret, 0, strlen(g_secret));
+        free(g_secret);
+        g_secret = NULL;
     }
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-        line[--len] = '\0';
+    for (size_t i = 0; i < g_answer_count; i++) {
+        if (g_answers[i] != NULL) {
+            memset(g_answers[i], 0, strlen(g_answers[i]));
+            free(g_answers[i]);
+        }
     }
-    return line;
+    free(g_answers);
+    g_answers = NULL;
+    g_answer_count = 0;
 }
 
 static void usage(FILE *out)
 {
-    fputs("usage: pam-drive [--show-creds] <service> <user> <phase> [<phase> ...]\n"
+    fputs("usage: pam-drive [--show-creds] [--answers-per-prompt] <service> <user> <phase> [<phase> ...]\n"
           "  phase: authenticate | acct_mgmt | open_session | close_session\n"
           "  secret (password/PIN) is read as a single line from stdin\n"
           "  output: one line per phase, e.g. \"auth: PAM_SUCCESS (0)\"\n"
           "  --show-creds: after a successful open_session, dump the resulting process\n"
           "                state (uid, gid, groups, groupnames, limit_nofile, pamenv),\n"
           "                one fact per line\n"
+          "  --answers-per-prompt: read one stdin line per prompt, as the prompt arrives,\n"
+          "                answering the i-th prompt with the i-th line; a prompt met with\n"
+          "                end of input ends the conversation with an error rather than an\n"
+          "                empty answer\n"
           "  exit: 0 if all phases succeeded, otherwise the code of the first failure\n",
           out);
 }
@@ -354,6 +441,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--show-creds") == 0) {
             show_creds = 1;
+        } else if (strcmp(argv[i], "--answers-per-prompt") == 0) {
+            g_per_prompt = 1;
         } else {
             args[nargs++] = argv[i];
         }
@@ -382,7 +471,11 @@ int main(int argc, char **argv)
         }
     }
 
-    g_secret = read_secret_line();
+    /* В построчном режиме stdin читается по ходу разговора, поэтому здесь
+     * не читается ничего: строка берётся в момент промпта. */
+    if (!g_per_prompt) {
+        g_secret = read_secret_line();
+    }
 
     struct pam_conv conv = { conv_fn, NULL };
     pam_handle_t *pamh = NULL;
@@ -393,10 +486,7 @@ int main(int argc, char **argv)
          * с NULL допустим и даёт общий текст. */
         fprintf(stderr, "pam-drive: pam_start failed: %s (%d)\n",
                 pam_code_name(rc), rc);
-        if (g_secret != NULL) {
-            memset(g_secret, 0, strlen(g_secret));
-            free(g_secret);
-        }
+        wipe_answers();
         free(args);
         return EXIT_INTERNAL;
     }
@@ -428,13 +518,7 @@ int main(int argc, char **argv)
                 pam_code_name(end_rc), end_rc);
     }
 
-    if (g_secret != NULL) {
-        /* Секрет затирается до free: процесс короткоживущий, но его память
-         * может попасть в core dump артефактов провалившегося кейса. */
-        memset(g_secret, 0, strlen(g_secret));
-        free(g_secret);
-        g_secret = NULL;
-    }
+    wipe_answers();
 
     free(args);
 

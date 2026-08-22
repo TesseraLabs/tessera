@@ -9,6 +9,8 @@
 //! Currently understood top-level arguments:
 //!
 //! - `config=<path>`              — override the config TOML path.
+//! - `method=cert|code`           — which login method this stack line drives;
+//!   see [`method_from_args`].
 //!
 //! Unrecognised `key=value` pairs are kept in [`ParsedPamArgs::extra`] so
 //! later phases can extend the surface without breaking older builds.
@@ -44,10 +46,77 @@ pub fn parse_pam_args(args: &[&str]) -> ParsedPamArgs {
     out
 }
 
+/// Which login method a stack line drives.
+///
+/// A device can offer both: the certificate on the console where a token can
+/// be plugged in, the code on the one that is reachable only by telephone.
+/// They are separate lines in the PAM stack rather than one line choosing at
+/// runtime, so which credential a service accepts is written down where an
+/// administrator reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthMethod {
+    /// X.509 certificate on a token or a USB carrier.
+    #[default]
+    Certificate,
+    /// One-time code, dictated over the telephone.
+    Code,
+}
+
+/// The method a stack line names, or the value it named instead.
+///
+/// A `method=` nobody recognises is an error rather than a fallback. Reading
+/// an unknown value as the default would let a typo in one stack line quietly
+/// change which credential a service accepts, which is the one mistake this
+/// argument must not be able to make.
+///
+/// # Errors
+///
+/// The unrecognised value, for the caller to report.
+pub fn method_from_args(args: &BTreeMap<String, String>) -> Result<AuthMethod, &str> {
+    match args.get("method").map(String::as_str) {
+        None | Some("cert" | "certificate") => Ok(AuthMethod::Certificate),
+        Some("code" | "codes") => Ok(AuthMethod::Code),
+        Some(other) => Err(other),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn args(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_stack_line_without_a_method_drives_the_certificate() {
+        assert_eq!(
+            method_from_args(&args(&[])).unwrap(),
+            AuthMethod::Certificate
+        );
+    }
+
+    #[test]
+    fn the_code_method_is_named_explicitly() {
+        for value in ["code", "codes"] {
+            assert_eq!(
+                method_from_args(&args(&[("method", value)])).unwrap(),
+                AuthMethod::Code,
+                "method={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_method_is_not_the_default() {
+        // A typo must not quietly change which credential a service accepts.
+        assert_eq!(method_from_args(&args(&[("method", "cod")])), Err("cod"));
+        assert_eq!(method_from_args(&args(&[("method", "")])), Err(""));
+    }
 
     #[test]
     fn config_path_parsed() {

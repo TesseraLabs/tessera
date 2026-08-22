@@ -147,3 +147,51 @@ pub fn platform_config_toml(src: &str) -> String {
         body + &monitor_section_toml()
     }
 }
+
+/// Marker of a fixture that hands a validator a POSIX path literal directly.
+///
+/// See [`assert_no_posix_path_fixtures`] for what to do about it.
+const POSIX_PATH_FIXTURE: &str = ": Some(PathBuf::from(\"/";
+
+/// Fail when a test fixture in `source` supplies an optional path as a POSIX
+/// literal instead of going through [`absolute`].
+///
+/// This catches on any host a mistake that otherwise only appears on Windows,
+/// and it is worth catching that way: the failure there is not the fixture's
+/// subject at all. `/srv/tessera/codes` carries no drive letter, so Windows
+/// reads it as relative, and the validator refuses it with "must be absolute" —
+/// a test about where a store lives goes red over the shape of a string, and
+/// whoever reads the report first assumes the product broke.
+///
+/// The check is deliberately narrow. It looks for `field: Some(PathBuf::from("/`
+/// — the shape of *handing a value to a validator* — and not for POSIX literals
+/// in general: a test that compares against a product default written in POSIX
+/// is right to spell it in POSIX, because that constant is the same string on
+/// every platform. A broader ban would be noise, and noise is how a guard gets
+/// switched off.
+///
+/// # Panics
+///
+/// When `source` carries no test module — a guard that silently checked
+/// nothing is worse than no guard — or when a fixture inside it names a POSIX
+/// path literal.
+pub fn assert_no_posix_path_fixtures(source: &str) {
+    // Assertions rather than `expect`: this file is pulled into the integration
+    // test crates through `#[path]`, and there it is ordinary crate code under
+    // the workspace lint table, which denies `expect` and `unwrap`.
+    let tests = source.split_once("mod tests").map(|(_, tests)| tests);
+    assert!(
+        tests.is_some(),
+        "the source handed to the guard carries no test module, so the guard checked nothing"
+    );
+    let found = tests
+        .unwrap_or_default()
+        .match_indices(POSIX_PATH_FIXTURE)
+        .count();
+    assert_eq!(
+        found, 0,
+        "a fixture hands a validator a POSIX path literal ({POSIX_PATH_FIXTURE}…): on Windows \
+         that path is relative and the validator refuses it. Wrap it in \
+         `crate::test_support::absolute(\"/…\")`, which re-roots it onto a drive there."
+    );
+}

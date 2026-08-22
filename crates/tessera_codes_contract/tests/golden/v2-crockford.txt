@@ -1,0 +1,26 @@
+# Golden vector: a ten-character code over Crockford base32, with a base32
+# nonce tail. The rendered code must never carry I, L, O or U.
+#
+# The expected values below are the compatibility surface of the phone channel.
+# They are not to be regenerated when a test fails: a change here is a breaking
+# change of the contract and travels through the two-step procedure of the
+# workspace compatibility policy.
+
+device_number = 77-000999-X
+nonce = K7QZ3M9X20VHTRB5C8EDNF4WGA
+role_id = ops.branch
+level = 1
+epoch = 1
+engineer_id = eng-2
+ticket = tessera-codes/v1/ticket;server=op-7;key=04aabb;tags=branch-9;roles=ops.branch,serv;region=ru-north;max_level=1;not_after=1830000000;number=tk-3;signature=0f0f
+z_hex = ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+
+alphabet = crockford32
+code_len = 10
+nonce_width = 26
+
+canon_hex = 0000000937373030303939395800000004000000010000001a4b37515a334d39583230564854524235433845444e46345747410000000a6f70732e6272616e6368000000040000000100000005656e672d32
+ticket_hex = 000000046f702d370000000304aabb0000000400000001000000086272616e63682d3900000004000000020000000a6f70732e6272616e636800000004736572760000000872752d6e6f727468000000040000000100000008000000006d13958000000004746b2d33000000020f0f
+context_hex = 00000009373730303039393958000000208c5951ae439834f7849690f4a0cede3f33281a909e9a9ec315710ebc659338be
+k_hex = dde93d5bc8afd72b5744a914cf3fb5bf2e17608fefd421437c155fe3084590cc
+code = 9YS459YNQA

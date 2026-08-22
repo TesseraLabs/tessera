@@ -1719,6 +1719,7 @@ dependencies = [
  "sha2 0.11.0",
  "syslog",
  "tempfile",
+ "tessera_codes_contract",
  "tessera_core",
  "tessera_proto",
  "thiserror",
@@ -2648,6 +2649,7 @@ dependencies = [
  "ab_glyph_rasterizer",
  "anyhow",
  "async-trait",
+ "chrono",
  "clap",
  "futures-util",
  "hex",
@@ -2659,12 +2661,14 @@ dependencies = [
  "parking_lot",
  "rustix 0.38.44",
  "sd-notify",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "skrifa",
  "tempfile",
  "tessera_core",
+ "tessera_hashchain",
  "tessera_proto",
  "thiserror",
  "tokio",
@@ -2679,9 +2683,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera_codes_contract"
+version = "0.5.0"
+dependencies = [
+ "hex",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "unicode-normalization",
+ "zeroize",
+]
+
+[[package]]
 name = "tessera_core"
 version = "0.5.0"
 dependencies = [
+ "base64",
  "chrono",
  "cms",
  "cryptoki",
@@ -2708,7 +2725,9 @@ dependencies = [
  "subtle",
  "syslog",
  "tempfile",
+ "tessera_codes_contract",
  "tessera_ext",
+ "tessera_hashchain",
  "tessera_issuer",
  "tessera_proto",
  "thiserror",
@@ -2743,6 +2762,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera_hashchain"
+version = "0.5.0"
+dependencies = [
+ "base64",
+ "hex",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tessera_hashchain",
+ "thiserror",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "tessera_issuer"
 version = "0.5.0"
 dependencies = [
@@ -2769,7 +2804,9 @@ dependencies = [
  "sha2 0.11.0",
  "spki 0.7.3",
  "tempfile",
+ "tessera_codes_contract",
  "tessera_ext",
+ "tessera_hashchain",
  "thiserror",
  "ureq",
  "x509-cert",
@@ -2887,6 +2924,21 @@ dependencies = [
  "displaydoc",
  "zerovec",
 ]
+
+[[package]]
+name = "tinyvec"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f"
+dependencies = [
+ "tinyvec_macros",
+]
+
+[[package]]
+name = "tinyvec_macros"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
@@ -3093,6 +3145,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-xid"
@@ -3694,9 +3755,11 @@ name = "xtask"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "hex",
+ "p256",
  "regex",
  "secrecy",
  "serde",
@@ -3705,6 +3768,9 @@ dependencies = [
  "sha2 0.11.0",
  "signal-hook",
  "tempfile",
+ "tessera_codes_contract",
+ "tessera_ext",
+ "tessera_issuer",
  "thiserror",
  "toml",
  "zeroize",

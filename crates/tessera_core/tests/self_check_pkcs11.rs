@@ -29,7 +29,7 @@ mod test_support;
 use std::path::Path;
 
 use tessera_core::config::{RawConfig, ValidatedConfig};
-use tessera_core::self_check::self_check;
+use tessera_core::self_check::{self_check, self_check_certificate, self_check_common};
 use tessera_core::SelfCheckError;
 
 /// Minimal self-signed-looking PEM blob that satisfies the PEM sniff
@@ -129,4 +129,44 @@ fn pkcs11_no_token_branch_compiles() {
     // constructible by external code so the public API is stable.
     let e: SelfCheckError = SelfCheckError::Pkcs11NoToken;
     assert!(format!("{e}").contains("pkcs11"));
+}
+
+/// The split that keeps the code method alive on a device where the
+/// certificate path cannot work.
+///
+/// An unreachable PKCS#11 module is the plainest case: nothing about it says
+/// anything about a login by dictated code, which reads a PKCS#12 container
+/// off the device's own disk and never opens a token. The shared self-check
+/// used to refuse it for both, and the code method exists precisely for the
+/// device where the certificate path is out of action.
+#[test]
+fn a_module_that_cannot_be_loaded_stops_the_certificate_method_and_nothing_else() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let anchor = write_anchor(dir.path());
+    let cfg = cfg_with("pkcs11", &missing_module_path(), &anchor);
+
+    assert!(
+        self_check_certificate(&cfg).is_err(),
+        "the certificate path still has to refuse a module it cannot load",
+    );
+    assert!(
+        self_check_common(&cfg).is_ok(),
+        "nothing every method depends on is broken by an unreachable token module",
+    );
+    assert!(
+        self_check(&cfg).is_err(),
+        "the combined check keeps the verdict every existing caller had",
+    );
+}
+
+/// The split must not have turned into "the certificate half never runs".
+#[test]
+fn a_device_whose_certificate_material_is_sound_passes_both_halves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let anchor = write_anchor(dir.path());
+    let cfg = cfg_with("pkcs12", &missing_module_path(), &anchor);
+
+    assert!(self_check_common(&cfg).is_ok());
+    assert!(self_check_certificate(&cfg).is_ok());
+    assert!(self_check(&cfg).is_ok());
 }

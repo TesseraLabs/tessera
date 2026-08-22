@@ -49,6 +49,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 
 use crate::role::manifest::MANIFEST_FILENAME;
@@ -147,6 +148,49 @@ impl Default for InstallPaths {
     }
 }
 
+/// Everything an import needs in order to accept the Codes part of a package.
+///
+/// Handed in rather than configured, because both of its parts are decisions of
+/// the operator running the import: where this device keeps its Codes artefacts
+/// and the PIN the delivery container was closed with. An import without this
+/// value ignores the Codes part of a package entirely — which is what a fleet
+/// that has not enabled the method wants, and what every caller predating the
+/// method gets for free.
+#[derive(Debug, Clone)]
+pub struct CodesImport<'a> {
+    /// Where the artefacts are to live on the device.
+    pub paths: crate::codes::CodesPaths,
+    /// PIN that opens the delivery container.
+    ///
+    /// Never carried by the package: a container whose password travels beside
+    /// it is not a protected container. `None` is meaningful — a package that
+    /// rotates tickets alone needs no PIN — and a package that does carry a
+    /// container is then refused with [`ImportError::CodesPinRequired`] rather
+    /// than half-applied.
+    pub container_pin: Option<&'a SecretString>,
+    /// Path to the GOST engine, forwarded to the container.
+    pub gost_engine_path: Option<&'a Path>,
+    /// Whether the finished store is walked with the ownership policy a login
+    /// applies.
+    ///
+    /// A device enrols with [`crate::codes::artefacts::StoreCheck::Enforced`];
+    /// the value exists because a store under a temporary directory cannot
+    /// satisfy any ownership policy, which is the same reason the login path
+    /// has both [`crate::codes::CodeMethod::open`] and
+    /// [`crate::codes::CodeMethod::open_privileged`].
+    pub store_check: crate::codes::artefacts::StoreCheck,
+    /// Key epoch the configuration of this device runs on, when it could be
+    /// read.
+    ///
+    /// The floor a device with no epoch file has: without it a delivery naming
+    /// an older epoch is written down, and every login afterwards refuses
+    /// because the configuration is ahead of the store. [`None`] where the
+    /// store was named on the command line and the configuration could not be
+    /// loaded — there is nothing to compare against then, and inventing a floor
+    /// would refuse deliveries a fleet has every right to apply.
+    pub configured_epoch: Option<crate::codes::Epoch>,
+}
+
 /// Outcome of a successful import.
 #[derive(Debug, Clone)]
 pub struct ImportOutcome {
@@ -161,6 +205,11 @@ pub struct ImportOutcome {
     /// `true` when nothing changed because the bundle was already applied
     /// (managed idempotent re-import of the same `bundle_version`).
     pub no_op: bool,
+    /// What the Codes part of the package did, when the package carried one and
+    /// the caller asked for it to be applied. `None` covers both "no Codes part
+    /// in the package" (an Access-only fleet) and "the caller did not ask" —
+    /// neither is a failure.
+    pub codes: Option<crate::codes::artefacts::Applied>,
 }
 
 /// Errors from parsing or importing an enrollment package. Mirrors the
@@ -198,12 +247,13 @@ pub enum ImportError {
         name: String,
     },
     /// An artefact exceeds its size cap.
-    #[error("{artefact} is {size} bytes, exceeds the {max}-byte cap")]
+    #[error("{artefact} exceeds the {max}-byte cap (the read stopped after {read} bytes)")]
     Oversize {
         /// Which artefact.
         artefact: &'static str,
-        /// Actual size.
-        size: usize,
+        /// How many bytes were read before the read was stopped; the file is at
+        /// least this large, and how much larger is deliberately not measured.
+        read: usize,
         /// Cap.
         max: usize,
     },
@@ -233,6 +283,38 @@ pub enum ImportError {
         /// Underlying I/O error message.
         reason: String,
     },
+    /// The Codes section of the package does not hold what its format
+    /// describes.
+    #[error("the Codes part of the package is invalid: {reason}")]
+    CodesSection {
+        /// What was wrong with it.
+        reason: String,
+    },
+    /// A managed package names a Codes file without pinning its hash.
+    #[error("managed enrollment names Codes file {file:?} without a sha256 pin")]
+    CodesUnpinned {
+        /// The unpinned file.
+        file: String,
+    },
+    /// A Codes file did not match the SHA-256 the package pins it at.
+    #[error("Codes hash mismatch: the pin does not match the shipped {file:?}")]
+    CodesHashMismatch {
+        /// The offending file.
+        file: String,
+    },
+    /// The Codes section names a file that is absent from the package.
+    #[error("the Codes part names {file:?} but it is missing from the package")]
+    CodesMissing {
+        /// The named file.
+        file: String,
+    },
+    /// The package carries a Codes key container and the import was not given
+    /// the PIN that opens it.
+    #[error("the package carries a Codes key container and no PIN was supplied")]
+    CodesPinRequired,
+    /// Applying the Codes artefacts to the device failed.
+    #[error(transparent)]
+    Codes(#[from] crate::codes::ArtefactError),
 }
 
 impl EnrollmentPackage {
@@ -241,6 +323,13 @@ impl EnrollmentPackage {
     /// Locates exactly one `.p12`, the mode-required bundle file
     /// (`manifest.toml` managed / `tags.toml` standalone), and an optional CRL.
     /// Does not touch device paths and does not decrypt the `.p12`.
+    ///
+    /// A package carrying a Codes part carries a second `.p12` — the delivery
+    /// container of the device key — and "exactly one" still means the per-host
+    /// identity: the container the Codes section names is not counted. When the
+    /// section cannot be read at all, the container is counted like any other
+    /// file and the package is reported as ambiguous; a package whose section
+    /// does not parse is broken either way, and the install says so precisely.
     ///
     /// # Errors
     ///
@@ -256,6 +345,7 @@ impl EnrollmentPackage {
 
         let mut p12s: Vec<String> = Vec::new();
         let mut crl_file: Option<String> = None;
+        let codes_container = codes_container_name(root, mode)?;
         let entries = fs::read_dir(root).map_err(|e| ImportError::Io {
             path: root.display().to_string(),
             reason: e.to_string(),
@@ -274,7 +364,9 @@ impl EnrollmentPackage {
                 continue;
             };
             if has_ext(&path, "p12") {
-                p12s.push(name.to_owned());
+                if codes_container.as_deref() != Some(name) {
+                    p12s.push(name.to_owned());
+                }
             } else if has_ext(&path, "crl") {
                 crl_file = Some(name.to_owned());
             }
@@ -350,6 +442,110 @@ impl EnrollmentPackage {
         )
     }
 
+    /// Like [`Self::install_with_ids`], but also applies the Codes part of the
+    /// package when it carries one.
+    ///
+    /// `codes` names where the artefacts go and carries the PIN of the delivery
+    /// container. Passing `None` is the Access-only import: a Codes part in the
+    /// package is then left where it is, and the device stays a device without
+    /// the code method.
+    ///
+    /// The Codes part is read and applied **after** the Access part has been
+    /// committed, and deliberately so: for a managed package the pins that
+    /// authenticate the Codes files live in the manifest, and the manifest is
+    /// authenticated by the install itself. Verifying them earlier would mean
+    /// acting on a signature nobody had checked yet.
+    ///
+    /// The consequence is stated rather than hidden. A package whose Codes part
+    /// is broken leaves a device that is a working Access device and does not
+    /// offer the code method, and the command reports the failure. What does
+    /// *not* happen is a half-applied Codes store: every file of the part is
+    /// read and verified before the first of them is written, and the key epoch
+    /// — the value everything else is ordered against — is written last, so a
+    /// repeat of the same import finishes the job rather than duplicating it.
+    ///
+    /// The section itself travels from the install rather than being read again
+    /// afterwards — see [`Self::apply_codes`].
+    ///
+    /// # Errors
+    ///
+    /// Any [`ImportError`], including the `Codes*` variants and
+    /// [`ImportError::Codes`] for a failure of the artefact store itself.
+    pub fn install_with_codes(
+        &self,
+        paths: &InstallPaths,
+        device_os: RoleOs,
+        trusted_pubkey: Option<&[u8]>,
+        ids: audit::EnrollAuditIds<'_>,
+        codes: Option<&CodesImport<'_>>,
+    ) -> Result<ImportOutcome, ImportError> {
+        let (mut outcome, section) =
+            self.install_capturing_codes(paths, device_os, trusted_pubkey, ids)?;
+        outcome.codes = self.apply_codes(codes, section)?;
+        Ok(outcome)
+    }
+
+    /// Applies the Codes part the install carried out of the verified package.
+    ///
+    /// `Ok(None)` when the package carries no Codes part or the caller asked
+    /// for none: an Access-only fleet has nothing to apply here, and saying so
+    /// is not the same as failing.
+    ///
+    /// `section` is a value rather than a path, and that is the whole point of
+    /// the signature. In a managed package the section is what decides which
+    /// ticket authority this device believes, and it is authenticated by the
+    /// manifest signature — which was checked on the bytes the install read.
+    /// Reading `manifest.toml` a second time here would authenticate one byte
+    /// stream and act on another, with the entire Access install in between:
+    /// the package sits on a removable medium its owner may rewrite, and the
+    /// second read is not covered by any signature.
+    fn apply_codes(
+        &self,
+        codes: Option<&CodesImport<'_>>,
+        section: Option<role::ManifestCodes>,
+    ) -> Result<Option<crate::codes::artefacts::Applied>, ImportError> {
+        let Some(codes) = codes else {
+            return Ok(None);
+        };
+        let Some(section) = section else {
+            return Ok(None);
+        };
+        let pin = match (&section.key_container, codes.container_pin) {
+            (Some(_), None) => return Err(ImportError::CodesPinRequired),
+            (_, supplied) => supplied
+                .cloned()
+                .unwrap_or_else(|| SecretString::from(String::new())),
+        };
+        let delivery = super::codes::read_delivery(&section, &self.root, self.mode, &pin)?;
+        let applied = crate::codes::artefacts::apply(
+            &codes.paths,
+            &delivery,
+            codes.gost_engine_path,
+            codes.store_check,
+            codes.configured_epoch,
+        )?;
+
+        // The container was a way to carry the key here, and the key now lives
+        // in the store under root-only permissions. Leaving the delivery copy
+        // in the package directory would keep a second, PIN-protected copy of
+        // the device key on whatever medium the package arrived on.
+        if let Some(named) = &section.key_container {
+            let delivered = self.root.join(&named.file);
+            if let Err(error) = crate::codes::artefacts::shred_delivered_key(&delivered) {
+                // A read-only medium is the ordinary case and must not fail an
+                // import that has already succeeded; it is the operator who
+                // then has to account for the medium.
+                tracing::warn!(
+                    target: "enrollment.audit",
+                    path = %delivered.display(),
+                    error = %error,
+                    "the delivered Codes key container could not be removed from the package"
+                );
+            }
+        }
+        Ok(Some(applied))
+    }
+
     /// Like [`Self::install`], but emits the enrollment audit event enriched
     /// with the caller-supplied identifiers ([`audit::EnrollAuditIds`]): the
     /// `host_id` prefix8, plus a `serial` field that every caller leaves empty
@@ -371,6 +567,25 @@ impl EnrollmentPackage {
         trusted_pubkey: Option<&[u8]>,
         ids: audit::EnrollAuditIds<'_>,
     ) -> Result<ImportOutcome, ImportError> {
+        self.install_capturing_codes(paths, device_os, trusted_pubkey, ids)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// The Access half of the import, plus the Codes section exactly as the
+    /// trusted read of the package saw it.
+    ///
+    /// Managed: the section comes out of the parse whose signature was
+    /// verified. Standalone: out of the single read of `codes.toml`. Either
+    /// way the caller receives a value and never a path to read again — see
+    /// [`Self::apply_codes`] for why a second read of a removable medium is not
+    /// the same bytes.
+    fn install_capturing_codes(
+        &self,
+        paths: &InstallPaths,
+        device_os: RoleOs,
+        trusted_pubkey: Option<&[u8]>,
+        ids: audit::EnrollAuditIds<'_>,
+    ) -> Result<(ImportOutcome, Option<role::ManifestCodes>), ImportError> {
         let result = match self.mode {
             ImportMode::Managed => match trusted_pubkey {
                 Some(key) => self.install_managed(paths, device_os, key),
@@ -381,8 +596,8 @@ impl EnrollmentPackage {
         match &result {
             // A no-op (same bundle already applied) changed nothing, so it
             // emits no `device_enrolled`.
-            Ok(o) if !o.no_op => {
-                audit::emit_device_enrolled_full(self.mode.label(), o.bundle_version, ids);
+            Ok((outcome, _)) if !outcome.no_op => {
+                audit::emit_device_enrolled_full(self.mode.label(), outcome.bundle_version, ids);
             }
             Ok(_) => {}
             Err(e) => {
@@ -398,7 +613,13 @@ impl EnrollmentPackage {
         &self,
         paths: &InstallPaths,
         device_os: RoleOs,
-    ) -> Result<ImportOutcome, ImportError> {
+    ) -> Result<(ImportOutcome, Option<role::ManifestCodes>), ImportError> {
+        // The Codes section is read once, here, and carried out rather than
+        // re-read after the install: a standalone package is trusted by the
+        // permissions of the medium it sits on, and reading the same file twice
+        // would still let what is installed differ from what was checked.
+        let codes_section = super::codes::read_standalone_section(&self.root)?;
+
         // Stage the role base (copy slices), validate it, swap into place.
         let staged = stage_dir(&paths.roles_dir, "roles")?;
         let stage_guard = StageGuard::new(staged.clone());
@@ -447,12 +668,16 @@ impl EnrollmentPackage {
         match install_result {
             Ok(()) => {
                 stage_guard.disarm();
-                Ok(ImportOutcome {
-                    mode: self.mode,
-                    bundle_version: 0,
-                    baseline_established: false,
-                    no_op: false,
-                })
+                Ok((
+                    ImportOutcome {
+                        mode: self.mode,
+                        bundle_version: 0,
+                        baseline_established: false,
+                        no_op: false,
+                        codes: None,
+                    },
+                    codes_section,
+                ))
             }
             Err(e) => Err(e),
         }
@@ -561,6 +786,47 @@ fn best_effort_restore(from: &Path, to: &Path) {
     }
 }
 
+/// The file name the Codes section of this package names as the delivery
+/// container, when the section names one.
+///
+/// The job is narrow: keep the delivery container out of the count of per-host
+/// identities. The two trust modes are treated differently on purpose. A
+/// standalone `codes.toml` is this module's own surface and a broken one is
+/// reported here, precisely. A managed section lives inside the manifest, whose
+/// verification belongs to the install and not to a parse that trusts nothing
+/// yet; a manifest that does not even parse therefore yields `Ok(None)` here,
+/// and the package is then reported as ambiguous rather than diagnosed — a
+/// package with a broken manifest is refused either way, and the install says
+/// which.
+///
+/// # Errors
+///
+/// [`ImportError::CodesSection`] for a standalone section that does not parse,
+/// [`ImportError::UnsafeName`] for a name that is not a bare file name, and
+/// [`ImportError::Io`] for a read that failed.
+fn codes_container_name(root: &Path, mode: ImportMode) -> Result<Option<String>, ImportError> {
+    let section = match mode {
+        ImportMode::Standalone => super::codes::read_standalone_section(root)?,
+        // Under the manifest cap, like every other read of this file: a parse
+        // that trusts nothing yet is the first thing a package directory gets
+        // to run, and it must not be the place where the size of a file on
+        // somebody's medium decides how much memory this process asks for.
+        ImportMode::Managed => match read_capped(
+            &root.join(MANIFEST_FILENAME),
+            "manifest",
+            role::manifest::MAX_MANIFEST_BYTES,
+        ) {
+            Ok(bytes) => role::parse_manifest(&bytes).ok().and_then(|m| m.codes),
+            Err(_) => None,
+        },
+    };
+    let Some(named) = section.and_then(|section| section.key_container) else {
+        return Ok(None);
+    };
+    ensure_bare_name(&named.file)?;
+    Ok(Some(named.file))
+}
+
 /// Whether `path` has the (ASCII-case-insensitive) extension `ext` (no dot).
 fn has_ext(path: &Path, ext: &str) -> bool {
     path.extension()
@@ -583,19 +849,24 @@ fn ensure_bare_name(name: &str) -> Result<(), ImportError> {
 }
 
 /// Read `path` with a size cap, mapping I/O and oversize to [`ImportError`].
+///
+/// The cap bounds the read itself rather than the buffer that comes back: a
+/// package sits on a medium whose owner may have put a file of any size on it,
+/// and a read that allocates first and measures afterwards is an out-of-memory
+/// kill of the import process on demand.
 fn read_capped(path: &Path, artefact: &'static str, max: usize) -> Result<Vec<u8>, ImportError> {
-    let bytes = fs::read(path).map_err(|e| ImportError::Io {
-        path: path.display().to_string(),
-        reason: e.to_string(),
-    })?;
-    if bytes.len() > max {
-        return Err(ImportError::Oversize {
+    match crate::fs_mode::read_capped_regular(path, max) {
+        Ok(crate::fs_mode::CappedRead::Whole(bytes)) => Ok(bytes),
+        Ok(crate::fs_mode::CappedRead::TooLarge) => Err(ImportError::Oversize {
             artefact,
-            size: bytes.len(),
+            read: max.saturating_add(1),
             max,
-        });
+        }),
+        Err(e) => Err(ImportError::Io {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        }),
     }
-    Ok(bytes)
 }
 
 /// Create (if needed) the parent dir of `target` with `0755` and return a fresh
@@ -678,8 +949,16 @@ fn copy_role_slices(src: &Path, dst: &Path, include_manifest: bool) -> Result<()
             // trusted role dir.
             continue;
         }
-        // Only role slices and the manifest belong in the role dir.
-        let is_slice = has_ext(&path, "toml") && name != "tags.toml";
+        // Only role slices and the manifest belong in the role dir. The two
+        // package files that are TOML but not slices are named here rather than
+        // filtered by shape: a file that rides into the role directory is
+        // re-parsed as a slice on every load, fails, and writes a line to the
+        // journal each time — and it also counts against the bound on how many
+        // candidates a role base may hold, so a package with a full complement
+        // of slices would stop loading because of a file that is not one.
+        let is_slice = has_ext(&path, "toml")
+            && name != "tags.toml"
+            && name != super::codes::STANDALONE_CODES_FILENAME;
         if !is_slice {
             continue;
         }
@@ -950,8 +1229,21 @@ impl EnrollmentPackage {
             name: pin.file.clone(),
         })?;
         let crl_path = self.root.join(&pin.file);
-        let bytes = match fs::read(&crl_path) {
-            Ok(b) => b,
+        // The same capped, symlink-refusing read the rest of the package goes
+        // through: the cap has to bound the read rather than the buffer that
+        // comes back, and a name in a package must not redirect it elsewhere.
+        // The absent file keeps its own diagnostic — a manifest that pins a CRL
+        // the package does not carry is a different mistake from a medium that
+        // would not read, and the operator fixes the two differently.
+        let bytes = match crate::fs_mode::read_capped_regular(&crl_path, MAX_CRL_BYTES) {
+            Ok(crate::fs_mode::CappedRead::Whole(bytes)) => bytes,
+            Ok(crate::fs_mode::CappedRead::TooLarge) => {
+                return Err(ImportError::Oversize {
+                    artefact: "crl",
+                    read: MAX_CRL_BYTES.saturating_add(1),
+                    max: MAX_CRL_BYTES,
+                })
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(ImportError::CrlMissing {
                     file: pin.file.clone(),
@@ -964,13 +1256,6 @@ impl EnrollmentPackage {
                 })
             }
         };
-        if bytes.len() > MAX_CRL_BYTES {
-            return Err(ImportError::Oversize {
-                artefact: "crl",
-                size: bytes.len(),
-                max: MAX_CRL_BYTES,
-            });
-        }
         let actual = hex::encode(Sha256::digest(&bytes));
         if actual.eq_ignore_ascii_case(pin.sha256.trim()) {
             Ok(bytes)
@@ -1007,7 +1292,7 @@ impl EnrollmentPackage {
         paths: &InstallPaths,
         device_os: RoleOs,
         trusted_pubkey: &[u8],
-    ) -> Result<ImportOutcome, ImportError> {
+    ) -> Result<(ImportOutcome, Option<role::ManifestCodes>), ImportError> {
         // The anti-rollback floor lives under persist_dir; ensure it exists so
         // verify_manifest's persist step can write bundle.version.
         ensure_dir(&paths.persist_dir)?;
@@ -1018,18 +1303,37 @@ impl EnrollmentPackage {
             role::manifest::MAX_MANIFEST_BYTES,
         )?;
         let manifest = role::parse_manifest(&manifest_bytes)?;
+        // The signature is checked here, on the bytes that were just read, and
+        // before anything at all is decided from the manifest's contents.
+        //
+        // Two reasons, and the second is the one that bites. Everything below
+        // — including the idempotent no-op — acts on values taken from this
+        // file, and a no-op that returned before the check would report success
+        // for a package nobody signed. And the Codes section travels out of
+        // this parse rather than a second read of the same path: a package sits
+        // on removable media, so bytes re-read after a check are not the bytes
+        // that were checked. That is the same read-once rule the CRL pin below
+        // already follows.
+        let payload = role::signed_payload(&manifest_bytes)?;
+        role::verify_signature(&payload, &manifest.signature, trusted_pubkey)?;
+        let codes_section = manifest.codes.clone();
+
         let already =
             role::last_accepted_bundle_version(&paths.persist_dir).map_err(ImportError::from)?;
         let baseline_established = already.is_none();
 
         // 1) Idempotent no-op: same version already applied.
         if already == Some(manifest.bundle_version) {
-            return Ok(ImportOutcome {
-                mode: self.mode,
-                bundle_version: manifest.bundle_version,
-                baseline_established: false,
-                no_op: true,
-            });
+            return Ok((
+                ImportOutcome {
+                    mode: self.mode,
+                    bundle_version: manifest.bundle_version,
+                    baseline_established: false,
+                    no_op: true,
+                    codes: None,
+                },
+                codes_section,
+            ));
         }
 
         // 2) Stage the role base + manifest.
@@ -1040,17 +1344,15 @@ impl EnrollmentPackage {
         copy_role_slices(&self.root, &staged, true)?;
 
         let outcome = (|| -> Result<ImportOutcome, ImportError> {
-            // 3) Pre-validate WITHOUT touching the floor or the device.
-            //    Signature over the file bytes (reusing the role-store
-            //    primitives), anti-rollback against the persisted floor, and
-            //    the CRL pin. This guarantees a bad signature / rollback / CRL
-            //    installs nothing and leaves the anti-rollback floor untouched.
+            // 3) Pre-validate WITHOUT touching the floor or the device: the
+            //    anti-rollback check against the persisted floor and the CRL
+            //    pin. The signature held before this closure was entered. This
+            //    guarantees a rollback or a bad CRL installs nothing and leaves
+            //    the anti-rollback floor untouched.
             //
             //    The CRL pin is checked on the SAME in-memory bytes that get
             //    staged below (read-once, no TOCTOU re-read from removable
             //    media).
-            let payload = role::signed_payload(&manifest_bytes)?;
-            role::verify_signature(&payload, &manifest.signature, trusted_pubkey)?;
             if let Some(prev) = already {
                 if manifest.bundle_version < prev {
                     return Err(ImportError::Manifest(ManifestError::Rollback {
@@ -1111,13 +1413,14 @@ impl EnrollmentPackage {
                 bundle_version: manifest.bundle_version,
                 baseline_established,
                 no_op: false,
+                codes: None,
             })
         })();
 
         match outcome {
-            Ok(o) => {
+            Ok(outcome) => {
                 stage_guard.disarm();
-                Ok(o)
+                Ok((outcome, codes_section))
             }
             Err(e) => Err(e),
         }

@@ -1686,7 +1686,7 @@ pub(crate) fn session_open_extras(cert: &Certificate, pam_user: &str) -> Session
 /// active-session lookup will simply miss for uid 0 (root is never the
 /// PAM-target user in production).
 #[cfg(unix)]
-fn resolve_uid(pam_user: &str) -> u32 {
+pub(crate) fn resolve_uid(pam_user: &str) -> u32 {
     match nix::unistd::User::from_name(pam_user) {
         Ok(Some(u)) => u.uid.as_raw(),
         Ok(None) => {
@@ -1712,7 +1712,7 @@ fn resolve_uid(pam_user: &str) -> u32 {
 /// Resolve `pam_user` to a Unix uid — there is no passwd database off Unix,
 /// so the caller gets the same value a failed lookup yields.
 #[cfg(not(unix))]
-fn resolve_uid(_pam_user: &str) -> u32 {
+pub(crate) fn resolve_uid(_pam_user: &str) -> u32 {
     0
 }
 

@@ -19,6 +19,7 @@
 )]
 
 pub mod actions;
+pub mod audit;
 pub mod check;
 pub mod daemon;
 pub mod dump_host_id;

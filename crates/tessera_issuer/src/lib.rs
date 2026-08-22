@@ -72,6 +72,11 @@
 //! # }
 //! ```
 
+// The operator side of the Tessera Codes phone channel: the checks, the
+// receipts and the reconciliation around a code computation that lives entirely
+// in `tessera_codes_contract`. Built for the wasm core as well, so the browser
+// cabinet and the CLI refuse the same request for the same reason.
+pub mod codes;
 pub mod crl;
 pub mod csr;
 mod error;

@@ -15,7 +15,7 @@
 |---|---|
 | Спек в `openspec/specs/` | 32 |
 | Сценариев в них | 338 |
-| Кейсов в реестре | 89 |
+| Кейсов в реестре | 127 |
 | Спек, к которым привязан хотя бы один кейс | 26 |
 | Спек без единого кейса | 6 |
 
@@ -24,6 +24,7 @@
 | Спека | Сценариев | Кейсов |
 |---|---:|---:|
 | configuration | 19 | 13 |
+| device-enrollment | 5 | 13 |
 | cli-diagnostics | 3 | 9 |
 | revocation | 19 | 6 |
 | cert-authentication-flow | 15 | 6 |
@@ -39,7 +40,6 @@
 | host-identity | 6 | 3 |
 | build-release | 10 | 2 |
 | hooks | 7 | 2 |
-| device-enrollment | 5 | 2 |
 | role-store | 13 | 1 |
 | cert-scope-binding | 12 | 1 |
 | issuance-journal | 12 | 1 |
@@ -63,13 +63,17 @@
 
 ## Спеки, ещё не синкнутые из предложений
 
-На них ссылается кейсов: 5. Именно на столько сумма по таблицам выше меньше числа кейсов в сводке: строки в тех таблицах эти спеки получат, когда переедут в `openspec/specs/`.
+На них ссылается кейсов: 32. Именно на столько сумма по таблицам выше меньше числа кейсов в сводке: строки в тех таблицах эти спеки получат, когда переедут в `openspec/specs/`.
 
 | Спека | Предложение | Кейсов |
 |---|---|---:|
+| qr-login-method | online-approval | 15 |
+| audit-chain | audit-chain | 6 |
+| codes-operator-cli | codes-operator-cli | 5 |
 | credential-packaging | issuer-key-generation | 2 |
 | token-data-carrier | pkcs12-token-carrier | 2 |
 | carrier-presence | token-presence-monitor | 1 |
+| device-unenroll | codes-device-artifacts | 1 |
 <!-- END GENERATED -->
 
 ## Чем проверять непокрытое
