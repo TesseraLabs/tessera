@@ -15,7 +15,7 @@
 |---|---|
 | Спек в `openspec/specs/` | 32 |
 | Сценариев в них | 338 |
-| Кейсов в реестре | 124 |
+| Кейсов в реестре | 127 |
 | Спек, к которым привязан хотя бы один кейс | 26 |
 | Спек без единого кейса | 6 |
 
@@ -63,13 +63,13 @@
 
 ## Спеки, ещё не синкнутые из предложений
 
-На них ссылается кейсов: 29. Именно на столько сумма по таблицам выше меньше числа кейсов в сводке: строки в тех таблицах эти спеки получат, когда переедут в `openspec/specs/`.
+На них ссылается кейсов: 32. Именно на столько сумма по таблицам выше меньше числа кейсов в сводке: строки в тех таблицах эти спеки получат, когда переедут в `openspec/specs/`.
 
 | Спека | Предложение | Кейсов |
 |---|---|---:|
-| qr-login-method | online-approval | 13 |
+| qr-login-method | online-approval | 15 |
 | audit-chain | audit-chain | 6 |
-| codes-operator-cli | codes-operator-cli | 4 |
+| codes-operator-cli | codes-operator-cli | 5 |
 | credential-packaging | issuer-key-generation | 2 |
 | token-data-carrier | pkcs12-token-carrier | 2 |
 | carrier-presence | token-presence-monitor | 1 |
