@@ -67,7 +67,7 @@
 
 | Спека | Предложение | Кейсов |
 |---|---|---:|
-| qr-login-method | online-approval | 15 |
+| qr-login-method | greeter-prompt-channel | 15 |
 | audit-chain | audit-chain | 6 |
 | codes-operator-cli | codes-operator-cli | 5 |
 | credential-packaging | issuer-key-generation | 2 |
