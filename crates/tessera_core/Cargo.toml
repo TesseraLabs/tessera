@@ -36,6 +36,13 @@ mac-tests = ["dep:mockall"]
 [dependencies]
 tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
 tessera_ext = { path = "../tessera_ext", version = "0.5.0" }
+# The frozen phone-channel contract: canonical serialisation, key derivation and
+# the code itself. The device recomputes what the operator's cabinet computed,
+# so neither the formula nor the encoding may be written a second time here.
+tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.5.0" }
+# The append-only chain the device audit journal is built on — the same one the
+# issuance journal uses, so the two records stay one format.
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.5.0", features = ["file"] }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
@@ -47,6 +54,9 @@ openssl-sys = "0.9"
 foreign-types = "0.3"
 rand = { workspace = true }
 hex = { workspace = true }
+# Head signatures are recorded base64-encoded, the same as in the issuance
+# journal: one format for both records.
+base64 = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }
 subtle = { workspace = true }

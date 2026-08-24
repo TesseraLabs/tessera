@@ -364,6 +364,21 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // 1. Args + config.
         // SAFETY: `argc`/`argv` are the PAM-supplied module argument vector.
         let args = unsafe { collect_args(argc, argv) };
+        // An unrecognised `method=` is a broken stack line, not an unavailable
+        // credential: answering `PAM_AUTHINFO_UNAVAIL` would let a stack
+        // configured to step over that code fall through to whatever follows,
+        // which is the password this module exists to replace.
+        let auth_method = match crate::pam_args::method_from_args(&args) {
+            Ok(method) => method,
+            Err(unknown) => {
+                tracing::error!(
+                    target: "tessera.auth",
+                    method = %unknown,
+                    "unrecognised method= module argument; refusing the login",
+                );
+                return PAM_SYSTEM_ERR;
+            }
+        };
         let cfg_path = config_path_from_args(&args);
         let cfg = match tessera_core::config::load_privileged_validated_config(&cfg_path) {
             Ok(c) => c,
@@ -372,9 +387,40 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 return PAM_AUTHINFO_UNAVAIL;
             }
         };
-        if let Err(err) = tessera_core::self_check::self_check(&cfg) {
+        // Only what every method depends on. The certificate preconditions —
+        // trust anchors, CRLs, the PKCS#11 module, the GOST engine the trust
+        // configuration asks for — are checked inside the certificate branch
+        // below, because the code method exists for the device where exactly
+        // those are missing. Gating it here closed the last way into such a
+        // device for the reason that way exists.
+        if let Err(err) = tessera_core::self_check::self_check_common(&cfg) {
             tracing::error!(target: "tessera.auth", error = %err, "self-check failed");
             return PAM_AUTHINFO_UNAVAIL;
+        }
+
+        // The audit chain, before anybody is authenticated. It has to be here
+        // and not later: the record of a successful login is part of granting
+        // it, and a journal opened after the decision could only report one.
+        //
+        // A device configured to keep a journal that cannot be opened is
+        // refused rather than let through without one. That is the same
+        // fail-closed rule the login itself follows, applied one level up: the
+        // alternative is a device that believes it is accountable and is not,
+        // which is worse than one that says so.
+        match tessera_core::audit::sink::install_from_config(&cfg) {
+            // Either a journal is open, or this device keeps none — the second
+            // is a configuration, not a failure, and `install_from_config` has
+            // already said which of the two it is in the system journal.
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(
+                    target: "tessera.auth",
+                    error = %err,
+                    "this device is configured to keep an audit journal and it could not be \
+                     opened; refusing to authenticate without one",
+                );
+                return PAM_AUTHINFO_UNAVAIL;
+            }
         }
 
         // 2. PAM_USER / PAM_SERVICE.
@@ -419,6 +465,43 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 return PAM_AUTHINFO_UNAVAIL;
             }
         };
+
+        // 3b. The code login method, when this stack line names it. It shares
+        // the configuration, the host identity and the role store with the
+        // certificate path and nothing else: there is no USB bus to wait on,
+        // no trust anchor to build a chain against, and no token whose removal
+        // the daemon would have to watch. Branching here, before `di::wire`
+        // consumes the config, keeps that separation honest.
+        if auth_method == crate::pam_args::AuthMethod::Code {
+            // SAFETY: `pamh` is the live PAM handle for this callback, and the
+            // call does not outlive this frame.
+            return unsafe {
+                authenticate_by_code_entry(
+                    pamh,
+                    &cfg,
+                    CodeEntryInputs {
+                        pam_user: &pam_user,
+                        pam_service: &pam_service,
+                        host_id_source,
+                        host_id_hash: &host_id_hash,
+                        pam_target,
+                    },
+                )
+            };
+        }
+
+        // 3c. The preconditions of the certificate method, checked now that it
+        // is certain this login is one. Everything below reads material only a
+        // certificate login uses, and a device missing it has no certificate
+        // path — which is a refusal of this method, not of the module.
+        if let Err(err) = tessera_core::self_check::self_check_certificate(&cfg) {
+            tracing::error!(
+                target: "tessera.auth",
+                error = %err,
+                "certificate self-check failed",
+            );
+            return PAM_AUTHINFO_UNAVAIL;
+        }
 
         // 4. Wire trust verifier + monitor (consumes cfg; we keep wired.cfg).
         // The resolved raw host id selects any per-host `[[trust_override]]`
@@ -533,6 +616,223 @@ pub unsafe extern "C" fn pam_sm_authenticate(
             }
         }
     })
+}
+
+/// What `pam_sm_authenticate` has already established about this login.
+///
+/// Gathered into one value because both methods derive it identically and
+/// neither may derive it twice: `PAM_USER` in particular is application-owned
+/// mutable state, so a second read could name a different account than the one
+/// the rest of the attempt is running under.
+#[cfg(target_os = "linux")]
+struct CodeEntryInputs<'a> {
+    /// The login account, which is also the role being asked for.
+    pam_user: &'a str,
+    /// The PAM service that drove the stack.
+    pam_service: &'a str,
+    /// Source kind that produced the host id.
+    host_id_source: tessera_core::host_identity::HostIdSourceKind,
+    /// Resolved host id hash.
+    host_id_hash: &'a str,
+    /// Where the session lives, derived from `PAM_TTY`.
+    pam_target: tessera_proto::SessionTarget,
+}
+
+/// Drive the code login method against the live PAM handle.
+///
+/// Split out of [`pam_sm_authenticate`] because the two methods share almost
+/// nothing: this one waits on no bus, mounts nothing and builds no chain. It
+/// does register the session with the daemon, but for the other of the two
+/// reasons the certificate path does: there is no carrier here whose removal
+/// would have to be watched, and the daemon is also what ends a session when
+/// its term runs out.
+///
+/// # Safety
+///
+/// `pamh` must be the live PAM handle of the enclosing `pam_sm_authenticate`
+/// callback.
+#[cfg(target_os = "linux")]
+unsafe fn authenticate_by_code_entry(
+    pamh: *mut pam_sys::pam_handle_t,
+    cfg: &tessera_core::config::ValidatedConfig,
+    inputs: CodeEntryInputs<'_>,
+) -> i32 {
+    use crate::codes_flow::{
+        authenticate_by_code, open_method, withdraw_code_session, CodeDeps, CodeLogin,
+        CodeLoginOutcome, Registration, SystemProbe, CLOSE_REASON_CONTEXT_LOST,
+    };
+
+    let CodeEntryInputs {
+        pam_user,
+        pam_service,
+        host_id_source,
+        host_id_hash,
+        pam_target,
+    } = inputs;
+
+    // Before anything that can refuse, and once. libpam applies this only when
+    // the transaction ends in a refusal, so a successful login pays nothing
+    // and every refusal below is covered — including the ones added later,
+    // which a per-branch list would quietly miss.
+    //
+    // What it buys is not brute-force resistance: the issuance window already
+    // bounds that far harder. It is that the refusals of this method are many
+    // and of different cost — no ticket, a scope that does not cover, a
+    // revoked ticket, a code that does not meet, a spent budget, a role
+    // briefly locked — and without a randomised wait the response time tells
+    // a caller which of them happened. Several of those answers would give
+    // away that a role and a ticket exist before anything is authenticated.
+    //
+    // SAFETY: `pamh` is the live PAM handle of the enclosing callback.
+    if let Err(err) = unsafe {
+        crate::pam_helpers::set_fail_delay(pamh, tessera_core::codes::throttle::FAILURE_DELAY)
+    } {
+        // Best-effort: a refusal that could not be slowed down is still a
+        // refusal, and failing the login over it would turn a hardening
+        // measure into an outage.
+        tracing::warn!(
+            target: "tessera.codes",
+            error = %err,
+            "pam_fail_delay was refused; refusals of this attempt will not be delayed",
+        );
+    }
+
+    // One configured fact — whether this device runs a mandatory mechanism —
+    // decides both which role slices it accepts and where the level of a
+    // session comes from. A device with no such mechanism has no label to read
+    // and one level by construction; deriving that from the emptiness of the
+    // label file instead would refuse the method on the whole non-Astra fleet.
+    let (device_os, level_source) = if cfg.mac.backend.as_deref() == Some("parsec") {
+        (
+            tessera_core::role::RoleOs::Astra,
+            crate::codes_level::LevelSource::ProcessLabel,
+        )
+    } else {
+        (
+            tessera_core::role::RoleOs::Linux,
+            crate::codes_level::LevelSource::NoMandatoryMechanism,
+        )
+    };
+    let role_stage = match build_role_stage(&cfg.roles, device_os) {
+        Ok(stage) => stage,
+        Err(rc) => return rc,
+    };
+
+    // The artefacts are looked for before a single prompt is shown: a device
+    // that was never given a key container and a ticket set has no method
+    // here, and the stack should move on rather than ask an engineer for a
+    // code nobody can compute. The same configuration then travels into the
+    // flow for the attempt budget it counts. The epoch is not taken from it:
+    // opening the method may select a persisted epoch ahead of the configured
+    // one, and the flow reads that back off the method itself.
+    let codes_config = cfg.codes.method.as_ref();
+    let method = match open_method(codes_config, &role_stage.store) {
+        Ok(method) => method,
+        Err(err) => {
+            tracing::info!(
+                target: "tessera.codes",
+                error = %err,
+                pam_user = %pam_user,
+                "the code login method is not usable on this device",
+            );
+            return err.pam_code();
+        }
+    };
+    let Some(codes_config) = codes_config else {
+        // Unreachable: `open_method` refuses a `None` configuration above.
+        return crate::codes_flow::CodeFlowError::Unavailable.pam_code();
+    };
+
+    let session_id = match fresh_session_id() {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::error!(
+                target: "tessera.codes",
+                error = %err,
+                "OS RNG unavailable; cannot mint session id",
+            );
+            return PAM_AUTHINFO_UNAVAIL;
+        }
+    };
+
+    // The daemon, reached the same way the certificate path reaches it, but
+    // handed over unwrapped: the fail-mode policy is applied inside the flow,
+    // which is the only place that can say what a swallowed failure costs
+    // here — see `codes_flow::register_code_session`.
+    let monitor =
+        tessera_core::ipc::ConnectPerCall::new(tessera_core::ipc::MonitorClientFactory::new(
+            cfg.monitor.socket_path.clone(),
+            cfg.monitor.timeout,
+        ));
+
+    let deps = CodeDeps {
+        config: codes_config,
+
+        store: &role_stage.store,
+        accounts: tessera_core::role::AccountCheck::from_store(&role_stage.store),
+        default_session_ttl: role_stage.default_session_ttl,
+        host_id_hash,
+        host_id_source,
+        monitor: &monitor,
+        monitor_fail_mode: cfg.monitor.fail_mode.into(),
+        pam_target,
+    };
+    // SAFETY: `pamh` is the live PAM handle of the enclosing callback, and the
+    // conversation is dropped before this function returns.
+    let mut conv = unsafe { crate::codes_flow::PamCodeConversation::new(pamh) };
+
+    let login = CodeLogin {
+        pam_user,
+        pam_service,
+        session_id,
+        now: std::time::SystemTime::now(),
+    };
+
+    let probe = SystemProbe::new(level_source);
+    match authenticate_by_code(&deps, login, &method, &mut conv, &probe) {
+        Ok(outcome) => {
+            let CodeLoginOutcome {
+                auth_ctx,
+                registration,
+            } = outcome;
+            // Kept before the context is moved: it is the only handle on the
+            // session the daemon is holding.
+            let session_id = auth_ctx.session_id.clone();
+            // SAFETY: `pamh` is the live PAM handle for this callback.
+            if let Err(err) = unsafe { crate::data_handle::set_auth_context(pamh, auth_ctx) } {
+                tracing::error!(
+                    target: "tessera.codes",
+                    error = %err,
+                    "set_auth_context failed",
+                );
+                // The same phantom the journal path leaves behind, by a
+                // different door: the session is registered, PAM will not
+                // carry the context, so no session phase ever runs for it —
+                // and the daemon would keep it to the end of its term. Every
+                // refusal after the registration has to give it back, not just
+                // the one inside the flow.
+                if registration == Registration::Recorded {
+                    withdraw_code_session(
+                        &monitor,
+                        &session_id,
+                        pam_user,
+                        CLOSE_REASON_CONTEXT_LOST,
+                    );
+                }
+                return PAM_SYSTEM_ERR;
+            }
+            PAM_SUCCESS
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "tessera.codes",
+                error = %err,
+                pam_user = %pam_user,
+                "code login failed",
+            );
+            err.pam_code()
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

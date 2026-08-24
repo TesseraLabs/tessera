@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::raw::{
-    RawCertIntegrityMode, RawConfig, RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback,
-    RawHostIdentity, RawLogging, RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor,
-    RawMonitorFailMode, RawOnUsbRemoved, RawPkcs11LockingMode, RawPkcs12Source, RawRevocation,
-    RawRevocationMode, RawRoles, RawTags, RawTagsMode, RawTrust, RawTrustOverride,
+    RawAudit, RawCertIntegrityMode, RawCodeAlphabet, RawCodeProfile, RawCodes, RawConfig,
+    RawCryptoBackend, RawFlyDmGreeter, RawHostIdFallback, RawHostIdentity, RawLogging,
+    RawMacPolicy, RawMacRuntimeMode, RawMode, RawMonitor, RawMonitorFailMode, RawOnUsbRemoved,
+    RawPkcs11LockingMode, RawPkcs12Source, RawRevocation, RawRevocationMode, RawRoles, RawTags,
+    RawTagsMode, RawTrust, RawTrustOverride, RawWhenFull,
 };
 use crate::error::TrustError;
 use crate::hooks::{validate_hook, HookConfig};
@@ -97,6 +98,70 @@ pub struct ValidatedConfig {
     pub roles: RolesSection,
     /// Device-tags source section (`[tags]`, tags-delegation §5.2).
     pub tags: TagsSection,
+    /// Code login method section (`[codes]`).
+    pub codes: CodesSection,
+    /// Hash-chained audit journal section (`[audit]`).
+    pub audit: AuditSection,
+}
+
+/// Validated `[audit]` section — the device's hash-chained journal.
+///
+/// [`AuditSection::policy`] is the whole opt-in: `Some` means this device keeps
+/// a journal and the policy says where and how large, `None` means it keeps
+/// none. Nothing downstream has to consult a second flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditSection {
+    /// The journal policy, or `None` when this device keeps no journal.
+    pub policy: Option<AuditPolicySection>,
+}
+
+/// Where the journal lives and how it behaves.
+///
+/// Kept as its own type rather than as loose fields so the audit module can be
+/// handed exactly this and nothing else — it has no business reading the rest
+/// of the device configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditPolicySection {
+    /// File the chain lives in.
+    pub file: PathBuf,
+    /// Ceiling on the chain file, in bytes.
+    pub ceiling_bytes: u64,
+    /// What happens once the ceiling is reached.
+    pub when_full: crate::audit::WhenFull,
+    /// How often the head is attested on the schedule.
+    pub attest_interval: Duration,
+}
+
+/// Validated `[codes]` section — the device half of the code login method.
+///
+/// [`CodesSection::method`] is the whole opt-in: it is `Some` only when the
+/// section says `enabled = true` and every value the method cannot run without
+/// is present and well-formed. A device whose section is absent, or explicitly
+/// disabled, does not offer the method at all, which is not the same as a
+/// misconfiguration — a PAM stack meeting the method there falls through to
+/// the next one rather than refusing the login.
+#[derive(Debug, Clone, Default)]
+pub struct CodesSection {
+    /// Everything the method reads from a fleet configuration, or `None` when
+    /// this device does not offer it.
+    ///
+    /// No secret is among those values. The key of the device is opened without
+    /// a person in the room and without a password of any kind — see
+    /// [`crate::codes::store::load_device_key`].
+    pub method: Option<crate::codes::CodesConfig>,
+    /// Where the artefacts of the method live, whether or not it is enabled.
+    ///
+    /// Answered even for a disabled section, and that is the point: a device is
+    /// normally prepared before the method is switched on, so the import that
+    /// delivers the key runs while `enabled = false`. If the store were known
+    /// only to an enabled section, that import would write into the default
+    /// directory while the login path later reads the configured one — and by
+    /// then the delivery container has been shredded from the medium, so the
+    /// key material exists in exactly one place and it is the wrong one.
+    ///
+    /// [`CodesSection::method`] carries the same paths when it is `Some`; they
+    /// are computed once, here, so the two cannot disagree.
+    pub paths: crate::codes::CodesPaths,
 }
 
 /// Validated `[fly_dm_greeter]` section. See [`RawFlyDmGreeter`] for the
@@ -560,6 +625,11 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             RawCryptoBackend::Pkcs11Native => CryptoBackend::Pkcs11Native,
         };
         let gost_engine_path = validate_gost_engine_path(raw, crypto_backend)?;
+        // The key container of the code method is opened with the same engine
+        // as every other GOST container on the device: one configured path,
+        // so an inherited engine search path cannot select a second provider
+        // for one of the two callers.
+        let gost_engine_path_for_codes = gost_engine_path.clone();
         let mode = match raw.mode {
             RawMode::Pkcs12 => Mode::Pkcs12,
             RawMode::Pkcs11 => Mode::Pkcs11,
@@ -613,6 +683,8 @@ impl TryFrom<&RawConfig> for ValidatedConfig {
             fly_dm_greeter: validate_fly_dm_greeter(raw.fly_dm_greeter.as_ref())?,
             roles: validate_roles(&raw.roles)?,
             tags: validate_tags(&raw.tags, &raw.roles)?,
+            codes: validate_codes(&raw.codes, gost_engine_path_for_codes)?,
+            audit: validate_audit(&raw.audit, &raw.codes),
         };
         if validated.needs_gost() && validated.gost_engine_path.is_none() {
             let reason = match validated.crypto_backend {
@@ -688,6 +760,251 @@ fn validate_tags(raw: &RawTags, roles: &RawRoles) -> Result<TagsSection, Error> 
     })
 }
 
+/// Longest `[codes]` free-text value accepted: the device number, the region,
+/// and each tag. They are read aloud or matched against a ticket scope, and a
+/// value longer than this is a paste accident rather than a configuration.
+const CODES_TEXT_MAX_LEN: usize = 128;
+
+/// Validate the `[audit]` section.
+///
+/// Takes the raw `[codes]` section too, and only to resolve the default of
+/// `enabled`: an unset flag follows whether the device offers the code method.
+/// See [`crate::config::raw::RawAudit::enabled`] for why the two are coupled.
+///
+/// Infallible on purpose. Every value has a defensible default, and there is no
+/// input here that could make a journal unsafe to keep — a bad path or a full
+/// disk is discovered when the first record is written, and discovered as a
+/// refusal, which is the behaviour the section is configuring in the first
+/// place. Refusing to load the whole configuration over it would take a device
+/// that logs nothing and make it a device that boots nothing.
+fn validate_audit(raw: &RawAudit, codes: &RawCodes) -> AuditSection {
+    let enabled = raw.enabled.unwrap_or(codes.enabled);
+    if !enabled {
+        return AuditSection { policy: None };
+    }
+    AuditSection {
+        policy: Some(AuditPolicySection {
+            file: raw
+                .file
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_AUDIT_FILE)),
+            ceiling_bytes: raw
+                .ceiling_bytes
+                .unwrap_or(crate::audit::DEFAULT_CEILING_BYTES),
+            when_full: match raw.when_full {
+                RawWhenFull::Refuse => crate::audit::WhenFull::Refuse,
+                RawWhenFull::Rotate => crate::audit::WhenFull::Rotate,
+            },
+            attest_interval: Duration::from_secs(
+                raw.attest_interval_seconds
+                    .unwrap_or(crate::audit::DEFAULT_ATTEST_INTERVAL_SECS),
+            ),
+        }),
+    }
+}
+
+/// Default location of the device's audit journal.
+const DEFAULT_AUDIT_FILE: &str = "/var/lib/tessera/audit.ndjson";
+
+/// Validate the `[codes]` section — the device half of the code login method.
+///
+/// The section is validated whether or not it is enabled: a device number with
+/// a wrong check character is a typo an operator must see at load, not on the
+/// first login after the method is switched on. What `enabled = true` adds is
+/// the demand that the values the method cannot run without be there at all.
+///
+/// A tag set is among them. The scope of a ticket reaches a device only when
+/// the two share at least one tag, so an enabled method on a device carrying
+/// no tags would refuse every code that was ever computed for it, and report
+/// the refusal as an unrelated denial.
+fn validate_codes(
+    raw: &RawCodes,
+    gost_engine_path: Option<PathBuf>,
+) -> Result<CodesSection, Error> {
+    use crate::codes::store::DEFAULT_CODES_DIR;
+    use crate::codes::{CodesConfig, CodesPaths, DeviceScope};
+    use tessera_codes_contract::device_number::CheckedDeviceNumber;
+    use tessera_codes_contract::key::Epoch;
+
+    if raw.key_password.is_some() {
+        return Err(Error::ConfigInvalid {
+            reason: CODES_KEY_PASSWORD_REMOVED.to_string(),
+        });
+    }
+
+    let dir = match raw.dir.as_ref() {
+        Some(path) => {
+            if !path.is_absolute() {
+                return Err(Error::ConfigInvalid {
+                    reason: format!("[codes].dir must be absolute (got {})", path.display()),
+                });
+            }
+            path.clone()
+        }
+        None => PathBuf::from(DEFAULT_CODES_DIR),
+    };
+
+    let device_number = match raw.device_number.as_deref() {
+        Some(text) => {
+            codes_text("[codes].device_number", text)?;
+            Some(
+                CheckedDeviceNumber::parse(text).map_err(|error| Error::ConfigInvalid {
+                    reason: format!(
+                        "[codes].device_number must carry its check character: {error}"
+                    ),
+                })?,
+            )
+        }
+        None => None,
+    };
+
+    // The lifetime of an attempt is a fleet parameter and is checked where the
+    // rest of them are: the contract bounds it from both ends, and a second
+    // copy of it beside the parameters would be a second answer to the same
+    // question.
+    let params = validate_code_params(raw)?;
+    let code_ttl = Duration::from_secs(params.attempt_ttl_secs());
+
+    if let Some(region) = raw.region.as_deref() {
+        codes_text("[codes].region", region)?;
+    }
+    for tag in &raw.tags {
+        codes_text("[codes].tags", tag)?;
+    }
+
+    let paths = CodesPaths::under(&dir);
+
+    if !raw.enabled {
+        return Ok(CodesSection {
+            method: None,
+            paths,
+        });
+    }
+
+    let (Some(device_number), Some(epoch), Some(region)) =
+        (device_number, raw.epoch, raw.region.clone())
+    else {
+        return Err(Error::ConfigInvalid {
+            reason: "[codes].enabled = true requires device_number, epoch and region: a code is \
+                     computed over the number and the epoch of this device, and a ticket reaches \
+                     it by region"
+                .into(),
+        });
+    };
+    if raw.tags.is_empty() {
+        return Err(Error::ConfigInvalid {
+            reason: "[codes].enabled = true requires at least one tag: an operator ticket reaches \
+                     a device only through a tag they share, so a device with none refuses every \
+                     code issued for it"
+                .into(),
+        });
+    }
+
+    Ok(CodesSection {
+        method: Some(CodesConfig {
+            paths: paths.clone(),
+            params,
+            device_number,
+            epoch: Epoch::new(epoch),
+            device_scope: DeviceScope {
+                tags: raw.tags.clone(),
+                region,
+            },
+            code_ttl,
+            gost_engine_path,
+        }),
+        paths,
+    })
+}
+
+/// Build the fleet parameters of the code channel.
+///
+/// Every coordinate the two sides have to agree on is checked by the contract
+/// crate rather than here, so "only stricter" is verified in one place and a
+/// configuration weaker than the minimum fails to load instead of being
+/// quietly replaced by a default.
+fn validate_code_params(
+    raw: &RawCodes,
+) -> Result<tessera_codes_contract::params::FleetParams, Error> {
+    use tessera_codes_contract::code::Alphabet;
+    use tessera_codes_contract::params::{FleetParams, FleetParamsInput};
+    use tessera_codes_contract::profile::UnconfirmedProfileRisk;
+
+    // A profile this device cannot perform is refused here, where an operator
+    // is looking at the file, and not at the moment a code is verified.
+    //
+    // The two are worlds apart in what they cost. A configuration that loads
+    // says the method is available: the device starts, `tessera check` passes,
+    // the deployment looks finished — and then every single code an operator
+    // reads out over the telephone is refused, on the one channel that exists
+    // because nobody can reach that device. The refusal carries no clue either,
+    // because a key agreement that cannot be set up is reported exactly like a
+    // wrong code. What the fleet can perform is answered by the module that
+    // performs it, so the two cannot drift apart.
+    let profile = profile_of(raw.profile);
+    if !crate::codes::agreement::device_supports(profile) {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "[codes].profile = \"{}\" names a key agreement this device cannot perform, so \
+                 every code computed for it would be refused; the supported profile is \"p256\"",
+                profile.as_str()
+            ),
+        });
+    }
+
+    let defaults = FleetParamsInput::defaults();
+    FleetParams::parse(FleetParamsInput {
+        code_len: raw.code_len.unwrap_or(defaults.code_len),
+        attempts_per_nonce: raw
+            .attempts_per_nonce
+            .unwrap_or(defaults.attempts_per_nonce),
+        alphabet: match raw.alphabet {
+            RawCodeAlphabet::Decimal => Alphabet::Decimal,
+            RawCodeAlphabet::CrockfordBase32 => Alphabet::CrockfordBase32,
+        },
+        nonce_width: raw.nonce_width.unwrap_or(defaults.nonce_width),
+        attempt_ttl_secs: raw.code_ttl_seconds.unwrap_or(defaults.attempt_ttl_secs),
+        profile: profile_of(raw.profile),
+        unconfirmed_profile_risk: if raw.accept_unconfirmed_profile {
+            UnconfirmedProfileRisk::AcceptedByFleetOwner
+        } else {
+            UnconfirmedProfileRisk::NotAccepted
+        },
+    })
+    .map_err(|error| Error::ConfigInvalid {
+        reason: format!("[codes] parameters are weaker than the contract allows: {error}"),
+    })
+}
+
+/// The contract profile a raw `[codes].profile` names.
+fn profile_of(raw: RawCodeProfile) -> tessera_codes_contract::profile::AlgorithmProfile {
+    use tessera_codes_contract::profile::AlgorithmProfile;
+
+    match raw {
+        RawCodeProfile::P256 => AlgorithmProfile::P256,
+        RawCodeProfile::GostVko34102012 => AlgorithmProfile::GostVko34102012,
+        RawCodeProfile::X25519 => AlgorithmProfile::X25519,
+    }
+}
+
+/// Check one free-text `[codes]` value against the shared bound.
+fn codes_text(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::ConfigInvalid {
+            reason: format!("{field} must be non-empty when set"),
+        });
+    }
+    if value.len() > CODES_TEXT_MAX_LEN {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "{field} must be at most {CODES_TEXT_MAX_LEN} bytes (got {})",
+                value.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Rejection message for the removed `[[user_mapping]]` section.
 ///
 /// The section let the device itself decide who was admitted, matching a
@@ -703,6 +1020,25 @@ const USER_MAPPING_REMOVED: &str =
      there is no device-side fallback that admits a certificate by its CN or SAN — delete the \
      section from config.toml and re-issue any certificate that relied on it with the \
      appropriate --role list";
+
+/// Rejection message for the removed `[codes].key_password` key.
+///
+/// The key named the password of the device key container while the container
+/// sat beside it in the same root-only directory — a password stored next to
+/// what it opens, which protects nothing against anybody the permissions of
+/// those files already admit. It existed because key material arrives
+/// PIN-protected and the device cannot be asked for that PIN at boot; the
+/// enrolment import now resolves that properly, opening the delivery container
+/// once with a PIN the operator supplies and re-writing the key into the store
+/// without one. Naming the removal explicitly matters for the same reason as
+/// `[roles].enforce` — an operator upgrading a fleet must be able to tell a
+/// deliberate behaviour change from a typo.
+const CODES_KEY_PASSWORD_REMOVED: &str =
+    "[codes].key_password has been removed: the device key is no longer stored under a password, \
+     because a password the device reads unattended out of a file beside the container protects \
+     it from nobody the file permissions admit already; delete the key from config.toml and \
+     deliver the key container through `tessera enroll --codes-pin-file <file>`, which opens it \
+     once with the PIN and stores the key root-only";
 
 /// Rejection message for the removed `[roles].enforce` key.
 ///
@@ -2008,6 +2344,343 @@ fn validate_gost_engine_path(
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A `[codes]` block that validates, so each test below can spoil exactly
+    /// one value and watch that one refusal.
+    fn enabled_codes() -> RawCodes {
+        RawCodes {
+            enabled: true,
+            // The number as a device label prints it — body plus the check
+            // character. Taken from the algorithm rather than written out, so
+            // the fixture cannot drift from what a real label carries.
+            device_number: Some(
+                tessera_codes_contract::device_number::CheckedDeviceNumber::from_body("77-000123")
+                    .unwrap()
+                    .as_str()
+                    .to_owned(),
+            ),
+            epoch: Some(7),
+            region: Some("ru-south".to_owned()),
+            tags: vec!["dc-1".to_owned()],
+            ..RawCodes::default()
+        }
+    }
+
+    #[test]
+    fn an_absent_codes_section_does_not_offer_the_method() {
+        let section = validate_codes(&RawCodes::default(), None).unwrap();
+        assert!(section.method.is_none());
+    }
+
+    #[test]
+    fn an_enabled_section_carries_the_whole_method() {
+        let section = validate_codes(&enabled_codes(), None).unwrap();
+        let method = section
+            .method
+            .expect("an enabled section offers the method");
+        assert_eq!(method.epoch.get(), 7);
+        assert_eq!(method.device_scope.region, "ru-south");
+        assert_eq!(
+            method.code_ttl,
+            Duration::from_secs(tessera_codes_contract::params::DEFAULT_ATTEMPT_TTL_SECS)
+        );
+        assert!(method
+            .paths
+            .device_key_container
+            .starts_with(crate::codes::store::DEFAULT_CODES_DIR));
+    }
+
+    #[test]
+    fn a_device_number_without_its_check_character_is_refused() {
+        let raw = RawCodes {
+            device_number: Some("77-000123".to_owned()),
+            ..enabled_codes()
+        };
+        let err = validate_codes(&raw, None).unwrap_err();
+        assert!(
+            format!("{err}").contains("check character"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_section_still_refuses_a_malformed_device_number() {
+        // The typo is an operator's to see at load: switching the method on
+        // later must not be the first time the number is read.
+        let raw = RawCodes {
+            enabled: false,
+            device_number: Some("77-000123".to_owned()),
+            ..RawCodes::default()
+        };
+        assert!(validate_codes(&raw, None).is_err());
+    }
+
+    #[test]
+    fn an_enabled_section_without_a_device_number_is_refused() {
+        let raw = RawCodes {
+            device_number: None,
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&raw, None).is_err());
+    }
+
+    #[test]
+    fn an_enabled_section_without_tags_is_refused() {
+        // A device sharing no tag with any ticket scope refuses every code
+        // ever computed for it; the refusal belongs at load.
+        let raw = RawCodes {
+            tags: Vec::new(),
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&raw, None).is_err());
+    }
+
+    #[test]
+    fn parameters_weaker_than_the_contract_are_refused() {
+        // Two characters of any alphabet this contract holds are below the
+        // floor; a length that passed in one alphabet and failed in another
+        // would be testing the alphabet rather than the floor.
+        let raw = RawCodes {
+            code_len: Some(2),
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&raw, None).is_err());
+    }
+
+    #[test]
+    fn a_decimal_fleet_keeps_the_length_its_alphabet_needs() {
+        // The calibration is in bits, so a fleet that asks for decimal has to
+        // ask for the length decimal needs: the default length belongs to the
+        // default alphabet, and taking one without the other is what would
+        // weaken a code silently.
+        let short_decimal = RawCodes {
+            alphabet: RawCodeAlphabet::Decimal,
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&short_decimal, None).is_err());
+
+        let calibrated = RawCodes {
+            alphabet: RawCodeAlphabet::Decimal,
+            code_len: Some(8),
+            nonce_width: Some(39),
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&calibrated, None).is_ok());
+    }
+
+    #[test]
+    fn accepting_the_vendor_gate_does_not_make_an_unrunnable_profile_load() {
+        // Accepting the risk of an unconfirmed profile is an answer to a
+        // different question than "can this device perform it at all". The
+        // fleet owner may take the vendor gate on themselves; that does not
+        // give the device a key agreement it does not have, so the
+        // configuration is refused either way.
+        //
+        // The gate itself is not weakened here — it lives in the contract crate
+        // and is exercised there (`gost_without_an_accepted_risk_does_not_parse
+        // _and_names_the_gate`), which is also where a fleet that eventually
+        // gains the device half will meet it again.
+        let raw = RawCodes {
+            profile: RawCodeProfile::GostVko34102012,
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&raw, None).is_err());
+
+        let accepted = RawCodes {
+            accept_unconfirmed_profile: true,
+            ..raw
+        };
+        let error =
+            validate_codes(&accepted, None).expect_err("an accepted risk is not a key agreement");
+        assert!(
+            error.to_string().contains("cannot perform"),
+            "the refusal must name the real obstacle: {error}"
+        );
+    }
+
+    #[test]
+    fn a_profile_the_device_cannot_perform_is_refused_at_load() {
+        // The failure this prevents is silent and expensive: the file loads,
+        // the method announces itself, the deployment looks finished, and every
+        // code an operator reads out over the telephone is refused with a
+        // reason indistinguishable from a wrong code — on the one channel that
+        // exists because nobody can reach the device any other way.
+        for profile in [RawCodeProfile::X25519, RawCodeProfile::GostVko34102012] {
+            let raw = RawCodes {
+                profile,
+                // Accepted by the fleet owner, so the unconfirmed-profile gate
+                // is not what refuses the GOST case: what is under test is the
+                // device being unable to perform the agreement at all.
+                accept_unconfirmed_profile: true,
+                ..enabled_codes()
+            };
+            let error = validate_codes(&raw, None)
+                .expect_err("a profile the device cannot perform must not load");
+            let text = error.to_string();
+            assert!(
+                text.contains("cannot perform"),
+                "the refusal must say what is wrong: {text}"
+            );
+            assert!(
+                text.contains("p256"),
+                "the refusal must name the profile that works: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_profile_the_device_can_perform_is_accepted_by_the_configuration() {
+        // The other direction of the same agreement: a profile the device can
+        // run must not be refused by the configuration, or the fleet cannot use
+        // what it has.
+        use tessera_codes_contract::profile::AlgorithmProfile;
+
+        for (raw_profile, profile) in [
+            (RawCodeProfile::P256, AlgorithmProfile::P256),
+            (RawCodeProfile::X25519, AlgorithmProfile::X25519),
+            (
+                RawCodeProfile::GostVko34102012,
+                AlgorithmProfile::GostVko34102012,
+            ),
+        ] {
+            if !crate::codes::agreement::device_supports(profile) {
+                continue;
+            }
+            let raw = RawCodes {
+                profile: raw_profile,
+                accept_unconfirmed_profile: true,
+                ..enabled_codes()
+            };
+            assert!(
+                validate_codes(&raw, None).is_ok(),
+                "the device performs {} but the configuration refuses it",
+                profile.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_journal_follows_the_code_method_unless_the_section_says_otherwise() {
+        // Documented in `dist/config/config.toml.example`, so it needs a test:
+        // control over the operator of the telephone channel rests on
+        // reconciling the logins a device saw against the receipts its
+        // operators wrote, and a device offering the method without a journal
+        // cannot discover that about itself — every login looks fine locally
+        // and nothing can be paired afterwards.
+        let silent_audit = RawAudit::default();
+
+        let offering_codes = validate_audit(&silent_audit, &enabled_codes());
+        assert!(
+            offering_codes.policy.is_some(),
+            "a device offering the code method keeps a journal"
+        );
+
+        let no_codes = validate_audit(&silent_audit, &RawCodes::default());
+        assert!(
+            no_codes.policy.is_none(),
+            "a device that offers no method is not made to keep a journal by it"
+        );
+
+        // And the explicit value wins in both directions, which is the other
+        // half of what the example promises.
+        let refused = validate_audit(
+            &RawAudit {
+                enabled: Some(false),
+                ..RawAudit::default()
+            },
+            &enabled_codes(),
+        );
+        assert!(
+            refused.policy.is_none(),
+            "an explicit false switches it off"
+        );
+
+        let demanded = validate_audit(
+            &RawAudit {
+                enabled: Some(true),
+                ..RawAudit::default()
+            },
+            &RawCodes::default(),
+        );
+        assert!(
+            demanded.policy.is_some(),
+            "an explicit true switches it on without the code method"
+        );
+    }
+
+    #[test]
+    fn a_disabled_section_still_says_where_the_store_is() {
+        // A device is prepared before the method is switched on: the enrolment
+        // package that delivers the key is imported while `enabled = false`. If
+        // the configured directory were only known to an enabled section, that
+        // import would write the key into the default one while the login path
+        // later reads the configured one — and the delivery container is
+        // shredded from the medium by the same import, so the only copy of the
+        // key would be in the wrong place.
+        // The directory goes through `absolute`: what counts as an absolute
+        // path is a property of the platform, and a POSIX literal is a
+        // *relative* path on Windows, where the validator would then refuse the
+        // fixture for a reason that has nothing to do with what is under test.
+        let dir = crate::test_support::absolute("/srv/tessera/codes");
+        let raw = RawCodes {
+            enabled: false,
+            dir: Some(PathBuf::from(&dir)),
+            ..RawCodes::default()
+        };
+        let section = validate_codes(&raw, None).unwrap();
+        assert!(section.method.is_none(), "the method is not offered yet");
+        assert!(
+            section.paths.device_key_container.starts_with(&dir),
+            "the store is the configured one, not the default: {}",
+            section.paths.device_key_container.display()
+        );
+    }
+
+    #[test]
+    fn the_enabled_section_and_the_store_it_reports_are_the_same_paths() {
+        // Two answers to "where do the artefacts live" is one answer too many.
+        let raw = RawCodes {
+            dir: Some(PathBuf::from(crate::test_support::absolute(
+                "/srv/tessera/codes",
+            ))),
+            ..enabled_codes()
+        };
+        let section = validate_codes(&raw, None).unwrap();
+        let method = section.method.expect("the method is offered");
+        assert_eq!(method.paths, section.paths);
+    }
+
+    #[test]
+    fn no_fixture_here_hands_a_validator_a_posix_path_literal() {
+        // The guard for a class of failure this host cannot otherwise show: a
+        // POSIX literal is a *relative* path on Windows, so a fixture that
+        // spells one is refused there for a reason that has nothing to do with
+        // what the test is about. Twice already that arrived as a Windows-only
+        // red and was read as a product regression.
+        crate::test_support::assert_no_posix_path_fixtures(include_str!("validated.rs"));
+    }
+
+    #[test]
+    fn a_relative_codes_dir_is_refused() {
+        let raw = RawCodes {
+            dir: Some(PathBuf::from("codes")),
+            ..enabled_codes()
+        };
+        assert!(validate_codes(&raw, None).is_err());
+    }
+
+    #[test]
+    fn a_code_ttl_outside_the_contract_ceiling_is_refused() {
+        // Both ends, and both from the contract: zero is not "no limit", and a
+        // fleet cannot stretch the lifetime past the normative ceiling.
+        for seconds in [0, tessera_codes_contract::params::MAX_ATTEMPT_TTL_SECS + 1] {
+            let raw = RawCodes {
+                code_ttl_seconds: Some(seconds),
+                ..enabled_codes()
+            };
+            assert!(validate_codes(&raw, None).is_err(), "{seconds} s");
+        }
+    }
 
     #[test]
     fn crl_mode_with_empty_paths_is_rejected() {

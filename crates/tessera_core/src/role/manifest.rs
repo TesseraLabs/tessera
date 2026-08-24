@@ -83,6 +83,57 @@ pub struct ManifestCrl {
     pub sha256: String,
 }
 
+/// One file of the Codes part, and the hash the package pins it at.
+///
+/// The pin is optional in the *schema* and mandatory in a *managed* package:
+/// the same section shape describes the signed manifest and the standalone
+/// `codes.toml`, and what makes a missing pin a refusal is the trust mode, not
+/// the type. The enforcement lives in [`crate::enrollment::codes`], which is
+/// also what reads the bytes.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestCodesFile {
+    /// Bare file name within the package directory.
+    pub file: String,
+    /// SHA-256 over the raw file bytes, lowercase hex.
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// Optional Codes part of the bundle: the artefacts the telephone channel needs
+/// on the device (`codes-device-artifacts`).
+///
+/// Every file is pinned in the same style as the CRL, so the whole part rides
+/// the SAME signature and `bundle_version` as the role base — no second
+/// signature and no second anti-rollback counter. The key epoch below is a
+/// counter of its own, but it counts something else: which key pair the device
+/// holds, not which bundle it applied, and it is enforced by the artefact store
+/// rather than here.
+///
+/// The part is additive and optional in both directions: a bundle carrying no
+/// `[codes]` section is a bundle for an Access-only fleet, and a section
+/// carrying tickets without a key container is a rotation for a device that
+/// already has one. `verify_manifest` does not act on this field — installation
+/// is an enrollment-layer step.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestCodes {
+    /// Key epoch every artefact of this section belongs to.
+    pub epoch: u32,
+    /// The PIN-protected container the device private key is delivered in.
+    #[serde(default)]
+    pub key_container: Option<ManifestCodesFile>,
+    /// The operator ticket set.
+    #[serde(default)]
+    pub tickets: Option<ManifestCodesFile>,
+    /// The revocation list of those tickets.
+    #[serde(default)]
+    pub ticket_revocations: Option<ManifestCodesFile>,
+    /// The anchor every ticket is verified against.
+    #[serde(default)]
+    pub ticket_authority: Option<ManifestCodesFile>,
+}
+
 /// Parsed `manifest.toml` (strict: `deny_unknown_fields`).
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -121,6 +172,13 @@ pub struct Manifest {
     /// manifests still parse. `verify_manifest` does not act on this field.
     #[serde(default)]
     pub p12_sha256: Option<String>,
+    /// Optional Codes part: the artefacts of the telephone channel, each pinned
+    /// by SHA-256 in the CRL-pin style. When present, the enrollment importer
+    /// verifies and installs them under the SAME signature and `bundle_version`
+    /// as the rest of the bundle. Additive and optional so a bundle for an
+    /// Access-only fleet still parses; `verify_manifest` does not act on it.
+    #[serde(default)]
+    pub codes: Option<ManifestCodes>,
 }
 
 /// A manifest that has passed full verification (signature + anti-rollback +

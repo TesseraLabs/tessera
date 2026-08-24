@@ -1,0 +1,74 @@
+[package]
+name = "tessera_hashchain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The append-only hash-chained record shared by Tessera's journals: line framing, head signatures, annotations, and verification with the position of the first break."
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+# The plain file storage. Off by default so the wasm issuer core, which brings
+# its own host-side storage, never compiles a `std::fs` path it cannot use.
+file = ["dep:rustix", "dep:windows-sys"]
+# The in-memory and always-failing storages. A dependent turns this on for its
+# own tests; it is not a runtime backend.
+testing = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+# `flock(2)` for the append transaction. Optional and Unix-only: the wasm core
+# has no second process to race with, and no `flock` to call.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true }
+
+# `LockFileEx` for the same transaction on Windows. The issuing tool is
+# cross-platform by construction, and its journal has the same two-writer
+# problem there as a device journal has on Unix. Already a workspace dependency
+# with the needed features on — no new crate enters the graph for this.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The crate's own integration tests reach the in-memory and failing storages,
+# which live behind `testing`. A feature a dependent turns on is not on for this
+# crate's own test targets unless it is asked for here — without this line
+# `cargo test -p tessera_hashchain` does not build, and every guarantee of the
+# chain is checked only under `--all-features`.
+tessera_hashchain = { path = ".", version = "0.5.0", features = ["testing", "file"] }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+unused_must_use = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+panic_in_result_fn = "deny"
+let_underscore_must_use = "deny"
+let_underscore_lock = "deny"
+indexing_slicing = "deny"
+
+# The permissions test sets the process umask deliberately wide, to prove the
+# journal's mode does not come from it.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true }

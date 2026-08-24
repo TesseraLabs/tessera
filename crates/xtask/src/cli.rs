@@ -20,6 +20,41 @@ pub enum Command {
     E2e(E2eArgs),
     /// Пересборка матрицы покрытия спек кейсами реестра.
     E2eCoverage(CoverageArgs),
+    /// Пересборка фикстур телефонного канала (сюита `27-codes-phone`).
+    CodesFixtures(CodesFixturesArgs),
+    /// Подпись challenge ключом устройства — инструмент стенда для CODE-014.
+    CodesSignChallenge(CodesSignChallengeArgs),
+}
+
+/// Аргументы подписи challenge ключом устройства.
+#[derive(Debug, Clone, clap::Args)]
+pub struct CodesSignChallengeArgs {
+    /// Проводная форма challenge БЕЗ подписи.
+    #[arg(long, conflicts_with = "challenge_file")]
+    pub challenge: Option<String>,
+
+    /// Файл с проводной формой challenge БЕЗ подписи.
+    #[arg(long)]
+    pub challenge_file: Option<PathBuf>,
+
+    /// Приватный ключ устройства в PKCS#8 PEM (`device-key.pem` комплекта).
+    #[arg(long)]
+    pub key: PathBuf,
+}
+
+/// Аргументы генератора фикстур телефонного канала.
+#[derive(Debug, Clone, clap::Args)]
+pub struct CodesFixturesArgs {
+    /// Каталог комплекта. Подменяется целиком.
+    #[arg(long, default_value = "crates/tessera_core/tests/fixtures/codes")]
+    pub out: PathBuf,
+
+    /// Роль-учётная запись, которую допускает билет оператора (можно повторить).
+    ///
+    /// По умолчанию — учётные записи профилей стенда. Задавать нужно, только
+    /// если прогон идёт под другой.
+    #[arg(long = "role")]
+    pub roles: Vec<String>,
 }
 
 /// Аргументы сборки матрицы покрытия.

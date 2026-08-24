@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use tessera_cli::audit::{self, AuditArgs};
 use tessera_cli::check::{self, CheckArgs};
 use tessera_cli::daemon::{self, DaemonArgs};
 use tessera_cli::dump_host_id::{self, DumpHostIdArgs};
@@ -25,6 +26,12 @@ struct Cli {
 enum Cmd {
     /// Run the monitor daemon (USB / logind enforcement, IPC server).
     Daemon(DaemonArgs),
+    /// Work on the device's hash-chained audit journal. `audit verify`
+    /// recomputes the chain from genesis and exits non-zero at the first break;
+    /// `audit status` prints how full the journal is and when its head was last
+    /// attested; `audit attest` signs the current head with the device's
+    /// attestation key.
+    Audit(AuditArgs),
     /// Run the startup validation checks against `config.toml` without
     /// starting the daemon. Exits 0 when every check is INFO/WARN, exits
     /// 1 when at least one check reports ERROR. Intended as a preflight
@@ -62,6 +69,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Daemon(args) => daemon::run(args),
+        Cmd::Audit(args) => audit::run(args),
         Cmd::Check(args) => check::run(args),
         Cmd::DumpHostId(args) => dump_host_id::run_cli(args),
         Cmd::Role(args) => role::run(args),

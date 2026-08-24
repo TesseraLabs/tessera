@@ -277,6 +277,38 @@ pub(crate) enum Msg {
     /// Secret ladder: the source produced no line break within the accepted
     /// length (the source and the bound follow).
     SecretTooLong,
+    /// Codes: the heading above the code to read out (the grouped code follows).
+    CodesCodeHeading,
+    /// Codes: the receipt of the issuance was written (a path follows).
+    CodesReceiptWritten,
+    /// Codes: the command was refused (the refusal follows).
+    ///
+    /// Every command of the channel shares it, so the wording names no
+    /// particular one: a reconciliation that refuses to produce a report is not
+    /// an issuance that was turned away, and telling an auditor otherwise sends
+    /// them looking for a code nobody asked for.
+    CodesRefused,
+    /// Codes: what the nonce counter said about the call (a token follows).
+    /// Codes: how the operator key was held (a token follows).
+    CodesKeyStorage,
+    /// Codes: the site axis of the ticket was not checked (full-line warning).
+    CodesSiteUndeclared,
+    /// Codes: the second operator who approved an override (an identifier
+    /// follows).
+    /// Codes: the receipt is well formed and its name binds it to the ticket
+    /// (full line).
+    CodesReceiptValid,
+    /// Codes: the receipt does not hold together (a detail follows).
+    CodesReceiptInvalid,
+    /// Codes: the ticket verified against the anchored authority (full line).
+    CodesTicketVerified,
+    /// Codes: no authority anchor was supplied, so the ticket was read
+    /// unverified (full line).
+    CodesTicketUnverified,
+    /// Codes: the reconciliation found nothing (full line).
+    CodesReconcileClean,
+    /// Codes: the reconciliation ran without the device side (full line).
+    CodesReconcileIncomplete,
 }
 
 #[cfg(feature = "cli")]
@@ -364,6 +396,27 @@ impl Msg {
             Msg::SecretTooLong => {
                 "the secret source gave no line break within the accepted length:"
             }
+            Msg::CodesCodeHeading => "code to read out:",
+            Msg::CodesReceiptWritten => "receipt written to",
+            Msg::CodesRefused => "the command was refused:",
+            Msg::CodesKeyStorage => "operator key held:",
+            Msg::CodesSiteUndeclared => {
+                "the site of the device was not declared, so the ticket's region and tags were \
+                 not checked here; the device checks them itself before it accepts the code"
+            }
+            Msg::CodesReceiptValid => {
+                "the receipt is well formed and its name binds it to the ticket"
+            }
+            Msg::CodesReceiptInvalid => "the receipt does not hold together:",
+            Msg::CodesTicketVerified => "the ticket verified against the anchored authority",
+            Msg::CodesTicketUnverified => {
+                "no authority anchor was supplied: the fields below are what the document claims, \
+                 not what anybody signed for"
+            }
+            Msg::CodesReconcileClean => "the two sides agree",
+            Msg::CodesReconcileIncomplete => {
+                "incomplete report: no device journal was supplied, so only the receipts were read"
+            }
         }
     }
 
@@ -441,6 +494,25 @@ impl Msg {
             Msg::SecretEmpty => "источник секрета вернул пустое значение:",
             Msg::SecretTooLong => {
                 "источник секрета не дал перевода строки в пределах допустимой длины:"
+            }
+            Msg::CodesCodeHeading => "код для диктовки:",
+            Msg::CodesReceiptWritten => "квитанция записана в",
+            Msg::CodesRefused => "команда отклонена:",
+            Msg::CodesKeyStorage => "ключ оператора хранится:",
+            Msg::CodesSiteUndeclared => {
+                "место устройства не названо, поэтому регион и метки билета здесь не проверялись; \
+                 устройство проверяет их само, прежде чем принять код"
+            }
+            Msg::CodesReceiptValid => "квитанция целостна, имя файла связывает её с билетом",
+            Msg::CodesReceiptInvalid => "квитанция не сходится:",
+            Msg::CodesTicketVerified => "билет проверен по якорю удостоверяющей стороны",
+            Msg::CodesTicketUnverified => {
+                "якорь удостоверяющей стороны не задан: ниже то, что документ о себе заявляет, \
+                 а не то, за что кто-либо подписался"
+            }
+            Msg::CodesReconcileClean => "стороны сходятся",
+            Msg::CodesReconcileIncomplete => {
+                "отчёт неполон: журналы устройств не заданы, прочитаны только квитанции"
             }
         }
     }

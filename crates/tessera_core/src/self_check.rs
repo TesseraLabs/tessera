@@ -20,6 +20,63 @@ use tracing::warn;
 ///
 /// Any of the [`SelfCheckError`] variants — see the enum docs.
 pub fn self_check(cfg: &ValidatedConfig) -> Result<(), SelfCheckError> {
+    self_check_common(cfg)?;
+    self_check_certificate(cfg)
+}
+
+/// The preconditions **every** login method depends on, whichever credential
+/// it uses.
+///
+/// Only the hooks are here, and they belong here because they are not a
+/// property of a credential: `session_open` and `session_close` hooks run for
+/// any login that reaches the session phase, so a hook whose command is
+/// missing breaks a code login exactly as it breaks a certificate one.
+///
+/// # Errors
+///
+/// [`SelfCheckError::HookCommandMissing`] for a configured hook whose command
+/// is not on disk.
+pub fn self_check_common(cfg: &ValidatedConfig) -> Result<(), SelfCheckError> {
+    for hook in &cfg.hooks {
+        // `validate_hook` отвергает пустой command (EmptyCommand), поэтому
+        // в валидированном HookConfig первый элемент всегда присутствует.
+        #[allow(clippy::indexing_slicing)]
+        let path = std::path::PathBuf::from(&hook.command[0]);
+        if !path.exists() {
+            return Err(SelfCheckError::HookCommandMissing {
+                stage: hook.stage,
+                path,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The preconditions of the **certificate** method, and of nothing else.
+///
+/// Every check here is about material only a certificate login reads: the
+/// X.509 trust anchors, the CRLs that revoke certificates, the PKCS#11 module
+/// the credential is read through, and the GOST engine the configuration
+/// names by `gost_engine_path`.
+///
+/// Keeping them out of [`self_check_common`] is not tidiness. The code method
+/// exists for the device where the certificate path does not work — no anchor
+/// was ever delivered, no token is attached, the reader is broken — and it is
+/// the only way into such a device. Gating it on the readiness of the path it
+/// replaces would close the last door for the exact reason the door exists.
+///
+/// The code method is not left unchecked by this split: its own artefacts, and
+/// their ownership and mode, are verified by
+/// [`crate::codes::CodeMethod::open_privileged`] when the method opens, which
+/// is the check that means something for it.
+///
+/// # Errors
+///
+/// [`SelfCheckError::AnchorUnreadable`], [`SelfCheckError::AnchorNotPem`],
+/// [`SelfCheckError::CrlUnreadable`], [`SelfCheckError::CrlNotPem`], the
+/// PKCS#11 variants of [`self_check_pkcs11`], and
+/// [`SelfCheckError::GostEngineUnavailable`].
+pub fn self_check_certificate(cfg: &ValidatedConfig) -> Result<(), SelfCheckError> {
     for path in &cfg.trust.anchors {
         let text = std::fs::read_to_string(path)
             .map_err(|_| SelfCheckError::AnchorUnreadable { path: path.clone() })?;
@@ -34,18 +91,6 @@ pub fn self_check(cfg: &ValidatedConfig) -> Result<(), SelfCheckError> {
             if !text.contains("-----BEGIN X509 CRL-----") {
                 return Err(SelfCheckError::CrlNotPem { path: path.clone() });
             }
-        }
-    }
-    for hook in &cfg.hooks {
-        // `validate_hook` отвергает пустой command (EmptyCommand), поэтому
-        // в валидированном HookConfig первый элемент всегда присутствует.
-        #[allow(clippy::indexing_slicing)]
-        let path = std::path::PathBuf::from(&hook.command[0]);
-        if !path.exists() {
-            return Err(SelfCheckError::HookCommandMissing {
-                stage: hook.stage,
-                path,
-            });
         }
     }
     // The engine probe runs before the PKCS#11 one on purpose. Loading a

@@ -147,6 +147,174 @@ pub struct RawConfig {
     /// without a delegation envelope are unaffected.
     #[serde(default)]
     pub tags: RawTags,
+    /// Code login method section (`[codes]`). Optional; when absent the device
+    /// does not offer the method and a PAM stack meeting it falls through to
+    /// the next one.
+    #[serde(default)]
+    pub codes: RawCodes,
+    /// Hash-chained audit journal section (`[audit]`). Optional; when absent
+    /// the validated layer decides whether the device keeps one from whether
+    /// it offers the code method — see [`RawAudit::enabled`].
+    #[serde(default)]
+    pub audit: RawAudit,
+}
+
+/// What the device does when its audit journal reaches its ceiling
+/// (`[audit].when_full`).
+///
+/// Mirrors [`crate::audit::WhenFull`]; spelled separately because the
+/// configuration is a wire format of its own and must not change shape when a
+/// variant is renamed elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawWhenFull {
+    /// Refuse new records. The default: nothing is lost, and everything whose
+    /// record is load-bearing stops, which is the point of a journal.
+    #[default]
+    Refuse,
+    /// Rotate, leaving a record of the break in the new chain.
+    Rotate,
+}
+
+/// Raw `[audit]` block — the device's hash-chained journal.
+///
+/// The journal is what makes a login provable after the fact: entries chain,
+/// so removing one is visible. For the telephone channel that is not a nicety —
+/// the control over an operator *is* the reconciliation between the logins a
+/// fleet saw and the receipts its operators wrote.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawAudit {
+    /// Whether this device keeps a hash-chained audit journal.
+    ///
+    /// Unset — the ordinary case — means "follow `[codes].enabled`", and that
+    /// coupling is deliberate rather than clever. The code method's whole
+    /// control model rests on the reconciliation this journal makes possible,
+    /// so a device offering that method without a journal is misconfigured in
+    /// a way it cannot detect. Devices that never enabled the code method are
+    /// left exactly as they were, which is why this is not simply defaulted to
+    /// `true`: turning a journal on under every existing device at upgrade
+    /// would be a behaviour change nobody asked for, and one that can refuse
+    /// logins on a full disk.
+    ///
+    /// An explicit `true` or `false` overrides the coupling in either
+    /// direction.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// File the chain lives in. Default `/var/lib/tessera/audit.ndjson`.
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+    /// Ceiling on the chain file, in bytes. Default 64 MiB.
+    #[serde(default)]
+    pub ceiling_bytes: Option<u64>,
+    /// What happens once the ceiling is reached. Default `refuse`.
+    #[serde(default)]
+    pub when_full: RawWhenFull,
+    /// How often the head is attested on the schedule, in seconds.
+    /// Default 86400 (a day).
+    #[serde(default)]
+    pub attest_interval_seconds: Option<u64>,
+}
+
+/// Alphabet the code and the nonce tail are written in (`[codes].alphabet`).
+///
+/// Mirrors [`tessera_codes_contract::code::Alphabet`]; spelled separately here
+/// because the configuration is a wire format of its own and must not change
+/// shape when the contract crate renames a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawCodeAlphabet {
+    /// Decimal digits — an explicit choice of a fleet whose devices have a
+    /// keypad and nothing else. It was the default while codes were read
+    /// aloud; the code is typed now, and a keyboard has letters.
+    Decimal,
+    /// Crockford base32 — the default, and the reason the default code is
+    /// shorter than the decimal one it replaced without being weaker.
+    #[default]
+    CrockfordBase32,
+}
+
+/// Key agreement profile of the device pairs (`[codes].profile`).
+///
+/// Mirrors [`tessera_codes_contract::profile::AlgorithmProfile`]. The
+/// identifiers are the ones written in the documents of the channel, so a
+/// fleet configuration and an operator cabinet spell the profile the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Default)]
+pub enum RawCodeProfile {
+    /// NIST P-256 ECDH.
+    #[default]
+    #[serde(rename = "p256")]
+    P256,
+    /// ГОСТ Р 34.10-2012 VKO.
+    #[serde(rename = "gost-vko-34.10-2012")]
+    GostVko34102012,
+    /// X25519.
+    #[serde(rename = "x25519")]
+    X25519,
+}
+
+/// Raw `[codes]` block — the device half of the code login method.
+///
+/// Everything is optional at parse time so that a device which does not offer
+/// the method carries no section at all. What the method cannot run without —
+/// the number of this device, its key epoch, and the region and tags a ticket
+/// scope is matched against — is demanded by the validated layer, and only
+/// when `enabled = true`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCodes {
+    /// Whether this device offers the code login method. Default `false`:
+    /// a fleet that has not provisioned the artefacts has not configured a
+    /// method, and silence is not an opt-in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory the artefacts and the state live under. Default
+    /// `/var/lib/tessera/codes`.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Number of this device **including its check character**, exactly as it
+    /// is printed on the device label and read aloud over the telephone.
+    #[serde(default)]
+    pub device_number: Option<String>,
+    /// Key epoch of this device.
+    #[serde(default)]
+    pub epoch: Option<u32>,
+    /// Region this device stands in, matched against the scope of a ticket.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Tags this device carries, matched against the scope of a ticket.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Local lifetime of a printed challenge, in seconds. Default 300.
+    #[serde(default)]
+    pub code_ttl_seconds: Option<u64>,
+    /// Number of characters in the code. Contract default 8.
+    #[serde(default)]
+    pub code_len: Option<u8>,
+    /// Verification attempts allowed for one nonce. Contract default 5.
+    #[serde(default)]
+    pub attempts_per_nonce: Option<u8>,
+    /// Alphabet of the code and the nonce. Default `crockford-base32`.
+    #[serde(default)]
+    pub alphabet: RawCodeAlphabet,
+    /// Width of the nonce, in characters. Contract default 26.
+    #[serde(default)]
+    pub nonce_width: Option<u8>,
+    /// Key agreement profile of the device pairs. Default `p256`.
+    #[serde(default)]
+    pub profile: RawCodeProfile,
+    /// Whether the fleet owner accepted a profile whose vendor gate is still
+    /// open. Default `false` — an unconfirmed profile does not validate, and
+    /// silence is not consent.
+    #[serde(default)]
+    pub accept_unconfirmed_profile: bool,
+    /// Removed: the password of the device key container.
+    ///
+    /// Kept here only so the validation layer can reject it by name. The key
+    /// the device holds is no longer stored under a password at all — see the
+    /// rejection message and [`crate::codes::store::load_device_key`].
+    #[serde(default)]
+    pub key_password: Option<RemovedKey>,
 }
 
 /// Trust mode for the device-tags source (`[tags].mode`).

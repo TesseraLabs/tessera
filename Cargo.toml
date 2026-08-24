@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/tessera_codes_contract",
     "crates/tessera_core",
     "crates/tessera_ext",
+    "crates/tessera_hashchain",
     "crates/tessera_issuer",
     "crates/tessera_proto",
     "crates/pam_tessera",
@@ -16,8 +18,10 @@ members = [
 # обычными `cargo build` / `cargo test` без явного `-p xtask`, поэтому не
 # удлиняет ни сборку пакета, ни прогон unit-тестов продукта.
 default-members = [
+    "crates/tessera_codes_contract",
     "crates/tessera_core",
     "crates/tessera_ext",
+    "crates/tessera_hashchain",
     "crates/tessera_issuer",
     "crates/tessera_proto",
     "crates/pam_tessera",
