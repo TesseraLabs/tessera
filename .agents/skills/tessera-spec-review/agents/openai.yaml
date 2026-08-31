@@ -1,4 +1,0 @@
-interface:
-  display_name: "Tessera Spec Review"
-  short_description: "Review semantic spec changes from overview to evidence"
-  default_prompt: "Review Tessera spec changes from a Git base and open the result for annotation."

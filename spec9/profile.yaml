@@ -1,10 +1,10 @@
-# Профиль spec2 для Tessera.
+# Профиль spec9 для Tessera.
 # Профиль объявляет виды термов, легальные связи и обязательства. Ядро (термин,
 # ссылка, оператор, evidence, граф) от профиля не зависит — сменив этот файл,
 # тот же линт обслуживает другой домен.
 profile: tessera-auth
 
-# Каталоги, содержащие спецификации. Всё остальное под spec2/ — не спека:
+# Каталоги, содержащие спецификации. Всё остальное под spec9/ — не спека:
 # grammar/ (проект синтаксиса), REVIEW.md, README.md линту не подчиняются.
 sources: [terms, operations, processes, policies, patterns, decisions, events, interfaces, contracts, persistence]
 
@@ -189,7 +189,7 @@ slices:
     cross_context: open        # ревью обязано видеть, кого задело за границей
 
 # Веса сигналов для `spec.mjs candidates` (поиск доменных сущностей в коде,
-# не покрытых spec2). Вынесены сюда, чтобы калибровать ранжирование без
+# не покрытых spec9). Вынесены сюда, чтобы калибровать ранжирование без
 # правки tools/candidates-cmd.mjs. Итоговый вес кандидата — сумма сработавших
 # сигналов «за» минус сумма сработавших «против»; ниже threshold кандидат не
 # печатается вовсе (шум).
@@ -201,7 +201,7 @@ candidates:
     public_signature: 3        # тип встречается в публичной сигнатуре (параметр/возврат), не только в теле
     serialization: 2           # derive(Serialize/Deserialize) и аналоги — DTO/wire-тип
     error_or_audit: 2          # имя встречается в варианте ошибки или в audit/log-событии
-    vocabulary_overlap: 3      # имя пересекается с name/aliases термина spec2 или с якорем
+    vocabulary_overlap: 3      # имя пересекается с name/aliases термина spec9 или с якорем
     domain_module_name: 1      # модуль/крейт объявления — *_contract, domain, model, core
     # «против» (вычитаются)
     generic_name: 3            # родовое имя (Error, Result, Config, ...)

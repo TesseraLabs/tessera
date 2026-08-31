@@ -97,7 +97,7 @@ crates/tessera_issuer/src/serial.rs#Serial:
 
 crates/tessera_win_service/src/protocol.rs#Session:
   verdict: отложено
-  reason: контекст runtime и windows-путь в spec2 ещё не описаны
+  reason: контекст runtime и windows-путь в spec9 ещё не описаны
 
 crates/tessera_win_service/src/journal.rs#Event:
   verdict: отложено
