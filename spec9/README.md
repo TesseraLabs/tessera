@@ -2,7 +2,7 @@
 
 Этот каталог — продуктовый экземпляр [Spec9](../../../spec9/README.md). Здесь
 живут только профиль Tessera, доменные страницы, решения, процессы, границы и
-реестр кандидатов. Движок, грамматика, конституция и review-skill находятся в
+реестр кандидатов. Движок, контракт формата, конституция и agent skills находятся в
 отдельном репозитории `/Users/robonet/Projects/spec9`.
 
 Структурным источником служит YAML-frontmatter, а Markdown объясняет смысл и
@@ -52,7 +52,7 @@ npm --prefix spec9 run coverage
 Для произвольной команды:
 
 ```bash
-npm --prefix spec9 exec -- spec9 --spec-root . --product-root .. flow issuer-cli
+npm --prefix spec9 run spec9 -- --spec-root . --product-root .. flow issuer-cli
 ```
 
 Git остаётся журналом изменений. `change` формирует секцию `Domain impact`, но
