@@ -42,6 +42,7 @@ export const MANIFEST = [
   { pattern: 'contexts.*.title', owner: 'loadProfile', status: 'implemented', reason: 'человеческая метка, не гарантия' },
 
   { pattern: 'kinds.*.title', owner: 'loadProfile', status: 'implemented', reason: 'человеческая метка, не гарантия' },
+  { pattern: 'kinds.*.review_role', owner: 'buildSemanticDiff', status: 'implemented', reason: 'роль boundary поднимает изменения вида в отдельный раздел semantic review' },
   { pattern: 'kinds.*.required_fields', owner: 'checkKindShape', status: 'implemented', reason: 'для вида проверяется наличие и непустота каждого обязательного поля frontmatter' },
   { pattern: 'kinds.*.required_sections', owner: 'checkKindShape', status: 'implemented', reason: 'для вида проверяется наличие каждого обязательного смыслового раздела Markdown' },
   { pattern: 'kinds.*.anchors.required', owner: 'checkKindAnchors', status: 'implemented', reason: 'для каждого типа якоря из required проверяется наличие хотя бы одного якоря этого типа у термина' },
@@ -49,7 +50,7 @@ export const MANIFEST = [
   { pattern: 'kinds.*.links.may_reference', owner: 'checkLinkMayReference', status: 'implemented', reason: '' },
   { pattern: 'kinds.*.must', owner: 'checkKindMust', status: 'implemented', reason: 'значения "outcomes", "rejected_alternative", "producer" — см. checkKindMust' },
   { pattern: 'kinds.*.computes_obligations', owner: 'loadRepo (buildGraph.patternKind)', status: 'implemented', reason: 'помечает вид, требования которого вычисляются для каждого применения' },
-  { pattern: 'kinds.*.append_only', owner: 'loadRepo (buildGraph.decisionKind)', status: 'implemented', reason: 'используется, чтобы определить вид-решение; САМА гарантия append-only (запрет удаления/переписывания прежних решений) НЕ проверяется — вне объёма этой фазы (REVIEW.md P5)' },
+  { pattern: 'kinds.*.append_only', owner: 'loadRepo (decisionKind) + buildSemanticDiff', status: 'implemented', reason: 'semantic base/head review запрещает удаление решения и изменение уже принятого ADR; смена выбора оформляется новым replaces/revokes' },
   { pattern: 'kinds.*.applicable_to', owner: 'checkPatternApplication', status: 'implemented', reason: 'значение из profile.yaml — умолчание; frontmatter файла паттерна может переопределить (REVIEW.md P4)' },
   { pattern: 'kinds.*.lifecycle', owner: 'checkLifecycle', status: 'implemented', reason: 'status страницы обязан входить в закрытый список вида' },
 

@@ -80,7 +80,9 @@ node spec2/tools/spec.mjs quality --all
 node spec2/tools/spec.mjs next
 node spec2/tools/spec.mjs e2e --missing
 node spec2/tools/spec.mjs review --seed-git origin/main
+node spec2/tools/spec.mjs review --base origin/main
 node spec2/tools/spec.mjs change --seed-git origin/main
+node spec2/tools/spec.mjs change --base origin/main
 node spec2/tools/spec.mjs coverage --missing
 ```
 
@@ -144,14 +146,22 @@ review-среза. Файлы берутся из `--seed-git <ref>` или из
 даже если на её странице нет собственных требований; несопоставленные файлы
 выводятся отдельно, а не теряются.
 
+`review --base <ref>` добавляет смысловое сравнение Git-состояний. Без `--head`
+сравнивается base с текущим worktree, включая untracked-файлы; с `--head`
+сравниваются два коммита без checkout. Отчёт идёт от контекстов и границ к ADR,
+терминам, нормам, причинным relations и anchors. Удаление принятого ADR или его
+изменение — high risk: прежняя страница должна остаться, а новый выбор должен
+быть оформлен через `replaces`/`revokes`.
+
 `change` использует тот же diff, но собирает пакет подготовки изменения:
 затронутые контексты, термины, ADR и нормы, только локальные lint/trace/quality
 риски, сверки outcomes и список команд проверки. В конце печатается секция
 `Domain impact`, которую можно использовать как начало описания commit/MR.
-Текущая команда строит impact по состоянию head и честно помечает, что
-добавленные/удалённые связи и границы потребуют следующего semantic base/head
-review. Несопоставленный файл повышает риск, а не исчезает из отчёта; high risk
-даёт код `1`.
+В форме `change --base <ref>` секция содержит реальные количества
+добавленных/удалённых связей и изменений границ из semantic diff. Старый режим
+с `--seed-*` остаётся current-state impact и явно помечает отсутствие
+base/head-сравнения. Несопоставленный файл повышает риск, а не исчезает из
+отчёта; high risk даёт код `1`.
 
 `coverage` сравнивает все заголовки `### Requirement:` из legacy OpenSpec с
 `requirements.*.origins` в spec2. Одна старая норма обязана иметь ровно одного

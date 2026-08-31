@@ -8,6 +8,7 @@
     "doctor": "node tools/spec.mjs doctor",
     "quality": "node tools/spec.mjs quality",
     "next": "node tools/spec.mjs next",
+    "review": "node tools/spec.mjs review --base HEAD",
     "e2e-audit": "node tools/spec.mjs e2e --missing",
     "coverage": "node tools/spec.mjs coverage --missing"
   },

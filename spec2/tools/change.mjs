@@ -10,7 +10,7 @@ function changedSpecPath(path, changedSet) {
 }
 
 /** Один change-report: impact, локальные риски и необходимые проверки. */
-export function buildChangeReport(repo, changedFiles) {
+export function buildChangeReport(repo, changedFiles, { semanticDiff = null } = {}) {
   const impact = buildReviewImpact(repo, changedFiles);
   const changedSet = new Set(impact.changedFiles);
   const changedSpec = impact.changedFiles.some((changed) => changed.startsWith('spec2/') || repo.files.some((file) => file.path === changed));
@@ -36,15 +36,15 @@ export function buildChangeReport(repo, changedFiles) {
   if (requirementIds.size) checks.add('spec.mjs trace --missing');
   if (changedSpec) checks.add('spec.mjs coverage --missing');
 
-  const hasHardRisk = lintFindings.some((row) => row.level === 'ERROR') || traceGaps.length || outcomes.some((row) => row.status === 'discrepancy');
-  const hasReviewRisk = impact.unmappedFiles.length || lintFindings.length || quality.length || outcomes.some((row) => row.status === 'unchecked') || e2eRows.some((row) => row.coverage !== 'exact');
+  const hasHardRisk = lintFindings.some((row) => row.level === 'ERROR') || traceGaps.length || outcomes.some((row) => row.status === 'discrepancy') || semanticDiff?.risk === 'high';
+  const hasReviewRisk = impact.unmappedFiles.length || lintFindings.length || quality.length || outcomes.some((row) => row.status === 'unchecked') || e2eRows.some((row) => row.coverage !== 'exact') || semanticDiff?.risk === 'medium';
   const risk = hasHardRisk ? 'high' : hasReviewRisk ? 'medium' : 'low';
 
   return {
     risk,
     impact,
     affectedRequirements: [...requirementIds].sort(),
-    semanticDiff: { status: 'not-computed', reason: 'требуется сравнение base/head графов' },
+    semanticDiff: semanticDiff || { status: 'not-computed', reason: 'требуется сравнение base/head графов' },
     findings: { lint: lintFindings, trace: traceGaps, quality, outcomes, e2e: e2eRows },
     checks: [...checks],
   };
@@ -83,6 +83,16 @@ export function formatChangeReport(report) {
   lines.push(`- Термины: ${report.impact.contexts.flatMap((context) => context.terms.map((term) => term.id)).join(', ') || 'не определены'}`);
   lines.push(`- Нормы: ${report.affectedRequirements.join(', ') || 'не определены'}`);
   lines.push(`- Решения: ${report.impact.contexts.flatMap((context) => context.decisions).join(', ') || 'не затронуты'}`);
-  lines.push('- Связи и границы: текущий impact известен; добавления/удаления требуют semantic base/head review');
+  if (report.semanticDiff.status === 'not-computed') {
+    lines.push('- Связи и границы: текущий impact известен; добавления/удаления требуют semantic base/head review');
+  } else {
+    const relations = report.semanticDiff.counts.relations;
+    lines.push(`- Связи: +${relations.added} / -${relations.removed}`);
+    for (const edge of report.semanticDiff.relations.added) lines.push(`  - added: ${edge.from} -[${edge.type}]-> ${edge.to}`);
+    for (const edge of report.semanticDiff.relations.removed) lines.push(`  - removed: ${edge.from} -[${edge.type}]-> ${edge.to}`);
+    lines.push(`- Границы: ${report.semanticDiff.counts.boundaries} изменений`);
+    for (const item of report.semanticDiff.boundaries.terms) lines.push(`  - ${item.change}: ${item.term.id} (${item.term.kind})`);
+    for (const item of report.semanticDiff.boundaries.relations) lines.push(`  - ${item.change}: ${item.edge.from} -[${item.edge.type}]-> ${item.edge.to}`);
+  }
   return lines.join('\n');
 }

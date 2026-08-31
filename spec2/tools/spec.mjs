@@ -23,6 +23,8 @@ import { buildOpenSpecCoverage, formatOpenSpecCoverage } from './openspec-covera
 import { buildQualityReport, formatQualityReport } from './quality.mjs';
 import { buildNextQueue, formatNextQueue } from './next.mjs';
 import { buildChangeReport, formatChangeReport } from './change.mjs';
+import { loadRepoAtGitRef, changedFilesBetween } from './git-snapshot.mjs';
+import { buildSemanticReview, formatSemanticReview } from './semantic-review.mjs';
 
 // Вывод CLI обязан переживать `| head` / `| grep` / любой потребитель,
 // закрывающий трубу раньше, чем весь вывод записан: без обработчика `error`
@@ -81,7 +83,8 @@ function usage() {
       '  spec.mjs next [--all] [--json] [--strict]     (приоритизированная очередь)',
       '  spec.mjs e2e [--missing] [--json]    (точность связей E2E ↔ spec2)',
       '  spec.mjs review (--seed-files <file>|--seed-git <ref>) [--json]',
-      '  spec.mjs change (--seed-files <file>|--seed-git <ref>) [--json]',
+      '  spec.mjs review --base <ref> [--head <ref>] [--json] [--strict]  (semantic diff)',
+      '  spec.mjs change (--seed-files <file>|--seed-git <ref>|--base <ref> [--head <ref>]) [--json]',
       '  spec.mjs coverage [--missing] [--json]  (OpenSpec requirement → spec2 norm)',
       '',
     ].join('\n'),
@@ -102,6 +105,33 @@ function changedFilesFromArgs(args) {
   if (!ref) usage();
   return execFileSync('git', ['diff', '--name-only', ref], { cwd: PRODUCT_ROOT, encoding: 'utf8' })
     .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+}
+
+function withSemanticInputs(args, callback) {
+  if (args.includes('--seed-files') || args.includes('--seed-git')) usage();
+  const baseIdx = args.indexOf('--base');
+  if (baseIdx === -1 || !args[baseIdx + 1]) usage();
+  const baseRef = args[baseIdx + 1];
+  const headIdx = args.indexOf('--head');
+  const headRef = headIdx === -1 ? null : args[headIdx + 1];
+  if (headIdx !== -1 && !headRef) usage();
+
+  const baseSnapshot = loadRepoAtGitRef(PRODUCT_ROOT, baseRef);
+  let headSnapshot = null;
+  try {
+    headSnapshot = headRef ? loadRepoAtGitRef(PRODUCT_ROOT, headRef) : null;
+    const headRepo = headSnapshot?.repo || loadRepo(SPEC2_ROOT, PRODUCT_ROOT);
+    const changedFiles = changedFilesBetween(PRODUCT_ROOT, baseRef, headRef);
+    return callback({
+      baseRepo: baseSnapshot.repo,
+      headRepo,
+      changedFiles,
+      labels: { base: `${baseRef}@${baseSnapshot.commit.slice(0, 12)}`, head: headSnapshot ? `${headRef}@${headSnapshot.commit.slice(0, 12)}` : 'worktree' },
+    });
+  } finally {
+    if (headSnapshot) headSnapshot.cleanup();
+    baseSnapshot.cleanup();
+  }
 }
 
 /**
@@ -298,6 +328,12 @@ function main(argv) {
   }
 
   if (cmd === 'review') {
+    if (rest.includes('--base')) {
+      const report = withSemanticInputs(rest, ({ baseRepo, headRepo, changedFiles, labels }) => buildSemanticReview(baseRepo, headRepo, changedFiles, labels));
+      process.stdout.write(rest.includes('--json') ? `${JSON.stringify(report, null, 2)}\n` : `${formatSemanticReview(report)}\n`);
+      process.exitCode = report.semantic.risk === 'high' || (rest.includes('--strict') && report.semantic.risk === 'medium') ? 1 : 0;
+      return;
+    }
     const changedFiles = changedFilesFromArgs(rest);
     const repo = loadRepo(SPEC2_ROOT, PRODUCT_ROOT);
     const report = buildReviewImpact(repo, changedFiles);
@@ -306,6 +342,15 @@ function main(argv) {
   }
 
   if (cmd === 'change') {
+    if (rest.includes('--base')) {
+      const report = withSemanticInputs(rest, ({ baseRepo, headRepo, changedFiles, labels }) => {
+        const semantic = buildSemanticReview(baseRepo, headRepo, changedFiles, labels).semantic;
+        return buildChangeReport(headRepo, changedFiles, { semanticDiff: semantic });
+      });
+      process.stdout.write(rest.includes('--json') ? `${JSON.stringify(report, null, 2)}\n` : `${formatChangeReport(report)}\n`);
+      process.exitCode = report.risk === 'high' ? 1 : 0;
+      return;
+    }
     const changedFiles = changedFilesFromArgs(rest);
     const repo = loadRepo(SPEC2_ROOT, PRODUCT_ROOT);
     const report = buildChangeReport(repo, changedFiles);

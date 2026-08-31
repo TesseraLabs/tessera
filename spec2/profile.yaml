@@ -86,6 +86,7 @@ kinds:
 
   интерфейс:
     title: "Пользовательская поверхность и её состояния"
+    review_role: boundary
     required_fields: [relations.actor, entrypoint]
     required_sections: [Состояния, Доступность]
     anchors: { required: [code, test], optional: [schema] }
@@ -93,6 +94,7 @@ kinds:
 
   контракт:
     title: "Опубликованная форма на границе контекстов или процессов"
+    review_role: boundary
     required_fields: [relations.provider, relations.consumers, owner, compatibility]
     required_sections: [Граница, Совместимость, Отказы]
     anchors: { required: [schema, test], optional: [code, type] }
@@ -100,6 +102,7 @@ kinds:
 
   конфигурация:
     title: "Контракт между оператором и системой"
+    review_role: boundary
     required_fields: [owner, source, reload]
     required_sections: [Граница, Совместимость]
     anchors: { required: [code, type, test], optional: [schema] }
@@ -107,6 +110,7 @@ kinds:
 
   хранилище:
     title: "Контракт между приложением и сохранённым состоянием"
+    review_role: boundary
     required_fields: [owner, format, compatibility]
     required_sections: [Граница, Совместимость, Отказы]
     anchors: { required: [code, schema, test], optional: [type] }

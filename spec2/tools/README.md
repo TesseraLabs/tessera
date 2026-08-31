@@ -16,6 +16,10 @@ node tools/spec.mjs context <id> --slice <implement|why|review>
 node tools/spec.mjs why <path>[#symbol]
 node tools/spec.mjs outcomes <requirement-id>
 node tools/spec.mjs candidates [--new]
+node tools/spec.mjs quality [--all] [--json] [--strict]
+node tools/spec.mjs next [--all] [--json] [--strict]
+node tools/spec.mjs review --base <ref> [--head <ref>] [--json] [--strict]
+node tools/spec.mjs change --base <ref> [--head <ref>] [--json]
 ```
 
 Запускать из корня `spec2/` (или указывать пути от него — `SPEC2_ROOT`
@@ -62,6 +66,10 @@ node --test "tools/**/*.test.mjs"
 - `outcomes-cmd.mjs` — команда `outcomes`: сверка Outcomes требования с
   исходами кода. Без `--fix` — конституция §10 запрещает автоисправление
   расхождения, разрешение делает человек.
+- `git-snapshot.mjs` — безопасно материализует `spec2/` из Git-ref во временный
+  каталог через `git archive`, не меняя worktree.
+- `semantic-review.mjs` — сравнивает два состояния по терминам, нормам,
+  relations, anchors, границам и ADR; текстовый diff файлов для этого не нужен.
 
 ## Контракт профиля
 
