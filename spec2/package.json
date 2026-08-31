@@ -1,0 +1,17 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tools/*.test.mjs tools/adapters/*.test.mjs",
+    "lint": "node tools/spec.mjs lint",
+    "graph": "node tools/spec.mjs graph",
+    "doctor": "node tools/spec.mjs doctor",
+    "quality": "node tools/spec.mjs quality",
+    "next": "node tools/spec.mjs next",
+    "e2e-audit": "node tools/spec.mjs e2e --missing",
+    "coverage": "node tools/spec.mjs coverage --missing"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  }
+}

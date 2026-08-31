@@ -1,0 +1,211 @@
+# Профиль spec2 для Tessera.
+# Профиль объявляет виды термов, легальные связи и обязательства. Ядро (термин,
+# ссылка, оператор, evidence, граф) от профиля не зависит — сменив этот файл,
+# тот же линт обслуживает другой домен.
+profile: tessera-auth
+
+# Каталоги, содержащие спецификации. Всё остальное под spec2/ — не спека:
+# grammar/ (проект синтаксиса), REVIEW.md, README.md линту не подчиняются.
+sources: [terms, operations, processes, policies, patterns, decisions, events, interfaces, contracts, persistence]
+
+# Типы рёбер графа. `sources`/`targets` ограничивают виды концов, cardinality
+# отличает одну роль от набора. `references` остаётся безопасным escape hatch,
+# но причинный позвоночник процесса обязан использовать точные отношения.
+relation_types:
+  references:     { cardinality: many }
+  actor:          { cardinality: one,  sources: [интерфейс], targets: [сущность] }
+  provider:       { cardinality: one,  sources: [контракт], targets: [сущность] }
+  consumers:      { cardinality: many, sources: [контракт], targets: [сущность] }
+  producer:       { cardinality: one,  sources: [событие], targets: [операция, процесс] }
+  affects:        { cardinality: many, sources: [решение], targets: [сущность, значение, операция, событие, политика, процесс, паттерн, интерфейс, контракт, конфигурация, хранилище] }
+  replaces:       { cardinality: many, sources: [решение], targets: [решение] }
+  revokes:        { cardinality: many, sources: [решение], targets: [решение] }
+  prescribed_by: { cardinality: one,  sources: [паттерн], targets: [решение] }
+  starts:         { cardinality: one,  sources: [интерфейс], targets: [процесс], flow: forward }
+  triggered_by:   { cardinality: one,  sources: [процесс], targets: [интерфейс, сущность, событие], flow: reverse }
+  uses:           { cardinality: many, sources: [процесс], targets: [сущность, значение, конфигурация] }
+  accepts:        { cardinality: many, sources: [процесс, операция], targets: [значение, контракт] }
+  invokes:        { cardinality: many, sources: [процесс], targets: [операция], flow: forward }
+  emits:          { cardinality: many, sources: [процесс, операция], targets: [событие], flow: forward }
+  governed_by:    { cardinality: many, sources: [процесс], targets: [политика] }
+  reacts_to:      { cardinality: many, sources: [политика], targets: [событие], flow: reverse }
+  issues:         { cardinality: many, sources: [политика], targets: [операция], flow: forward }
+  transported_by: { cardinality: one,  sources: [операция], targets: [контракт], flow: forward }
+  handled_by:     { cardinality: one,  sources: [операция], targets: [сущность], flow: forward }
+  writes:         { cardinality: many, sources: [операция], targets: [хранилище, сущность], flow: forward }
+  produces:       { cardinality: many, sources: [операция], targets: [сущность], flow: forward }
+
+# Контексты. Ссылка без префикса разрешается внутри своего контекста.
+contexts:
+  auth:      { title: "Аутентификация на устройстве", prefix: [AUTH, REV, TRUST, SCOPE, ROLE, UI, AFLOW, SBIND, CCH, GOST, HID, REVS, RSEL, RST, PK11, TVAL, USB] }
+  issuance:  { title: "Выпуск удостоверений",         prefix: [ISS, JRN, CISS, IJRN, SIGN] }
+  runtime:   { title: "Демон и сессии",               prefix: [RT, IPC, STORE, CLI, CFG, DAE, HOOK, IPCR, LOG, PAMR, MON] }
+  codes:     { title: "Вход по коду (Tessera Codes)",  prefix: [CODE, TICKET, PARAM, NONCE, KEY] }
+  fleet:     { title: "Управление парком устройств",   prefix: [BOOT, ENR, TAG] }
+  platform:  { title: "Платформенная интеграция",      prefix: [BLD, FLY, LIC, MAC, PAMI, WPATH, WREM] }
+
+kinds:
+  сущность:
+    title: "Доменный объект с идентичностью"
+    # `type:` — якорь на сам тип (для W-... E-ENTITY-NO-TYPE-ANCHOR), `code:` —
+    # на функцию/операцию над сущностью; термины прежде якорили только функции,
+    # из-за чего тип оставался формально непокрытым.
+    anchors: { required: [code, type], optional: [test, schema] }
+    links:   { may_reference: [сущность, значение, операция, событие, политика, процесс, решение, паттерн, интерфейс, контракт, конфигурация, хранилище] }
+
+  значение:
+    title: "Доменное значение без собственной идентичности"
+    anchors: { required: [type, test], optional: [code, schema] }
+    links:   { may_reference: [сущность, значение, операция, событие, политика, процесс, решение, паттерн, интерфейс, контракт, конфигурация, хранилище] }
+
+  операция:
+    title: "Действие, которое кто-то выполняет над сущностью"
+    # schema — для операций с зафиксированным форматом (голден-векторы канонизации);
+    # type — когда у операции есть представляющий её тип.
+    anchors: { required: [code, test], optional: [schema, type] }
+    links:   { may_reference: [сущность, значение, событие, политика, процесс, решение, паттерн, интерфейс, контракт, конфигурация, хранилище] }
+
+  событие:
+    title: "Факт, наступивший в домене"
+    anchors: { required: [test], optional: [schema] }
+    # Событие обязано иметь источник: норму или операцию, которая его порождает.
+    must: [producer]
+    links: { may_reference: [сущность, значение, операция, событие, политика, процесс, решение, интерфейс, контракт, конфигурация, хранилище] }
+
+  политика:
+    title: "Правило, связывающее событие со следующим действием"
+    anchors: { required: [test], optional: [code] }
+    links:   { may_reference: [сущность, значение, операция, событие, процесс, решение, интерфейс, контракт, конфигурация, хранилище] }
+
+  процесс:
+    title: "Причинность, пересекающая несколько сущностей или внешнего участника"
+    anchors: { required: [code, test] }
+    # Процесс заводится, только когда причинность не помещается в одну сущность.
+    must: [outcomes]
+    links: { may_reference: [сущность, значение, операция, событие, политика, решение, паттерн, интерфейс, контракт, конфигурация, хранилище] }
+
+  интерфейс:
+    title: "Пользовательская поверхность и её состояния"
+    required_fields: [relations.actor, entrypoint]
+    required_sections: [Состояния, Доступность]
+    anchors: { required: [code, test], optional: [schema] }
+    links: { may_reference: [сущность, значение, операция, событие, политика, процесс, решение, паттерн, интерфейс, контракт, конфигурация] }
+
+  контракт:
+    title: "Опубликованная форма на границе контекстов или процессов"
+    required_fields: [relations.provider, relations.consumers, owner, compatibility]
+    required_sections: [Граница, Совместимость, Отказы]
+    anchors: { required: [schema, test], optional: [code, type] }
+    links: { may_reference: [сущность, значение, операция, событие, политика, процесс, решение, паттерн, интерфейс, контракт, конфигурация, хранилище] }
+
+  конфигурация:
+    title: "Контракт между оператором и системой"
+    required_fields: [owner, source, reload]
+    required_sections: [Граница, Совместимость]
+    anchors: { required: [code, type, test], optional: [schema] }
+    links: { may_reference: [сущность, значение, операция, событие, политика, процесс, решение, паттерн, интерфейс, контракт, конфигурация, хранилище] }
+
+  хранилище:
+    title: "Контракт между приложением и сохранённым состоянием"
+    required_fields: [owner, format, compatibility]
+    required_sections: [Граница, Совместимость, Отказы]
+    anchors: { required: [code, schema, test], optional: [type] }
+    links: { may_reference: [сущность, значение, операция, событие, политика, процесс, решение, паттерн, контракт, конфигурация, хранилище] }
+
+  паттерн:
+    title: "Пакет обязательств с образцами"
+    computes_obligations: true
+    anchors: { required: [exemplar], optional: [counterexample] }
+    # Кем паттерн может быть применён. Без этого Unity-пулинг формально
+    # применится к ADR и граф останется «валидным».
+    applicable_to: [сущность, операция, политика]
+
+  решение:
+    title: "Развилка с отвергнутой альтернативой"
+    append_only: true
+    must: [rejected_alternative]
+    lifecycle: [предложено, принято]
+    required_fields: [status, date, relations.affects]
+    required_sections: [Контекст, Решение, Отвергнутые альтернативы, Что заставит пересмотреть]
+
+# Типы норм и обязательное для них evidence (см. constitution.md §2).
+# Категории, которые доменными исходами НЕ считаются. Без этого перечня проверка
+# полноты исходов тонет в шуме: нехватка памяти есть у любой операции.
+non_domain_outcomes:
+  - нехватка памяти
+  - паника аллокатора
+  - отмена задачи планировщиком
+  - сбой самого процесса (SIGKILL, OOM-killer)
+
+# Правила для блоков Outcomes / Partition / Combinations (конституция §10).
+outcomes:
+  # Множество исходов операции замкнуто: исход, найденный в коде и отсутствующий
+  # здесь, — расхождение, и оно НЕ закрывается автоматически.
+  closed: true
+  auto_fix: forbidden
+  # Разбиение исхода на классы эквивалентности обязано покрывать исход целиком.
+  partition_must_be_total: true
+  # Таблица комбинаций проверяется на полноту и непересечение после раскрытия «*».
+  combinations:
+    require_total: true
+    require_disjoint: true
+
+norm_kinds:
+  инвариант:   { evidence: [test] }
+  контракт:    { evidence: [schema, test], any_of: true }
+  операционное: { evidence: [test, code],   any_of: true }
+  разрешение:  { evidence: [] }
+  liveness:    { evidence: [test] }
+
+# Именованные срезы графа. Обход идёт по типам рёбер, а не по глубине:
+# на глубине 2 у агрегата оказывается половина домена.
+slices:
+  implement:
+    seed: [норма]
+    follow:
+      - { edge: субъект,          load: full }
+      - { edge: применённый-паттерн, load: obligations }   # не страница, а вычисленные обязательства
+      - { edge: evidence,         load: full }
+      - { edge: решение,          load: heading }
+      - { edge: обратные,         load: names, hops: 1 }
+    cross_context: contract_only
+
+  why:
+    seed: [символ, норма]
+    follow:
+      - { edge: обратные, load: full, hops: 2 }   # здесь граф читается наоборот
+      - { edge: решение,  load: full }
+    cross_context: contract_only
+
+  review:
+    seed: [изменённые-файлы]
+    follow:
+      - { edge: обратные, load: names, hops: 1 }
+      - { edge: evidence, load: names }
+    cross_context: open        # ревью обязано видеть, кого задело за границей
+
+# Веса сигналов для `spec.mjs candidates` (поиск доменных сущностей в коде,
+# не покрытых spec2). Вынесены сюда, чтобы калибровать ранжирование без
+# правки tools/candidates-cmd.mjs. Итоговый вес кандидата — сумма сработавших
+# сигналов «за» минус сумма сработавших «против»; ниже threshold кандидат не
+# печатается вовсе (шум).
+candidates:
+  threshold: 10
+  weights:
+    # «за»
+    cross_module_ref: 2        # за каждый ЧУЖОЙ модуль/крейт, ссылающийся на тип (не за упоминание)
+    public_signature: 3        # тип встречается в публичной сигнатуре (параметр/возврат), не только в теле
+    serialization: 2           # derive(Serialize/Deserialize) и аналоги — DTO/wire-тип
+    error_or_audit: 2          # имя встречается в варианте ошибки или в audit/log-событии
+    vocabulary_overlap: 3      # имя пересекается с name/aliases термина spec2 или с якорем
+    domain_module_name: 1      # модуль/крейт объявления — *_contract, domain, model, core
+    # «против» (вычитаются)
+    generic_name: 3            # родовое имя (Error, Result, Config, ...)
+    util_module: 2             # модуль/крейт — util/internal/test/mock/liar
+    no_usage: 2                # нет методов и не встречается в публичных сигнатурах
+
+budget:
+  max_files: 25
+  # При исчерпании бюджета обход НЕ обрезается молча: узлы деградируют до имён,
+  # и срез явно сообщает, что осталось за границей.
+  on_exhaustion: degrade_to_names
