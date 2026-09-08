@@ -13,7 +13,7 @@ setup: [install-package, deploy-fixtures, deploy-issuer]
 cases:
   - id: SIGN-001
     title: Ключ, доступный не только владельцу, отвергается до чтения содержимого
-    requirement: openspec/specs/issuer-signing/spec.md
+    requirement: spec9:issuance.SIGN-005
     requires: []
     # Отказ обязан наступить раньше чтения: ключ, который прочитали и лишь
     # потом забраковали, уже побывал в памяти процесса.
@@ -44,7 +44,7 @@ cases:
 
   - id: SIGN-002
     title: Незашифрованный ключ работает, но каждый запуск об этом предупреждает
-    requirement: openspec/specs/issuer-signing/spec.md
+    requirement: spec9:issuance.SIGN-005
     requires: []
     # Предупреждение не формальность: оно единственное, что отличает временную
     # схему от постоянной, когда незашифрованный ключ остаётся на машине
@@ -76,7 +76,7 @@ cases:
 
   - id: SIGN-003
     title: Неверный пароль зашифрованного ключа останавливает выпуск до подписи
-    requirement: openspec/specs/issuer-signing/spec.md
+    requirement: spec9:issuance.SIGN-005
     requires: []
     # Пароль передаётся переменной окружения — тем самым запасным путём, на
     # который бэкенд переходит без pinentry. Кейс заодно закрепляет, что о
@@ -112,7 +112,7 @@ cases:
 
   - id: SIGN-004
     title: Заявленный алгоритм, не совпавший с ключом, отвергается вместо молчаливой замены
-    requirement: openspec/specs/issuer-signing/spec.md
+    requirement: spec9:issuance.SIGN-005
     requires: []
     # Алгоритм выводится из самого ключа. Если бы явное значение молча
     # переопределялось выведенным, оператор считал бы парк выпущенным на P-384,

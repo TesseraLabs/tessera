@@ -12,7 +12,7 @@
 - **INST (5), `10-install`** — идемпотентного teardown по SSH нет. `postrm`
   снимает только `@include tessera*`, оставляя `session required pam_tessera.so`
   на удалённый модуль, и машина теряет sudo и вход; пересоздать её нельзя.
-  Записано в `openspec/changes/e2e-harness/tasks.md`, задачи 7.1 и 7.1a.
+  Записано в приватном Spec9 ADR `ADR-PLAN-e2e-harness`.
 - **ISS (7), `60-issuer`** и **SIGN (4), `61-issuer-signing`** — подготовка
   `deploy-issuer` требует бинарь `issuer`, который раннер везёт в окружение как
   артефакт стенда (`[[artifacts]]` в `stand.toml`). В прогоне 2026-08-10 он не

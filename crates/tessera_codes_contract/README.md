@@ -11,8 +11,8 @@
 формулы — это способ получить «почти совпадающие» коды и разбираться с ними по телефону
 с объекта в другом городе. Поэтому реализация здесь одна, и она компилируется в обе цели.
 
-Канон решения — `tessera-ws/openspec/changes/codes-phone-channel` (D7);
-требования — `openspec/changes/codes-contract/specs/codes-contract/spec.md`.
+Канон решения — приватный Spec9 ADR `ADR-PLAN-codes-phone-channel` (D7);
+требования — Spec9 ADR `ADR-PLAN-codes-contract` и связанные стабильные ID норм.
 
 ## Границы
 

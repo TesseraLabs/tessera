@@ -606,7 +606,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 // `pam_sm_authenticate` returns. The session phase never
                 // re-mounts — by design, the auth context travels via
                 // pam_data instead (see
-                // openspec/specs/cert-authentication-flow/spec.md).
+                // Spec9 authentication-flow requirement).
                 drop(mount);
                 PAM_SUCCESS
             }

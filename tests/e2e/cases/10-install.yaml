@@ -5,7 +5,7 @@ setup: [install-package]
 cases:
   - id: INST-001
     title: Пакет раскладывает модуль, бинарь и юнит по штатным путям
-    requirement: openspec/specs/build-release/spec.md
+    requirement: spec9:platform.INST-001
     requires: []
     steps:
       # Пути — из debian/rules (модуль и бинарь ставятся вручную, минуя dh-cargo)
@@ -21,7 +21,7 @@ cases:
 
   - id: INST-002
     title: Пакет создаёт каталоги состояния и кеша
-    requirement: openspec/specs/build-release/spec.md
+    requirement: spec9:platform.INST-002
     requires: []
     steps:
       # Перечень — из debian/tessera.dirs. Каталоги создаёт пакет, а не первый
@@ -34,7 +34,7 @@ cases:
 
   - id: INST-003
     title: Служба не активируется установкой без конфигурации
-    requirement: openspec/specs/daemon-lifecycle/spec.md
+    requirement: spec9:platform.INST-003
     requires: [service-manager]
     steps:
       # Гарантия: установка пакета не поднимает enforcement сама по себе.
@@ -45,7 +45,7 @@ cases:
 
   - id: INST-004
     title: Интеграция в PAM-стек добавляет обе строки и повторно ничего не меняет
-    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requirement: spec9:platform.INST-004
     requires: []
     steps:
       - run: |
@@ -72,7 +72,7 @@ cases:
 
   - id: INST-005
     title: Откат интеграции снимает обе внесённые строки
-    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requirement: spec9:platform.INST-005
     requires: []
     steps:
       - run: |

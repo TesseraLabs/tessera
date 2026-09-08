@@ -7,14 +7,14 @@ description: >
 setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
 
 # Кейсы этой сюиты написаны ДО реализации режима 0 (правило «кейс раньше кода»):
-# ожидания взяты из спеки openspec/changes/qr-login-core/specs/qr-login-method/spec.md,
+# ожидания взяты из Spec9 ADR-PLAN-qr-login-core,
 # а не измерены. До появления кода и хелпера они красные и живут в BASELINE.md.
 # Подгонять их под факт нельзя — тогда реестр закрепит недоделку как эталон.
 
 cases:
   - id: CODE-001
     title: Продиктованный код пускает инженера на запрошенный уровень
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.CODE-001
     # Уровень модуль читает из метки процесса, а не из аргумента: на системе без
     # мандатного механизма он всегда 0, и кейс, просящий уровень 1, проверил бы
     # не то, что обещает. Отсюда `mac` — иначе он «проходит» там, где ничего не
@@ -33,7 +33,7 @@ cases:
 
   - id: CODE-002
     title: Устройство без всякой серверной конфигурации всё равно пускает по коду
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.CODE-002
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes --without-codes-url
@@ -47,7 +47,7 @@ cases:
 
   - id: CODE-003
     title: Неверный код не пускает
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.CODE-003
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
@@ -64,7 +64,7 @@ cases:
 
   - id: CODE-004
     title: Исчерпание попыток ввода кода закрывает попытку
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.CODE-005
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
@@ -79,7 +79,7 @@ cases:
 
   - id: CODE-005
     title: Ранее принятый код не пускает повторно после перезапуска
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.CODE-005
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
@@ -98,7 +98,7 @@ cases:
 
   - id: CODE-006
     title: Оператор не может выдать код за пределы рамок своего билета
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.KEY-002
     requires: [service-manager]
     steps:
       # Билет фикстуры покрывает уровень не выше 1. Наблюдаемая гарантия здесь —
@@ -120,7 +120,7 @@ cases:
 
   - id: CODE-007
     title: Отозванный билет оператора закрывает выдачу кодов на устройстве
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.TICKET-001
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
@@ -139,7 +139,7 @@ cases:
 
   - id: CODE-008
     title: Вход по коду проходит на устройстве, где сертификатный путь непригоден
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.CODE-001
     # Ровно тот случай, ради которого метод и существует: якорь доверия не
     # завезли, PKCS#11-модуля нет. Сертификатный вход тут невозможен, и это не
     # причина закрывать единственный оставшийся канал.
@@ -154,7 +154,7 @@ cases:
 
   - id: CODE-009
     title: Отклонённый вход не оставляет у демона записи о сессии
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.CODE-002
     # Журнал не принимает запись, вход отклоняется — и сессии, которой нет,
     # не должно быть и в реестре демона: иначе он ведёт её до истечения срока,
     # а сверка «входы против квитанций» получает призрак.
@@ -179,7 +179,7 @@ cases:
 
   - id: CODE-010
     title: Все события одного входа несут одну эпоху ключа
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.KEY-001
     # Персистированная эпоха ушла вперёд от той, что в config.toml — ровно тот
     # сценарий, ради которого выбор эффективной эпохи и написан. События,
     # эмитированные ядром и PAM-веткой, обязаны сойтись: журнал одного входа,
@@ -199,7 +199,7 @@ cases:
 
   - id: CODE-011
     title: Поток запросов challenge не убивает вход по коду насмерть
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.NONCE-002
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
@@ -223,7 +223,7 @@ cases:
 
   - id: CODE-012
     title: Отказ выдачи после потока сам отпускает устройство
-    requirement: openspec/specs/qr-login-method/spec.md
+    requirement: spec9:codes.NONCE-001
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes

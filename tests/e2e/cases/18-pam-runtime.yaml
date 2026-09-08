@@ -18,7 +18,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: PMR-001
     title: Проверка учётной записи без предшествующей аутентификации не выдаёт допуск
-    requirement: openspec/specs/pam-module-runtime/spec.md
+    requirement: spec9:runtime.PAMR-002
     requires: []
     # Фаза account вызывается без authenticate, то есть контекста аутентификации
     # нет. Ответ должен быть «нет данных для решения», а не «разрешено»:
@@ -32,7 +32,7 @@ cases:
 
   - id: PMR-002
     title: Сессия не открывается без предшествующей аутентификации
-    requirement: openspec/specs/pam-module-runtime/spec.md
+    requirement: spec9:runtime.PAMR-003
     requires: []
     # Открытие сессии — fail-closed: нет контекста аутентификации, значит
     # применять к сессии нечего, и продолжать нельзя.
@@ -45,7 +45,7 @@ cases:
 
   - id: PMR-003
     title: Закрытие сессии не блокируется отсутствием контекста
-    requirement: openspec/specs/pam-module-runtime/spec.md
+    requirement: spec9:runtime.PAMR-004
     requires: []
     # Закрытие — fail-open, и это не послабление: ошибка на выходе заперла бы
     # пользователя в системе. Асимметрия с открытием намеренная.
@@ -58,7 +58,7 @@ cases:
 
   - id: PMR-004
     title: Вход по удостоверению проходит все четыре фазы подряд
-    requirement: openspec/specs/pam-module-runtime/spec.md
+    requirement: spec9:runtime.PAMR-008
     requires: [usb]
     # Фазы проверяются одной последовательностью в одном процессе: контекст
     # аутентификации живёт между ними, и кейс ловит его потерю — по отдельности

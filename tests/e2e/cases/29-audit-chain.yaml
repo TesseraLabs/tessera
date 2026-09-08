@@ -14,7 +14,7 @@ setup: [install-package]
 cases:
   - id: AUD-001
     title: Вырезанная из журнала запись обнаруживается верификацией
-    requirement: openspec/specs/audit-chain/spec.md
+    requirement: spec9:runtime.PLAN-002
     steps:
       - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
       - run: tessera audit annotate --file /tmp/tessera-audit/audit.ndjson --kind e2e.audit --data '{"n":1}'
@@ -38,7 +38,7 @@ cases:
 
   - id: AUD-002
     title: Заполненный журнал сообщает об этом явно, а не молчит
-    requirement: openspec/specs/audit-chain/spec.md
+    requirement: spec9:runtime.PLAN-005
     steps:
       - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
       - run: helpers/audit-fill.sh /tmp/tessera-audit/audit.ndjson 300
@@ -56,7 +56,7 @@ cases:
 
   - id: AUD-003
     title: Ротация заполненного журнала оставляет запись об обрыве цепочки
-    requirement: openspec/specs/audit-chain/spec.md
+    requirement: spec9:runtime.PLAN-002
     steps:
       - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
       - run: helpers/audit-fill.sh /tmp/tessera-audit/audit.ndjson 300 rotate
@@ -74,7 +74,7 @@ cases:
 
   - id: AUD-004
     title: Заверение головы отличает заверенную цепочку от незаверённого хвоста
-    requirement: openspec/specs/audit-chain/spec.md
+    requirement: spec9:runtime.PLAN-003
     steps:
       - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
       - run: openssl ecparam -name prime256v1 -genkey -noout -out /tmp/tessera-audit/attestation.pem
@@ -115,7 +115,7 @@ cases:
   # мёртвым при зелёных тестах.
   - id: AUD-006
     title: Вход по коду ложится в журнал устройства
-    requirement: openspec/specs/audit-chain/spec.md
+    requirement: spec9:runtime.PLAN-004
     requires: [service-manager]
     steps:
       - run: helpers/codes-phone.sh prepare {{fixtures}}/codes --with-audit-chain
@@ -133,7 +133,7 @@ cases:
 
   - id: AUD-005
     title: Секрет не попадает в журнал даже через аннотацию
-    requirement: openspec/specs/audit-chain/spec.md
+    requirement: spec9:runtime.PLAN-004
     steps:
       - run: rm -rf /tmp/tessera-audit && mkdir -p /tmp/tessera-audit
       # Значение здесь не секрет — секретно ИМЯ поля, и отказ идёт по нему.

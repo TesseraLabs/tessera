@@ -12,7 +12,7 @@ setup: [install-package, deploy-fixtures]
 cases:
   - id: ENR-001
     title: Пакет без удостоверения узла отвергается целиком
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:fleet.ENR-001
     requires: []
     # Импорт неполного пакета обязан быть отказом, а не частичной раскладкой:
     # устройство с половиной привезённого состояния хуже нетронутого — оно
@@ -28,7 +28,7 @@ cases:
 
   - id: ENR-002
     title: Отсутствующий пакет не считается пустым
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:fleet.ENR-002
     requires: []
     # Опечатка в пути обязана останавливать первичную настройку, а не проходить
     # как «импортировать нечего»: иначе устройство уедет в парк ненастроенным,

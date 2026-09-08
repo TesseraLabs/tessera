@@ -10,7 +10,7 @@ setup: [install-package, deploy-fixtures]
 cases:
   - id: CLI-001
     title: Префлайт на исправной системе завершается успехом и печатает сводку
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: []
     # Предупреждения на исход не влияют: в контейнере всегда есть WARN об
     # отсутствии мандатного контроля, и гейт не должен на нём спотыкаться.
@@ -22,7 +22,7 @@ cases:
 
   - id: CLI-002
     title: Выгрузка идентичностей пробивает все источники и отмечает действующий
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-002
     requires: []
     # Команда намеренно игнорирует список источников из конфигурации: оператор
     # должен видеть всё железо целиком, включая источники, которые сейчас не
@@ -48,7 +48,7 @@ cases:
 
   - id: CLI-003
     title: Снятые подкоманды не воскресают
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-003
     requires: []
     # Подкоманды версии 0.2.x удалены. Возврат любой из них означал бы, что
     # чужой сценарий автоматизации снова начнёт «работать», делая не то, что

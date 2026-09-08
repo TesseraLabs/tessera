@@ -17,7 +17,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
 cases:
   - id: ISS-001
     title: Выпуск корня парка даёт самоподписанный сертификат
-    requirement: openspec/specs/cert-issuance/spec.md
+    requirement: spec9:issuance.CISS-004
     requires: []
     steps:
       - run: |
@@ -43,7 +43,7 @@ cases:
 
   - id: ISS-002
     title: Подделка записи в журнале выпусков ломает цепочку хешей
-    requirement: openspec/specs/issuance-journal/spec.md
+    requirement: spec9:issuance.IJRN-002
     requires: []
     steps:
       - run: |
@@ -86,7 +86,7 @@ cases:
 
   - id: ISS-003
     title: Выпущенный лист несёт заданные рамки применения
-    requirement: openspec/specs/cert-scope-binding/spec.md
+    requirement: spec9:issuance.CISS-001
     requires: []
     steps:
       - run: |
@@ -141,7 +141,7 @@ cases:
 
   - id: ISS-004
     title: Расширение рамок относительно родителя отклоняется
-    requirement: openspec/specs/cert-issuance/spec.md
+    requirement: spec9:issuance.CISS-002
     requires: []
     steps:
       # Монотонное сужение: выпускающий не может выдать больше прав, чем имеет сам.
@@ -184,7 +184,7 @@ cases:
 
   - id: ISS-005
     title: Выпущенным удостоверением можно войти в систему
-    requirement: openspec/specs/cert-issuance/spec.md
+    requirement: spec9:issuance.CISS-007
     requires: [service-manager, usb]
     steps:
       # Сквозной кейс: «выпустили → записали на носитель → вошли» целиком.
@@ -237,7 +237,7 @@ cases:
 
   - id: ISS-006
     title: Выпуск с ключом, порождённым инструментом, даёт удостоверение для входа
-    requirement: openspec/specs/credential-packaging/spec.md
+    requirement: spec9:issuance.CISS-007
     requires: [service-manager, usb]
     steps:
       # Второй сквозной кейс, отличающийся от ISS-005 происхождением ключа.
@@ -305,7 +305,7 @@ cases:
 
   - id: ISS-007
     title: Слишком короткий пароль контейнера отклоняет выпуск
-    requirement: openspec/specs/credential-packaging/spec.md
+    requirement: spec9:issuance.CISS-007
     requires: [service-manager]
     steps:
       # Отказ наступает до подписи: удостоверение с паролем ниже порога не

@@ -9,7 +9,7 @@ setup: [install-package, deploy-fixtures]
 cases:
   - id: TAG-001
     title: Корректный набор тегов принимается
-    requirement: openspec/specs/device-tags/spec.md
+    requirement: spec9:fleet.TAG-001
     requires: []
     # Опорный кейс: без него все отказы ниже объяснялись бы тем, что проверка
     # отвергает вообще всё.
@@ -24,7 +24,7 @@ cases:
 
   - id: TAG-002
     title: Повторяющийся ключ отвергает набор целиком
-    requirement: openspec/specs/device-tags/spec.md
+    requirement: spec9:fleet.TAG-002
     requires: []
     # Правило «последний выигрывает» здесь недопустимо: от того, какое из двух
     # значений возьмёт продукт, зависит попадание устройства в группу, и
@@ -41,7 +41,7 @@ cases:
 
   - id: TAG-003
     title: Посторонняя секция в файле тегов отвергается
-    requirement: openspec/specs/device-tags/spec.md
+    requirement: spec9:fleet.TAG-001
     requires: []
     # Файл тегов описывает ровно одну таблицу. Лишняя секция означает, что файл
     # не тот или собран не тем инструментом, и молча читать из него часть
@@ -58,7 +58,7 @@ cases:
 
   - id: TAG-004
     title: Без настроенного источника у устройства нет тегов
-    requirement: openspec/specs/device-tags/spec.md
+    requirement: spec9:fleet.TAG-002
     requires: []
     # «Тегов нет» — безопасное значение по умолчанию: групповые рамки при нём
     # неудовлетворимы. Обратное («тегов нет, значит подходят любые») открывало

@@ -18,8 +18,6 @@ pub struct Cli {
 pub enum Command {
     /// Прогон реестра e2e-кейсов.
     E2e(E2eArgs),
-    /// Пересборка матрицы покрытия спек кейсами реестра.
-    E2eCoverage(CoverageArgs),
     /// Пересборка фикстур телефонного канала (сюита `27-codes-phone`).
     CodesFixtures(CodesFixturesArgs),
 }
@@ -37,14 +35,6 @@ pub struct CodesFixturesArgs {
     /// если прогон идёт под другой.
     #[arg(long = "role")]
     pub roles: Vec<String>,
-}
-
-/// Аргументы сборки матрицы покрытия.
-#[derive(Debug, Clone, clap::Args)]
-pub struct CoverageArgs {
-    /// Ничего не писать: сверить файл со сгенерированным и упасть при расхождении.
-    #[arg(long)]
-    pub check: bool,
 }
 
 /// Аргументы прогона.

@@ -13,7 +13,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: USB-001
     title: Отсутствие носителя закрывает вход по истечении ожидания
-    requirement: openspec/specs/usb-media-pkcs12/spec.md
+    requirement: spec9:auth.USB-007
     requires: []
     # Ожидание носителя в стенде равно нулю, поэтому кейс проверяет исход, а не
     # длительность: ждать нечего, устройств нет, вход закрыт.
@@ -27,7 +27,7 @@ cases:
 
   - id: USB-002
     title: Носитель вне списка разрешённых устройств не рассматривается
-    requirement: openspec/specs/usb-media-pkcs12/spec.md
+    requirement: spec9:auth.USB-002
     requires: [usb]
     # Носитель подключён и удостоверение на нём валидно — отказ вызван ровно
     # фильтром устройств.
@@ -46,7 +46,7 @@ cases:
 
   - id: USB-003
     title: Носитель из списка разрешённых устройств проходит
-    requirement: openspec/specs/usb-media-pkcs12/spec.md
+    requirement: spec9:auth.USB-002
     requires: [usb]
     # Парный к USB-002: без него отказ выше объяснялся бы самим фактом
     # включения фильтра, а не его содержимым.

@@ -15,7 +15,7 @@ setup: [install-package, deploy-fixtures, deploy-issuer]
 cases:
   - id: REQ-001
     title: Запрос с генерацией не требует отдельного файла открытого ключа
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-079
     requires: []
     steps:
       - run: |
@@ -40,7 +40,7 @@ cases:
 
   - id: REQ-002
     title: Незашифрованного закрытого ключа на диске не остаётся
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-081
     requires: []
     # Проверяется не наличие пароля в заголовке, а невозможность прочитать ключ
     # без него: заголовок можно написать и над открытым ключом.
@@ -64,7 +64,7 @@ cases:
 
   - id: REQ-003
     title: Поданный чужой открытый ключ отвергается до подписи запроса
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-086
     requires: []
     steps:
       - run: |
@@ -90,7 +90,7 @@ cases:
 
   - id: REQ-004
     title: Имя csr работает и предупреждает об устаревании
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-087
     requires: []
     steps:
       - run: |
@@ -111,7 +111,7 @@ cases:
 
   - id: ACC-001
     title: Приём печатает вердикт по каждой проверке отдельной строкой
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-082
     requires: []
     # Шесть строк, а не сводная плашка: когда падает одна из шести, человеку
     # нужно знать какая.
@@ -140,7 +140,7 @@ cases:
 
   - id: ACC-002
     title: Несходящаяся цепочка прерывает приём и ничего не пишет на носитель
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-082
     requires: []
     steps:
       - run: helpers/issuer-request-fixture.sh prepare-foreign-root /tmp/issuer-request
@@ -162,7 +162,7 @@ cases:
 
   - id: ACC-003
     title: Заданная ожидаемая привязка превращает показ в проверку
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-082
     requires: []
     steps:
       - run: helpers/issuer-request-fixture.sh prepare /tmp/issuer-request
@@ -181,7 +181,7 @@ cases:
 
   - id: REQ-101
     title: Ключ на активном токене неизвлекаем и никогда не был извлекаемым
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-080
     requires: [hardware-token]
     # Живое железо обязательно: SoftHSM отдаёт NEVER_EXTRACTABLE по своей
     # внутренней модели, а вопрос стоит о вендорской библиотеке.
@@ -211,7 +211,7 @@ cases:
 
   - id: REQ-102
     title: Значение закрытого ключа с активного токена не читается
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-085
     requires: [hardware-token]
     steps:
       - run: |
@@ -229,7 +229,7 @@ cases:
 
   - id: REQ-103
     title: Пассивный токен отвергается как пригодный только под носитель
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-080
     requires: [hardware-token]
     steps:
       - run: |
@@ -246,7 +246,7 @@ cases:
 
   - id: PLC-101
     title: Сертификат ложится на активный токен с идентификатором ключа
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-083
     requires: [hardware-token]
     steps:
       - run: helpers/issuer-request-fixture.sh prepare-token /tmp/issuer-request
@@ -266,7 +266,7 @@ cases:
 
   - id: REQ-201
     title: Провайдер, проигнорировавший шаблон, отвергается
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-080
     requires: []
     steps:
       - run: |
@@ -287,7 +287,7 @@ cases:
 
   - id: REQ-202
     title: Провайдер, отдающий закрытый ключ вопреки атрибутам, отвергается
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-085
     requires: []
     steps:
       - run: |
@@ -305,7 +305,7 @@ cases:
 
   - id: REQ-203
     title: Не возвращённый устройством атрибут — отказ, а не FALSE
-    requirement: openspec/specs/issuance-request/spec.md
+    requirement: spec9:issuance.PLAN-080
     requires: []
     steps:
       - run: |

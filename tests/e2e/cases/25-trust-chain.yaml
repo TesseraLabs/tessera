@@ -13,7 +13,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: TRUST-001
     title: Якорь вне списка закреплённых отпечатков не пускает
-    requirement: openspec/specs/trust-chain-validation/spec.md
+    requirement: spec9:auth.TVAL-006
     requires: [usb]
     steps:
       - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
@@ -30,7 +30,7 @@ cases:
 
   - id: TRUST-002
     title: Закрепление отпечатка своего якоря вход не ломает
-    requirement: openspec/specs/trust-chain-validation/spec.md
+    requirement: spec9:auth.TRUST-002
     requires: [usb]
     # Парный к TRUST-001. Без него «чужой отпечаток не пускает» ничего не
     # доказывает: отказывать могло бы и само включение закрепления.
@@ -49,7 +49,7 @@ cases:
 
   - id: TRUST-003
     title: Цепочка длиннее разрешённой глубины не пускает
-    requirement: openspec/specs/trust-chain-validation/spec.md
+    requirement: spec9:auth.TRUST-003
     requires: [usb]
     steps:
       - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
@@ -66,7 +66,7 @@ cases:
 
   - id: TRUST-004
     title: Разрешённый алгоритм подписи не совпадает по подстроке
-    requirement: openspec/specs/trust-chain-validation/spec.md
+    requirement: spec9:auth.TVAL-005
     requires: [usb]
     # Сравнение строгое: подстрочное сравнение когда-то пропускало
     # sha1WithRSAEncryption под элементом whitelist "sha". Здесь whitelist
@@ -87,7 +87,7 @@ cases:
 
   - id: TRUST-005
     title: Промежуточный из самого удостоверения достраивает цепочку
-    requirement: openspec/specs/trust-chain-validation/spec.md
+    requirement: spec9:auth.TVAL-003
     requires: [usb]
     # Issuer ищется в якорях, затем среди предъявленного, затем в пуле.
     # Удостоверение фикстуры несёт промежуточный внутри, поэтому вход проходит

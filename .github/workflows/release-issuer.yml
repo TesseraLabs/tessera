@@ -7,7 +7,7 @@ name: release-issuer
 # astra-builder (самый старый glibc среди целей → бинарь работает на Astra,
 # Ubuntu и Debian по обратной совместимости glibc).
 #
-# Спека: openspec/specs/build-release (требование «Release job»).
+# Спека: Spec9 BLD-003 («Release job»).
 
 on:
   push:

@@ -323,7 +323,7 @@ impl OpensslVerifier {
         //     delegation-envelope checks (4.2-4.4, device.tags ⊇ requireTags +
         //     role/level/TTL ceilings) run in the PAM flow via
         //     `trust::enforce_delegation`, where the requested role/level and
-        //     device tags are known — see openspec change tags-delegation §4.
+        //     device tags are known — see Spec9 ADR-HIST-tags-delegation §4.
         crate::x509::profile_validation::verify_profile_and_criticals(
             &chain,
             self.max_supported_profile_version,

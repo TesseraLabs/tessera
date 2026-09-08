@@ -18,7 +18,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures, start-monitord]
 cases:
   - id: MON-001
     title: Сокет демона не доступен на запись посторонним
-    requirement: openspec/specs/ipc-protocol/spec.md
+    requirement: spec9:runtime.IPCR-001
     requires: [service-manager]
     # Через этот сокет сообщают об открытии и закрытии сессий. Доступный на
     # запись кому угодно, он позволил бы закрыть чужую сессию или скрыть свою.
@@ -39,7 +39,7 @@ cases:
 
   - id: MON-003
     title: Извлечение носителя при активной сессии замечается демоном
-    requirement: openspec/specs/session-monitoring/spec.md
+    requirement: spec9:runtime.MON-003
     requires: [service-manager, usb]
     # Носитель извлекается прямо в кейсе, после открытой сессии. Демон обязан
     # это заметить и начать отсчёт отсрочки — иначе сессия переживёт носитель,

@@ -59,8 +59,8 @@
 > применяет к сессии личность, срок (TTL) и — на Astra, через коммерческий
 > МКЦ-адаптер — маску целостности `mac_mask`. Группы, `sudo`-правила и лимиты
 > определены форматом роли и валидируются, но к сессии пока не применяются:
-> OS-enforcement для них в разработке
-> ([linux-session-enforcement](../../openspec/changes/linux-session-enforcement/proposal.md)).
+> OS-enforcement для них в разработке; решение отслеживается приватным Spec9 ADR
+> `ADR-PLAN-linux-session-enforcement`.
 
 | Операция | `oper` | `serv` | `admin` |
 |---|:---:|:---:|:---:|
@@ -189,8 +189,8 @@ Engine будет выставлять сам (не через `pam_group`), ч�
 
 > **Важно.** Этот раздел описывает целевую механику. В v0.4.0 `groups`,
 > `sudo_role` и `limits` разбираются и валидируются (`tessera role lint`),
-> но к сессии не применяются — реализация ведётся в change
-> [linux-session-enforcement](../../openspec/changes/linux-session-enforcement/proposal.md).
+> но к сессии не применяются — реализация отслеживается приватным Spec9 ADR
+> `ADR-PLAN-linux-session-enforcement`.
 > Примеры ниже корректны как формат роли и заработают без изменений.
 
 Оператор — минимальный профиль:

@@ -9,7 +9,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: CHAL-001
     title: Удостоверение с ключом на эллиптической кривой проходит наравне с RSA
-    requirement: openspec/specs/challenge-response/spec.md
+    requirement: spec9:auth.CCH-002
     requires: [usb]
     # Алгоритм подписи вызова выбирается по типу ключа из сертификата.
     # Ошибка выбора не даёт «неверную подпись» на глаз — она даёт отказ входа
@@ -31,7 +31,7 @@ cases:
 
   - id: LIC-001
     title: Пакет заявляет двойное лицензирование
-    requirement: openspec/specs/licensing-distribution/spec.md
+    requirement: spec9:platform.LIC-001
     requires: []
     # Условия распространения едут вместе с пакетом, а не только лежат в
     # репозитории: получатель .deb видит их из установленной системы.
