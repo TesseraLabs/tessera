@@ -34,6 +34,14 @@ pub const TICKET_REVOCATIONS_FILENAME: &str = "tickets.revoked";
 /// Default name of the ticket authority anchor.
 pub const TICKET_ANCHOR_FILENAME: &str = "ticket-authority.pem";
 
+/// Addresses of the engineer's page this device may show, one per line.
+///
+/// Delivered by the enrollment package and by nothing else. The device shows
+/// one of them in front of the challenge and composes no address of its own:
+/// whoever could talk a device into showing an address of their choosing would
+/// be sending the engineer to a page that collects challenges.
+pub const PAGE_URLS_FILENAME: &str = "page-urls.txt";
+
 /// Default name of the directory holding the state this module writes.
 pub const STATE_DIRNAME: &str = "state";
 
@@ -62,6 +70,8 @@ pub struct CodesPaths {
     pub ticket_revocations: PathBuf,
     /// The anchor every ticket is verified against.
     pub ticket_authority: PathBuf,
+    /// Addresses of the engineer's page the fleet allows this device to show.
+    pub page_urls: PathBuf,
 }
 
 impl CodesPaths {
@@ -74,6 +84,7 @@ impl CodesPaths {
             tickets: root.join(TICKETS_FILENAME),
             ticket_revocations: root.join(TICKET_REVOCATIONS_FILENAME),
             ticket_authority: root.join(TICKET_ANCHOR_FILENAME),
+            page_urls: root.join(PAGE_URLS_FILENAME),
         }
     }
 
@@ -304,6 +315,72 @@ pub enum DeviceKeyError {
     Container(#[from] Pkcs12Error),
 }
 
+/// Reads the addresses of the engineer's page the fleet allows this device to
+/// show.
+///
+/// One address per line; blank lines and lines opening with `#` are comments.
+/// An absent file is an empty allowlist and not an error: a fleet that
+/// published no page shows the challenge alone, which still scans.
+///
+/// The list is the fleet's, delivered by the enrollment package. Nothing here
+/// composes an address, and nothing accepts one from the configuration that the
+/// list does not carry — see [`page_url_is_allowed`].
+///
+/// # Errors
+///
+/// [`DeviceKeyError::Io`] when the file cannot be read or is not UTF-8. Read
+/// under the same cap as every other artefact: this runs at login, so it may
+/// never size a buffer from what is on disk.
+pub fn load_page_urls(path: &Path) -> Result<Vec<String>, DeviceKeyError> {
+    let bytes = match crate::fs_mode::read_capped_regular(path, MAX_KEY_CONTAINER_BYTES) {
+        Ok(crate::fs_mode::CappedRead::Whole(bytes)) => bytes,
+        Ok(crate::fs_mode::CappedRead::TooLarge) => {
+            return Err(DeviceKeyError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is larger than the artefact cap", path.display()),
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(DeviceKeyError::Io(error)),
+    };
+    let text = String::from_utf8(bytes).map_err(|_| {
+        DeviceKeyError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not valid UTF-8", path.display()),
+        ))
+    })?;
+    Ok(parse_page_urls(&text))
+}
+
+/// Reads the addresses out of the text of the list.
+///
+/// Split out and made public so that the import of an enrolment package can ask
+/// THIS question — "how many addresses does the device get out of this file?" —
+/// instead of asking a similar one of its own. A file of nothing but comments
+/// is the case that made the difference: a second reader that only looked for
+/// non-blank lines called it a list, the device read no address from it, and the
+/// device then refused its own configuration in the field, hours after the
+/// operator who could have fixed it had gone.
+#[must_use]
+pub fn parse_page_urls(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Reports whether an address is one the fleet delivered.
+///
+/// Byte equality, not a prefix match and not a host comparison. A prefix rule
+/// would admit `https://codes.fleet.example.attacker.test/e` under an entry for
+/// `https://codes.fleet.example`, and a host rule would admit any path on the
+/// host — including one somebody else controls on a shared domain.
+#[must_use]
+pub fn page_url_is_allowed(allowlist: &[String], candidate: &str) -> bool {
+    allowlist.iter().any(|allowed| allowed == candidate)
+}
+
 /// Opens the stored device key container and returns the private key.
 ///
 /// The container is the same PKCS#12 envelope the rest of the engine reads, so
@@ -363,13 +440,128 @@ pub fn load_device_key(
 mod tests {
     use std::path::Path;
 
-    use super::{CodesPaths, DEFAULT_CODES_DIR};
+    use super::{load_page_urls, page_url_is_allowed, CodesPaths, DEFAULT_CODES_DIR};
 
     #[test]
     fn the_default_layout_sits_under_the_default_directory() {
         let paths = CodesPaths::default();
         assert!(paths.device_key_container.starts_with(DEFAULT_CODES_DIR));
         assert_eq!(paths.state_dir, Path::new(DEFAULT_CODES_DIR).join("state"));
+    }
+
+    /// Writes a list of addresses and reads it back through the product.
+    fn addresses(contents: &str) -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodesPaths::under(dir.path());
+        std::fs::write(&paths.page_urls, contents).unwrap();
+        let read = load_page_urls(&paths.page_urls).unwrap();
+        (dir, read)
+    }
+
+    #[test]
+    fn an_address_outside_the_list_is_not_allowed() {
+        // The whole control, and until this test it was held by nothing: a
+        // mutation turning the answer into `true` left the suite green. What it
+        // guards is an engineer being sent, by their own device, to a page
+        // nobody in the fleet published.
+        let (_dir, allowed) = addresses("https://codes.fleet.example/e\n");
+
+        assert!(page_url_is_allowed(
+            &allowed,
+            "https://codes.fleet.example/e"
+        ));
+        assert!(!page_url_is_allowed(
+            &allowed,
+            "https://codes.fleet.example/f"
+        ));
+        // Neither a prefix nor a host match: both would admit an address on a
+        // name somebody else controls.
+        assert!(!page_url_is_allowed(
+            &allowed,
+            "https://codes.fleet.example.attacker.test/e"
+        ));
+        assert!(!page_url_is_allowed(
+            &allowed,
+            "https://codes.fleet.example"
+        ));
+        assert!(!page_url_is_allowed(&allowed, ""));
+    }
+
+    #[test]
+    fn an_empty_list_allows_nothing() {
+        // The direction a mistake would take: a fleet that delivered no list
+        // must not thereby allow every address.
+        let (_dir, allowed) = addresses("");
+        assert!(allowed.is_empty());
+        assert!(!page_url_is_allowed(
+            &allowed,
+            "https://codes.fleet.example/e"
+        ));
+    }
+
+    #[test]
+    fn the_list_ignores_blank_lines_comments_and_surrounding_space() {
+        // The file is written by whoever assembles an enrolment package, and it
+        // will carry a header line and a stray space. What must NOT happen is
+        // an address being admitted because of the space around it, or a
+        // commented-out address being admitted at all.
+        let (_dir, allowed) = addresses(
+            "# addresses of this fleet\n\
+             \n\
+             \thttps://codes.fleet.example/e  \n\
+             #https://retired.fleet.example/e\n\
+             https://second.fleet.example/e\n",
+        );
+
+        assert_eq!(
+            allowed,
+            vec![
+                "https://codes.fleet.example/e".to_owned(),
+                "https://second.fleet.example/e".to_owned(),
+            ]
+        );
+        assert!(page_url_is_allowed(
+            &allowed,
+            "https://codes.fleet.example/e"
+        ));
+        // The commented-out one is gone, not merely unlisted-looking.
+        assert!(!page_url_is_allowed(
+            &allowed,
+            "https://retired.fleet.example/e"
+        ));
+        assert!(!page_url_is_allowed(
+            &allowed,
+            "#https://retired.fleet.example/e"
+        ));
+    }
+
+    #[test]
+    fn a_missing_list_reads_as_no_addresses_rather_than_a_failure() {
+        // A device of a fleet that published no page has no such file, and that
+        // is not a fault: it shows the challenge alone. What it must not do is
+        // allow an address.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodesPaths::under(dir.path());
+        assert!(!paths.page_urls.exists());
+
+        let allowed = load_page_urls(&paths.page_urls).unwrap();
+        assert!(allowed.is_empty());
+        assert!(!page_url_is_allowed(
+            &allowed,
+            "https://codes.fleet.example/e"
+        ));
+    }
+
+    #[test]
+    fn a_list_that_is_not_utf8_is_refused_rather_than_read_as_empty() {
+        // Read as empty, it would look exactly like a fleet that published no
+        // page — and the configuration naming an address would be refused for
+        // the wrong reason, sending whoever debugs it to the wrong file.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodesPaths::under(dir.path());
+        std::fs::write(&paths.page_urls, [0xff_u8, 0xfe, 0xfd]).unwrap();
+
+        assert!(load_page_urls(&paths.page_urls).is_err());
     }
 
     #[test]

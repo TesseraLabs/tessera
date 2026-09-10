@@ -12,7 +12,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: LOG-001
     title: Успешный вход оставляет в журнале результат и идентификатор удостоверения
-    requirement: openspec/specs/logging-audit/spec.md
+    requirement: spec9:runtime.LOG-002
     requires: [usb]
     steps:
       - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
@@ -32,7 +32,7 @@ cases:
 
   - id: LOG-002
     title: Отказ во входе объясняется в журнале причиной, а не одним кодом
-    requirement: openspec/specs/logging-audit/spec.md
+    requirement: spec9:runtime.LOG-002
     requires: [usb]
     # Разбор инцидента начинается с журнала: код возврата PAM говорит вызвавшей
     # службе «нет», но не говорит администратору, почему.
@@ -51,7 +51,7 @@ cases:
 
   - id: LOG-003
     title: Вход при отключённой проверке отзыва сопровождается предупреждением
-    requirement: openspec/specs/logging-audit/spec.md
+    requirement: spec9:auth.REV-007
     requires: [usb]
     # Режим «отзыв не проверяется» выбирается явно, но молчать о нём нельзя:
     # отозванное удостоверение в этом режиме пускает, и запись в журнале —

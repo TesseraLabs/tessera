@@ -1,0 +1,17 @@
+# The list of withdrawn rights, vector 1.
+#
+# How a fleet takes a right away from an engineer or from an organisation. It is
+# signed by the AUTHORISATION KEY of the fleet and not by an organisation: an
+# organisation able to sign this list would publish one without its own people
+# in it.
+#
+# The entries below are divided by `|` for the readability of this file only; in
+# the document itself the list separator is a comma and the parts of an entry are
+# divided by a colon.
+serial = 7
+issued_at = 1800000100
+entries = engineer:eng-1:1800000000:left-the-fleet|organisation:acme:1800000050:contract-ended
+signature_hex = abcd
+canon_hex = 00000029746573736572612d636f6465732d636f6e74726163742f76312f7265766f636174696f6e2d6c69737400000008000000000000000700000008000000006b49d264000000040000000200000008656e67696e65657200000005656e672d3100000008000000006b49d2000000000e6c6566742d7468652d666c6565740000000c6f7267616e69736174696f6e0000000461636d6500000008000000006b49d2320000000e636f6e74726163742d656e646564
+wire = tessera-codes/v1/revocation-list;serial=7;issued_at=1800000100;entries=engineer:eng-1:1800000000:left-the-fleet,organisation:acme:1800000050:contract-ended
+signed_wire = tessera-codes/v1/signed-revocation-list;list=746573736572612d636f6465732f76312f7265766f636174696f6e2d6c6973743b73657269616c3d373b6973737565645f61743d313830303030303130303b656e74726965733d656e67696e6565723a656e672d313a313830303030303030303a6c6566742d7468652d666c6565742c6f7267616e69736174696f6e3a61636d653a313830303030303035303a636f6e74726163742d656e646564;authorisation_signature=abcd

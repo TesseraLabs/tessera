@@ -3,7 +3,7 @@ description: Допуск к роли при входе в ролевую учё
 setup: [build-pam-drive, install-package, deploy-fixtures]
 
 # Кейсы написаны от ЦЕЛЕВОЙ модели «роль = ролевая учётная запись» (решение
-# 2026-06-19, зафиксировано в openspec/specs/role-selection/spec.md): инженер
+# 2026-06-19, зафиксировано в Spec9 role-selection): инженер
 # входит в учётную запись с именем роли (`ssh serv@device`), запрошенная роль
 # равна имени этой записи, а допуск к ней проверяется расширением
 # pam_cert_allowed_roles — одна строка отвечает и «в какую запись пущен», и
@@ -21,7 +21,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: ROLE-001
     title: Вход в ролевую учётную запись с покрытой ролью открывает сессию
-    requirement: openspec/specs/role-selection/spec.md
+    requirement: spec9:auth.ROLE-001
     requires: [service-manager, usb]
     steps:
       - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
@@ -44,7 +44,7 @@ cases:
 
   - id: ROLE-002
     title: Роль вне списка разрешённых в удостоверении закрывает доступ
-    requirement: openspec/specs/role-selection/spec.md
+    requirement: spec9:auth.SCOPE-001
     requires: [service-manager, usb]
     steps:
       - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
@@ -65,7 +65,7 @@ cases:
 
   - id: ROLE-004
     title: Роль, разрешённая удостоверением, но отсутствующая в хранилище, закрывает доступ
-    requirement: openspec/specs/role-store/spec.md
+    requirement: spec9:auth.RSEL-002
     requires: [service-manager, usb]
     steps:
       - run: id -u serv >/dev/null 2>&1 || useradd -m -s /bin/bash serv
@@ -88,7 +88,7 @@ cases:
 
   - id: ROLE-005
     title: Вход в системную учётную запись не открывает сессию
-    requirement: openspec/specs/role-selection/spec.md
+    requirement: spec9:auth.RSEL-006
     requires: [service-manager, usb]
     steps:
       # root есть на любом устройстве и удовлетворяет грамматике имени роли:

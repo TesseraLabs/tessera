@@ -71,7 +71,7 @@ fn a_tamper_in_an_old_journal_is_still_caught_at_its_position() {
 /// The line the phone-channel ledger writes is an annotation with `kind`
 /// `codes.issue`. It has to keep round-tripping through the chain unchanged —
 /// the ledger is the operator's only memory of which nonce counters have been
-/// spoken aloud.
+/// shown on the screen of a device.
 #[test]
 fn the_ledger_annotation_is_read_back_as_it_was_written() {
     let lines = journal_written_by_the_previous_build();

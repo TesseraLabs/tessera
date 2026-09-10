@@ -59,6 +59,13 @@ override_dh_auto_install:
 	# by dh_strip.
 	install -D -m 0755 target/release/tessera \
 		debian/tessera/usr/bin/tessera
+	# The QR overlay of a graphical login. Not setuid, not a service and not
+	# started by the package: the PAM module of an attempt starts it under the
+	# greeter's own account and it exits with the attempt. A device with no
+	# graphical login never runs it, and its absence does not affect the text
+	# path — that is what makes shipping it in the same package safe.
+	install -D -m 0755 target/release/tessera-qr-overlay \
+		debian/tessera/usr/bin/tessera-qr-overlay
 
 override_dh_auto_test:
 	# We rely on `cargo test` having been run before invoking

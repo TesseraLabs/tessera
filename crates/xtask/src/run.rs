@@ -81,9 +81,6 @@ pub fn e2e(args: &E2eArgs) -> anyhow::Result<i32> {
         args.cases_dir.clone()
     };
     let registry = Registry::load(&cases_dirs)?;
-    for warning in registry.warnings() {
-        eprintln!("ВНИМАНИЕ: {warning}");
-    }
 
     let package = Provenance::of_package(
         &stand.package.deb,

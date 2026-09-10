@@ -5,7 +5,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: AUTH-001
     title: Валидное удостоверение пускает пользователя
-    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requirement: spec9:auth.AFLOW-004
     requires: [service-manager, usb]
     steps:
       - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
@@ -18,7 +18,7 @@ cases:
 
   - id: AUTH-002
     title: Неверный PIN не пускает пользователя
-    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requirement: spec9:auth.AFLOW-008
     requires: [service-manager, usb]
     steps:
       - run: helpers/usb-loop.sh attach {{fixtures}}/leaf_rsa.p12
@@ -39,7 +39,7 @@ cases:
 
   - id: AUTH-003
     title: Просроченное удостоверение не пускает пользователя
-    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requirement: spec9:auth.AFLOW-004
     requires: [service-manager, usb]
     steps:
       - run: helpers/usb-loop.sh attach {{fixtures}}/expired_leaf.p12

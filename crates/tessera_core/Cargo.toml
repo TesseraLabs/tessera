@@ -34,15 +34,18 @@ pkcs11-tests = ["tessera_issuer/pkcs11"]
 mac-tests = ["dep:mockall"]
 
 [dependencies]
-tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
-tessera_ext = { path = "../tessera_ext", version = "0.5.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.6.0" }
+tessera_ext = { path = "../tessera_ext", version = "0.6.0" }
 # The frozen phone-channel contract: canonical serialisation, key derivation and
 # the code itself. The device recomputes what the operator's cabinet computed,
 # so neither the formula nor the encoding may be written a second time here.
-tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.5.0" }
+tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.6.0" }
+# Draws the QR of a challenge for a console and an ssh session. See the
+# workspace manifest for why this crate and not another.
+qrcodegen = { workspace = true }
 # The append-only chain the device audit journal is built on — the same one the
 # issuance journal uses, so the two records stay one format.
-tessera_hashchain = { path = "../tessera_hashchain", version = "0.5.0", features = ["file"] }
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.6.0", features = ["file"] }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
@@ -109,7 +112,7 @@ tracing-subscriber = { workspace = true }
 # Cross-crate contract: the issuer builds artifacts, the Engine parsers here
 # accept them. `test-support` exposes the self-signed-root helper; no cycle —
 # `tessera_issuer` depends only on `tessera_ext`.
-tessera_issuer = { path = "../tessera_issuer", version = "0.5.0", features = ["test-support"] }
+tessera_issuer = { path = "../tessera_issuer", version = "0.6.0", features = ["test-support"] }
 p256 = { workspace = true }
 
 [lints.rust]

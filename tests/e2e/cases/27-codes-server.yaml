@@ -1,0 +1,621 @@
+suite: codes-server
+description: >
+  Вход по одноразовому коду, выданному сервером: устройство показывает подписанный
+  challenge, инженер снимает его своей стороной и приносит запрос на выдачу, сервер
+  считает код и отвечает грантом, инженер вводит код с клавиатуры. Сервера в контуре
+  нет — его роль исполняет helpers/codes-server.sh, который собирает подписанный
+  запрос инженера и зовёт ту же выдачу открытого ядра (`issuer codes issue`), что
+  вызывает внутри себя codes-core. Вторая реализация формулы на стенде разошлась бы
+  с продуктом молча.
+setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
+
+# Кейсы этой сюиты написаны ДО серверного пути (правило «кейс раньше кода»):
+# ожидания взяты из норм Spec9 процесса `codes.qr-login`
+# и из решений spec9 (ADR-CODES-001 — границы MVP, ADR-CODES-002 — формула кода и
+# документы канала, ADR-SRV-003 — ступень кастодии ключа согласования), а не измерены.
+# До появления кода они красные и живут в BASELINE.md. Подгонять их под факт нельзя —
+# тогда реестр закрепит недоделку как эталон.
+#
+# Что изменилось против телефонной редакции сюиты: пропало основание, диктуемое
+# голосом, — теперь оно живёт внутри подписанного запроса инженера и другого экземпляра
+# у него нет; пропала квитанция — её место заняли запрос и грант, а ступень кастодии
+# ключа согласования уехала в запись выдачи; оператор перестал быть стороной канала.
+
+cases:
+  - id: CODE-001
+    title: Код, выданный сервером, пускает инженера на запрошенный уровень
+    requirement: spec9:codes.CODE-001
+    # Уровень модуль читает из метки процесса, а не из аргумента: на системе без
+    # мандатного механизма он всегда 0, и кейс, просящий уровень 1, проверил бы
+    # не то, что обещает. Отсюда `mac` — иначе он «проходит» там, где ничего не
+    # проверяет.
+    requires: [service-manager, mac]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Хелпер снимает напечатанный challenge, собирает по нему подписанный запрос
+      # инженера, получает у выдачи код и подаёт его в ввод — ровно те шаги, что на
+      # объекте делают камерой телефона и страницей инженера.
+      - run: helpers/codes-server.sh authenticate {{user}} --level 1
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      - expect_journal: { identifier: pam_tessera, matches: 'qr_code_login' }
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-002
+    title: Устройство без всякой серверной конфигурации всё равно пускает по коду
+    requirement: spec9:codes.CODE-101
+    # Codes-URL на этом транспорте — удобство навигации, а не участник проверки:
+    # спека прямо говорит, что проверка подписей от него не зависит. Устройство без
+    # настроенного URL обязано пускать по коду ровно так же.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes --without-codes-url
+      # Уровень 0: кейс проверяет работу без серверной конфигурации, а не уровень,
+      # поэтому мандатный механизм ему не нужен и он исполним в контейнере.
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-003
+    title: Неверный код не пускает
+    requirement: spec9:codes.CODE-005
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Заведомо неверный код, не секрет: он не сходится ни с каким K.
+      # Через хелпер, а не прямым pam-drive: разговор состоит из нескольких разных
+      # промптов (сервер, личный номер, PIN контейнера, код), и одна строка на все
+      # означала бы отказ по нечитаемому контейнеру вместо отказа по коду — кейс
+      # зеленел бы по неверной причине.
+      - run: helpers/codes-server.sh authenticate-with-code {{user}} --level 0 --code 00000000
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-004
+    title: Исчерпание попыток ввода кода закрывает попытку
+    requirement: spec9:codes.PARAM-112
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Обещанное поведение: исчерпание бюджета попыток сообщается стеку как
+      # PAM_MAXTRIES (11) — не PAM_CRED_INSUFFICIENT (8), которым эта граница
+      # ошибочно обозначалась в cert-пути (см. BASELINE.md, AUTH-002).
+      - run: helpers/codes-server.sh exhaust-attempts {{user}}
+        expect: { exit_code: 11, stdout_matches: 'auth: PAM_MAXTRIES \(11\)' }
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-005
+    title: Записанный код не пускает во второй раз, и перезапуск этого не меняет
+    requirement: spec9:codes.CODE-031
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Первый вход проходит, код запоминается; хелпер перезапускает службы и
+      # сбрасывает кэши, после чего подаёт тот же код снова.
+      #
+      # Заголовок сужен намеренно, и вот его граница. Одноразовость
+      # ПОТРЕБЛЁННОГО nonce снаружи не предъявить: nonce — одно длинное
+      # случайное значение, которое устройство тянет из системного генератора на
+      # КАЖДУЮ попытку (`crates/tessera_core/src/codes/draw.rs`), а показывает
+      # challenge только само устройство. Разговора со старым nonce не бывает ни
+      # при каком внешнем воздействии, поэтому прежний код не сходится уже по
+      # MAC. Вторую половину — что после перезапуска попытки со старым nonce не
+      # существует вовсе — держит unit-тест ядра
+      # `a_reboot_puts_out_a_pending_attempt`
+      # (`crates/tessera_core/src/codes/tests.rs`).
+      #
+      # Кейсу остаётся полный путь целиком — выдача, вход, перезапуск, повтор —
+      # и наблюдаемое инженером: записанный на бумажке код после перезапуска
+      # остаётся мусором. Код здесь настоящий, посчитанный выдачей для этого
+      # устройства и однажды сработавший, — этим кейс отличается от CODE-003;
+      # механика отказа у них общая, и на большее кейс не претендует.
+      - run: helpers/codes-server.sh replay-after-restart {{user}}
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 120
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-006
+    title: Сервер не может выдать код за пределы рамок своего билета
+    requirement: spec9:codes.TICKET-003
+    requires: [service-manager]
+    steps:
+      # Билет фикстуры покрывает уровень не выше 1. Наблюдаемая гарантия здесь —
+      # что инженер вообще не получит код на уровень 2: выдача проверяет рамки
+      # ДО вычисления, тем же ядром, что вызывает codes-core.
+      #
+      # Честная граница кейса: «код посчитан верно, но устройство отвергло его по
+      # рамкам» снаружи невоспроизводимо санкционированным путём. Чтобы такой код
+      # появился, его должен посчитать инструмент, рамки не проверяющий, — то есть
+      # скомпрометированный или багованный сервер. Эту защиту (fail-closed на
+      # устройстве) стережёт unit-тест ядра; здесь проверяется то, что видно
+      # снаружи и что защищает инженера от бесполезной поездки.
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-issue-refused {{user}} --level 2
+        expect: { exit_code: 0 }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-007
+    title: Билет сервера, внесённый в список отзыва, закрывает вход по коду
+    requirement: spec9:codes.TICKET-003
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Список отзыва билетов приезжает payload'ом и применяется ДО аутентификации —
+      # тем же порядком, что CRL. Хелпер дописывает номер билета в
+      # `tickets.revoked`, то есть кейс проверяет ровно ЭТОТ путь снятия права.
+      #
+      # Второй путь — сборка нового набора билетов без этого билета — отзывом НЕ
+      # является: набор не монотонен, и повторная подача прежнего standalone-
+      # носителя возвращает билет вместе с собой (модель угроз, §5.15). Это
+      # отдельная гарантия и отдельный кейс — ENRC-012 в `28-codes-enrollment`.
+      - run: helpers/codes-server.sh revoke-ticket
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-008
+    title: Вход по коду проходит на устройстве, где сертификатный путь непригоден
+    requirement: spec9:codes.CODE-105
+    # Ровно тот случай, ради которого метод и существует: якорь доверия не
+    # завезли, PKCS#11-модуля нет. Сертификатный вход тут невозможен, и это не
+    # причина закрывать единственный оставшийся канал.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes --break-cert-preconditions
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-009
+    title: Отклонённый вход не оставляет у демона записи о сессии
+    requirement: spec9:codes.CODE-071
+    # Журнал не принимает запись, вход отклоняется — и сессии, которой нет,
+    # не должно быть и в реестре демона: иначе он ведёт её до истечения срока,
+    # а сверка «входы против выдач» получает призрак.
+    #
+    # Дверей две: отказ журнала и невозможность передать контекст в PAM. Вторая
+    # с прогона не воспроизводится — она внутри PAM-фазы, — и закрыта модульно;
+    # здесь стережётся первая.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh seal-audit-chain
+      # PAM_PERM_DENIED: журнал не принял запись, значит вход не может быть
+      # учтён — это отказ по существу, а не сбой устройства.
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 6 }
+        timeout: 60
+      - run: helpers/codes-server.sh expect-no-session {{user}}
+        expect: { exit_code: 0 }
+        timeout: 30
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-010
+    title: Все события одного входа несут одну эпоху ключа
+    requirement: spec9:codes.CODE-071
+    # Персистированная эпоха ушла вперёд от той, что в config.toml — ровно тот
+    # сценарий, ради которого выбор эффективной эпохи и написан. События,
+    # эмитированные ядром и PAM-веткой, обязаны сойтись: журнал одного входа,
+    # противоречащий сам себе, хуже отсутствующего.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh rotate-persisted-epoch
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      - run: helpers/codes-server.sh expect-one-epoch-in-journal
+        expect: { exit_code: 0 }
+        timeout: 30
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-011
+    title: Поток запросов challenge не убивает вход по коду насмерть
+    requirement: spec9:codes.CODE-051
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Challenge показывается ДО того, как предъявлен код, поэтому всякий, кто
+      # дотягивается до PAM-стека с именем ролевой учётной записи, занимает
+      # единственный слот попытки и заставляет устройство породить эфемерную пару.
+      #
+      # Обещанное поведение: выдача challenge ограничена собственным бюджетом,
+      # поток упирается во ВРЕМЕННЫЙ отказ (PAM_MAXTRIES, 11). Постоянный отказ
+      # приходит тем же кодом — их различает следующий кейс, а не этот.
+      - run: helpers/codes-server.sh issue-storm {{user}} --level 0 --count 12
+        expect: { exit_code: 11, stdout_matches: 'auth: PAM_MAXTRIES \(11\)' }
+        timeout: 180
+      # Ищется именно отказ по бюджету ВЫДАЧИ, а не общее событие входа: срез
+      # журнала берётся за весь кейс, а поток начинается с разговоров, которым
+      # challenge выдаётся, поэтому строка `qr_code_login` появилась бы и в
+      # прогоне, где лимит не сработал вовсе. Причина `issuance_throttled` —
+      # константа ядра (`codes::audit::REASON_ISSUANCE_THROTTLED`), она не
+      # переводится и в журнал попадает полем той же записи `qr_code_login`.
+      # Регексп не привязан к кавычкам вокруг значения поля: их ставит
+      # форматтер трассировки, а не продукт.
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'qr_code_login.*issuance_throttled'
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-012
+    title: Отказ выдачи после потока сам отпускает устройство
+    requirement: spec9:codes.CODE-030
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Вторая половина той же гарантии, и без неё первая опасна: лечение не
+      # должно стать той же болезнью. Лимит, который вешает вход навсегда, на
+      # банкомате не лучше подбора, поэтому отказ обязан быть временным —
+      # выждав окно, инженер входит без чьего-либо вмешательства.
+      - run: helpers/codes-server.sh issue-storm {{user}} --level 0 --count 12 --recover-after 130
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 300
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-014
+    title: Код, вычисленный из одного статического ключа устройства, не пускает
+    requirement: spec9:codes.CODE-021
+    # Гарантия: «Знание статического ключа устройства не даёт кода». `K`
+    # выводится на эфемерной паре попытки и ключе согласования сервера,
+    # поэтому код, посчитанный из долгоживущего ключа устройства, не сходится ни
+    # с чем. Пока вывод шёл из этого ключа, такой код проходил вход.
+    #
+    # Что именно воспроизводится: изъятие носителя или образа (подготовитель
+    # снял диск, бэкап, украденное устройство). Атакующему доступно всё, что
+    # лежит на устройстве, но не приватная часть эфемерной пары — её на момент
+    # снятия образа не существует.
+    #
+    # Подменённый challenge стенд подписывает ЗАНОВО ключом устройства — тем
+    # самым инструментом стенда, что подписывает теми же байтами, что и продукт.
+    # Это не поблажка: у снявшего диск ключ устройства есть по условию задачи, и
+    # кейс, где отказ приходил бы по подписи, стерёг бы не ту гарантию —
+    # настоящий атакующий этого класса подписал бы законно. Отказ обязан прийти
+    # из СВЕРКИ КОДА, что и проверяется записью журнала ниже.
+    #
+    # Стенду нужен бинарь раннера (`[[artifacts]]` в stand.toml) и файл
+    # `device-key.pem` в комплекте фикстур.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-with-device-key {{user}} --level 0
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 60
+      # Отказ должен прийти из сверки кода, а не из отсутствия артефактов или
+      # поломки хранилища: иначе кейс позеленеет по чужой причине и перестанет
+      # стеречь эту гарантию.
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'qr_code_login.*mismatch'
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-015
+    title: Выдача не считает код на чужой личный номер
+    requirement: spec9:codes.ENG-011
+    # Личный номер инженера стоит в подписанном challenge, и подпись устройства
+    # покрывает его. Назвавший выдаче номер другого человека подписать строку
+    # заново не может — ключа устройства у него нет, — поэтому выдача отвергает
+    # запрос, не посчитав ничего, и до ввода кода дело не доходит.
+    #
+    # Что воспроизводится: у устройства стоит один инженер и называет свой номер,
+    # а в запрос к серверу подставлен номер другого. Всё остальное в challenge —
+    # номер устройства, эпоха, nonce, роль, уровень, эфемерная точка — то же самое.
+    #
+    # Вторая половина той же гарантии — что личный номер входит и в БАЙТЫ кода
+    # (ADR-CODES-002, CODE-320), так что код, выданный на одного, не сходится у
+    # другого, — снаружи больше не наблюдается: чтобы такой код появился, его
+    # должна посчитать выдача, а она отказывает раньше. Эту половину держат
+    # юнит-тесты ядра.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-issue-refused-under-another-name {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'challenge_signature_rejected' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-016
+    title: Однажды сработавший код не открывает вход во второй раз
+    requirement: spec9:codes.CODE-030
+    # Одноразовость nonce не держится файлом потреблённых значений: попытка
+    # живёт в памяти процесса, кончается вместе с ответом, и код от кончившейся
+    # попытки не сходится ни с чем — следующий разговор заводит новую попытку с
+    # новым nonce.
+    #
+    # Кейс проверяет обе половины подряд, потому что различает их только
+    # предпосылка отказа:
+    #
+    #   — второй разговор БЕЗ перезапуска: попытка кончилась ответом;
+    #   — второй разговор ПОСЛЕ перезапуска: попытки нет, потому что нет
+    #     процесса, который её держал, и нет файла, который бы её воскресил.
+    #
+    # Что кейс НЕ покрывает: снимок ВМ вместе с памятью. Он воскрешает саму
+    # попытку, снаружи не наблюдается ничем и записан предпосылкой среды в
+    # спеке, а не свойством продукта.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh replay-in-new-conversation {{user}}
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 120
+      # Отказ обязан прийти из сверки кода: иначе кейс позеленеет на сломанном
+      # стенде — на отсутствующих артефактах, на исчерпанном бюджете выдачи.
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'qr_code_login.*mismatch'
+      - run: helpers/codes-server.sh replay-after-restart {{user}}
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 180
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  # Кейсы CODE-020..022 написаны под серверный путь и на телефонном канале
+  # предмета не имели: там основание диктовалось голосом и жило в квитанции,
+  # а ступени кастодии ключа согласования не было видно нигде, кроме приложения
+  # к той же квитанции.
+
+  - id: CODE-020
+    title: Выдача без основания не считает код
+    requirement: spec9:codes.REQ-011
+    # Основание живёт внутри подписанного запроса инженера и второго экземпляра
+    # не имеет (ADR-CODES-002, документы канала). Проверка «основание непусто»
+    # стоит первой ступенью лестницы: код, выданный без причины, которую кто-то
+    # назвал, — это код, за который потом некому отвечать, и считать его нельзя
+    # даже в тот момент, когда все документы в порядке.
+    #
+    # Наблюдаемое снаружи: выдача отказывает своим классом отказа и не печатает
+    # кода. Порядок ступеней проверяется здесь именно тем, что все остальные
+    # документы запроса действительны.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-issue-refused-without-grounds {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'missing_reason' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-021
+    title: Ступень кастодии ключа согласования записана в каждую выдачу
+    requirement: spec9:server.KC-101
+    # Ключ согласования в MVP живёт в памяти процесса выдачи, и это принятая
+    # граница, а не закрытый вопрос (ADR-SRV-003, KC-004): владелец парка обязан
+    # видеть фактическую ступень по журналу, а не по конфигурации, которую никто
+    # не перечитывает. Раньше ступень писалась в приложение к квитанции; квитанции
+    # больше нет, и если ступень не переехала в запись выдачи, её нет нигде —
+    # молчаливая регрессия аудита, которую этот кейс и стережёт.
+    #
+    # `software` — ожидаемое значение для программного ключа, а не дефект. Кейс
+    # проверяет, что оно НАЗВАНО: перенос ключа на аппаратный носитель иначе
+    # нечем будет подтвердить.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      - run: helpers/codes-server.sh expect-custody-tier-in-record
+        expect: { exit_code: 0, stdout_matches: 'key_storage=software' }
+        timeout: 30
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-022
+    title: Выдача, где личность инженера никто не подтвердил, помечена в записи
+    requirement: spec9:server.CORE-022
+    # Признак «личность не подтверждена» — не украшение отчёта, а единственное,
+    # что отличает MVP с заглушкой-провайдером от рабочего контура доступа
+    # (ADR-CODES-003: перечень требований, которые в MVP не выполняются). Он
+    # обязан пережить разбор записи, а не жить в памяти того, кто её писал.
+    #
+    # Стенд подтверждающего провайдера не имеет вовсе, поэтому признак здесь
+    # взведён всегда; кейс проверяет, что он ДОШЁЛ до записи и читается из неё.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+      - run: helpers/codes-server.sh expect-unverified-identity-in-record
+        expect: { exit_code: 0, stdout_matches: 'identity_unverified=yes' }
+        timeout: 30
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-023
+    title: Номер устройства с переставленными соседями отвергается на выдаче
+    requirement: spec9:codes.CODE-020
+    # Контрольный символ номера устройства нужен ровно для того, чтобы номер,
+    # переписанный с этикетки с перепутанными соседними знаками, был отвергнут
+    # КАК НОМЕР — до разбора подписи, до реестра, до всякого вычисления. Класс
+    # отказа здесь и есть проверяемое: `challenge_malformed` говорит инженеру,
+    # что он ошибся, переписывая номер, а любой другой класс уводит разбор к
+    # доверию и ключам.
+    #
+    # Хелпер перебирает ВСЕ соседние буквенно-цифровые пары тела номера, а не
+    # одну: гарантия сформулирована про любую перестановку.
+    #
+    # Что этот кейс НЕ доказывает: что контрольный символ ловит любую
+    # перестановку в любом номере. Он проверяет один номер — тот, что в
+    # фикстурах стенда. Исчерпывающая проверка по всему алфавиту принадлежит
+    # свойству в юнит-тестах контрактного крейта; здесь проверяется, что ответ
+    # доходит до вызывающего своим классом, а не тонет по дороге.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-transposed-number-refused {{user}}
+        expect:
+          exit_code: 0
+          stdout_matches: 'перестановок отвергнуто как challenge_malformed: [1-9]'
+        timeout: 120
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-024
+    title: Личный номер с неверным контрольным символом не порождает challenge
+    requirement: spec9:codes.ENG-010
+    # Норма ENG-010: номер инженера несёт сегмент организации, серийную часть и
+    # контрольный символ, и устройство обязано отвергнуть номер, чей символ не
+    # сходится, — ДО порождения challenge. Иначе опечатка даёт код, который
+    # «почти сошёлся», и её разбирают на объекте, глядя на арифметику вместо
+    # строки, которую человек набрал не так.
+    #
+    # Проверяемое — отсутствие challenge, а не текст промпта: текст переводится
+    # и переписывается, а порождённый challenge на неверный номер означает
+    # потраченный впустую nonce и попытку, которой не должно было быть.
+    #
+    # Номер портится в последнем знаке и сохраняет форму настоящего: кейс про
+    # контрольный символ, а не про длину и не про алфавит.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-personal-number-refused {{user}}
+        expect:
+          exit_code: 0
+          stdout_matches: 'challenge не порождён'
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  # Кейсы QR-001…QR-010 — этап C: показ challenge на устройстве. До появления
+  # генератора QR и оверлея они красные.
+
+  - id: QR-001
+    title: Устройство показывает challenge QR-кодом, читаемым камерой
+    requirement: spec9:codes.CODE-114
+    # Единственный способ передать challenge со стенда на телефон — экран, и
+    # проверять надо именно его: не то, что продукт что-то напечатал, а то, что
+    # напечатанное ЧИТАЕТСЯ декодером и разбирается в тот же самый документ,
+    # который устройство подписало. Кейс, сверяющий строку с ожидаемой строкой,
+    # прошёл бы и на QR, который камера не берёт.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-qr-decodes-to-challenge {{user}}
+        expect:
+          exit_code: 0
+          stdout_matches: "qr-decoded: tessera-codes/v1/signed-challenge;"
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: QR-002
+    title: QR виден в тексте промпта, а не в PAM_TEXT_INFO
+    requirement: spec9:auth.UI-004
+    # Не украшение интерфейса, а условие работы на целевом парке: fly-modern
+    # рисует свой греетер и PAM_TEXT_INFO до экрана не доносит (проверено живьём
+    # на 1.8.4, дизайн 2026-07-03 §6.1). Показ, который виден в консоли и не
+    # виден в графическом входе, — это метод, которого на объекте нет.
+    #
+    # Здесь проверяется TTY: строка обязана прийти вместе с промптом кода, то
+    # есть в том же обмене, а не отдельным сообщением до него.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-qr-in-code-prompt {{user}}
+        expect:
+          exit_code: 0
+          stdout_matches: "qr-in-prompt: yes"
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: QR-003
+    title: Тот же показ доходит по ssh
+    requirement: spec9:auth.UI-004
+    # Вторая половина той же гарантии. Инженер на объекте у консоли, а
+    # администратор — по ssh, и метод, работающий только у одного из них,
+    # закрывает вход тому, у кого нет физического доступа.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-over-ssh {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 120
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: QR-004
+    title: Адрес страницы вне списка допустимых не даёт устройству подняться
+    requirement: spec9:codes.CODE-113
+    # Защита от увода инженера на чужой хост, и место проверки здесь важнее
+    # самой проверки: отказ обязан наступать при ЗАГРУЗКЕ КОНФИГУРАЦИИ, а не при
+    # показе QR. Устройство, которое поднялось с адресом вне списка и отказало
+    # только в момент входа, уже стоит в парке и выглядит исправным.
+    #
+    # Список допустимых адресов привозит enrollment-пакет; конфигурация может
+    # только выбрать один из них.
+    requires: []
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh set-page-url https://not-in-the-list.example/e
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: "codes.page_url"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: QR-005
+    title: "Порядок промптов: сервер выдачи, личный номер, код"
+    requirement: spec9:auth.UI-003
+    # Порядок — не вкус: личный номер спрашивается НЕ первым промптом, потому
+    # что первый промпт съедает форма греетера (память проекта: канал промпта
+    # в fly-modern). Спрошенный первым личный номер молча подменяется тем, что
+    # инженер ввёл в поле входа, и код считается на чужой номер.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-prompt-order {{user}}
+        expect:
+          exit_code: 0
+          stdout_matches: "prompt-order: server, engineer, code"
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: QR-010
+    title: В графическом входе QR показывает оверлей, а код принимает греетер
+    requirement: spec9:auth.UI-005
+    # Режим 2a дизайна отображения (2026-07-03, §4.1): собственный оверлей
+    # поверх fly-modern рисует QR, а код инженер вводит родным полем греетера.
+    # Проверить это можно только на живой ВМ с графическим сеансом —
+    # контейнерный профиль греетера не даёт, и кейс, занизивший `requires`,
+    # «проходил» бы там, где ничего не проверяет.
+    #
+    # Три вопроса спайка, которые закрываются только здесь и никаким
+    # рассуждением: доступ оверлея к :0 через xauth греетера, синхронизация
+    # показа и скрытия по фазам попытки, порядок окон при модальных диалогах
+    # греетера.
+    requires: [service-manager, graphics]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-overlay.sh expect-overlay-login {{user}}
+        expect:
+          exit_code: 0
+          stdout_matches: "overlay: shown, code accepted, overlay closed"
+        timeout: 300
+    teardown:
+      - run: helpers/codes-overlay.sh cleanup
+      - run: helpers/codes-server.sh cleanup

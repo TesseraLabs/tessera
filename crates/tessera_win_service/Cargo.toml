@@ -26,9 +26,9 @@ name = "tessera-engine-cli"
 path = "src/bin/cli.rs"
 
 [dependencies]
-tessera_core = { path = "../tessera_core", version = "0.5.0" }
-tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
-pam_tessera = { path = "../pam_tessera", version = "0.5.0" }
+tessera_core = { path = "../tessera_core", version = "0.6.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.6.0" }
+pam_tessera = { path = "../pam_tessera", version = "0.6.0" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

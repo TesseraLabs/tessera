@@ -1,4 +1,4 @@
-//! Contract of the Tessera Codes phone channel.
+//! Contract of Tessera Codes.
 //!
 //! One property justifies this crate: the device and the cabinet compute the
 //! same bytes. Everything else follows from it. The same source builds for the
@@ -34,13 +34,13 @@
 //!   about where the device key is kept.
 //! - [`engineer`] — the registry record of a person and the authorisation that
 //!   says what they may ask for, kept apart on purpose.
-//! - [`receipt`] — the issuance receipt, its mandatory grounds and its composed
-//!   file name.
 //! - [`request`] — the signed request of an engineer: one canonical object with
 //!   the challenge inside it and the authorisation fields in a single copy.
 //! - [`grant`] — what the issuing side answers a request with: the signed
 //!   request, the signature of the issuing side, and the confirmation of a
 //!   second person when the fleet asks for one.
+//! - [`revocation`] — the list of rights the fleet withdrew, signed by its
+//!   authorisation key and refusable when it is a replay of an older one.
 //! - [`status`] — the status-token: what the status service says about an
 //!   engineer's authorisation right now, bound to the attempt it was asked for.
 //! - [`signature`] — the verifier trait the consumers implement; the crate holds
@@ -117,18 +117,20 @@ pub mod challenge;
 pub mod code;
 pub mod device_number;
 pub mod engineer;
+pub mod engineer_number;
 #[cfg(test)]
 mod golden_tests;
 pub mod grant;
 pub mod key;
 mod mac;
 pub mod nonce;
+pub mod number;
 pub mod outcome;
 pub mod params;
 pub mod profile;
-pub mod receipt;
 pub mod registry;
 pub mod request;
+pub mod revocation;
 pub mod signature;
 pub mod status;
 pub mod ticket;

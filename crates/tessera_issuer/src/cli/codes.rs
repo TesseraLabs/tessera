@@ -1,16 +1,15 @@
-//! The `issuer codes` command surface: the operator side of the phone channel.
+//! The `issuer codes` command surface: the issuing side, on a command line.
 //!
-//! Four commands, and none of them decides anything. Every check lives in
-//! [`crate::codes`], which the browser cabinet calls too; what happens here is
-//! reading files, choosing where the operator key is, printing the result and
-//! writing the receipt. A refusal an operator meets on this command line is the
-//! same refusal, from the same function, that they would meet in the cabinet.
+//! Three commands, and none of them decides anything. Every check lives in
+//! [`crate::codes`], which the browser cabinet and the issuing service call too;
+//! what happens here is reading files, choosing where the agreement key is and
+//! printing the result. A refusal met on this command line is the same refusal,
+//! from the same function, that would be met anywhere else.
 //!
-//! - `codes issue` — answer a challenge read out over the telephone;
-//! - `codes receipt verify` — read a receipt back and check it holds together;
+//! - `codes issue` — answer the signed request an engineer brought;
 //! - `codes ticket show` — show the bounds, the term and the provenance of a
 //!   ticket;
-//! - `codes reconcile` — put the receipts of an operator beside the journals of
+//! - `codes reconcile` — put the issuance records beside the journals of
 //!   the devices.
 //!
 //! # Exit codes
@@ -21,9 +20,8 @@
 //! | code | what happened |
 //! |------|---------------|
 //! | `0`  | the code was issued |
-//! | `10` | the request fell outside the operator's ticket — device, epoch, operator, region, tags, role, level |
-//! | `11` | the nonce counter does not fit the receipts — ahead, behind, or no history at all |
-//! | `12` | a signature or an anchor did not hold — organisation signature, proof of possession, unanchored signer, ticket term, wrong operator key |
+//! | `10` | the request fell outside the ticket — device, epoch, server, region, tags, role, level |
+//! | `12` | a signature or an anchor did not hold — organisation signature, proof of possession, unanchored signer, ticket term, wrong agreement key |
 //! | `13` | the issuance carried no grounds |
 //! | `14` | any other refusal of the issuance |
 //! | `1`  | **the check never happened**: a missing file, a document that does not parse, a key that cannot be reached, a token that would not answer |
@@ -66,20 +64,23 @@ use tessera_codes_contract::params::{
 };
 use tessera_codes_contract::profile::{AlgorithmProfile, UnconfirmedProfileRisk};
 use tessera_codes_contract::registry::DeviceRecord;
+use tessera_codes_contract::request::{RequestError, SignedRequest};
 use tessera_codes_contract::ticket::SignedTicket;
 use tessera_codes_contract::time::ClaimedTime;
 
-use crate::codes::agreement::{OperatorKey, SoftwareOperatorKey};
-use crate::codes::annex::SiteScope;
+use crate::codes::agreement::{KeyStorage, OperatorKey, SoftwareOperatorKey};
 use crate::codes::issue::{issue, IssuanceRequest};
 use crate::codes::reconcile::{
-    read_journal, reconcile, JournalError, LoginEntry, Provenance, Report, Verdict,
+    read_journal, read_server_chain, reconcile, Expectations, IssuingAnchors, JournalError,
+    LoginEntry, Provenance, Report, Revocation, RevocationListUsed, ServerChain, ServerChainError,
+    Verdict,
 };
-use crate::codes::scope::DeviceScope;
-use crate::codes::store;
+use crate::codes::scope::{DeviceScope, SiteScope};
 use crate::codes::trust::{AnchorKey, Anchors};
 use crate::codes::RefusalGroup;
+use crate::codes::{IssuanceRecord, RECORD_PREFIX};
 use crate::l10n::{Locale, Msg};
+use tessera_codes_contract::revocation::{SignedRevocationList, SubjectKind};
 
 use super::{decode_pem_or_der, now_unix, read_file, CliError};
 
@@ -102,11 +103,25 @@ const CLASS_DEVICE_RECORD_MALFORMED: &str = "device_record_malformed";
 const CLASS_TICKET_MALFORMED: &str = "ticket_malformed";
 /// A ticket whose signature or term the anchors rejected.
 const CLASS_TICKET_REJECTED: &str = "ticket_rejected";
-/// A receipt file that does not parse, or a receipt directory that cannot be
-/// read as one.
-const CLASS_RECEIPT_MALFORMED: &str = "receipt_malformed";
-/// A receipt that does not belong to the ticket it was checked against.
-const CLASS_RECEIPT_TICKET_MISMATCH: &str = "receipt_ticket_mismatch";
+/// A signed request that does not parse.
+const CLASS_REQUEST_MALFORMED: &str = "request_malformed";
+/// A request that carries no grounds.
+///
+/// The token an operator sees for this is the one the refusal ladder uses, so
+/// that "no grounds were recorded" reads the same whether the absence was caught
+/// while reading the document or while answering it.
+const CLASS_MISSING_REASON: &str = "missing_reason";
+/// A revocation list that did not verify, replayed an older serial, or does not
+/// parse.
+const CLASS_REVOCATIONS_REJECTED: &str = "revocations_rejected";
+/// A file that does not hold the chain of the issuing side.
+const CLASS_SERVER_CHAIN_MALFORMED: &str = "server_chain_malformed";
+/// A chain of the issuing side whose hashes do not add up.
+///
+/// A class of its own rather than a shade of the one above, for the same reason
+/// the device side has two: "this history has been edited" and "this is not the
+/// journal you meant to hand over" are answers a caller acts on differently.
+const CLASS_SERVER_CHAIN_BROKEN: &str = "server_chain_broken";
 /// A device journal line that does not hold what the reconciliation pairs on,
 /// or a chain that does not verify.
 const CLASS_JOURNAL_MALFORMED: &str = "journal_malformed";
@@ -125,7 +140,7 @@ pub(super) struct CodesArgs {
     command: CodesCommand,
 }
 
-/// The commands of the phone channel.
+/// The commands of the channel.
 #[derive(Debug, Subcommand)]
 #[expect(
     clippy::large_enum_variant,
@@ -133,20 +148,22 @@ pub(super) struct CodesArgs {
               arguments struct itself, not a box around it, and the value is built once per run"
 )]
 enum CodesCommand {
-    /// Answer a challenge read out over the telephone.
+    /// Answer the signed request an engineer brought.
     #[command(long_about = "\
-Answer a challenge read out over the telephone.
+Answer the signed request an engineer brought.
 
-The code is computed from the challenge, the signed device record and the \
-operator ticket; the receipt of the issuance is written into --receipts.
+The code is computed from the challenge the device showed, the signed request \
+of the engineer, the signed device record and the ticket of the issuing side. \
+The grounds live inside the request and have no second copy. The journal record \
+of the issuance is written by whoever signs the grant, which this command does \
+not.
 
 Exit codes:
   0   the code was issued
-  10  the request fell outside the operator ticket (device, epoch, operator,
-      region, tags, role, level)
-  11  the nonce counter does not fit the receipts (ahead, behind, no history)
+  10  the request fell outside the ticket (device, epoch, server, region,
+      tags, role, level)
   12  a signature or an anchor did not hold (organisation signature, proof of
-      possession, unanchored signer, ticket term, wrong operator key)
+      possession, unanchored signer, ticket term, wrong agreement key)
   13  the issuance carried no grounds
   14  any other refusal of the issuance
   1   the check never happened: a missing file, a document that does not parse,
@@ -157,21 +174,37 @@ exact check, for example:
 
   codes-refusal: ticket_scope_level")]
     Issue(IssueArgs),
-    /// Work with the receipts of the channel.
+    /// Read an issuance record back, field by field.
     #[command(subcommand)]
-    Receipt(ReceiptCommand),
-    /// Work with operator tickets.
+    Record(RecordCommand),
+    /// Work with the tickets of issuing sides.
     #[command(subcommand)]
     Ticket(TicketCommand),
-    /// Reconcile receipts against device journals.
+    /// Reconcile issuance records against device journals.
     Reconcile(ReconcileArgs),
 }
 
-/// The receipt commands.
+/// The record commands.
 #[derive(Debug, Subcommand)]
-enum ReceiptCommand {
-    /// Read a receipt back and check it holds together.
-    Verify(ReceiptVerifyArgs),
+enum RecordCommand {
+    /// Show the fields of an issuance record.
+    Show(RecordShowArgs),
+}
+
+/// Flags for `issuer codes record show`.
+///
+/// The record travels as one line with the grant inside it in hexadecimal, and
+/// the request inside the grant in hexadecimal again. Anything outside this
+/// crate that wanted a field of it — a stand helper, an operator at a terminal —
+/// would have to decode two layers with a text tool, which is a second reader of
+/// the format written in `sed`. This command is that reader, once, here.
+#[derive(Debug, Args)]
+struct RecordShowArgs {
+    #[command(flatten)]
+    fleet: FleetArgs,
+    /// The record file to read, or the chain line carrying it.
+    #[arg(long = "record")]
+    server_chain_line: PathBuf,
 }
 
 /// The ticket commands.
@@ -289,7 +322,7 @@ struct OperatorKeyArgs {
     #[arg(long)]
     pin_file: Option<PathBuf>,
     /// The explicitly enabled software mode: a PKCS#8 operator key file, PEM or
-    /// DER. The receipt records that the key was held this way.
+    /// DER. The journal record of the issuance says the key was held this way.
     #[arg(long)]
     soft_key: Option<PathBuf>,
     /// Passphrase of an encrypted operator key file, read as one line from a
@@ -309,7 +342,7 @@ struct IssueArgs {
     fleet: FleetArgs,
     #[command(flatten)]
     key: OperatorKeyArgs,
-    /// The challenge as it was read out, in its wire form.
+    /// The challenge the device showed, in its wire form.
     #[arg(long, conflicts_with = "challenge_file")]
     challenge: Option<String>,
     /// A file holding the challenge in its wire form.
@@ -328,13 +361,13 @@ struct IssueArgs {
     /// An organisation anchor as `id=path` (repeat for several).
     #[arg(long = "anchor-organisation")]
     anchor_organisations: Vec<String>,
-    /// Grounds for the issuance: a work order, a request, a ticket of the
-    /// fleet's own tracker. Required, and not satisfied by whitespace.
+    /// A file holding the signed request of the engineer, in its wire form.
+    ///
+    /// The grounds of the issuance live inside it and nowhere else: a flag
+    /// beside the document would be a second copy, and a second copy is a second
+    /// answer to "what was this code handed out for".
     #[arg(long)]
-    reason: String,
-    /// Directory the receipts of this operator live in.
-    #[arg(long)]
-    receipts: PathBuf,
+    request: PathBuf,
     /// Region the device stands in, from the fleet inventory.
     #[arg(long, requires = "device_tags")]
     device_region: Option<String>,
@@ -343,32 +376,15 @@ struct IssueArgs {
     device_tags: Vec<String>,
     /// The moment to work at, Unix seconds.
     ///
-    /// Only test builds carry it. In a shipped build the term of the ticket and
-    /// the moment written into the receipt both come from the system clock and
-    /// from nothing else: a flag that moved them would let an operator keep
-    /// issuing under an expired ticket and file receipts whose timestamps say
-    /// whatever suits, and the difference between the moment of a receipt and
-    /// the moment of a login is one of the few signals a reconciliation has.
+    /// Only test builds carry it. In a shipped build the term of the ticket
+    /// comes from the system clock and from nothing else: a flag that moved it
+    /// would let an issuing side keep working under an expired ticket.
     #[cfg(test)]
     #[arg(long)]
     now: Option<u64>,
     /// Print the code alone, without captions — for a caller that reads it.
     #[arg(long)]
     code_only: bool,
-}
-
-/// Flags for `issuer codes receipt verify`.
-#[derive(Debug, Args)]
-struct ReceiptVerifyArgs {
-    #[command(flatten)]
-    fleet: FleetArgs,
-    /// The receipt file to read.
-    #[arg(long)]
-    receipt: PathBuf,
-    /// The ticket the receipt claims to have been issued under. Supplying it
-    /// checks the binding the receipt's file name carries.
-    #[arg(long)]
-    ticket: Option<PathBuf>,
 }
 
 /// Flags for `issuer codes ticket show`.
@@ -387,14 +403,75 @@ struct TicketShowArgs {
     now: Option<u64>,
 }
 
+/// Custody tier of the agreement key, as a flag value.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CustodyArg {
+    /// A key file, in the explicitly enabled software mode.
+    Software,
+    /// A PKCS#11 token or HSM.
+    Token,
+}
+
+impl CustodyArg {
+    /// The tier this flag value names.
+    const fn tier(self) -> KeyStorage {
+        match self {
+            Self::Software => KeyStorage::Software,
+            Self::Token => KeyStorage::Token,
+        }
+    }
+}
+
 /// Flags for `issuer codes reconcile`.
 #[derive(Debug, Args)]
 struct ReconcileArgs {
     #[command(flatten)]
     fleet: FleetArgs,
-    /// Directory holding the receipts to reconcile.
+    /// The chain of the issuing side, as one file of newline-delimited JSON.
     #[arg(long)]
-    receipts: PathBuf,
+    server_chain: PathBuf,
+    /// The custody tier the fleet declares for the agreement key. Without it
+    /// the tier of each issuance is reported and not judged.
+    #[arg(long)]
+    declared_custody: Option<CustodyArg>,
+    /// The signed list of withdrawn rights, as the fleet published it.
+    ///
+    /// Verified against the authorisation key before a single entry is read: an
+    /// unsigned list is one anybody on the path can replace with an empty one,
+    /// and an empty list is indistinguishable from "nobody has been cut off".
+    /// Public key of an issuing side, as `<server-id>=<path>`, repeatable.
+    ///
+    /// Without it the signatures on the grants are read from the file and
+    /// nowhere else, and the report says so as a caveat rather than staying
+    /// silent: a grant assembled by anybody at all reads like one the issuing
+    /// side signed.
+    #[arg(long = "anchor-issuing-key", value_name = "SERVER=PATH")]
+    anchor_issuing_keys: Vec<String>,
+    #[arg(long, requires = "anchor_authorisation_key")]
+    revocation_list: Option<PathBuf>,
+    /// `SubjectPublicKeyInfo` of the fleet's authorisation key (PEM or DER).
+    #[arg(long)]
+    anchor_authorisation_key: Option<PathBuf>,
+    /// The serial of the revocation list already applied.
+    ///
+    /// A signature stops substitution but not replay: yesterday's list is
+    /// signed just as validly, and it is the one that still admits whoever was
+    /// cut off this morning.
+    ///
+    /// Optional, and NOT defaulted to zero. Zero says "nothing has been applied
+    /// yet" and admits any list; leaving the flag off says nothing, and the
+    /// report answers with a caveat rather than pretending a waterline was
+    /// declared. An auditor who does not know the applied serial can still run
+    /// the command — and will be told what that cost.
+    #[arg(long)]
+    applied_revocation_serial: Option<u64>,
+    /// A withdrawn right as `kind:subject=unix-seconds`, where the kind is
+    /// `engineer` or `organisation` (repeat for several).
+    ///
+    /// For a stand, and marked as such in the report: nothing signed these, so a
+    /// report built on them cannot call itself complete.
+    #[arg(long = "revoked")]
+    revoked: Vec<String>,
     /// A device journal as `device-number=path` (repeat for several). Without
     /// any, the report is marked incomplete.
     #[arg(long = "device-journal")]
@@ -405,7 +482,7 @@ struct ReconcileArgs {
 pub(super) fn run(args: CodesArgs, locale: Locale) -> Result<(), CliError> {
     match args.command {
         CodesCommand::Issue(args) => run_issue(&args, locale),
-        CodesCommand::Receipt(ReceiptCommand::Verify(args)) => run_receipt_verify(&args, locale),
+        CodesCommand::Record(RecordCommand::Show(args)) => run_record_show(&args),
         CodesCommand::Ticket(TicketCommand::Show(args)) => run_ticket_show(&args, locale),
         CodesCommand::Reconcile(args) => run_reconcile(&args, locale),
     }
@@ -433,13 +510,15 @@ fn run_issue(args: &IssueArgs, locale: Locale) -> Result<(), CliError> {
         _ => None,
     };
 
+    let signed_request = read_request(&args.request, params)?;
+
     let request = IssuanceRequest {
         challenge: &challenge,
+        request: &signed_request,
         record: &record,
         ticket: &ticket,
         params: &params,
         device_scope: device_scope.as_ref(),
-        reason: &args.reason,
         now,
     };
 
@@ -451,91 +530,123 @@ fn run_issue(args: &IssueArgs, locale: Locale) -> Result<(), CliError> {
         })
     })?;
 
-    create_private_dir(&args.receipts)?;
-
-    let path = store::write(&args.receipts, &issuance, ticket.ticket())
-        .map_err(|error| CliError::Io(error.to_string()))?;
-
     if args.code_only {
         println!("{}", issuance.code);
         return Ok(());
     }
 
-    println!(
-        "{} {}",
-        Msg::CodesCodeHeading.text(locale),
-        issuance.spoken_code()
-    );
-    println!(
-        "{} {}",
-        Msg::CodesReceiptWritten.text(locale),
-        path.display()
-    );
+    println!("{} {}", Msg::CodesCodeHeading.text(locale), issuance.code);
     println!(
         "{} {}",
         Msg::CodesKeyStorage.text(locale),
-        issuance.annex.key_storage().as_str()
+        issuance.key_storage.as_str()
     );
-    if issuance.annex.site_scope() == SiteScope::Undeclared {
+    // The grant leaves here unsigned: the key that signs it is not the key that
+    // agreed the secret, and this command holds only the second. What it can
+    // state is what will be signed.
+    println!(
+        "{} {}",
+        Msg::CodesGrantServer.text(locale),
+        issuance.grant.server_id()
+    );
+    // The state of the site axis comes out of the issuance, where the coverage
+    // was decided. Recomputing it here from "was a device scope supplied" would
+    // be a second answer to a question already answered.
+    if issuance.site_scope == SiteScope::Undeclared {
         eprintln!("{}", Msg::CodesSiteUndeclared.text(locale));
     }
     Ok(())
 }
 
-/// `issuer codes receipt verify`.
-fn run_receipt_verify(args: &ReceiptVerifyArgs, locale: Locale) -> Result<(), CliError> {
+/// Reads the signed request of the engineer.
+///
+/// A request whose grounds are absent is refused here under the class the
+/// refusal ladder uses for it: the document does not assemble without them, so
+/// this is where their absence is met, and an operator should not have to learn
+/// two tokens for one fact.
+fn read_request(path: &Path, params: FleetParams) -> Result<SignedRequest, CliError> {
+    let text = String::from_utf8(read_file(path)?)
+        .map_err(|_| CliError::Io(format!("{} is not UTF-8", path.display())))?;
+    SignedRequest::parse(text.trim(), &params).map_err(|error| {
+        // Two different answers wear two different groups. "The request records
+        // no grounds" is a verdict about the issuance and exits as one; "this
+        // file is not a request" is a stand nobody set up, and a caller that
+        // could not tell them apart would read a broken directory as a refused
+        // issuance.
+        let (class, group) = match error {
+            RequestError::MissingGrounds => (CLASS_MISSING_REASON, RefusalGroup::Grounds),
+            _ => (CLASS_REQUEST_MALFORMED, RefusalGroup::Environment),
+        };
+        CliError::Codes {
+            class,
+            group,
+            detail: error.to_string(),
+        }
+    })
+}
+
+/// `issuer codes record show`.
+///
+/// Prints one `key=value` per line, in a form a script can read: the values are
+/// identifiers, numbers and tokens, the same bytes in every locale. A caption
+/// would be prose, and prose is what a caller must never parse.
+fn run_record_show(args: &RecordShowArgs) -> Result<(), CliError> {
     let params = args.fleet.params()?;
-    let stored = store::read_file(&args.receipt, &params).map_err(|error| CliError::Codes {
-        class: CLASS_RECEIPT_MALFORMED,
-        group: RefusalGroup::Environment,
-        detail: error.to_string(),
-    })?;
+    let text = String::from_utf8(read_file(&args.server_chain_line)?)
+        .map_err(|_| CliError::Io(format!("{} is not UTF-8", args.server_chain_line.display())))?;
 
-    if let Some(path) = args.ticket.as_deref() {
-        let ticket = read_ticket(path)?;
-        let expected =
-            stored
-                .receipt
-                .file_name(ticket.ticket())
-                .map_err(|error| CliError::Codes {
-                    class: CLASS_RECEIPT_MALFORMED,
-                    group: RefusalGroup::Environment,
-                    detail: error.to_string(),
-                })?;
-        let actual = args
-            .receipt
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if expected != actual {
-            return Err(CliError::Codes {
-                class: CLASS_RECEIPT_TICKET_MISMATCH,
-                group: RefusalGroup::Other,
-                detail: format!(
-                    "{} the file name does not match the receipt under this ticket (expected \
-                     {expected})",
-                    Msg::CodesReceiptInvalid.text(locale)
-                ),
-            });
-        }
-        if stored.annex.ticket_number() != ticket.ticket().number() {
-            return Err(CliError::Codes {
-                class: CLASS_RECEIPT_TICKET_MISMATCH,
-                group: RefusalGroup::Other,
-                detail: format!(
-                    "{} the annex names ticket {} and the supplied ticket is {}",
-                    Msg::CodesReceiptInvalid.text(locale),
-                    stored.annex.ticket_number(),
-                    ticket.ticket().number()
-                ),
-            });
-        }
-        println!("{}", Msg::CodesReceiptValid.text(locale));
-    }
+    // A file holding the record itself, or a line of the chain that carries it:
+    // a caller has whichever it has, and making it strip the framing first
+    // would put the format back into a text tool.
+    let wire = record_wire(text.trim());
+    let record =
+        IssuanceRecord::parse(&wire, &params).map_err(record_error(&args.server_chain_line))?;
 
-    println!("{}", stored.receipt.to_wire());
-    println!("{}", stored.annex.to_wire());
+    let request = record.request().request();
+    let challenge = request.challenge();
+    println!("device={}", challenge.device_number().as_str());
+    println!("epoch={}", challenge.epoch().get());
+    println!("nonce={}", challenge.nonce().as_str());
+    println!("role={}", challenge.role_id());
+    println!("level={}", challenge.level().get());
+    println!("server={}", record.grant().server_id());
+    println!("engineer={}", challenge.engineer_id());
+    println!("organisation={}", record.organisation_id());
+    println!("ticket={}", record.ticket_number().as_str());
+    println!("requested_at={}", request.requested_at().get());
+    println!("grounds={}", request.grounds());
+    println!("key_storage={}", record.key_storage().as_str());
+    println!("site_scope={}", record.site_scope().as_str());
+    println!(
+        "identity_unverified={}",
+        if record.identity_unverified() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
     Ok(())
+}
+
+/// Names a file that does not hold a record.
+fn record_error(path: &Path) -> impl Fn(crate::codes::IssuanceRecordError) -> CliError + '_ {
+    move |error| CliError::Codes {
+        class: CLASS_SERVER_CHAIN_MALFORMED,
+        group: RefusalGroup::Environment,
+        detail: format!("{}: {error}", path.display()),
+    }
+}
+
+/// Takes the record out of whatever the caller had.
+fn record_wire(text: &str) -> String {
+    if let Some(index) = text.find(RECORD_PREFIX) {
+        // A chain line: the record is a JSON string field inside it, so it ends
+        // at the quote. A record on its own ends at the end of the text.
+        let rest = &text[index..];
+        let end = rest.find('"').unwrap_or(rest.len());
+        return rest[..end].to_owned();
+    }
+    text.to_owned()
 }
 
 /// `issuer codes ticket show`.
@@ -585,23 +696,250 @@ fn run_ticket_show(args: &TicketShowArgs, locale: Locale) -> Result<(), CliError
     Ok(())
 }
 
-/// `issuer codes reconcile`.
-fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
-    let params = args.fleet.params()?;
-    let receipts =
-        store::read_directory(&args.receipts, &params).map_err(|error| CliError::Codes {
-            class: CLASS_RECEIPT_MALFORMED,
-            group: RefusalGroup::Environment,
-            detail: error.to_string(),
-        })?;
-    let entries = store::entries(&receipts);
+/// Reads the chain of the issuing side.
+///
+/// The chain is written by whoever computes codes — the issuing service — and
+/// read here without being re-derived: a reconciliation that rebuilt what it
+/// checks would be checking its own arithmetic.
+fn read_server_chain_file(
+    path: &Path,
+    params: FleetParams,
+    anchors: &IssuingAnchors,
+) -> Result<ServerChain, CliError> {
+    let text = String::from_utf8(read_file(path)?)
+        .map_err(|_| CliError::Io(format!("{} is not UTF-8", path.display())))?;
+    read_server_chain(&text, &params, anchors).map_err(|error| CliError::Codes {
+        // "This history has been edited" and "this is not the journal you meant
+        // to hand over" send a reader to different places, exactly as they do on
+        // the device side; one token for both would hide which.
+        class: match error {
+            ServerChainError::BrokenChain { .. } => CLASS_SERVER_CHAIN_BROKEN,
+            _ => CLASS_SERVER_CHAIN_MALFORMED,
+        },
+        group: RefusalGroup::Environment,
+        detail: format!("{}: {error}", path.display()),
+    })
+}
 
-    let mut provenance = Provenance {
+/// Reads the withdrawals a caller supplied as `kind:subject=unix-seconds`.
+///
+/// Unsigned by construction, and the report says so: this is what a stand has
+/// before a fleet publishes a list, and a reconciliation that treated it like a
+/// published one would be treating a command line as an authority.
+fn read_revocations(pairs: &[String]) -> Result<Vec<Revocation>, CliError> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (subject, at) = split_pair(pair, "--revoked")?;
+            let (kind, subject) = subject.split_once(':').ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--revoked expects `kind:subject=unix-seconds`, where the kind is `engineer` \
+                     or `organisation`; got `{pair}`"
+                ))
+            })?;
+            let kind = SubjectKind::parse(kind).ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--revoked names the subject kind `{kind}`, which is neither `engineer` nor \
+                     `organisation`: a fleet may number a person and an organisation alike, so \
+                     the kind cannot be guessed from the identifier"
+                ))
+            })?;
+            let at = at.parse::<u64>().map_err(|_| {
+                CliError::Usage(format!(
+                    "--revoked names the moment `{at}`, which is not Unix seconds"
+                ))
+            })?;
+            Ok(Revocation {
+                kind,
+                subject: subject.to_owned(),
+                at,
+            })
+        })
+        .collect()
+}
+
+/// Reads the published list of withdrawn rights, signature first.
+///
+/// The signature is checked before any entry is read, and the serial before the
+/// entries are used: the first stops substitution, the second stops replay, and
+/// neither stops the other.
+fn read_revocation_list(args: &ReconcileArgs) -> Result<Option<ReadRevocations>, CliError> {
+    let Some(path) = args.revocation_list.as_deref() else {
+        return Ok(None);
+    };
+    let anchor_path = args.anchor_authorisation_key.as_deref().ok_or_else(|| {
+        CliError::Usage("--revocation-list needs --anchor-authorisation-key".into())
+    })?;
+    let anchor_bytes = decode_pem_or_der(&read_file(anchor_path)?)?;
+    let anchor = AnchorKey::from_spki_der(&anchor_bytes).map_err(|error| CliError::Codes {
+        class: CLASS_REVOCATIONS_REJECTED,
+        group: RefusalGroup::Environment,
+        detail: format!("{}: {error}", anchor_path.display()),
+    })?;
+
+    let text = String::from_utf8(read_file(path)?)
+        .map_err(|_| CliError::Io(format!("{} is not UTF-8", path.display())))?;
+    let signed = SignedRevocationList::parse(text.trim()).map_err(revocations_rejected(path))?;
+    signed
+        .verify(&AuthorisationOnly(anchor))
+        .map_err(revocations_rejected(path))?;
+
+    let list = signed.list();
+    if let Some(waterline) = args.applied_revocation_serial {
+        if !list.is_newer_than(waterline) {
+            return Err(CliError::Codes {
+                class: CLASS_REVOCATIONS_REJECTED,
+                group: RefusalGroup::Environment,
+                detail: format!(
+                    "the list carries serial {} and serial {waterline} has already been \
+                     applied: an older list is signed just as validly as the current one, and \
+                     it is the one that still admits whoever was cut off since",
+                    list.serial(),
+                ),
+            });
+        }
+    }
+
+    Ok(Some(ReadRevocations {
+        used: RevocationListUsed {
+            serial: list.serial(),
+            waterline: args.applied_revocation_serial,
+        },
+        entries: list
+            .entries()
+            .iter()
+            .map(|entry| Revocation {
+                kind: entry.kind(),
+                subject: entry.subject_id().to_owned(),
+                at: entry.revoked_at().get(),
+            })
+            .collect(),
+    }))
+}
+
+/// The withdrawals a run read, and which list they came from.
+struct ReadRevocations {
+    /// The list itself, for the report to name.
+    used: RevocationListUsed,
+    /// The withdrawals in it.
+    entries: Vec<Revocation>,
+}
+
+/// Reads the keys of the issuing sides, as `<server-id>=<path>` pairs.
+///
+/// An empty list is legitimate and is NOT the same as "no signatures to
+/// check": what it means is that this run cannot check them, and the report
+/// says so. An auditor reconciling a journal they were handed may have no key
+/// for the side that issued it, and a command that refused to run without one
+/// would be a command nobody could run.
+///
+/// # Errors
+///
+/// [`CliError::Usage`] for a pair without an `=`, and the file and key errors
+/// of the anchor itself.
+fn read_issuing_anchors(pairs: &[String]) -> Result<IssuingAnchors, CliError> {
+    let mut anchors = IssuingAnchors::default();
+    for pair in pairs {
+        let (server_id, path) = pair.split_once('=').ok_or_else(|| {
+            CliError::Usage(format!(
+                "--anchor-issuing-key expects `<server-id>=<path>`, and `{pair}` has no `=`"
+            ))
+        })?;
+        if server_id.is_empty() {
+            return Err(CliError::Usage(
+                "--anchor-issuing-key names an empty issuing side".into(),
+            ));
+        }
+        let bytes = decode_pem_or_der(&read_file(Path::new(path))?)?;
+        let key = AnchorKey::from_spki_der(&bytes).map_err(|error| CliError::Codes {
+            class: CLASS_SERVER_CHAIN_MALFORMED,
+            group: RefusalGroup::Environment,
+            detail: format!("{path}: {error}"),
+        })?;
+        anchors.insert(server_id.to_owned(), key);
+    }
+    Ok(anchors)
+}
+
+/// Names a revocation list that did not hold.
+fn revocations_rejected<E: core::fmt::Display>(path: &Path) -> impl Fn(E) -> CliError + '_ {
+    move |error| CliError::Codes {
+        class: CLASS_REVOCATIONS_REJECTED,
+        group: RefusalGroup::Environment,
+        detail: format!("{}: {error}", path.display()),
+    }
+}
+
+/// A verifier that knows one key and one office.
+///
+/// Reconciling reads one signed document — the list of withdrawn rights — and
+/// the key that signs it is the fleet's authorisation key. Building the full
+/// anchor set here would mean holding a ticket authority this command has no
+/// use for, and a verifier that resolved more signers than it needs is a
+/// verifier that can be asked the wrong question.
+struct AuthorisationOnly(AnchorKey);
+
+impl tessera_codes_contract::signature::SignatureVerifier for AuthorisationOnly {
+    fn verify(
+        &self,
+        signer: tessera_codes_contract::signature::SignerRef<'_>,
+        message: &[u8],
+        signature: &tessera_codes_contract::signature::Signature,
+    ) -> Result<(), tessera_codes_contract::signature::SignatureError> {
+        match signer {
+            tessera_codes_contract::signature::SignerRef::AuthorisationKey => {
+                self.0.verify(message, signature)
+            }
+            _ => Err(tessera_codes_contract::signature::SignatureError::UnknownSigner),
+        }
+    }
+}
+
+/// `issuer codes reconcile`.
+/// What the chain of the issuing side establishes, before the device side is
+/// read.
+///
+/// A function rather than a literal inside the command, because it is the one
+/// place where a property of the file becomes a property of the report — and a
+/// literal there is a line no test can reach without capturing the output of a
+/// whole command. Both fields it fills are caveats: an unsigned tail says
+/// issuances could have been dropped from the end, an unread line says this
+/// build did not read part of what it was given.
+fn provenance_of(chain: &ServerChain) -> Provenance {
+    Provenance {
         chain_verified: true,
         unsigned_from_seq: None,
+        server_unsigned_from_seq: chain.unsigned_from_seq,
+        server_unread_lines: chain.unread_lines,
         refusals_without_nonce: 0,
         unpairable_lines: Vec::new(),
+    }
+}
+
+fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
+    let params = args.fleet.params()?;
+    let anchors = read_issuing_anchors(&args.anchor_issuing_keys)?;
+    let chain = read_server_chain_file(&args.server_chain, params, &anchors)?;
+    let mut provenance = provenance_of(&chain);
+    let entries = chain.entries;
+    let signed_list = read_revocation_list(args)?;
+    let mut revocations = signed_list
+        .as_ref()
+        .map(|read| read.entries.clone())
+        .unwrap_or_default();
+    let unsigned = read_revocations(&args.revoked)?;
+    let unsigned_count = unsigned.len();
+    revocations.extend(unsigned);
+    let expectations = Expectations {
+        declared_key_storage: args.declared_custody.map(CustodyArg::tier),
+        revocations,
+        unsigned_revocations: unsigned_count,
+        // Which list the withdrawals came from, and whether a waterline was
+        // declared at all. Both go into the report: a reader told which rights
+        // were withdrawn and not which list said so has been told half of it.
+        revocation_list: signed_list.map(|read| read.used),
     };
+
     let logins = if args.device_journals.is_empty() {
         None
     } else {
@@ -609,7 +947,7 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
         for pair in &args.device_journals {
             let (device_number, path) = split_pair(pair, "--device-journal")?;
             // The number arrives typed by a person, from a label or a printout,
-            // and the receipts hold its significant form. Comparing the two as
+            // and the records hold its significant form. Comparing the two as
             // strings makes every pairing fail — and a reconciliation where
             // nothing pairs is not an empty report, it is a page of alarms in
             // the two classes the whole command exists for.
@@ -658,8 +996,17 @@ fn run_reconcile(args: &ReconcileArgs, locale: Locale) -> Result<(), CliError> {
         &if logins.is_some() {
             provenance
         } else {
-            Provenance::absent()
+            // The device side is absent, but what was established about the
+            // chain of the issuing side still holds: an unsigned tail there is
+            // a caveat about the issuances, not about the journals nobody
+            // supplied.
+            Provenance {
+                server_unsigned_from_seq: provenance.server_unsigned_from_seq,
+                server_unread_lines: provenance.server_unread_lines,
+                ..Provenance::absent()
+            }
         },
+        &expectations,
     );
     if !report.is_complete() {
         eprintln!("{}", Msg::CodesReconcileIncomplete.text(locale));
@@ -790,22 +1137,6 @@ fn claimed_now(args: &IssueArgs) -> Result<u64, CliError> {
     #[cfg(not(test))]
     let _ = args;
     now_unix()
-}
-
-/// Creates a directory only its owner can enter.
-///
-/// Receipts are audit records of who was let into what; a directory the whole
-/// machine can read is not where they belong.
-fn create_private_dir(path: &Path) -> Result<(), CliError> {
-    std::fs::create_dir_all(path)
-        .map_err(|error| CliError::Io(format!("{}: {error}", path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| CliError::Io(format!("{}: {error}", path.display())))?;
-    }
-    Ok(())
 }
 
 /// Builds the operator key the flags name and hands it to `job`.
@@ -1064,15 +1395,20 @@ mod tests {
         use std::path::{Path, PathBuf};
 
         use super::super::{
-            run_issue, run_receipt_verify, run_reconcile, run_ticket_show, IssueArgs,
-            OperatorKeyArgs, ReceiptVerifyArgs, ReconcileArgs, TicketShowArgs,
+            run_issue, run_reconcile, run_record_show, run_ticket_show, CustodyArg, IssueArgs,
+            OperatorKeyArgs, ReconcileArgs, RecordShowArgs, TicketShowArgs,
         };
         use super::defaults;
         use crate::cli::CliError;
-        use crate::codes::store;
+        use crate::codes::agreement::KeyStorage;
+        use crate::codes::reconcile::{ServerLine, ISSUANCE_OP, ISSUANCE_RECORD_FIELD};
+        use crate::codes::scope::SiteScope;
         use crate::codes::tests::fixtures;
+        use crate::codes::{IssuanceRecord, IssuanceRecordFields};
         use crate::l10n::Locale;
-        use tessera_codes_contract::params::FleetParams;
+        use tessera_codes_contract::grant::UnsignedGrant;
+        use tessera_codes_contract::signature::Signature;
+        use tessera_codes_contract::ticket::TicketNumber;
 
         /// A fleet laid out in a temporary directory.
         struct Files {
@@ -1106,6 +1442,10 @@ mod tests {
                 write_owner_only(
                     &root.path().join("operator.key"),
                     &fixtures::pkcs8_of(fixtures::OPERATOR_SEED),
+                );
+                write(
+                    &root.path().join("request"),
+                    &fixtures::signed_request(&world).to_wire(),
                 );
                 Self { root, world }
             }
@@ -1141,8 +1481,7 @@ mod tests {
                             self.path("owner.spki").display()
                         ),
                     ],
-                    reason: "work order 42".to_owned(),
-                    receipts: self.path("receipts"),
+                    request: self.path("request"),
                     device_region: Some("ru-central".to_owned()),
                     device_tags: vec!["dc-1".to_owned()],
                     now: Some(fixtures::NOW.get()),
@@ -1173,6 +1512,59 @@ mod tests {
             format!("{}\n", chain.storage().lines().join("\n"))
         }
 
+        /// Кладёт challenge и подписанный запрос вокруг него под одним именем.
+        ///
+        /// Порознь их класть нельзя: выдача сверяет два документа между собой и
+        /// отказывает по расхождению раньше всех прочих проверок, так что тест,
+        /// подменивший только challenge, проверял бы эту сверку вместо той оси,
+        /// ради которой написан.
+        fn write_pair(
+            files: &Files,
+            name: &str,
+            challenge: &tessera_codes_contract::challenge::SignedChallenge,
+        ) -> (PathBuf, PathBuf) {
+            let challenge_path = files.path(&format!("challenge-{name}"));
+            let request_path = files.path(&format!("request-{name}"));
+            write(&challenge_path, &challenge.to_wire());
+            write(
+                &request_path,
+                &fixtures::signed_request_for(challenge.challenge(), fixtures::GROUNDS).to_wire(),
+            );
+            (challenge_path, request_path)
+        }
+
+        /// Проводная форма запроса, у которого основание — одни пробелы.
+        ///
+        /// Собирается правкой байтов, а не конструктором: документ с пустым
+        /// основанием не собирается вовсе, и в этом вся гарантия. Тест обязан
+        /// подать выдаче ровно то, что могло бы приехать по сети от стороны,
+        /// собравшей документ иначе, — иначе он проверял бы конструктор,
+        /// который и так отказывает.
+        fn blank_grounds(files: &Files) -> String {
+            let signed = fixtures::signed_request(&files.world);
+            let inner = signed
+                .request()
+                .to_wire()
+                .replace(&format!("grounds={}", fixtures::GROUNDS), "grounds=   ");
+            format!(
+                "tessera-codes/v1/signed-engineer-request;request={};engineer_signature={}",
+                hex::encode(inner),
+                match signed.engineer_signature() {
+                    tessera_codes_contract::request::EngineerSignature::Signed(signature) => {
+                        hex::encode(signature.as_bytes())
+                    }
+                    // The blank-grounds fixture builds a signed request, so
+                    // this arm is unreachable through it; naming the variant
+                    // rather than wildcarding it means a third case added later
+                    // stops the build here instead of being formatted with
+                    // `Debug` into a document.
+                    unverified @ tessera_codes_contract::request::EngineerSignature::Unverified {
+                        ..
+                    } => format!("{unverified:?}"),
+                }
+            )
+        }
+
         fn write(path: &Path, text: &str) {
             fs::write(path, format!("{text}\n")).unwrap();
         }
@@ -1198,10 +1590,11 @@ mod tests {
         fn a_request_outside_the_ticket_is_told_apart_from_a_broken_stand() {
             let files = Files::new();
             let outside = fixtures::signed_challenge_with(|input| input.level = 9);
-            write(&files.path("challenge-level-9"), &outside.to_wire());
+            let (challenge, request) = write_pair(&files, "level-9", &outside);
 
             let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-level-9"));
+            args.challenge_file = Some(challenge);
+            args.request = request;
             let refusal = run_issue(&args, Locale::En).unwrap_err();
             assert_eq!(refusal.refusal_class(), Some("ticket_scope_level"));
             assert_eq!(refusal.exit_code(), crate::cli::EXIT_REFUSED_TICKET_SCOPE);
@@ -1224,9 +1617,10 @@ mod tests {
             let files = Files::new();
             let role =
                 fixtures::signed_challenge_with(|input| input.role_id = "ops.dc.root".to_owned());
-            write(&files.path("challenge-role"), &role.to_wire());
+            let (challenge, request) = write_pair(&files, "role", &role);
             let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-role"));
+            args.challenge_file = Some(challenge);
+            args.request = request;
             assert_eq!(
                 run_issue(&args, Locale::En).unwrap_err().refusal_class(),
                 Some("ticket_scope_role")
@@ -1257,21 +1651,25 @@ mod tests {
 
             // Вне рамок билета.
             let outside = fixtures::signed_challenge_with(|input| input.level = 9);
-            write(&files.path("challenge-level-9"), &outside.to_wire());
+            let (challenge, request) = write_pair(&files, "level-9", &outside);
             let mut args = files.issue_args();
-            args.challenge_file = Some(files.path("challenge-level-9"));
+            args.challenge_file = Some(challenge);
+            args.request = request;
             assert_eq!(
                 run_issue(&args, Locale::En).unwrap_err().exit_code(),
                 EXIT_REFUSED_TICKET_SCOPE
             );
 
-            // Нет основания.
+            // Нет основания: документ с пустым основанием не собирается, и
+            // отказ приходит из чтения запроса — под тем же классом и тем же
+            // кодом возврата, что и прежде. Оператору не за чем знать, на каком
+            // шаге отсутствие основания было замечено.
+            write(&files.path("request-blank"), &blank_grounds(&files));
             let mut args = files.issue_args();
-            args.reason = "  ".to_owned();
-            assert_eq!(
-                run_issue(&args, Locale::En).unwrap_err().exit_code(),
-                EXIT_REFUSED_GROUNDS
-            );
+            args.request = files.path("request-blank");
+            let refusal = run_issue(&args, Locale::En).unwrap_err();
+            assert_eq!(refusal.refusal_class(), Some("missing_reason"));
+            assert_eq!(refusal.exit_code(), EXIT_REFUSED_GROUNDS);
 
             // Доверие: ключ оператора не тот, что в билете.
             let mut args = files.issue_args();
@@ -1297,28 +1695,31 @@ mod tests {
         }
 
         #[test]
-        fn an_issuance_writes_a_receipt_that_reads_back() {
+        fn a_request_that_is_not_a_request_issues_nothing() {
             let files = Files::new();
-            run_issue(&files.issue_args(), Locale::En).unwrap();
+            write(&files.path("request-broken"), "not a signed request");
+            let mut args = files.issue_args();
+            args.request = files.path("request-broken");
 
-            let receipts =
-                store::read_directory(&files.path("receipts"), &FleetParams::defaults()).unwrap();
-            let stored = receipts.first().unwrap();
-            assert_eq!(stored.receipt.reason(), "work order 42");
-            assert_eq!(stored.annex.server_id(), "op-42");
+            let refusal = run_issue(&args, Locale::En).unwrap_err();
+            assert_eq!(refusal.refusal_class(), Some("request_malformed"));
         }
 
         #[test]
-        fn grounds_of_whitespace_alone_issue_nothing() {
+        fn a_request_signed_over_another_challenge_issues_nothing() {
+            // Основание одной попытки, отвечающее за код другой: два документа
+            // разошлись, и выдача обязана отказать до вычисления.
             let files = Files::new();
+            let other = fixtures::signed_challenge_with(|input| input.level = 1);
+            write(
+                &files.path("request-other"),
+                &fixtures::signed_request_for(other.challenge(), fixtures::GROUNDS).to_wire(),
+            );
             let mut args = files.issue_args();
-            args.reason = "   ".to_owned();
+            args.request = files.path("request-other");
 
-            assert!(matches!(
-                run_issue(&args, Locale::En),
-                Err(CliError::Codes { .. })
-            ));
-            assert!(!files.path("receipts").exists());
+            let refusal = run_issue(&args, Locale::En).unwrap_err();
+            assert_eq!(refusal.refusal_class(), Some("request_challenge_mismatch"));
         }
 
         #[test]
@@ -1330,35 +1731,6 @@ mod tests {
             assert!(matches!(
                 run_issue(&args, Locale::En),
                 Err(CliError::Usage(_))
-            ));
-        }
-
-        #[test]
-        fn a_receipt_verifies_against_the_ticket_it_was_issued_under() {
-            let files = Files::new();
-            run_issue(&files.issue_args(), Locale::En).unwrap();
-            let receipts =
-                store::read_directory(&files.path("receipts"), &FleetParams::defaults()).unwrap();
-            let path = receipts.first().unwrap().path.clone();
-
-            let args = ReceiptVerifyArgs {
-                fleet: defaults(),
-                receipt: path.clone(),
-                ticket: Some(files.path("ticket")),
-            };
-            run_receipt_verify(&args, Locale::En).unwrap();
-
-            // A receipt whose file was renamed no longer binds to the ticket.
-            let renamed = files.path("receipts").join("renamed.receipt");
-            fs::rename(&path, &renamed).unwrap();
-            let args = ReceiptVerifyArgs {
-                fleet: defaults(),
-                receipt: renamed,
-                ticket: Some(files.path("ticket")),
-            };
-            assert!(matches!(
-                run_receipt_verify(&args, Locale::En),
-                Err(CliError::Codes { .. })
             ));
         }
 
@@ -1392,19 +1764,121 @@ mod tests {
             ));
         }
 
+        /// Цепочка выдач того же прогона, какой её пишет выдающая сторона.
+        ///
+        /// Пишет её здесь тест, а не команда: журнал ведёт тот, кто считает и
+        /// подписывает, а `issuer codes issue` подписи гранта не ставит — ключа
+        /// подписи у него нет по построению. Цепочка настоящая, собранная тем
+        /// же `tessera_hashchain`, которым её соберёт служба: фикстура «одна
+        /// строка JSON» оставила бы этот тест зелёным даже там, где читатель не
+        /// умеет читать цепочку вовсе.
+        fn write_server_chain(files: &Files, key_storage: KeyStorage) {
+            write_server_chain_of(files, key_storage, 1);
+        }
+
+        /// The same, with a chosen number of issuances in it.
+        fn write_server_chain_of(files: &Files, key_storage: KeyStorage, records: usize) {
+            use tessera_hashchain::storage::MemoryStorage;
+            use tessera_hashchain::Chain;
+
+            let grant = UnsignedGrant::new(fixtures::signed_request(&files.world), "op-42")
+                .unwrap()
+                .sign(Signature::new(vec![0x11, 0x22]).unwrap(), None)
+                .unwrap();
+            let record = IssuanceRecord::new(IssuanceRecordFields {
+                grant,
+                ticket_number: TicketNumber::parse("tk-e2e-1").unwrap(),
+                organisation_id: "acme".to_owned(),
+                key_storage,
+                site_scope: SiteScope::Checked,
+                // The fixture request is signed, so the mark is clear: the two
+                // have to agree, and the type refuses a record where they do
+                // not.
+                identity_unverified: false,
+            })
+            .unwrap();
+
+            let mut chain: Chain<MemoryStorage, ServerLine> =
+                Chain::load(MemoryStorage::new()).unwrap();
+            for index in 0..records {
+                let line: ServerLine = serde_json::from_value(serde_json::json!({
+                    "op": ISSUANCE_OP,
+                    ISSUANCE_RECORD_FIELD: record.to_wire(),
+                }))
+                .unwrap();
+                chain.append(&line, 1_800_000_000 + index as u64).unwrap();
+            }
+            fs::write(
+                files.path("server-chain.ndjson"),
+                format!("{}\n", chain.storage().lines().join("\n")),
+            )
+            .unwrap();
+        }
+
+        /// The same chain with one line whose `op` this build does not know.
+        ///
+        /// Appended by the chain crate itself and not by hand: a line typed out
+        /// would not link, the reader would refuse the file as broken, and the
+        /// test would go green for the wrong reason.
+        fn write_server_chain_with_an_unknown_line(files: &Files) {
+            use tessera_hashchain::storage::MemoryStorage;
+            use tessera_hashchain::Chain;
+
+            let grant = UnsignedGrant::new(fixtures::signed_request(&files.world), "op-42")
+                .unwrap()
+                .sign(Signature::new(vec![0x11, 0x22]).unwrap(), None)
+                .unwrap();
+            let record = IssuanceRecord::new(IssuanceRecordFields {
+                grant,
+                ticket_number: TicketNumber::parse("tk-e2e-1").unwrap(),
+                organisation_id: "acme".to_owned(),
+                key_storage: KeyStorage::Software,
+                site_scope: SiteScope::Checked,
+                identity_unverified: false,
+            })
+            .unwrap();
+
+            let mut chain: Chain<MemoryStorage, ServerLine> =
+                Chain::load(MemoryStorage::new()).unwrap();
+            let issuance: ServerLine = serde_json::from_value(serde_json::json!({
+                "op": ISSUANCE_OP,
+                ISSUANCE_RECORD_FIELD: record.to_wire(),
+            }))
+            .unwrap();
+            chain.append(&issuance, 1_800_000_000).unwrap();
+            let unknown: ServerLine = serde_json::from_value(serde_json::json!({
+                "op": "codes.something-a-later-build-invented",
+                "note": "a line this build cannot read",
+            }))
+            .unwrap();
+            chain.append(&unknown, 1_800_000_001).unwrap();
+            fs::write(
+                files.path("server-chain.ndjson"),
+                format!("{}\n", chain.storage().lines().join("\n")),
+            )
+            .unwrap();
+        }
+
         #[test]
         fn a_reconciliation_without_journals_runs_and_is_marked_incomplete() {
             let files = Files::new();
             run_issue(&files.issue_args(), Locale::En).unwrap();
+            write_server_chain(&files, KeyStorage::Software);
 
             let args = ReconcileArgs {
                 fleet: defaults(),
-                receipts: files.path("receipts"),
+                server_chain: files.path("server-chain.ndjson"),
+                declared_custody: None,
+                revocation_list: None,
+                anchor_issuing_keys: Vec::new(),
+                anchor_authorisation_key: None,
+                applied_revocation_serial: Some(0),
+                revoked: Vec::new(),
                 device_journals: Vec::new(),
             };
             run_reconcile(&args, Locale::En).unwrap();
 
-            // With the device side present, the receipt of that issuance pairs.
+            // With the device side present, the record of that issuance pairs.
             // The journal is a real chain, in the form the device writes: a
             // fixture in the tracing form would keep this test green even if
             // the reader could not read a device journal at all.
@@ -1422,13 +1896,313 @@ mod tests {
             .unwrap();
             let args = ReconcileArgs {
                 fleet: defaults(),
-                receipts: files.path("receipts"),
+                server_chain: files.path("server-chain.ndjson"),
+                declared_custody: None,
+                revocation_list: None,
+                anchor_issuing_keys: Vec::new(),
+                anchor_authorisation_key: None,
+                applied_revocation_serial: Some(0),
+                revoked: Vec::new(),
                 device_journals: vec![format!(
                     "{device}={}",
                     files.path("device.ndjson").display()
                 )],
             };
             run_reconcile(&args, Locale::En).unwrap();
+        }
+
+        /// Сверка читает серверную цепочку, а правленую — отвергает.
+        ///
+        /// Два ответа в одном тесте, потому что порознь ни один не отличает
+        /// «прочитала» от «не заметила»: чтение подтверждается парой, которая
+        /// сошлась, а отказ — тем, что та же цепочка с изъятой строкой не даёт
+        /// отчёта вовсе.
+        #[test]
+        fn a_chain_that_was_edited_produces_no_report() {
+            let files = Files::new();
+            run_issue(&files.issue_args(), Locale::En).unwrap();
+            write_server_chain(&files, KeyStorage::Software);
+
+            let device = files
+                .world
+                .challenge
+                .challenge()
+                .device_number()
+                .significant()
+                .to_owned();
+            fs::write(
+                files.path("device.ndjson"),
+                device_chain_line(files.world.challenge.challenge()),
+            )
+            .unwrap();
+            let args = |chain: PathBuf| ReconcileArgs {
+                fleet: defaults(),
+                server_chain: chain,
+                declared_custody: None,
+                revocation_list: None,
+                anchor_issuing_keys: Vec::new(),
+                anchor_authorisation_key: None,
+                applied_revocation_serial: Some(0),
+                revoked: Vec::new(),
+                device_journals: vec![format!(
+                    "{device}={}",
+                    files.path("device.ndjson").display()
+                )],
+            };
+            run_reconcile(&args(files.path("server-chain.ndjson")), Locale::En).unwrap();
+
+            // Та же цепочка, из которой вынули строку из СЕРЕДИНЫ: чтение
+            // обязано остановиться, а не отдать отчёт, который «ничего не
+            // нашёл». Хвост ловится не этим — его ловит оговорка о незаверённом
+            // хвосте, и кейс, обрезающий хвост, проверял бы её.
+            write_server_chain_of(&files, KeyStorage::Software, 3);
+            let text = fs::read_to_string(files.path("server-chain.ndjson")).unwrap();
+            let mut lines: Vec<&str> = text.lines().collect();
+            lines.remove(1);
+            let edited = files.path("server-chain-edited.ndjson");
+            fs::write(&edited, lines.join("\n")).unwrap();
+            let refusal = run_reconcile(&args(edited), Locale::En).unwrap_err();
+            assert_eq!(refusal.refusal_class(), Some("server_chain_broken"));
+        }
+
+        /// Объявленная ступень кастодии превращает запись отчёта в тревогу.
+        #[test]
+        fn a_declared_custody_tier_turns_a_lower_one_into_a_finding() {
+            let files = Files::new();
+            run_issue(&files.issue_args(), Locale::En).unwrap();
+            write_server_chain(&files, KeyStorage::Software);
+
+            let args = ReconcileArgs {
+                fleet: defaults(),
+                server_chain: files.path("server-chain.ndjson"),
+                declared_custody: Some(CustodyArg::Token),
+                revocation_list: None,
+                anchor_issuing_keys: Vec::new(),
+                anchor_authorisation_key: None,
+                applied_revocation_serial: Some(0),
+                revoked: Vec::new(),
+                device_journals: Vec::new(),
+            };
+            // Отчёт собирается и печатается; вердикт читается отдельно, потому
+            // что команда возвращает Ok и на находках — находка не сбой.
+            run_reconcile(&args, Locale::En).unwrap();
+        }
+
+        /// Справка команды не упоминает ни телефона, ни квитанций.
+        ///
+        /// Единственное, что оператор читает перед первым вызовом. Пока в ней
+        /// стоят подкоманды удалённого канала, она обещает то, чего нет.
+        #[test]
+        fn the_help_of_the_surface_speaks_of_no_telephone() {
+            use clap::CommandFactory as _;
+
+            let mut command = crate::cli::Cli::command();
+            let mut rendered = Vec::new();
+            command.write_long_help(&mut rendered).unwrap();
+            for subcommand in command.get_subcommands_mut() {
+                let mut text = Vec::new();
+                subcommand.write_long_help(&mut text).unwrap();
+                rendered.extend(text);
+                for nested in subcommand.get_subcommands_mut() {
+                    let mut text = Vec::new();
+                    nested.write_long_help(&mut text).unwrap();
+                    rendered.extend(text);
+                }
+            }
+            let help = String::from_utf8(rendered).unwrap().to_lowercase();
+            for word in ["telephone", "receipt", "квитанц", "телефон"] {
+                assert!(!help.contains(word), "справка всё ещё говорит про `{word}`");
+            }
+        }
+
+        /// Список отзыва принимается только подписанным и только новее
+        /// применённого.
+        ///
+        /// Три ответа подряд, потому что порознь ни один не отличает «сверка
+        /// прочитала список» от «сверка его не заметила»: подпись не той
+        /// стороны, повтор вчерашнего серийника и честный список.
+        #[test]
+        fn a_revocation_list_is_read_only_when_signed_and_newer() {
+            use tessera_codes_contract::revocation::{
+                RevocationEntry, RevocationList, RevocationListFields, SignedRevocationList,
+                SubjectKind,
+            };
+            use tessera_codes_contract::time::ClaimedTime;
+
+            let files = Files::new();
+            write_server_chain(&files, KeyStorage::Software);
+
+            let list = RevocationList::new(RevocationListFields {
+                serial: 7,
+                issued_at: ClaimedTime::new(1_800_000_100),
+                entries: vec![RevocationEntry::new(
+                    SubjectKind::Engineer,
+                    "eng-1",
+                    ClaimedTime::new(1_799_999_999),
+                    "left-the-fleet",
+                )
+                .unwrap()],
+            })
+            .unwrap();
+            // Подписывает ключ авторизаций фикстурного парка — тот же, чей
+            // якорь кладётся ниже. Байты подписи настоящие: список проверяется
+            // подписью, и фикстура, подписанная «чем-нибудь», проверяла бы
+            // разбор вместо проверки.
+            let signer = fixtures::signer(fixtures::AUTHORITY_SEED);
+            let published =
+                SignedRevocationList::new(list.clone(), signer.sign(&list.encode().unwrap()));
+            write(&files.path("revocations.txt"), &published.to_wire());
+            fs::write(
+                files.path("authorisation.spki"),
+                fixtures::spki_of(fixtures::AUTHORITY_SEED),
+            )
+            .unwrap();
+
+            let args = |serial: u64, anchor: &str| ReconcileArgs {
+                fleet: defaults(),
+                server_chain: files.path("server-chain.ndjson"),
+                declared_custody: None,
+                revocation_list: Some(files.path("revocations.txt")),
+                anchor_issuing_keys: Vec::new(),
+                anchor_authorisation_key: Some(files.path(anchor)),
+                applied_revocation_serial: Some(serial),
+                revoked: Vec::new(),
+                device_journals: Vec::new(),
+            };
+
+            // Честный список новее применённого: читается.
+            run_reconcile(&args(6, "authorisation.spki"), Locale::En).unwrap();
+
+            // Тот же список, но серийник уже применён: повтор вчерашнего.
+            let replay = run_reconcile(&args(7, "authorisation.spki"), Locale::En).unwrap_err();
+            assert_eq!(replay.refusal_class(), Some("revocations_rejected"));
+
+            // Тот же список против ЧУЖОГО якоря: подписал не тот.
+            fs::write(
+                files.path("stranger.spki"),
+                fixtures::spki_of(fixtures::ORGANISATION_SEED),
+            )
+            .unwrap();
+            let stranger = run_reconcile(&args(6, "stranger.spki"), Locale::En).unwrap_err();
+            assert_eq!(stranger.refusal_class(), Some("revocations_rejected"));
+
+            // И без ватерлинии вовсе: команда не отказывает — аудитор может не
+            // знать применённого серийника, — но отчёт обязан сказать, что
+            // принял бы список ЛЮБОГО возраста. До правки флаг по умолчанию
+            // стоял нулём, то есть молча утверждал «применено ничего», и
+            // подавленные находки выглядели как их отсутствие.
+            let without = ReconcileArgs {
+                applied_revocation_serial: None,
+                ..args(6, "authorisation.spki")
+            };
+            run_reconcile(&without, Locale::En).unwrap();
+
+            let anchors = super::super::read_issuing_anchors(&without.anchor_issuing_keys).unwrap();
+            let chain = super::super::read_server_chain_file(
+                &without.server_chain,
+                without.fleet.params().unwrap(),
+                &anchors,
+            )
+            .unwrap();
+            let read = super::super::read_revocation_list(&without)
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.used.waterline, None);
+            let report = crate::codes::reconcile::reconcile(
+                &chain.entries,
+                None,
+                &crate::codes::reconcile::Provenance::absent(),
+                &crate::codes::reconcile::Expectations {
+                    declared_key_storage: None,
+                    revocations: read.entries,
+                    unsigned_revocations: 0,
+                    revocation_list: Some(read.used),
+                },
+            );
+            assert!(!report.is_complete(), "{report}");
+            assert!(
+                report
+                    .to_string()
+                    .contains("revocation-waterline-unset serial=7"),
+                "{report}"
+            );
+        }
+
+        /// Запись выдачи читается из СТРОКИ ЦЕПОЧКИ, а не только из файла.
+        ///
+        /// Это то, что есть у стенда: грант лежит в строке шестнадцатеричным
+        /// полем, а запрос внутри гранта — снова шестнадцатеричным, и разбор
+        /// текстовым инструментом по такой строке не работает вовсе. Читатель
+        /// формата один, и он здесь.
+        #[test]
+        fn a_record_is_read_out_of_a_chain_line() {
+            let files = Files::new();
+            write_server_chain(&files, KeyStorage::Software);
+
+            let args = RecordShowArgs {
+                fleet: defaults(),
+                server_chain_line: files.path("server-chain.ndjson"),
+            };
+            run_record_show(&args).unwrap();
+        }
+
+        /// Строка цепочки, которую сборка не прочла, доходит до отчёта.
+        ///
+        /// Проверяется ПРОВОДКА, а не сама оговорка: её держит тест в
+        /// `reconcile`, а здесь — что команда действительно берёт счёт из
+        /// прочитанной цепочки и кладёт его в происхождение. Мутация «класть
+        /// ноль» не роняла ничего, пока этого теста не было: отчёт над файлом,
+        /// прочитанным наполовину, называл себя полным, и вся правка держалась
+        /// на одной строке присваивания, которую никто не стерёг.
+        #[test]
+        fn an_unread_line_of_the_chain_reaches_the_report() {
+            let files = Files::new();
+            run_issue(&files.issue_args(), Locale::En).unwrap();
+            write_server_chain_with_an_unknown_line(&files);
+
+            let args = ReconcileArgs {
+                fleet: defaults(),
+                server_chain: files.path("server-chain.ndjson"),
+                declared_custody: None,
+                revocation_list: None,
+                anchor_issuing_keys: Vec::new(),
+                anchor_authorisation_key: None,
+                applied_revocation_serial: Some(0),
+                revoked: Vec::new(),
+                device_journals: Vec::new(),
+            };
+            // The command does not refuse: a chain that carries issuances IS
+            // the journal that was asked for.
+            run_reconcile(&args, Locale::En).unwrap();
+
+            // And what it read carries the count, so the report built from it
+            // cannot call itself complete. Read through the same path the
+            // command uses; a mutation that puts a zero into the provenance
+            // makes this red.
+            let params = args.fleet.params().unwrap();
+            let chain = super::super::read_server_chain_file(
+                &args.server_chain,
+                params,
+                &crate::codes::reconcile::IssuingAnchors::default(),
+            )
+            .unwrap();
+            assert_eq!(chain.unread_lines, 1, "the unknown line was not counted");
+            assert_eq!(chain.entries.len(), 1, "the issuance was not read");
+
+            // Through the very function the command uses to turn a chain into
+            // a provenance. Building the provenance by hand here would test
+            // this test's idea of the wiring rather than the wiring.
+            let report = crate::codes::reconcile::reconcile(
+                &chain.entries,
+                None,
+                &super::super::provenance_of(&chain),
+                &crate::codes::reconcile::Expectations::default(),
+            );
+            assert!(!report.is_complete(), "{report}");
+            assert!(
+                report.to_string().contains("unread-server-lines"),
+                "{report}"
+            );
         }
 
         /// Вердикт «чисто» печатается только над отчётом, который смог
@@ -1438,7 +2212,7 @@ mod tests {
         /// прямо в `println!`, и его откат оставлял весь набор зелёным.
         #[test]
         fn the_clean_verdict_is_withheld_from_a_report_that_could_not_look() {
-            use crate::codes::reconcile::{reconcile, Provenance};
+            use crate::codes::reconcile::{reconcile, Expectations, Provenance};
 
             let complete = reconcile(
                 &[],
@@ -1446,14 +2220,17 @@ mod tests {
                 &Provenance {
                     chain_verified: true,
                     unsigned_from_seq: None,
+                    server_unsigned_from_seq: None,
+                    server_unread_lines: 0,
                     refusals_without_nonce: 0,
                     unpairable_lines: Vec::new(),
                 },
+                &Expectations::default(),
             );
             assert!(crate::cli::codes::clean_verdict(&complete, Locale::En).is_some());
 
             // Устройства не было вовсе.
-            let absent = reconcile(&[], None, &Provenance::absent());
+            let absent = reconcile(&[], None, &Provenance::absent(), &Expectations::default());
             assert!(
                 crate::cli::codes::clean_verdict(&absent, Locale::En).is_none(),
                 "вердикт «чисто» над отчётом без устройства"
@@ -1466,6 +2243,8 @@ mod tests {
                 &Provenance {
                     chain_verified: true,
                     unsigned_from_seq: None,
+                    server_unsigned_from_seq: None,
+                    server_unread_lines: 0,
                     refusals_without_nonce: 0,
                     unpairable_lines: vec![crate::codes::reconcile::UnpairableLine {
                         device_number: "77000123".to_owned(),
@@ -1473,6 +2252,7 @@ mod tests {
                         outcome: "granted".to_owned(),
                     }],
                 },
+                &Expectations::default(),
             );
             assert!(
                 crate::cli::codes::clean_verdict(&unreadable, Locale::En).is_none(),

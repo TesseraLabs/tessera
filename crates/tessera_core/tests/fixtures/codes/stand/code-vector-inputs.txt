@@ -1,0 +1,12 @@
+# Входы вектора кода. Ожидаемый код лежит отдельно и считается не этим крейтом.
+device_number_significant=77000123S
+epoch=7
+nonce=K7Q2M9XR4T6B
+role_id=serv
+level=1
+engineer_id=ORG1-0000014
+ticket_hash_sha256=2bd1758ffe4a662a98295a9bf05d42479ebe8881d972c37c7c7c48742f9b536b
+ephemeral_public_sec1=040bbbc5e8bc84bd33d1d3ce03ffac9a747f4c1993fddb2ec93a4116a86f022a77c3c17191559a4c2a1aa57e79b8d1977da2c959172f478e341e27028d69fffb7b
+code_len=6
+alphabet=crockford-base32
+kdf_salt=tessera-codes-contract/v1/kdf

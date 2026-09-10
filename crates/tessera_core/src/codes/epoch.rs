@@ -9,7 +9,7 @@
 //! What the file is for is anti-rollback. A device that has moved to a new key
 //! must never be talked back into the old one by re-presenting the medium the
 //! old one arrived on: the codes of the previous epoch were computed against a
-//! key whose nonces have already been spoken aloud, and a fleet that recovers a
+//! key whose nonces have already been shown, and a fleet that recovers a
 //! stolen medium cannot undo that. So the number only ever grows, exactly as
 //! `bundle_version` does for the role bundle, and an import naming a smaller
 //! epoch is refused rather than merged.

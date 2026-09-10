@@ -132,6 +132,14 @@ pub struct ManifestCodes {
     /// The anchor every ticket is verified against.
     #[serde(default)]
     pub ticket_authority: Option<ManifestCodesFile>,
+    /// The addresses of the engineer's page this fleet publishes.
+    ///
+    /// One per line. The device shows one of them in front of the challenge and
+    /// composes none of its own, so the list is a decision of the fleet owner
+    /// and travels the same way every other decision of theirs does: signed
+    /// into the package, pinned by its hash in a managed one.
+    #[serde(default)]
+    pub page_urls: Option<ManifestCodesFile>,
 }
 
 /// Parsed `manifest.toml` (strict: `deny_unknown_fields`).

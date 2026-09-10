@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use secrecy::SecretString;
@@ -41,7 +41,7 @@ use tessera_core::x509::CertIdent;
 use super::{
     authenticate_by_code, open_method, Accepted, AttemptRequest, BootMarkers, CodeConversation,
     CodeDeps, CodeFlowError, CodeLogin, CodeLoginError, CodeMethodApi, CodesConfig, DeviceProbe,
-    HostIdSourceKind, Level, LevelError, PamConvError, SystemTime,
+    HostIdSourceKind, Level, LevelError, OverlayHandle, OverlayPresenter, PamConvError, SystemTime,
 };
 
 /// The login account, which is also the role.
@@ -59,7 +59,12 @@ const RIGHT_CODE: &str = "13572468";
 const EFFECTIVE_EPOCH: u32 = 9;
 
 /// Personal number the engineer gives at the device.
-const ENGINEER: &str = "eng-1";
+///
+/// A number of the shape the format names — organisation segment, serial part,
+/// check character — because the device refuses anything else before it starts
+/// an attempt. The fixture used to carry `eng-1`, which no fleet would issue,
+/// and a branch tested against it was tested against a value the rule forbids.
+const ENGINEER: &str = "ORG1-0000014";
 
 /// A conversation whose every answer is written down in advance.
 struct ScriptedConversation {
@@ -71,6 +76,13 @@ struct ScriptedConversation {
     shown: Vec<String>,
     /// Whether the secret prompt was driven, and how often.
     secrets_asked: usize,
+    /// A log shared with the overlay of the same attempt, when a test needs to
+    /// see the two interleaved.
+    ///
+    /// The order is what several guarantees are actually about — the symbol is
+    /// up while the code is being typed and down afterwards — and two separate
+    /// logs cannot answer a question about order.
+    timeline: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl ScriptedConversation {
@@ -80,6 +92,22 @@ impl ScriptedConversation {
             asked: Vec::new(),
             shown: Vec::new(),
             secrets_asked: 0,
+            timeline: None,
+        }
+    }
+
+    /// The same conversation, writing its prompts into a shared timeline.
+    fn on_timeline(mut self, timeline: Arc<Mutex<Vec<String>>>) -> Self {
+        self.timeline = Some(timeline);
+        self
+    }
+
+    fn note(&self, event: String) {
+        if let Some(timeline) = &self.timeline {
+            timeline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
         }
     }
 }
@@ -91,6 +119,12 @@ impl CodeConversation for ScriptedConversation {
 
     fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
         self.asked.push(prompt.to_owned());
+        // Only the last line of the prompt: the code prompt carries the whole
+        // drawn challenge in front of it, and a timeline of that is unreadable.
+        self.note(format!(
+            "asked {}",
+            prompt.lines().next_back().unwrap_or(prompt).trim()
+        ));
         self.answers.pop_front().ok_or(PamConvError::ConvFailed)
     }
 
@@ -149,8 +183,8 @@ impl DeviceProbe for ScriptedProbe {
 
 /// A method whose verdicts are written down in advance.
 ///
-/// The attempt it hands out is the spoken form of the challenge, which is all
-/// the branch ever does with it.
+/// The attempt it hands out is the payload of the challenge, which is all the
+/// branch ever does with it.
 struct ScriptedMethod {
     /// What `begin` answers.
     start: RefCell<Option<Result<String, CodeLoginError>>>,
@@ -224,7 +258,7 @@ impl CodeMethodApi for ScriptedMethod {
             .unwrap_or(Err(CodeLoginError::Denied))
     }
 
-    fn spoken_form(&self, attempt: &Self::Attempt) -> String {
+    fn payload(&self, attempt: &Self::Attempt) -> String {
         attempt.clone()
     }
 
@@ -285,6 +319,7 @@ fn astra_role_store(dir: &Path) -> RoleStore {
 /// configuration is the epoch and the attempt budget.
 fn config(dir: &Path) -> CodesConfig {
     CodesConfig {
+        page_url: Some("https://codes.fleet.example/e".to_owned()),
         paths: CodesPaths::under(dir),
         params: FleetParams::defaults(),
         device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
@@ -295,6 +330,7 @@ fn config(dir: &Path) -> CodesConfig {
         },
         code_ttl: Duration::from_secs(300),
         gost_engine_path: None,
+        overlay: None,
     }
 }
 
@@ -390,6 +426,80 @@ struct Harness {
     config: CodesConfig,
     monitor: RecordingMonitor,
     fail_mode: MonitorFailMode,
+    overlay: ScriptedOverlay,
+}
+
+/// A screen that records rather than draws.
+///
+/// The interleaving matters as much as the calls: the symbol must go up before
+/// the first prompt for a code and come down after the attempt is over, and a
+/// recorder that only counted would pass on an overlay that drew nothing until
+/// the login had finished.
+#[derive(Debug, Default, Clone)]
+struct ScriptedOverlay {
+    events: Arc<Mutex<Vec<String>>>,
+    refuse: bool,
+}
+
+impl ScriptedOverlay {
+    /// The same overlay, writing into a timeline shared with a conversation.
+    fn on_timeline(events: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            events,
+            refuse: false,
+        }
+    }
+
+    /// An overlay that never comes up — no display manager, no greeter, no
+    /// socket, an overlay binary nobody installed. All of them look like this.
+    fn absent() -> Self {
+        Self {
+            events: Arc::default(),
+            refuse: true,
+        }
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn note(&self, event: &str) {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event.to_owned());
+    }
+}
+
+impl OverlayPresenter for ScriptedOverlay {
+    fn present(&self, payload: &str) -> Option<Box<dyn OverlayHandle>> {
+        if self.refuse {
+            self.note("refused");
+            return None;
+        }
+        self.note(&format!("shown {payload}"));
+        Some(Box::new(ScriptedHandle {
+            events: Arc::clone(&self.events),
+        }))
+    }
+}
+
+struct ScriptedHandle {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl OverlayHandle for ScriptedHandle {}
+
+impl Drop for ScriptedHandle {
+    fn drop(&mut self) {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push("hidden".to_owned());
+    }
 }
 
 impl Harness {
@@ -412,6 +522,7 @@ impl Harness {
             config,
             monitor: RecordingMonitor::default(),
             fail_mode: MonitorFailMode::Strict,
+            overlay: ScriptedOverlay::default(),
         }
     }
 
@@ -426,6 +537,7 @@ impl Harness {
 
     fn deps(&self) -> CodeDeps<'_> {
         CodeDeps {
+            overlay: &self.overlay,
             config: &self.config,
             store: &self.store,
             accounts: AccountCheck::from_store(&self.store),
@@ -481,6 +593,209 @@ fn a_dictated_code_admits_the_engineer() {
     assert!(ctx.usb_serial.is_none());
     // The session is bounded: a role that names no TTL takes the global one.
     assert!(ctx.role.as_ref().unwrap().ttl > Duration::ZERO);
+}
+
+// ---------------------------------------------------------------------------
+// The overlay of a graphical login
+// ---------------------------------------------------------------------------
+
+/// Runs one accepted login and returns the context, with the overlay named.
+fn login_with_overlay(overlay: ScriptedOverlay) -> tessera_core::pam_data::AuthContext {
+    let harness = Harness {
+        overlay,
+        ..Harness::new()
+    };
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+    harness.run(&method, &mut conv, &probe, ROLE).unwrap()
+}
+
+#[test]
+fn an_overlay_that_never_comes_up_leaves_the_login_exactly_as_it_was() {
+    // The whole guarantee of this path in one test. No display manager, no
+    // greeter, no socket, an overlay binary nobody installed — every one of
+    // them arrives here as "the overlay did not come up", and the login has to
+    // be the login it would have been on a device that DOES have a screen.
+    //
+    // The two sides must be DIFFERENT configurations, and this test failed to
+    // be that once: both halves ran with the overlay absent, so it compared a
+    // login with nothing against a login with nothing and would have passed
+    // while an overlay that came up changed the verdict, the role and the term.
+    // Vacuous in the exact way this branch keeps catching elsewhere.
+    let absent = ScriptedOverlay::absent();
+    let raised = ScriptedOverlay::default();
+    let without = login_with_overlay(absent.clone());
+    let with = login_with_overlay(raised.clone());
+
+    // Each side did what its name says, so the comparison below is between two
+    // different runs and not between two copies of one.
+    assert_eq!(absent.events(), vec!["refused"]);
+    assert!(
+        raised
+            .events()
+            .iter()
+            .any(|event| event.starts_with("shown ")),
+        "the raised overlay never drew: {:?}",
+        raised.events()
+    );
+
+    // The same verdict, the same role, the same term: compared field by field
+    // rather than by the fact that both are `Ok`, because "the login still
+    // succeeded" is the weaker half of the claim and the one that would pass
+    // even if the overlay had changed what the login granted.
+    assert_eq!(without.session_id, with.session_id);
+    assert_eq!(
+        without.role.as_ref().unwrap().role.as_str(),
+        with.role.as_ref().unwrap().role.as_str()
+    );
+    assert_eq!(
+        without.role.as_ref().unwrap().ttl,
+        with.role.as_ref().unwrap().ttl
+    );
+    assert_eq!(without.pam_service, with.pam_service);
+    // The ceiling the session label is built from: the field an overlay has the
+    // least business touching and the one whose change would be hardest to see.
+    assert_eq!(without.cert_max_integrity, with.cert_max_integrity);
+    assert_eq!(without.host_id, with.host_id);
+}
+
+#[test]
+fn a_refused_login_is_refused_the_same_way_with_and_without_an_overlay() {
+    // The other half, and the one an implementation is likelier to get wrong:
+    // an overlay must not turn a refusal into anything else either. The wrong
+    // code spends the budget and the verdict is the same both ways.
+    let refuse = |overlay: ScriptedOverlay| {
+        let harness = Harness {
+            overlay,
+            ..Harness::new()
+        };
+        let method = ScriptedMethod::with_verdicts([Err(CodeLoginError::Denied)]);
+        let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
+        let probe = ScriptedProbe::at_level(1);
+        harness
+            .run(&method, &mut conv, &probe, ROLE)
+            .map(|_| ())
+            .map_err(|error| error.pam_code())
+    };
+
+    assert_eq!(
+        refuse(ScriptedOverlay::default()),
+        refuse(ScriptedOverlay::absent()),
+        "the overlay changed how a refused login is refused"
+    );
+}
+
+#[test]
+fn the_symbol_is_on_the_screen_while_the_code_is_being_typed() {
+    // Order, not presence. An overlay that went up and came down again before
+    // the engineer was asked for anything would satisfy a test that only
+    // counted the calls, and it would show a QR nobody had time to photograph.
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let overlay = ScriptedOverlay::on_timeline(Arc::clone(&timeline));
+    let harness = Harness {
+        overlay: overlay.clone(),
+        ..Harness::new()
+    };
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE])
+        .on_timeline(Arc::clone(&timeline));
+    let probe = ScriptedProbe::at_level(1);
+
+    harness.run(&method, &mut conv, &probe, ROLE).unwrap();
+
+    let events = timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let shown = events
+        .iter()
+        .position(|event| event.starts_with("shown "))
+        .expect("the overlay was asked to draw");
+    let code_prompt = events
+        .iter()
+        .rposition(|event| event.starts_with("asked "))
+        .expect("the engineer was asked for something");
+    let hidden = events
+        .iter()
+        .position(|event| event == "hidden")
+        .expect("the symbol was taken down");
+
+    assert!(
+        shown < code_prompt,
+        "the symbol went up after the code was asked for: {events:?}"
+    );
+    assert!(
+        code_prompt < hidden,
+        "the symbol came down before the code was typed: {events:?}"
+    );
+
+    // And what went up is the payload of the attempt, byte for byte. The
+    // scripted method hands back a stand-in rather than a real wire form, so
+    // this compares against that stand-in: the question here is which value
+    // reaches the overlay, not what a real payload looks like.
+    assert_eq!(
+        events.get(shown).map(String::as_str),
+        Some("shown 77-000123M 004217-8391")
+    );
+    let _ = &overlay;
+}
+
+#[test]
+fn the_symbol_comes_down_even_when_the_conversation_fails_before_the_code() {
+    // The failure this guards is the one a person would see: an attempt that
+    // ended badly and left a QR on the screen of a machine anybody can walk up
+    // to. The conversation here dies at the very first prompt, which is the
+    // earliest an attempt can end after the symbol went up.
+    let overlay = ScriptedOverlay::default();
+    let harness = Harness {
+        overlay: overlay.clone(),
+        ..Harness::new()
+    };
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    // Server and engineer answered, then nothing: the code prompt has no answer
+    // to give and the conversation fails.
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER]);
+    let probe = ScriptedProbe::at_level(1);
+
+    let refusal = harness.run(&method, &mut conv, &probe, ROLE);
+
+    assert!(refusal.is_err(), "the login should not have succeeded");
+    assert_eq!(
+        overlay.events().last().map(String::as_str),
+        Some("hidden"),
+        "the symbol stayed on the screen after the attempt ended: {:?}",
+        overlay.events()
+    );
+}
+
+#[test]
+fn the_overlay_is_given_the_payload_and_not_the_prompt_around_it() {
+    // The prompt carries the challenge, a QR drawn in half blocks and a line of
+    // instructions. Handing that to the overlay would put a picture of a
+    // picture on the screen; the overlay draws its own symbol from the wire
+    // form and needs exactly that.
+    let overlay = ScriptedOverlay::default();
+    let _ctx = login_with_overlay(overlay.clone());
+
+    let shown = overlay
+        .events()
+        .first()
+        .cloned()
+        .expect("the overlay was asked to draw");
+    let payload = shown.strip_prefix("shown ").unwrap_or_default().to_owned();
+    assert!(
+        !payload.contains('\n'),
+        "the overlay was given more than one line"
+    );
+    assert!(
+        !payload.contains('█') && !payload.contains('▀'),
+        "the overlay was given the drawn symbol instead of the payload"
+    );
+    assert!(
+        !payload.contains("Код"),
+        "the overlay was given the text of the prompt: {payload}"
+    );
 }
 
 #[test]
@@ -711,7 +1026,7 @@ fn the_session_opens_when_the_cert_integrity_policy_is_required() {
 }
 
 #[test]
-fn the_challenge_is_printed_before_the_code_is_asked_for() {
+fn the_challenge_is_shown_in_the_text_of_the_code_prompt() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
     let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
@@ -719,21 +1034,41 @@ fn the_challenge_is_printed_before_the_code_is_asked_for() {
 
     harness.run(&method, &mut conv, &probe, ROLE).unwrap();
 
-    assert_eq!(
-        conv.asked,
-        vec![
-            super::SERVER_PROMPT.to_owned(),
-            super::ENGINEER_PROMPT.to_owned(),
-            super::CODE_PROMPT.to_owned()
-        ],
-        "the operator is named, then the engineer names themselves, then the \
-         code is asked for — and nothing else is, least of all anything about \
-         the key of the device",
-    );
-    let shown = conv.shown.first().expect("the challenge is printed");
+    // Three prompts, in this order and no other. The personal number is not
+    // asked first on purpose: the first prompt is eaten by the form of the
+    // greeter on the target fleet, and a personal number asked there would be
+    // silently replaced by whatever was typed into the login field — a code cut
+    // for somebody else's number.
+    let asked: Vec<&str> = conv.asked.iter().map(String::as_str).collect();
+    assert_eq!(asked.len(), 3, "asked: {asked:?}");
+    assert_eq!(asked.first().copied(), Some(super::SERVER_PROMPT));
+    assert_eq!(asked.get(1).copied(), Some(super::ENGINEER_PROMPT));
+
+    // The challenge travels in the TEXT of the code prompt, and the prompt ends
+    // with the question itself so the cursor sits where the engineer types.
+    let code_prompt = asked.get(2).copied().expect("the code is asked for");
     assert!(
-        shown.contains("77-000123M"),
-        "the printed challenge carries the device number: {shown}"
+        code_prompt.ends_with(super::CODE_PROMPT),
+        "the code prompt does not end with its own question: {code_prompt:?}"
+    );
+    assert!(
+        code_prompt.contains("77-000123M"),
+        "the code prompt does not carry the challenge: {code_prompt:?}"
+    );
+    // And a symbol was drawn from it, not only the text: half-block glyphs are
+    // what a camera reads.
+    assert!(
+        code_prompt.contains('█') || code_prompt.contains('▀'),
+        "the code prompt carries no QR: {code_prompt:?}"
+    );
+
+    // Nothing about the attempt goes through `PAM_TEXT_INFO`. On fly-modern an
+    // info message becomes a modal box, and a challenge shown there never
+    // reaches the login screen — which is the whole reason for the change.
+    assert!(
+        conv.shown.iter().all(|shown| !shown.contains("77-000123M")),
+        "the challenge leaked into an info message: {:?}",
+        conv.shown
     );
     // Nothing is ever asked in secret. The key of the device is opened by the
     // device out of a root-only file, so an engineer has no secret to give and
@@ -789,7 +1124,8 @@ fn the_retry_loop_does_not_outlive_the_attempt_budget() {
     let method = ScriptedMethod::with_verdicts(
         std::iter::repeat_with(|| Err(CodeLoginError::Denied)).take(16),
     );
-    let mut conv = ScriptedConversation::new(std::iter::once("op-42").chain(["00000000"; 16]));
+    let mut conv =
+        ScriptedConversation::new(["op-42", ENGINEER].into_iter().chain(["00000000"; 16]));
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -875,6 +1211,49 @@ fn an_answer_past_the_bound_is_refused_without_a_verification() {
 }
 
 #[test]
+fn the_bound_on_an_answer_is_counted_in_bytes_and_not_in_characters() {
+    // The bound belongs to the payload budget, and a budget is spent in bytes.
+    // Counted in characters, sixty-four Cyrillic letters pass the prompt as
+    // "short enough" and are then refused inside the document — which reaches
+    // the engineer as the device breaking rather than as a value being too
+    // long, at the point where the challenge is already being assembled.
+    //
+    // The pair is the test: the same COUNT of characters, refused in one
+    // alphabet and accepted in the other. Either half alone passes on a build
+    // that counts the wrong thing.
+    let limit = super::MAX_SERVER_ID_LEN;
+    let cyrillic: &'static str = Box::leak("я".repeat(limit).into_boxed_str());
+    assert!(cyrillic.chars().count() == limit && cyrillic.len() > limit);
+
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new([cyrillic, ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+    let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
+    assert!(
+        matches!(error, CodeFlowError::Input { .. }),
+        "an answer of {} bytes passed a bound of {limit}: {error:?}",
+        cyrillic.len()
+    );
+    assert!(
+        method.presented.borrow().is_empty(),
+        "an attempt was started on an answer over the bound"
+    );
+
+    // The same number of characters in ASCII is inside the bound and goes
+    // through, so what was refused above is the length in bytes and not the
+    // alphabet.
+    let ascii: &'static str = Box::leak("a".repeat(limit).into_boxed_str());
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new([ascii, ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+    harness
+        .run(&method, &mut conv, &probe, ROLE)
+        .expect("an answer exactly at the bound was refused");
+}
+
+#[test]
 fn an_empty_answer_is_refused() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
@@ -884,6 +1263,41 @@ fn an_empty_answer_is_refused() {
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
 
     assert!(matches!(error, CodeFlowError::Input { .. }));
+}
+
+#[test]
+fn a_personal_number_whose_check_character_does_not_meet_starts_no_attempt() {
+    // Норма ENG-010. A mistyped number would otherwise produce a code that
+    // ALMOST met, and the person debugging that stands at a machine on a site
+    // comparing arithmetic when the answer was a character somebody typed
+    // wrong.
+    //
+    // Three ways to be wrong, and the middle one is the point: the check
+    // character alone is off, everything else about the number is right.
+    for typed in [
+        // A number with no organisation segment at all.
+        "0000014",
+        // The fixture number with its last character changed.
+        "ORG1-0000015",
+        // A device number, which is a well-formed number of the other kind.
+        "77-000123S",
+    ] {
+        let harness = Harness::new();
+        let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+        let mut conv = ScriptedConversation::new(["op-42", typed, RIGHT_CODE]);
+        let probe = ScriptedProbe::at_level(1);
+
+        let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
+
+        assert!(
+            matches!(error, CodeFlowError::Input { .. }),
+            "{typed}: {error:?}"
+        );
+        assert!(
+            method.presented.borrow().is_empty(),
+            "{typed}: an attempt was started on a number that is not one"
+        );
+    }
 }
 
 #[test]
@@ -923,7 +1337,10 @@ fn a_personal_number_the_format_cannot_carry_is_asked_again_not_blamed_on_the_de
 fn a_value_the_format_does_carry_is_not_refused_at_the_prompt() {
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op 42", "Иван Петров", "123456"]);
+    // The server is named by whoever runs it and may be written in any script
+    // the wire form carries. The personal number is a number and is checked as
+    // one, so the Cyrillic value belongs on the first prompt and not the second.
+    let mut conv = ScriptedConversation::new(["Сервер выдачи «Восток»", ENGINEER, "123456"]);
     let probe = ScriptedProbe::at_level(1);
 
     assert!(harness.run(&method, &mut conv, &probe, ROLE).is_ok());

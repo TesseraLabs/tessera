@@ -71,8 +71,8 @@ pub const ALL_ROLES: &str = "*";
 
 /// Characters a ticket number may carry.
 ///
-/// The set is the intersection of what is readable over a telephone and what is
-/// safe in a file name: the ticket number is one component of the receipt file
+/// The set is the intersection of what a person can read off a screen and what is
+/// safe in a file name: the ticket number is one component of a journal file
 /// name, and a component that could carry a path separator would let a document
 /// choose where it is written.
 fn is_number_character(symbol: char) -> bool {
@@ -579,7 +579,9 @@ pub(crate) mod tests {
             match signer {
                 SignerRef::TicketAuthority if message == self.accepted => Ok(()),
                 SignerRef::TicketAuthority => Err(SignatureError::Rejected),
-                SignerRef::Key(_) | SignerRef::Named(_) => Err(SignatureError::UnknownSigner),
+                SignerRef::Key(_) | SignerRef::Named(_) | SignerRef::AuthorisationKey => {
+                    Err(SignatureError::UnknownSigner)
+                }
             }
         }
     }

@@ -34,8 +34,8 @@ use cryptoki::types::Ulong;
 use tessera_codes_contract::key::{KeyAgreement, KeyAgreementError, SharedSecret};
 use tessera_codes_contract::profile::AlgorithmProfile;
 
+use crate::codes::agreement::KeyStorage;
 use crate::codes::agreement::{require_p256, OperatorKey};
-use crate::codes::annex::KeyStorage;
 use crate::pkcs11::{find_slot_in, PinSource, Pkcs11SignError};
 
 /// Length of the shared secret of the P-256 profile, in bytes.

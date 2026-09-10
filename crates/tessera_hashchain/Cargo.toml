@@ -46,7 +46,7 @@ tempfile = { workspace = true }
 # crate's own test targets unless it is asked for here — without this line
 # `cargo test -p tessera_hashchain` does not build, and every guarantee of the
 # chain is checked only under `--all-features`.
-tessera_hashchain = { path = ".", version = "0.5.0", features = ["testing", "file"] }
+tessera_hashchain = { path = ".", version = "0.6.0", features = ["testing", "file"] }
 
 [lints.rust]
 missing_docs = "deny"

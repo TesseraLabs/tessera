@@ -137,7 +137,7 @@ fn expected() -> Vec<Captured> {
         ),
         // The exhausted budget carries the ticket too. It did not always: the
         // field was added so the reconciliation can join this outcome to an
-        // operator receipt on the same key as the other two, and this test is
+        // issuance record on the same key as the other two, and this test is
         // what noticed the schema move.
         code_login(
             "0000031234",

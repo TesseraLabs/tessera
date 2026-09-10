@@ -1,21 +1,32 @@
-//! Login by a one-time code read out over the telephone.
+//! Login by a one-time code the device shows and a server issues.
 //!
-//! The engineer stands at an offline device. The device prints a challenge, the
-//! engineer reads it to an operator, the operator computes a code in their
-//! cabinet and reads it back, the device checks it locally. Nothing in that
-//! sequence needs a network, a site or a clock anybody trusts — which is the
-//! point, because the device this method exists for is the one nobody can reach
-//! any other way.
+//! The engineer stands at a device with no network of its own. The device shows
+//! a challenge on its screen — as a QR, and as the text under it; the engineer
+//! photographs it with their telephone, and the server, which the telephone can
+//! reach and the device cannot, issues a code against a signed request naming
+//! who is asking and why. The engineer types the code in, and the device checks
+//! it locally. Nothing the DEVICE does needs a network, a site or a clock
+//! anybody trusts, which is the point: this method exists for the machine
+//! nobody can reach any other way.
+//!
+//! Until September 2026 the channel was a telephone: the engineer read the
+//! challenge out to an operator, who computed the code in their cabinet and
+//! read it back. That is gone — the operator is no longer a party, the spoken
+//! form of a challenge no longer exists, and the grounds for an issuance live
+//! inside the engineer's signed request instead of in what somebody said aloud.
+//! Named here because the shape of this module still carries the marks of it,
+//! and a reader arriving at "operator ticket" below deserves to know that the
+//! ticket outlived the operator.
 //!
 //! # What this module is, and is not
 //!
 //! It is the device half of the method: assembling the challenge, holding the
-//! one live attempt, checking the operator ticket, deriving the key and
-//! verifying the code. It is not the PAM branch — it prompts for
-//! nothing, prints nothing and returns no PAM code — and it is not the formula:
-//! every byte that both sides have to agree on comes from
-//! [`tessera_codes_contract`], and no serialisation, truncation or key
-//! derivation is written a second time here.
+//! one live attempt, checking the ticket of the issuing side, deriving the key
+//! and verifying the code. It is not the PAM branch — it prompts for nothing,
+//! prints nothing and returns no PAM code — it is not the overlay that draws
+//! the symbol on a graphical login, and it is not the formula: every byte that
+//! both sides have to agree on comes from [`tessera_codes_contract`], and no
+//! serialisation, truncation or key derivation is written a second time here.
 //!
 //! # The two calls
 //!
@@ -23,9 +34,9 @@
 //! it is thin:
 //!
 //! - [`CodeMethod::begin`] starts an attempt and hands back the challenge to
-//!   print;
-//! - [`CodeMethod::verify`] takes the code that was read back and either
-//!   accepts it or refuses.
+//!   show;
+//! - [`CodeMethod::verify`] takes the code that was typed in and either accepts
+//!   it or refuses.
 //!
 //! # Order of the checks
 //!
@@ -40,7 +51,7 @@
 //!
 //! # Where the level ceiling comes from
 //!
-//! From the operator ticket, and from nowhere else. The ticket bounds the
+//! From the ticket of the issuing side, and from nowhere else. The ticket bounds the
 //! linear level the same way the `MAX_INTEGRITY` extension of a certificate
 //! does in the certificate path; a role slice states no such bound, so nothing
 //! on the device is read as one. [`Accepted::level_ceiling`] carries it out to
@@ -71,6 +82,8 @@ pub mod draw;
 pub mod epoch;
 pub mod error;
 pub mod lock;
+pub mod overlay_ipc;
+pub mod qr;
 pub mod roles;
 pub mod state;
 pub mod store;
@@ -135,9 +148,39 @@ pub struct CodesConfig {
     pub device_scope: DeviceScope,
     /// Local lifetime of a printed challenge.
     pub code_ttl: Duration,
+    /// Address of the engineer's page shown in front of the challenge.
+    ///
+    /// One of the addresses the enrollment package delivered, checked while the
+    /// configuration was loaded. `None` when the fleet published no page: the
+    /// device then shows the challenge alone, which still scans.
+    pub page_url: Option<String>,
     /// Path to the GOST engine, forwarded to the key container.
     pub gost_engine_path: Option<PathBuf>,
+    /// How the QR is put on the screen of a graphical login.
+    ///
+    /// [`None`] on every device that has no display manager, and on every
+    /// login over ssh. Nothing about it can change the verdict of an attempt:
+    /// the challenge travels in the prompt either way, and the overlay is the
+    /// better case on top of that, never a condition of it.
+    pub overlay: Option<OverlaySettings>,
 }
+
+/// What the device needs in order to start the QR overlay of a graphical login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlaySettings {
+    /// The account the overlay runs as — the greeter's.
+    ///
+    /// Named rather than guessed. The module starts a process as this account
+    /// and hands it the socket of an attempt; a device that had to work out for
+    /// itself whose screen it was drawing on would be a device that sometimes
+    /// worked it out wrong.
+    pub user: String,
+    /// Where the overlay binary lives.
+    pub binary: PathBuf,
+}
+
+/// Where the package installs the overlay.
+pub const DEFAULT_OVERLAY_BINARY: &str = "/usr/bin/tessera-qr-overlay";
 
 /// What the engineer is asking for.
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +189,13 @@ pub struct AttemptRequest<'a> {
     pub role_id: &'a str,
     /// Integrity level being asked for.
     pub level: Level,
-    /// Operator on the telephone, as they named themselves.
+    /// The issuing server this attempt is for, as the engineer named it.
+    ///
+    /// It names which server is expected to cut the code, and it goes into the
+    /// signed challenge so that the server can see whether the attempt was
+    /// meant for it. The device checks nothing about the value: an offline
+    /// device holds no register of servers, and what the two sides have to
+    /// agree on is the bytes.
     pub server_id: &'a str,
     /// Personal number of the engineer at the device, as they gave it.
     ///
@@ -226,10 +275,21 @@ impl StartedAttempt {
         &self.signed
     }
 
-    /// Returns the challenge in the grouped form it is read aloud in.
+    /// Returns the payload a device shows: the page address, `#`, and the
+    /// signed challenge.
+    ///
+    /// One rendering and no other. The grouped form this used to have existed
+    /// for a person reading the challenge out over a telephone; the channel has
+    /// nobody in that place any more, and a second spelling of one document
+    /// drifts from the first.
+    ///
+    /// The address comes from the configuration, which took it from the list
+    /// the fleet delivered — see [`crate::codes::store::page_url_is_allowed`].
+    /// Nothing here composes one, and `None` is a fleet that published no page:
+    /// the document alone still scans.
     #[must_use]
-    pub fn spoken_form(&self) -> String {
-        self.signed.spoken_form()
+    pub fn payload(&self, base_url: Option<&str>) -> String {
+        self.signed.payload(base_url)
     }
 
     /// Returns the number of the ticket the operator is working under.
@@ -267,8 +327,8 @@ impl StartedAttempt {
 /// daemon — any of which can refuse, and the strict monitoring mode does. An
 /// event written here would record a successful login for an attempt that ends
 /// in a PAM refusal, and the reconciliation an auditor performs is precisely
-/// between the logins a fleet saw and the receipts its operators wrote: a
-/// success that never happened makes an operator receipt look paired when it
+/// between the logins a fleet saw and the issuances its server recorded: a
+/// success that never happened makes an issuance record look paired when it
 /// is not.
 ///
 /// So the success event is the caller's to emit, once nothing is left that can
@@ -315,6 +375,17 @@ pub struct CodeMethod {
 }
 
 impl CodeMethod {
+    /// Returns the address of the engineer's page this device shows.
+    ///
+    /// Read off the configuration, which checked it against the list the
+    /// enrollment package delivered while it was being loaded. The method does
+    /// not check it again and must not: a second place that decided which
+    /// addresses are allowed would be a second answer.
+    #[must_use]
+    pub fn page_url(&self) -> Option<&str> {
+        self.config.page_url.as_deref()
+    }
+
     /// Opens the method against the artefacts of the device.
     ///
     /// The ticket set, its revocation list and the trust anchor are read here,

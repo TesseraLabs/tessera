@@ -85,17 +85,13 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use tessera_codes_contract::canon::Level;
 #[cfg(unix)]
-use tessera_codes_contract::challenge::{Challenge, ChallengeFields, SignedChallenge};
+use tessera_codes_contract::challenge::{Challenge, SignedChallenge};
 #[cfg(unix)]
 use tessera_codes_contract::code::compute_code;
 #[cfg(unix)]
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
 #[cfg(unix)]
-use tessera_codes_contract::key::{
-    derive_key, EphemeralPublicPoint, Epoch, KeyAgreement as _, KeyContext,
-};
-#[cfg(unix)]
-use tessera_codes_contract::nonce::Nonce;
+use tessera_codes_contract::key::{derive_key, Epoch, KeyAgreement as _, KeyContext};
 #[cfg(unix)]
 use tessera_codes_contract::params::{FleetParams, FleetParamsInput};
 #[cfg(unix)]
@@ -140,8 +136,13 @@ const ROLE: &str = "oper";
 const SERVER: &str = "op-42";
 
 /// The personal number the engineer gives at the device.
+///
+/// A number of the shape the format names — organisation segment, serial part,
+/// check character — because the device refuses anything else before it starts
+/// an attempt. The fixture used to carry `eng-1`, which no fleet would issue,
+/// and a branch tested against it was tested against a value the rule forbids.
 #[cfg(unix)]
-const ENGINEER: &str = "eng-1";
+const ENGINEER: &str = "ORG1-0000014";
 
 /// The level the fixture logs in at.
 #[cfg(unix)]
@@ -245,6 +246,7 @@ impl LiveFixture {
         .unwrap();
 
         let config = CodesConfig {
+            page_url: Some("https://codes.fleet.example/e".to_owned()),
             paths,
             params,
             device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
@@ -255,6 +257,7 @@ impl LiveFixture {
             },
             code_ttl: Duration::from_mins(5),
             gost_engine_path: None,
+            overlay: None,
         };
 
         let roles_dir = dir.path().join("roles");
@@ -300,6 +303,9 @@ impl LiveFixture {
 
     fn deps(&self) -> CodeDeps<'_> {
         CodeDeps {
+            // These tests exercise the channel on real artefacts; a device with
+            // no graphical login is the case they stand for.
+            overlay: &super::NoOverlay,
             config: &self.config,
             store: &self.store,
             accounts: AccountCheck::from_store(&self.store),
@@ -363,40 +369,25 @@ fn sign_ticket(authority: &PKey<Private>, operator_point: Vec<u8>) -> SignedTick
     SignedTicket::new(ticket, Signature::new(raw).unwrap())
 }
 
-/// Rebuilds a signed challenge out of the text the branch printed.
+/// Rebuilds a signed challenge out of the text the branch showed.
 ///
-/// The spoken form is nine fields separated by ` / `, with the device number
-/// and the nonce broken into groups of three for reading aloud, and the
-/// ephemeral point of the attempt and the signature of the device each in one
-/// run of hexadecimal. Everything the issuing side needs is in there and
-/// nothing else is: this function is the whole of what the cabinet — or an e2e
-/// helper scraping `PAM_TEXT_INFO` — has to do.
+/// The device shows one line: the wire form of the signed challenge, signature
+/// included. Reading it back is a call to the parser of the contract and
+/// nothing else — this function is the whole of what the engineer's side, or an
+/// e2e helper scraping the prompt, has to do. It used to be a hand-written
+/// splitter over a form meant to be read aloud, and that was a second reader of
+/// one document.
 #[cfg(unix)]
-fn challenge_from_spoken(spoken: &str, params: FleetParams) -> SignedChallenge {
-    let line = spoken.lines().next_back().unwrap_or(spoken);
-    let fields: Vec<&str> = line.split(" / ").collect();
-    let [device, epoch, nonce, role, level, operator, engineer, ephemeral, signature] =
-        <[&str; 9]>::try_from(fields.as_slice())
-            .unwrap_or_else(|_| panic!("unexpected spoken form: {line}"));
-    let ungrouped = |text: &str| text.replace(' ', "");
-
-    let challenge = Challenge::new(ChallengeFields {
-        device_number: CheckedDeviceNumber::parse(&ungrouped(device)).unwrap(),
-        epoch: Epoch::new(epoch.parse().unwrap()),
-        nonce: Nonce::parse(&ungrouped(nonce), &params).unwrap(),
-        role_id: role,
-        level: Level::new(level.parse().unwrap()),
-        server_id: operator,
-        engineer_id: engineer,
-        ephemeral_point: EphemeralPublicPoint::new(hex::decode(ungrouped(ephemeral)).unwrap())
-            .unwrap(),
-    })
-    .unwrap();
-
-    SignedChallenge::new(
-        challenge,
-        Signature::new(hex::decode(ungrouped(signature)).unwrap()).unwrap(),
-    )
+fn challenge_from_payload(payload: &str, params: FleetParams) -> SignedChallenge {
+    let line = payload
+        .lines()
+        .find(|line| line.contains("tessera-codes/v1/signed-challenge;"))
+        .unwrap_or_else(|| panic!("no challenge in what the branch showed: {payload}"));
+    let start = line
+        .find("tessera-codes/v1/signed-challenge;")
+        .unwrap_or_default();
+    SignedChallenge::parse(line[start..].trim(), &params)
+        .unwrap_or_else(|error| panic!("the branch showed no challenge: {error}"))
 }
 
 /// A device standing at [`LEVEL`] whose boot markers never move.
@@ -458,12 +449,10 @@ impl<'a> Engineer<'a> {
 #[cfg(unix)]
 impl CodeConversation for Engineer<'_> {
     #[cfg(unix)]
-    fn show_info(&mut self, message: &str) {
-        if let Some(rest) = message.strip_prefix("Передайте выдающей стороне:\n")
-        {
-            *self.printed.borrow_mut() =
-                Some(challenge_from_spoken(rest, self.fixture.config.params));
-        }
+    fn show_info(&mut self, _message: &str) {
+        // Nothing of the attempt arrives this way any more, and that is the
+        // point of the change: on fly-modern an info message becomes a modal
+        // box the engineer never reads the challenge out of.
     }
 
     #[cfg(unix)]
@@ -473,6 +462,13 @@ impl CodeConversation for Engineer<'_> {
         }
         if prompt == super::ENGINEER_PROMPT {
             return Ok(ENGINEER.to_owned());
+        }
+        // The challenge travels in the TEXT of the code prompt. Reading it here
+        // is what an engineer does with their eyes and a telephone camera, and
+        // it is the only channel that reaches every front end.
+        if prompt.contains("tessera-codes/v1/signed-challenge;") {
+            *self.printed.borrow_mut() =
+                Some(challenge_from_payload(prompt, self.fixture.config.params));
         }
         let Some(next) = self.script.borrow_mut().pop_front() else {
             // The engineer gave up rather than keep typing.
@@ -984,7 +980,7 @@ fn a_code_typed_in_the_groups_it_was_dictated_in_is_accepted() {
 ///
 /// The record of a successful login is not a report about the session — it is
 /// part of granting it. The control over an operator of the telephone channel
-/// is the reconciliation between the logins a fleet saw and the receipts its
+/// is the reconciliation between the logins a fleet saw and the issuances its
 /// operators wrote, so a session that reached no journal is precisely the
 /// session an operator with something to hide would want.
 ///

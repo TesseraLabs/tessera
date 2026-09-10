@@ -829,7 +829,9 @@ pub(crate) mod tests {
                 SignerRef::Key(_) => (&self.possession, 0x01_u8),
                 SignerRef::Named("acme") => (&self.organisation, 0x02),
                 SignerRef::Named(_) => (&self.owner, 0x03),
-                SignerRef::TicketAuthority => return Err(SignatureError::UnknownSigner),
+                SignerRef::TicketAuthority | SignerRef::AuthorisationKey => {
+                    return Err(SignatureError::UnknownSigner)
+                }
             };
             if message != expected_message.as_slice() {
                 return Err(SignatureError::Rejected);

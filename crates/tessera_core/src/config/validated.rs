@@ -806,7 +806,144 @@ fn validate_audit(raw: &RawAudit, codes: &RawCodes) -> AuditSection {
 /// Default location of the device's audit journal.
 const DEFAULT_AUDIT_FILE: &str = "/var/lib/tessera/audit.ndjson";
 
-/// Validate the `[codes]` section — the device half of the code login method.
+/// The overlay settings of a graphical login, if the fleet named an account.
+///
+/// The account is what decides whether there is an overlay at all. A binary
+/// path without an account is a configuration that says where to find something
+/// it never says to run, and answering that with silence would leave whoever
+/// wrote it waiting for a QR that is never going to appear.
+fn validate_overlay(raw: &RawCodes) -> Result<Option<crate::codes::OverlaySettings>, Error> {
+    let Some(user) = raw.overlay_user.as_deref() else {
+        if raw.overlay_binary.is_some() {
+            return Err(Error::ConfigInvalid {
+                reason: "[codes].overlay_binary is set without [codes].overlay_user: the overlay \
+                         runs as the account of the greeter, and a device that was not told which \
+                         account never starts it"
+                    .into(),
+            });
+        }
+        return Ok(None);
+    };
+    codes_text("[codes].overlay_user", user)?;
+
+    let binary = raw
+        .overlay_binary
+        .as_deref()
+        .unwrap_or(crate::codes::DEFAULT_OVERLAY_BINARY);
+    if !std::path::Path::new(binary).is_absolute() {
+        return Err(Error::ConfigInvalid {
+            reason: format!(
+                "[codes].overlay_binary `{binary}` is not an absolute path: a relative one is \
+                 resolved against whatever directory the login process happens to be in"
+            ),
+        });
+    }
+
+    Ok(Some(crate::codes::OverlaySettings {
+        user: user.to_owned(),
+        binary: std::path::PathBuf::from(binary),
+    }))
+}
+
+/// The address of the engineer's page, checked against what the fleet delivered.
+///
+/// [`None`] when the fleet published no page, which is legitimate: the device
+/// then shows the challenge alone and it still scans.
+///
+/// Split out of [`validate_codes`] because it is a decision of its own and
+/// reads a file to make it — and because the function it came from was already
+/// long enough that a reader stopped seeing where one check ended and the next
+/// began.
+///
+/// # Errors
+///
+/// [`Error::ConfigInvalid`] for an address that carries a fragment or a query
+/// of its own, is not `https`, is wider than the payload budget reserves, or is
+/// not one of the addresses the enrolment package delivered.
+fn validate_page_url(
+    raw: &RawCodes,
+    paths: &crate::codes::CodesPaths,
+) -> Result<Option<String>, Error> {
+    // The address is checked against the list the enrollment package delivered,
+    // and it is checked HERE — while the configuration is being loaded, before
+    // the device offers the method at all. A device that came up with an
+    // address outside the list and refused only at the moment of a login is
+    // already standing in a fleet, looking healthy, sending whoever logs in to
+    // whatever page its configuration names.
+    match raw.page_url.as_deref() {
+        Some(url) => {
+            codes_text("[codes].page_url", url)?;
+            // No fragment and no query, and the reason is not tidiness: the
+            // payload is `base #  document`, so an address that already carries
+            // a `#` makes the challenge part of somebody else's fragment — the
+            // route of a single-page application, say — and the engineer's page
+            // reads a document that stops at the first separator. A `?` is
+            // refused beside it: fields of an attempt must never reach a server
+            // in the query, and an address that opens one invites exactly that.
+            if let Some(symbol) = url.chars().find(|symbol| matches!(symbol, '#' | '?')) {
+                return Err(Error::ConfigInvalid {
+                    reason: format!(
+                        "[codes].page_url carries `{symbol}`: the payload puts the signed \
+                         challenge in the fragment, so an address with a fragment or a query of \
+                         its own would swallow it — the page would read a document that stops at \
+                         the first separator"
+                    ),
+                });
+            }
+            // `https` and nothing else. The QR sends an engineer to this
+            // address with a telephone that is not on the fleet's network, and
+            // over plain http the whole exchange — the challenge in the
+            // fragment included — is readable and rewritable by whoever carries
+            // the traffic. The allowlist below says the fleet published the
+            // address; only the scheme says the connection to it is protected.
+            if !url.starts_with("https://") {
+                return Err(Error::ConfigInvalid {
+                    reason: format!(
+                        "[codes].page_url `{url}` is not https: an engineer opens it from a \
+                         telephone on somebody else's network, and over plain http the page and \
+                         everything it is given can be read and rewritten in transit"
+                    ),
+                });
+            }
+            if url.len() > tessera_codes_contract::challenge::MAX_BASE_URL_BYTES {
+                return Err(Error::ConfigInvalid {
+                    reason: format!(
+                        "[codes].page_url is {} bytes, over the {} the payload budget reserves \
+                         for it: a wider address draws a QR a telephone cannot resolve",
+                        url.len(),
+                        tessera_codes_contract::challenge::MAX_BASE_URL_BYTES
+                    ),
+                });
+            }
+            let allowed =
+                crate::codes::store::load_page_urls(&paths.page_urls).map_err(|error| {
+                    Error::ConfigInvalid {
+                        reason: format!(
+                        "[codes].page_url is set, but the list of addresses the fleet delivered \
+                         could not be read from {}: {error}",
+                        paths.page_urls.display()
+                    ),
+                    }
+                })?;
+            if !crate::codes::store::page_url_is_allowed(&allowed, url) {
+                return Err(Error::ConfigInvalid {
+                    reason: format!(
+                        "[codes].page_url `{url}` is not one of the {} addresses the enrollment \
+                         package delivered in {}: a device shows an address its fleet published \
+                         and composes none of its own, so an engineer scanning this QR cannot be \
+                         sent to a page nobody vouched for",
+                        allowed.len(),
+                        paths.page_urls.display()
+                    ),
+                });
+            }
+            Ok(Some(url.to_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Validates the `[codes]` section — the device half of the code login method.
 ///
 /// The section is validated whether or not it is enabled: a device number with
 /// a wrong check character is a typo an operator must see at load, not on the
@@ -847,6 +984,25 @@ fn validate_codes(
     let device_number = match raw.device_number.as_deref() {
         Some(text) => {
             codes_text("[codes].device_number", text)?;
+            // Bounded by what the PAYLOAD reserves, and counted on the number as
+            // it is WRITTEN. The budget assertion of the contract counts the
+            // folded form, and the wire carries the raw one: a number printed
+            // `7-7-0-0-0-1-2-3-S` folds to nine characters and travels as
+            // seventeen. It passed the general text bound of this file, which
+            // is a hundred and twenty-eight, and pushed the QR past the version
+            // a telephone can resolve — on a device that had accepted its
+            // configuration happily, at every login.
+            if text.len() > tessera_codes_contract::challenge::MAX_DEVICE_NUMBER_BYTES {
+                return Err(Error::ConfigInvalid {
+                    reason: format!(
+                        "[codes].device_number is {} bytes as written, over the {} the payload \
+                         budget reserves for it: the separators travel with the number, and a \
+                         wider one draws a QR a telephone cannot resolve",
+                        text.len(),
+                        tessera_codes_contract::challenge::MAX_DEVICE_NUMBER_BYTES
+                    ),
+                });
+            }
             Some(
                 CheckedDeviceNumber::parse(text).map_err(|error| Error::ConfigInvalid {
                     reason: format!(
@@ -881,6 +1037,8 @@ fn validate_codes(
         });
     }
 
+    let page_url = validate_page_url(raw, &paths)?;
+
     let (Some(device_number), Some(epoch), Some(region)) =
         (device_number, raw.epoch, raw.region.clone())
     else {
@@ -911,7 +1069,9 @@ fn validate_codes(
                 region,
             },
             code_ttl,
+            page_url,
             gost_engine_path,
+            overlay: validate_overlay(raw)?,
         }),
         paths,
     })
@@ -2366,6 +2526,170 @@ mod tests {
         }
     }
 
+    /// A `[codes]` block whose artefacts directory carries a list of addresses.
+    ///
+    /// Returned with the directory alive: dropping it takes the file with it,
+    /// and a test that let it go would be checking the "no list" path while
+    /// claiming to check the allowlist.
+    fn codes_with_addresses(addresses: &str) -> (tempfile::TempDir, RawCodes) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::codes::CodesPaths::under(dir.path());
+        std::fs::write(&paths.page_urls, addresses).unwrap();
+        let raw = RawCodes {
+            dir: Some(dir.path().to_path_buf()),
+            ..enabled_codes()
+        };
+        (dir, raw)
+    }
+
+    #[test]
+    fn an_address_the_fleet_never_published_is_refused_at_load() {
+        // The control this exists for: a device shows an address its fleet
+        // published and composes none of its own. Refused while the
+        // configuration is being LOADED — a device that came up with such an
+        // address and refused only at a login is already standing in a fleet,
+        // looking healthy, sending whoever logs in to whatever it names.
+        let (_dir, mut raw) = codes_with_addresses("https://codes.fleet.example/e\n");
+        raw.page_url = Some("https://somewhere.else.example/e".to_owned());
+
+        let refused = validate_codes(&raw, None);
+        let Err(Error::ConfigInvalid { reason }) = refused else {
+            unreachable!("an address outside the list was accepted: {refused:?}")
+        };
+        assert!(
+            reason.contains("not one of"),
+            "refused for the wrong reason: {reason}"
+        );
+
+        // And the address that IS in the list passes, so the check refuses the
+        // address rather than the feature.
+        raw.page_url = Some("https://codes.fleet.example/e".to_owned());
+        assert_eq!(
+            validate_codes(&raw, None)
+                .unwrap()
+                .method
+                .unwrap()
+                .page_url
+                .as_deref(),
+            Some("https://codes.fleet.example/e")
+        );
+    }
+
+    #[test]
+    fn an_address_that_is_not_https_is_refused_at_load() {
+        // The engineer opens it from a telephone on somebody else's network.
+        // Over plain http the page and everything it is given can be read and
+        // rewritten in transit, and the allowlist below says only that the
+        // fleet published the address — not that the connection to it is
+        // protected.
+        //
+        // The list carries the very address being refused, so the only thing
+        // wrong with it is the scheme.
+        let (_dir, mut raw) = codes_with_addresses("http://codes.fleet.example/e\n");
+        raw.page_url = Some("http://codes.fleet.example/e".to_owned());
+
+        let refused = validate_codes(&raw, None);
+        let Err(Error::ConfigInvalid { reason }) = refused else {
+            unreachable!("a plain http address was accepted: {refused:?}")
+        };
+        assert!(
+            reason.contains("not https"),
+            "refused for the wrong reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_device_that_names_no_overlay_account_gets_no_overlay() {
+        // The ordinary case, and it has to be the quiet one: every device
+        // without a display manager and every login over ssh arrives here.
+        let raw = enabled_codes();
+        let section = validate_codes(&raw, None).unwrap();
+        assert!(section.method.unwrap().overlay.is_none());
+    }
+
+    #[test]
+    fn an_overlay_binary_without_an_account_is_refused_at_load() {
+        // A configuration that says where to find something it never says to
+        // run. Answering it with silence would leave whoever wrote it waiting
+        // for a QR that is never going to appear, on a device that looks
+        // healthy.
+        let mut raw = enabled_codes();
+        raw.overlay_binary = Some("/usr/bin/tessera-qr-overlay".to_owned());
+        assert!(matches!(
+            validate_codes(&raw, None),
+            Err(Error::ConfigInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn a_relative_overlay_binary_is_refused_at_load() {
+        // Resolved against whatever directory the login process happens to be
+        // in, which on a PAM module is not a directory anybody chose.
+        let mut raw = enabled_codes();
+        raw.overlay_user = Some("fly-dm".to_owned());
+        raw.overlay_binary = Some("tessera-qr-overlay".to_owned());
+        assert!(matches!(
+            validate_codes(&raw, None),
+            Err(Error::ConfigInvalid { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_overlay_account_alone_is_enough_and_takes_the_installed_binary() {
+        let mut raw = enabled_codes();
+        raw.overlay_user = Some("fly-dm".to_owned());
+        let overlay = validate_codes(&raw, None)
+            .unwrap()
+            .method
+            .unwrap()
+            .overlay
+            .expect("naming the account is what turns the overlay on");
+        assert_eq!(overlay.user, "fly-dm");
+        assert_eq!(
+            overlay.binary,
+            std::path::PathBuf::from(crate::codes::DEFAULT_OVERLAY_BINARY)
+        );
+    }
+
+    #[test]
+    fn a_page_url_with_a_fragment_or_a_query_is_refused_at_load() {
+        // The payload is `address # document`. An address that already carries
+        // a `#` — the route of a single-page application, say — swallows the
+        // challenge into somebody else's fragment, and the engineer's page
+        // reads a document that stops at the first separator. A `?` is refused
+        // beside it: fields of an attempt must never reach a server in a query.
+        //
+        // Refused while the configuration is being LOADED, not when the QR is
+        // drawn: a device that came up with such an address is already standing
+        // in a fleet, looking healthy.
+        for url in [
+            "https://codes.fleet.example/e#/route",
+            "https://codes.fleet.example/e?tenant=1",
+        ] {
+            let mut raw = enabled_codes();
+            raw.page_url = Some(url.to_owned());
+            let refused = validate_codes(&raw, None);
+            assert!(
+                matches!(refused, Err(Error::ConfigInvalid { .. })),
+                "`{url}` was accepted: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_url_wider_than_the_budget_is_refused_at_load() {
+        // The budget of the payload reserves sixty-four bytes for the address.
+        // Past it the QR draws modules a telephone cannot resolve — and it
+        // draws them, which is the failure that costs an engineer a trip.
+        let mut raw = enabled_codes();
+        raw.page_url = Some(format!("https://{}.example/e", "a".repeat(80)));
+        assert!(matches!(
+            validate_codes(&raw, None),
+            Err(Error::ConfigInvalid { .. })
+        ));
+    }
+
     #[test]
     fn an_absent_codes_section_does_not_offer_the_method() {
         let section = validate_codes(&RawCodes::default(), None).unwrap();
@@ -2388,6 +2712,50 @@ mod tests {
             .paths
             .device_key_container
             .starts_with(crate::codes::store::DEFAULT_CODES_DIR));
+    }
+
+    #[test]
+    fn a_device_number_stretched_with_separators_is_refused_at_load() {
+        // The payload budget reserves sixteen bytes for the number, and it
+        // counts the FOLDED form — but the wire carries the number as it was
+        // written, separators and all. A number printed `7-7-0-0-0-1-2-3-S`
+        // folds to nine characters and travels as seventeen: it passed the
+        // budget assertion and the general text bound, and pushed the QR past
+        // the version a telephone can resolve.
+        //
+        // The failure that made this worth catching here: it showed up at
+        // EVERY login, on a device that had accepted its configuration
+        // happily, as a QR that would not scan.
+        let mut raw = enabled_codes();
+        raw.device_number = Some(
+            tessera_codes_contract::device_number::CheckedDeviceNumber::from_body(
+                "7-7-0-0-0-1-2-3-",
+            )
+            .unwrap()
+            .as_str()
+            .to_owned(),
+        );
+
+        let refused = validate_codes(&raw, None);
+        let Err(Error::ConfigInvalid { reason }) = refused else {
+            unreachable!("a number wider than the payload reserves was accepted: {refused:?}")
+        };
+        assert!(
+            reason.contains("payload budget"),
+            "refused for the wrong reason: {reason}"
+        );
+
+        // A number of exactly the reserved width still passes, so the bound is
+        // a bound and not a refusal of separators.
+        raw.device_number = Some(
+            tessera_codes_contract::device_number::CheckedDeviceNumber::from_body(
+                "ru-77 / dc-01.4",
+            )
+            .unwrap()
+            .as_str()
+            .to_owned(),
+        );
+        assert!(validate_codes(&raw, None).is_ok());
     }
 
     #[test]
@@ -2563,7 +2931,7 @@ mod tests {
     fn the_journal_follows_the_code_method_unless_the_section_says_otherwise() {
         // Documented in `dist/config/config.toml.example`, so it needs a test:
         // control over the operator of the telephone channel rests on
-        // reconciling the logins a device saw against the receipts its
+        // reconciling the logins a device saw against the issuances its
         // operators wrote, and a device offering the method without a journal
         // cannot discover that about itself — every login looks fine locally
         // and nothing can be paired afterwards.

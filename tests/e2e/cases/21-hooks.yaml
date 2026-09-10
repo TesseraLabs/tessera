@@ -9,7 +9,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: HOOK-001
     title: Хук стадии открытия сессии запускается и его исход виден в журнале
-    requirement: openspec/specs/hooks/spec.md
+    requirement: spec9:runtime.HOOK-004
     requires: [usb]
     steps:
       - run: rm -f /tmp/tessera-e2e-hook-ran
@@ -33,7 +33,7 @@ cases:
 
   - id: HOOK-002
     title: Хук с неабсолютным путём отвергается при загрузке конфигурации
-    requirement: openspec/specs/hooks/spec.md
+    requirement: spec9:runtime.HOOK-002
     requires: []
     # Путь берётся буквально и не ищется по PATH: иначе подсунутый в PATH
     # исполняемый файл выполнялся бы с правами продукта в момент входа.

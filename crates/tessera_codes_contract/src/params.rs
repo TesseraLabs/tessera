@@ -1,4 +1,4 @@
-//! Fleet parameters of the phone channel.
+//! Fleet parameters of the channel.
 //!
 //! The parameters are checked where they are parsed, not where they are used:
 //! otherwise "only stricter" gets verified in the cabinet and forgotten on the

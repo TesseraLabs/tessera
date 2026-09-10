@@ -113,6 +113,7 @@ impl Fixture {
         .unwrap();
 
         let config = CodesConfig {
+            page_url: Some("https://codes.fleet.example/e".to_owned()),
             paths,
             params,
             device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
@@ -123,6 +124,7 @@ impl Fixture {
             },
             code_ttl: DEFAULT_CODE_TTL,
             gost_engine_path: None,
+            overlay: None,
         };
 
         Self {
@@ -258,8 +260,18 @@ fn a_dictated_code_admits_the_engineer() {
     let boot = markers("boot-a", 100);
     let (method, mut attempt) = start(&fixture, 1, &boot);
 
-    // What the engineer reads out, and what the operator reads back.
-    assert!(attempt.spoken_form().contains(' '));
+    // What the device shows and what the engineer's side reads: the address of
+    // the page, then the whole signed challenge in the fragment. Nothing of the
+    // attempt before the `#` — that half is what a server sees when the page is
+    // fetched.
+    let payload = attempt.payload(method.page_url());
+    let (base, fragment) = payload.split_once('#').unwrap();
+    assert_eq!(base, "https://codes.fleet.example/e");
+    assert!(fragment.starts_with("tessera-codes/v1/signed-challenge;"));
+    // And without an address the document travels alone, and still scans.
+    assert!(attempt
+        .payload(None)
+        .starts_with("tessera-codes/v1/signed-challenge;"));
     assert_eq!(attempt.ticket_number(), "tk-17");
     let code = fixture.cabinet_code(attempt.challenge());
 
@@ -730,6 +742,7 @@ fn a_device_without_artefacts_does_not_offer_the_method() {
     let dir = tempfile::tempdir().unwrap();
     let paths = CodesPaths::under(dir.path());
     let config = CodesConfig {
+        page_url: Some("https://codes.fleet.example/e".to_owned()),
         paths,
         params: FleetParams::defaults(),
         device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
@@ -740,6 +753,7 @@ fn a_device_without_artefacts_does_not_offer_the_method() {
         },
         code_ttl: DEFAULT_CODE_TTL,
         gost_engine_path: None,
+        overlay: None,
     };
     assert!(matches!(
         CodeMethod::open(config, LocalRoles::default()),
@@ -932,8 +946,8 @@ fn a_code_that_meets_emits_no_success_event_of_its_own() {
     // integrity level, fixes the role payload and registers the session, and
     // any of those can refuse. An event written here would record a successful
     // login for an attempt that ends in a PAM refusal, and the reconciliation
-    // this event exists for — logins against operator receipts — would then
-    // pair a receipt with a login that never happened.
+    // this event exists for — logins against issuance records — would then
+    // pair an issuance with a login that never happened.
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
     let (method, mut attempt) = start(&fixture, 1, &boot);
@@ -1213,10 +1227,10 @@ fn a_login_clears_the_run_of_failures_behind_it() {
 
 #[test]
 fn a_refused_code_names_the_ticket_it_was_refused_under() {
-    // A login and an operator receipt are reconciled by the ticket number and
-    // the nonce. A refusal that names neither cannot be paired with the receipt
+    // A login and an issuance record are reconciled by the ticket number and
+    // the nonce. A refusal that names neither cannot be paired with the record
     // of the call it belongs to, and the pairing is the whole point of writing
-    // refusals down: a login without a receipt and a receipt without a login
+    // refusals down: a login without an issuance and an issuance without a login
     // are both alarms.
     let fixture = Fixture::new();
     let boot = markers("boot-a", 100);
@@ -1366,6 +1380,7 @@ fn the_method_reports_the_epoch_it_is_running_under_not_the_configured_one() {
 fn a_platform_without_posix_permissions_offers_no_code_method() {
     let dir = tempfile::tempdir().unwrap();
     let config = CodesConfig {
+        page_url: Some("https://codes.fleet.example/e".to_owned()),
         paths: CodesPaths::under(dir.path()),
         params: FleetParams::defaults(),
         device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
@@ -1376,6 +1391,7 @@ fn a_platform_without_posix_permissions_offers_no_code_method() {
         },
         code_ttl: DEFAULT_CODE_TTL,
         gost_engine_path: None,
+        overlay: None,
     };
 
     assert!(matches!(

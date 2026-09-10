@@ -351,12 +351,18 @@ update_wallpaper = false
 # template_ru          = "Устройство %n  host_id={host_id_short} ({source})"
 # template_en          = "Device %n  host_id={host_id_short} ({source})"
 
-# --- Code login (telephone channel) ------------------------------------------
-# The device prints a challenge, the engineer reads it to an operator over the
-# telephone, the operator computes a code in their cabinet and reads it back,
-# the device verifies it locally. No network, no site, no trusted clock — which
-# is the point: this is the method for the device nobody can reach any other
-# way.
+# --- Code login (server channel) ---------------------------------------------
+# The device shows a challenge on its screen — as a QR, and as the text under
+# it. The engineer photographs it with a telephone, which reaches the issuing
+# server the device cannot; the server issues a code against a signed request
+# naming who is asking and why; the engineer types the code in and the device
+# verifies it locally. Nothing THIS DEVICE does needs a network, a site or a
+# trusted clock, which is the point: this is the method for the machine nobody
+# can reach any other way.
+#
+# Until September 2026 the channel was a telephone and the code came from an
+# operator's cabinet. That is gone — there is no operator in the channel any
+# more — and a configuration written for it does not describe this method.
 #
 # The artefacts the method needs (the device key container, the operator ticket
 # set, its revocation list and the ticket anchor) are NOT configured here. They
@@ -386,7 +392,11 @@ enabled = false
 # Where the artefacts and the nonce state live. Absolute path. Default:
 # dir = "/var/lib/tessera/codes"
 # Number of THIS device including its check character, exactly as printed on
-# the device label and read aloud. Required when enabled.
+# the device label. Required when enabled. At most 16 bytes AS WRITTEN: the
+# separators travel with the number into the QR, and the payload budget reserves
+# that much for it — a number stretched with separators draws a symbol a
+# telephone cannot resolve, and it would do so at every login on a device whose
+# configuration had loaded without a word.
 # device_number = "77-000123S"
 # Key epoch of this device. Required when enabled. It is a declaration, not the
 # authority: the number written beside the key at import wins, and a
@@ -441,6 +451,40 @@ enabled = false
 # still open. Default false — an unconfirmed profile does not validate, and
 # silence is not consent.
 # accept_unconfirmed_profile = false
+# Address of the engineer's page the QR points at. Absent means the device shows
+# the challenge alone, which still scans: the address is navigation, the fragment
+# is the channel.
+#
+# It MUST be one of the addresses the enrolment package delivered — the device
+# composes no address of its own. The package carries them under
+# `[codes].page_urls` of its manifest; the import writes them beside the
+# artefacts as `page-urls.txt`. An address that is not in that list is refused
+# when this file is LOADED, not when the QR is drawn: a device that came up with
+# such an address is already standing in a fleet, looking healthy.
+#
+# No query and no fragment of its own: the payload is `address # document`, and
+# an address that already carries a `#` swallows the challenge into somebody
+# else's fragment.
+# page_url = "https://codes.fleet.example/e"
+# The account the QR overlay of a GRAPHICAL login runs as — the greeter's.
+# Absent means no overlay, which is what every device without a display manager
+# does and what every device does over ssh: the challenge is shown in the
+# prompt and nothing else happens.
+#
+# Nothing about the overlay can change whether a login succeeds. It is started
+# for the length of one attempt, handed one payload over a socket of its own,
+# and stopped when the attempt ends; if it does not come up — no display, no
+# X server, no such account, a binary nobody installed — the login proceeds
+# exactly as it would have without it. The text path is the base one.
+#
+# The account is named rather than guessed: the module starts a process as it
+# and gives that process the socket of an attempt, and neither is something to
+# work out by looking around.
+# overlay_user = "fly-dm"
+# Where the overlay binary lives. Absolute path. Default: the path the package
+# installs. Setting this without `overlay_user` is refused when the file is
+# loaded — it would say where to find something the device is never told to run.
+# overlay_binary = "/usr/bin/tessera-qr-overlay"
 
 # --- Audit journal -----------------------------------------------------------
 # The device's own journal, hash-chained: each record carries the hash of the
@@ -448,12 +492,12 @@ enabled = false
 # can see.
 #
 # It switches itself on together with the code login method, and that coupling
-# is not a convenience. Control over the operator of the telephone channel
-# rests on reconciling the logins a device saw against the receipts its
-# operators wrote, and this journal is what makes that reconciliation possible.
-# A device offering the method without a journal is broken in a way it cannot
-# discover about itself: every login looks fine locally and nothing can be
-# paired afterwards. Stating `enabled` here decides it outright, in either
+# is not a convenience. Control over the issuing side rests on reconciling the
+# logins a device saw against the records that side wrote when it issued the
+# codes, and this journal is the device's half of that pairing. A device
+# offering the method without a journal is broken in a way it cannot discover
+# about itself: every login looks fine locally and nothing can be paired
+# afterwards. Stating `enabled` here decides it outright, in either
 # direction.
 [audit]
 # enabled = true

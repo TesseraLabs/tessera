@@ -1,7 +1,7 @@
-//! The operator side of the Tessera Codes phone channel.
+//! The issuing side of Tessera Codes.
 //!
-//! The device computes a code and the operator computes the same code; what
-//! lives here is everything the operator side needs around that computation and
+//! The device computes a code and the issuing side computes the same code; what
+//! lives here is everything the issuing side needs around that computation and
 //! nothing of the computation itself. The formula, the canonical bytes, the
 //! documents and their parsers come from [`tessera_codes_contract`] — a second
 //! implementation of any of them would part ways with the device's, and the
@@ -9,33 +9,34 @@
 //! a red test.
 //!
 //! The modules are split by what they are allowed to touch, so that the browser
-//! cabinet and the command line run the same checks:
+//! cabinet, the command line and the issuing service run the same checks:
 //!
-//! - [`scope`], [`annex`], [`reconcile`], [`trust`] and
-//!   [`agreement`] are pure: no clock, no filesystem, no environment. They build
-//!   for `wasm32-unknown-unknown` and are what the cabinet calls.
+//! - [`scope`], [`trust`], [`agreement`] and the journal record
+//!   ([`IssuanceRecord`]) are pure: no clock, no filesystem, no environment.
+//!   They build for `wasm32-unknown-unknown`.
 //! - [`issue`] is the whole refusal ladder of one issuance, in one function, for
 //!   the same reason: a wrapper that assembled the steps in its own order would
 //!   be a second policy.
-//! - [`store`] is the only module that reads and writes files, and it exists
-//!   only in a native build: it is where the receipts live.
+//! - [`reconcile`] puts the journal of a device beside the records of the
+//!   issuing side; it is native-only because it reads hash chains.
+//!
+//! Nothing here writes a file. The journal record of an issuance
+//! ([`IssuanceRecord`]) is assembled here and written by whoever holds the
+//! signing key — the issuing service — because the journal belongs to the side
+//! that computes and signs, and a record written by anybody else is a retelling.
 //!
 //! # Refusals
 //!
 //! Every refusal of an issuance is a [`Refusal`]. The value names the axis that
-//! did not cover the request, because the operator on the telephone has to be
-//! able to say what is missing; nothing here is a security oracle towards a
-//! caller at the device, since the caller never sees these messages — they are
-//! printed on the operator's own terminal.
+//! did not cover the request, so that a caller can say what is missing; nothing
+//! here is a security oracle towards a caller at the device, since that caller
+//! never sees these messages.
 
 pub mod agreement;
-pub mod annex;
 pub mod issue;
 #[cfg(feature = "native")]
 pub mod reconcile;
 pub mod scope;
-#[cfg(feature = "native")]
-pub mod store;
 #[cfg(feature = "pkcs11")]
 pub mod token;
 pub mod trust;
@@ -43,15 +44,17 @@ pub mod trust;
 #[cfg(test)]
 pub(crate) mod tests;
 
+mod record;
+
+pub use record::{IssuanceRecord, IssuanceRecordError, IssuanceRecordFields, RECORD_PREFIX};
+
 use tessera_codes_contract::canon::CanonError;
 use tessera_codes_contract::challenge::ChallengeError;
 use tessera_codes_contract::code::CodeError;
+use tessera_codes_contract::grant::GrantError;
 use tessera_codes_contract::key::KeyAgreementError;
-use tessera_codes_contract::receipt::ReceiptError;
 use tessera_codes_contract::registry::RecordError;
 use tessera_codes_contract::ticket::TicketError;
-
-use crate::codes::annex::AnnexError;
 
 /// Why an issuance was refused.
 ///
@@ -64,7 +67,7 @@ pub enum Refusal {
     /// The challenge and the device record are about different devices.
     #[error("the challenge names device {challenge}, the record is for {record}")]
     DeviceNumber {
-        /// Number read out over the telephone.
+        /// Number the device showed.
         challenge: String,
         /// Number the signed record carries.
         record: String,
@@ -72,7 +75,7 @@ pub enum Refusal {
     /// The challenge and the device record name different key epochs.
     #[error("the challenge is for key epoch {challenge}, the record carries epoch {record}")]
     Epoch {
-        /// Epoch read out over the telephone.
+        /// Epoch the device showed.
         challenge: u32,
         /// Epoch the signed record carries.
         record: u32,
@@ -80,7 +83,7 @@ pub enum Refusal {
     /// The challenge names an operator other than the holder of the ticket.
     #[error("the challenge names operator `{challenge}`, the ticket belongs to `{ticket}`")]
     Operator {
-        /// Operator identifier read out over the telephone.
+        /// Identifier of the issuing side the challenge names.
         challenge: String,
         /// Operator the ticket was issued to.
         ticket: String,
@@ -110,9 +113,18 @@ pub enum Refusal {
         /// Highest level the ticket admits.
         ceiling: u32,
     },
-    /// No grounds were recorded for the issuance.
+    /// The request carries no grounds.
+    ///
+    /// A document of this contract cannot be in that state — the request does
+    /// not assemble without grounds — so this refusal is raised by whoever read
+    /// the request off a wire, not by the ladder. It exists so that the class an
+    /// operator sees is the same wherever the absence was caught.
     #[error("the issuance records no grounds; a code handed out for no stated reason is a code nobody can answer for")]
     MissingReason,
+    /// The challenge the device signed and the challenge inside the request are
+    /// not the same challenge.
+    #[error("the request was signed over another challenge than the device showed")]
+    RequestChallengeMismatch,
     /// The device record did not verify.
     #[error("the device record was rejected: {0}")]
     Record(#[from] RecordError),
@@ -130,9 +142,9 @@ pub enum Refusal {
     /// The key performing the agreement is not the key the ticket carries.
     ///
     /// Deriving with another key would produce a shared secret the device never
-    /// arrives at, so the code would simply not fit — and the operator would
-    /// spend the call looking for the reason at the device.
-    #[error("the operator key does not match the public key of the ticket")]
+    /// arrives at, so the code would simply not fit — and the engineer would
+    /// spend the visit looking for the reason at the device.
+    #[error("the agreement key does not match the public key of the ticket")]
     OperatorKeyMismatch,
     /// The key agreement failed.
     #[error("the key agreement failed: {0}")]
@@ -140,12 +152,9 @@ pub enum Refusal {
     /// The code could not be computed.
     #[error("the code could not be computed: {0}")]
     Code(#[from] CodeError),
-    /// The receipt could not be assembled.
-    #[error("the receipt could not be assembled: {0}")]
-    Receipt(#[from] ReceiptError),
-    /// The annex of the receipt could not be assembled.
-    #[error("the receipt annex could not be assembled: {0}")]
-    Annex(#[from] AnnexError),
+    /// The grant could not be assembled.
+    #[error("the grant could not be assembled: {0}")]
+    Grant(#[from] GrantError),
     /// A document could not be encoded canonically.
     #[error(transparent)]
     Canon(#[from] CanonError),
@@ -223,14 +232,15 @@ impl Refusal {
             | Self::Ticket(_)
             | Self::ChallengeSignature(_)
             | Self::OperatorKeyMismatch
-            | Self::Agreement(KeyAgreementError::InvalidPublicPoint) => RefusalGroup::Trust,
+            | Self::Agreement(KeyAgreementError::InvalidPublicPoint)
+            // Two documents that disagree about which attempt they are for is a
+            // verdict about the documents, not a mishap of the environment.
+            | Self::RequestChallengeMismatch => RefusalGroup::Trust,
             Self::MissingReason => RefusalGroup::Grounds,
             // A backend that failed for its own reason is the token not
             // answering, and that is not an answer about the request at all.
             Self::Agreement(KeyAgreementError::Backend(_)) => RefusalGroup::Environment,
-            Self::Code(_) | Self::Receipt(_) | Self::Annex(_) | Self::Canon(_) => {
-                RefusalGroup::Other
-            }
+            Self::Code(_) | Self::Grant(_) | Self::Canon(_) => RefusalGroup::Other,
         }
     }
 
@@ -264,8 +274,8 @@ impl Refusal {
             Self::OperatorKeyMismatch => "operator_key_mismatch",
             Self::Agreement(_) => "key_agreement_failed",
             Self::Code(_) => "code_computation_failed",
-            Self::Receipt(_) => "receipt_rejected",
-            Self::Annex(_) => "annex_rejected",
+            Self::Grant(_) => "grant_rejected",
+            Self::RequestChallengeMismatch => "request_challenge_mismatch",
             Self::Canon(_) => "encoding_failed",
         }
     }

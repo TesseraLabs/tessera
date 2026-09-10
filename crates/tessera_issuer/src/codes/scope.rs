@@ -1,4 +1,4 @@
-//! Whether the ticket of the operator covers the request read out to them.
+//! Whether the ticket of the issuing side covers the request it was brought.
 //!
 //! Four axes, checked apart and in a fixed order: the device, the operator, the
 //! role, the level. They are orthogonal — a ceiling on the level says nothing
@@ -10,7 +10,7 @@
 //! The device axis splits in two. The part that is *signed* is the device
 //! record: the number and the key epoch. Those are checked here against the
 //! challenge, because deriving a key for another device or another epoch
-//! produces a code that cannot fit and a receipt that records the wrong device.
+//! produces a code that cannot fit and a record that names the wrong device.
 //!
 //! The part that is *not* signed is where the device stands — its region and
 //! its site tags. The fleet holds that in its inventory, the record does not
@@ -19,7 +19,7 @@
 //! (`tessera_core::codes::tickets`), where the values are the device's own; here
 //! the check runs only when the operator declares them, as a refusal that saves
 //! a call rather than as the bound itself. Which of the two happened is written
-//! into the receipt annex, so nobody reads a receipt as proof of a check that
+//! into the journal record, so nobody reads a record as proof of a check that
 //! was not made.
 
 use tessera_codes_contract::challenge::Challenge;
@@ -46,7 +46,7 @@ pub struct DeviceScope {
 /// signed about the device, and under which ticket the operator is working.
 #[derive(Debug, Clone, Copy)]
 pub struct Coverage<'a> {
-    /// The challenge read out over the telephone.
+    /// The challenge the device showed.
     pub challenge: &'a Challenge,
     /// The signed record of the device the challenge names.
     pub record: &'a DeviceRecord,
@@ -59,11 +59,56 @@ pub struct Coverage<'a> {
 impl Coverage<'_> {
     /// Reports whether the site axis was checked at all.
     ///
-    /// A receipt records this, because "the ticket covered the site" and "the
-    /// site was never named" are two different statements about one issuance.
+    /// The journal record of the issuance carries this, because "the ticket
+    /// covered the site" and "the site was never named" are two different
+    /// statements about one issuance.
     #[must_use]
     pub const fn site_axis_checked(&self) -> bool {
         self.device_scope.is_some()
+    }
+
+    /// The site axis of this coverage, as the journal record states it.
+    #[must_use]
+    pub const fn site_scope(&self) -> SiteScope {
+        if self.site_axis_checked() {
+            SiteScope::Checked
+        } else {
+            SiteScope::Undeclared
+        }
+    }
+}
+
+/// Whether the site axis of the ticket was checked against the device.
+///
+/// The device checks that axis itself before it accepts a code, so an
+/// undeclared site is not a hole. It is, however, a fact about how the issuance
+/// was decided, and the journal record carries it: an audit that could not tell
+/// "the fleet said where this device stands" from "nobody did" would read the
+/// two as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteScope {
+    /// The caller declared where the device stands, and the ticket covered it.
+    Checked,
+    /// Nobody declared where the device stands.
+    Undeclared,
+}
+
+impl SiteScope {
+    /// The token this state is written under.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Checked => "checked",
+            Self::Undeclared => "undeclared",
+        }
+    }
+
+    /// Parses a state written by [`SiteScope::as_str`].
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        [Self::Checked, Self::Undeclared]
+            .into_iter()
+            .find(|scope| scope.as_str() == token)
     }
 }
 

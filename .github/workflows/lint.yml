@@ -50,6 +50,14 @@ jobs:
       - name: cargo clippy (workspace, all targets, all features, -D warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # И второй набор — тот, которым собирается пакет. Прогон только с
+      # `--all-features` пропускает нарушения в коде, который эти фичи
+      # ВЫКЛЮЧАЮТ: `cfg(not(feature = ...))`-ветви и импорты, нужные лишь без
+      # фичи, не линтятся вообще. Дефолтная сборка уже успевала быть красной
+      # незамеченной, и стоит это дешевле, чем стоило её чинить.
+      - name: cargo clippy (workspace, all targets, default features, -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   e2e-registry:
     # Реестр e2e-кейсов проверяется без стенда: загрузка реестра валидирует поле
     # `requirement` каждого кейса (спека, на которую он ссылается, обязана
@@ -70,9 +78,6 @@ jobs:
 
       - name: Rust build cache
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-
-      - name: cargo xtask e2e-coverage --check
-        run: cargo xtask e2e-coverage --check
 
   supply-chain:
     # cargo-deny + cargo-audit работают по lockfile, компиляция crate-графа

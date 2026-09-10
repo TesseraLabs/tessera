@@ -107,7 +107,7 @@ pub unsafe fn prompt_pin(
 
 /// Ask the user for a value that is meant to be seen while it is typed.
 ///
-/// The code read back over the telephone is one: it is spoken aloud in the
+/// The code the engineer types back is one: it is read off a screen in the
 /// same room a moment earlier, so hiding it on screen buys nothing and costs
 /// the engineer the ability to check what they typed before an attempt of a
 /// small budget is spent on a typo.

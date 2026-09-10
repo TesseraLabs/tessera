@@ -5,7 +5,7 @@ setup: [install-package, deploy-fixtures]
 cases:
   - id: TOK-001
     title: Конверт, записанный на токен, читается обратно побайтово
-    requirement: openspec/specs/token-data-carrier/spec.md
+    requirement: spec9:auth.PLAN-140
     requires: [hardware-token]
     steps:
       # Запись на токен не диагностирует превышение размера объекта: устройство
@@ -45,7 +45,7 @@ cases:
 
   - id: TOK-002
     title: Слишком большой конверт отвергается до обращения к токену
-    requirement: openspec/specs/token-data-carrier/spec.md
+    requirement: spec9:auth.PLAN-142
     requires: [hardware-token]
     steps:
       # Потолок объекта данных измерен на одном экземпляре и превышение
@@ -68,7 +68,7 @@ cases:
 
   - id: TOK-003
     title: Вход с удостоверения на токене открывает сессию
-    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requirement: spec9:auth.PLAN-139
     requires: [hardware-token, service-manager]
     steps:
       # Ручной кейс: раздел съёмного носителя при этом источнике не
@@ -90,7 +90,7 @@ cases:
 
   - id: TOK-004
     title: Извлечение токена во время сессии применяет настроенное действие
-    requirement: openspec/specs/carrier-presence/spec.md
+    requirement: spec9:runtime.PLAN-170
     requires: [hardware-token, service-manager]
     steps:
       # Присутствие токена наблюдается опросом, а не событием, поэтому реакция

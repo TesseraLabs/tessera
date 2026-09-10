@@ -14,7 +14,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: REV-001
     title: Отозванное удостоверение не пускает
-    requirement: openspec/specs/revocation/spec.md
+    requirement: spec9:auth.REVS-002
     requires: [service-manager, usb]
     steps:
       - run: |
@@ -31,7 +31,7 @@ cases:
 
   - id: REV-002
     title: Включённая проверка отзыва не мешает валидному удостоверению
-    requirement: openspec/specs/revocation/spec.md
+    requirement: spec9:auth.REVS-002
     requires: [service-manager, usb]
     steps:
       # Обратная сторона REV-001: без этого кейса «отказ всем подряд» выглядел бы
@@ -54,7 +54,7 @@ cases:
 
   - id: REV-003
     title: Устаревшая CRL закрывает доступ, а не игнорируется
-    requirement: openspec/specs/revocation/spec.md
+    requirement: spec9:auth.REVS-002
     requires: [service-manager, usb]
     steps:
       # Режим crl — strict offline: просроченная CRL даёт отказ, а не «WARN и
@@ -74,7 +74,7 @@ cases:
 
   - id: REV-006
     title: Неполное покрытие цепочки списками отзыва закрывает доступ
-    requirement: openspec/specs/revocation/spec.md
+    requirement: spec9:auth.REVS-003
     requires: [service-manager, usb]
     steps:
       # Указана только CRL промежуточного центра: она покрывает удостоверение,
@@ -100,7 +100,7 @@ cases:
 
   - id: REV-005
     title: CRL из каталога вне контроля root не принимается
-    requirement: openspec/specs/revocation/spec.md
+    requirement: spec9:auth.REVS-003
     requires: [service-manager, usb]
     steps:
       # Материал доверия обязан лежать там, где его не может подменить
@@ -127,7 +127,7 @@ cases:
 
   - id: REV-004
     title: Режим none пропускает отозванное удостоверение
-    requirement: openspec/specs/revocation/spec.md
+    requirement: spec9:auth.REVS-001
     requires: [service-manager, usb]
     steps:
       # Документированное поведение, а не недосмотр: отказ от проверки отзыва

@@ -47,23 +47,24 @@ file = [
     "dep:secrecy",
 ]
 # Integration-test gates, mirroring tessera_core's `pkcs11-tests`: the heavy
-# tests compile only with these on and still skip gracefully (print `skipped:`
-# and return Ok) when the external dependency — a SoftHSM module, the `vault`
-# binary — is absent at runtime.
+# tests compile only with these on. `vault-tests` does NOT skip gracefully: a
+# missing `vault` binary fails the test, because the graceful skip is exactly
+# what hid a defect that made every https request panic — the test reported a
+# pass without ever reaching a request.
 pkcs11-tests = ["pkcs11"]
 vault-tests = ["vault"]
 
 [dependencies]
-tessera_ext = { path = "../tessera_ext", version = "0.5.0" }
+tessera_ext = { path = "../tessera_ext", version = "0.6.0" }
 # The frozen contract of the phone channel: the code formula, the documents and
 # their canonical bytes. The operator side of the channel holds no second
 # implementation of any of them — a divergence would show up as "the code does
 # not fit" at the device, not in CI.
-tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.5.0" }
+tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.6.0" }
 # The shared hash-chained record: line framing, head-signature accounting and
 # verification. The device's audit chain is built on the same crate, so the two
 # journals cannot drift into two dialects of one format.
-tessera_hashchain = { path = "../tessera_hashchain", version = "0.5.0" }
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.6.0" }
 der = { workspace = true }
 spki = { workspace = true }
 const-oid = { workspace = true }
@@ -103,7 +104,18 @@ clap = { workspace = true, optional = true }
 rpassword = { workspace = true, optional = true }
 cryptoki = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
-ureq = { workspace = true, optional = true }
+# `native-tls` on top of the workspace set, and not for the TLS library itself:
+# `native-tls-no-default` already links it. What the workspace set does not do is
+# turn on ureq's own `native-tls` FEATURE FLAG, and ureq checks that flag at the
+# first https request — `TlsProvider::is_feature_enabled` — and panics when it is
+# off. So with the workspace set alone, every Vault Transit signature panicked,
+# and plaintext was refused by `require_https`: the adapter had no working
+# address at all. Cargo features are additive, so this is the smallest fix that
+# reaches the flag. Its price is `native-tls-webpki-roots`, which drags a bundled
+# root store into the tree; the adapter never trusts it — it uses the platform
+# verifier or the operator's CA bundle — but it is compiled in, and the workspace
+# manifest no longer gets to claim otherwise.
+ureq = { workspace = true, optional = true, features = ["native-tls"] }
 
 # The wasm core (browser cabinet) needs an entropy backend for the RustCrypto
 # stack pulled by CSR verification; the browser provides one via getrandom's
@@ -116,7 +128,7 @@ p256 = { workspace = true, features = ["pem"] }
 # The crate's own tests reach the shared chain's in-memory and failing storages
 # through `journal::storage`; the feature that carries them is a test aid, not a
 # runtime backend, so it is turned on here rather than in `[dependencies]`.
-tessera_hashchain = { path = "../tessera_hashchain", version = "0.5.0", features = ["testing", "file"] }
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.6.0", features = ["testing", "file"] }
 # The file-backend tests write key fixtures to disk with restricted permissions;
 # tempfile gives a self-cleaning path. Native-only test aid.
 tempfile = { workspace = true }

@@ -980,6 +980,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gethostname"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
+dependencies = [
+ "rustix 1.1.4",
+ "windows-link",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1552,6 +1562,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -1708,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "pam_tessera"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "nix",
@@ -1991,6 +2002,12 @@ name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
+
+[[package]]
+name = "qrcodegen"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
 
 [[package]]
 name = "quick-error"
@@ -2644,7 +2661,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "tessera_cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ab_glyph_rasterizer",
  "anyhow",
@@ -2684,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_codes_contract"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "sha2 0.11.0",
@@ -2696,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "chrono",
@@ -2715,6 +2732,7 @@ dependencies = [
  "parking_lot",
  "pkcs12",
  "proptest",
+ "qrcodegen",
  "rand 0.10.1",
  "regex",
  "rustix 0.38.44",
@@ -2742,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_cp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tempfile",
  "tessera_proto",
@@ -2756,14 +2774,14 @@ dependencies = [
 
 [[package]]
 name = "tessera_ext"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "tessera_hashchain"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "hex",
@@ -2779,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_issuer"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "clap",
@@ -2815,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2825,15 +2843,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera_qr_overlay"
+version = "0.6.0"
+dependencies = [
+ "nix",
+ "tessera_core",
+ "thiserror",
+ "x11rb",
+]
+
+[[package]]
 name = "tessera_test_plugin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tessera_core",
 ]
 
 [[package]]
 name = "tessera_win_service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "pam_tessera",
@@ -3185,6 +3213,7 @@ dependencies = [
  "serde_json",
  "ureq-proto",
  "utf8-zero",
+ "webpki-root-certs",
 ]
 
 [[package]]
@@ -3370,6 +3399,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "webpki-root-certs"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -3740,6 +3778,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
+name = "x11rb"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a8885a854a8bfdf87a301e53e41b17c5f8f33639903131338b997b1eb614f44"
+dependencies = [
+ "gethostname",
+ "rustix 1.1.4",
+ "x11rb-protocol",
+]
+
+[[package]]
+name = "x11rb-protocol"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acf4d1bc32aa46eec18caa634ec3cf4c05bfa151f12b93b510b15190f69a1ca8"
+
+[[package]]
 name = "x509-cert"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3752,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3769,7 +3824,9 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tessera_codes_contract",
+ "tessera_core",
  "tessera_ext",
+ "tessera_hashchain",
  "tessera_issuer",
  "thiserror",
  "toml",

@@ -3,7 +3,7 @@
 //! The code is `truncate_N(HMAC(K, canon(...)))`. The truncation is uniform:
 //! reducing a MAC modulo an alphabet range that does not divide the range of
 //! the sample skews the low codes upwards, and a skew is exactly what an
-//! attacker guessing codes over the telephone is looking for. Values in the
+//! attacker guessing codes at a keyboard is looking for. Values in the
 //! incomplete tail of the sample range are therefore rejected rather than
 //! folded.
 

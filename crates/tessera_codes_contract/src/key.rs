@@ -107,7 +107,7 @@ impl core::fmt::Debug for SharedSecret {
 /// The derived key `K`.
 ///
 /// Wiped on drop, and redacted in [`Debug`] output for the same reason as
-/// [`SharedSecret`]: this key is the entire strength of the phone channel.
+/// [`SharedSecret`]: this key is the entire strength of the channel.
 ///
 /// As with [`SharedSecret`], the type carries no [`PartialEq`]: a derived
 /// comparison would leak the length of the common prefix of two keys through

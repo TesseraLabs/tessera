@@ -166,6 +166,33 @@ pub fn read_delivery(
         "codes ticket authority anchor",
     )?;
 
+    let page_urls = read_optional(
+        root,
+        mode,
+        section.page_urls.as_ref(),
+        "codes engineer page addresses",
+    )?;
+
+    // The list is read here for the same reason the anchor below is: a device
+    // that took an unreadable list would come up refusing its own
+    // configuration, and the operator standing at the import is the one who can
+    // do something about it.
+    if let Some(bytes) = &page_urls {
+        let text = core::str::from_utf8(bytes).map_err(|_| ImportError::CodesSection {
+            reason: "the list of engineer page addresses is not UTF-8".to_owned(),
+        })?;
+        // Counted by the reader the DEVICE will use, not by a rule that looks
+        // similar: a file of nothing but comments has lines, and a second
+        // reader that only asked whether the file was blank would let it
+        // through — leaving the device to refuse its own configuration later,
+        // in the field, with nobody there who could fix it.
+        if crate::codes::store::parse_page_urls(text).is_empty() {
+            return Err(ImportError::CodesSection {
+                reason: "the list of engineer page addresses carries no address".to_owned(),
+            });
+        }
+    }
+
     // The anchor decides which operator tickets are real, so an anchor that is
     // not a public key has to stop the import rather than sit in the store
     // until the first login discovers it.
@@ -180,6 +207,7 @@ pub fn read_delivery(
         tickets,
         revocations,
         ticket_authority,
+        page_urls,
     })
 }
 

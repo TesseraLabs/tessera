@@ -181,7 +181,7 @@ pub enum RawWhenFull {
 /// The journal is what makes a login provable after the fact: entries chain,
 /// so removing one is visible. For the telephone channel that is not a nicety —
 /// the control over an operator *is* the reconciliation between the logins a
-/// fleet saw and the receipts its operators wrote.
+/// fleet saw and the issuances its server recorded.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawAudit {
@@ -308,6 +308,29 @@ pub struct RawCodes {
     /// silence is not consent.
     #[serde(default)]
     pub accept_unconfirmed_profile: bool,
+    /// Address of the engineer's page this device shows in front of the
+    /// challenge. Must be one of the addresses the enrollment package
+    /// delivered; a device composes no address of its own.
+    ///
+    /// Absent means the device shows the challenge alone, which still scans:
+    /// the URL is navigation, the fragment is the channel.
+    #[serde(default)]
+    pub page_url: Option<String>,
+    /// The account the QR overlay of a graphical login runs as.
+    ///
+    /// Absent means no overlay: the challenge is shown in the prompt and
+    /// nothing else happens, which is what every device without a display
+    /// manager does and what every device does over ssh. Naming it is the
+    /// deliberate act — the module starts a process as this account and gives
+    /// it the socket of an attempt, and neither is something to guess at.
+    #[serde(default)]
+    pub overlay_user: Option<String>,
+    /// Where the overlay binary lives.
+    ///
+    /// Absent means the path the package installs. A fleet that puts it
+    /// somewhere else says so here rather than being searched for.
+    #[serde(default)]
+    pub overlay_binary: Option<String>,
     /// Removed: the password of the device key container.
     ///
     /// Kept here only so the validation layer can reject it by name. The key

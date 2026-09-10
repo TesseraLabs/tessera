@@ -1,4 +1,4 @@
-//! Генератор фикстур телефонного канала для сюиты `27-codes-phone`.
+//! Генератор фикстур канала входа по коду для сюиты `27-codes-server`.
 //!
 //! Кейсы этой сюиты требуют согласованного комплекта: ключа устройства в
 //! контейнере, билета оператора, подписанной записи устройства и якорей, по
@@ -73,7 +73,7 @@ const REGION: &str = "ru-central";
 /// них попадает и в рамки билета.
 const TAGS: [&str; 2] = ["dc-1", "hq"];
 
-/// Идентификатор оператора телефонного канала.
+/// Идентификатор выдающей стороны (сервера) в фикстурах.
 const OPERATOR_ID: &str = "op-e2e";
 
 /// Номер билета оператора.
@@ -115,6 +115,14 @@ const DEFAULT_ROLES: [&str; 2] = ["tester", "serv"];
 /// Дата продублирована в README комплекта.
 const TICKET_NOT_AFTER: u64 = 1_924_905_600;
 
+/// Адрес страницы инженера, который «опубликовал» этот парк.
+///
+/// `https` и вымышленное имя. Схему проверяет загрузка конфигурации: по
+/// обычному http страница и всё, что ей передано, читается и переписывается в
+/// пути. Имя вымышленное намеренно — разрешимый хост в фикстуре есть
+/// приглашение до него достучаться.
+const PAGE_URL: &str = "https://codes.fleet.example/e";
+
 /// Начало срока действия сертификата в контейнере: 2020-01-01T00:00:00Z.
 const CERT_NOT_BEFORE: u64 = 1_577_836_800;
 
@@ -125,7 +133,7 @@ const CERT_MAX_TTL_SECS: u64 = 3_600;
 const CERT_PROFILE_VERSION: u32 = 1;
 
 /// Имена файлов комплекта. Совпадают с тем, что читает
-/// `tests/e2e/helpers/codes-phone.sh`; расхождение здесь выглядит на прогоне как
+/// `tests/e2e/helpers/codes-server.sh`; расхождение здесь выглядит на прогоне как
 /// отказ продукта.
 mod names {
     /// Манифест каталога.
@@ -155,6 +163,13 @@ mod names {
     pub(super) const ORGANISATION_ANCHOR: &str = "organisation-anchor.pem";
     pub(super) const OWNER_ANCHOR: &str = "owner-anchor.pem";
     /// Описание комплекта.
+    /// Адреса страницы инженера, которые парк опубликовал.
+    ///
+    /// Имя обязано совпадать с `codes::store::PAGE_URLS_FILENAME` продукта:
+    /// комплект кладёт файл туда, откуда его берёт проверка конфигурации.
+    /// Записано строкой, а не взято из крейта, потому что раннер от
+    /// `tessera_core` не зависит; совпадение стережёт тест ниже.
+    pub(super) const PAGE_URLS: &str = "page-urls.txt";
     pub(super) const README: &str = "README.md";
 }
 
@@ -206,7 +221,7 @@ struct FixtureFile {
     /// исполнения), поэтому в свежем клоне — то есть в CI и на любом стенде,
     /// куда репозиторий не скопировали целиком, — файл появится с 0644 по
     /// umask. Права обязан выставить тот, кто раскладывает комплект;
-    /// `tests/e2e/helpers/codes-phone.sh` делает это копией под 0600, и его
+    /// `tests/e2e/helpers/codes-server.sh` делает это копией под 0600, и его
     /// копия несущая, а не подстраховочная. Здесь 0600 стоит для того дерева,
     /// где ключ только что появился на диске.
     owner_only: bool,
@@ -360,7 +375,7 @@ impl SignatureBackend for DeviceCertSigner<'_> {
 /// Журнал выпуска, живущий в памяти: сертификат фикстуры никуда не
 /// журналируется, но ядру выпуска журнал нужен.
 #[derive(Default)]
-struct MemoryJournal {
+pub(crate) struct MemoryJournal {
     lines: Vec<String>,
 }
 
@@ -448,6 +463,11 @@ fn build(roles: &[String]) -> Result<Bundle> {
             FixtureFile {
                 name: names::OWNER_ANCHOR,
                 bytes: owner.spki_pem()?.into_bytes(),
+                owner_only: false,
+            },
+            FixtureFile {
+                name: names::PAGE_URLS,
+                bytes: page_urls().into_bytes(),
                 owner_only: false,
             },
             FixtureFile {
@@ -630,7 +650,7 @@ fn device_container(
 /// Манифест каталога — то, чем хелпер узнаёт номер, эпоху и рамки.
 fn manifest(device_number: &CheckedDeviceNumber) -> String {
     format!(
-        "# Манифест комплекта фикстур телефонного канала.\n\
+        "# Манифест комплекта фикстур канала входа по коду.\n\
          # Сгенерирован `cargo xtask codes-fixtures`; правки руками разойдутся с ключами.\n\
          DEVICE_NUMBER={}\n\
          EPOCH={EPOCH_VALUE}\n\
@@ -647,9 +667,23 @@ fn manifest(device_number: &CheckedDeviceNumber) -> String {
 }
 
 /// Описание комплекта рядом с ним самим.
+/// Список адресов страницы инженера, как его доставляет комплект зачисления.
+///
+/// Файл с шапкой: его читает человек, собирающий комплект для своего парка, и
+/// строка, объясняющая, что это, стоит одного комментария. Комментарии и пустые
+/// строки разбор пропускает — это проверено тестом продукта.
+fn page_urls() -> String {
+    format!(
+        "# Адреса страницы инженера, опубликованные этим парком.\n\
+         # Устройство показывает ОДИН из них перед challenge и своего не составляет:\n\
+         # адрес вне этого списка отвергается при загрузке конфигурации.\n\
+         {PAGE_URL}\n"
+    )
+}
+
 fn readme(roles: &[String], device_number: &CheckedDeviceNumber) -> String {
     format!(
-        "# Фикстуры телефонного канала (`27-codes-phone`)\n\
+        "# Фикстуры канала входа по коду (`27-codes-server`)\n\
          \n\
          Комплект собран `cargo xtask codes-fixtures`. Руками его не правят: файлы связаны\n\
          подписями и общими значениями, и отредактированный файл выглядит на прогоне как\n\
@@ -679,7 +713,7 @@ fn readme(roles: &[String], device_number: &CheckedDeviceNumber) -> String {
          сам по себе эту проверку проходит — но контейнер несёт приватный ключ устройства,\n\
          поэтому кладут его 0600 root:root, а не «лишь бы не писали».\n\
          \n\
-         `tests/e2e/helpers/codes-phone.sh` делает и то, и другое: ключ оператора копией под\n\
+         `tests/e2e/helpers/codes-server.sh` делает и то, и другое: ключ оператора копией под\n\
          0600 в рабочий каталог прогона, артефакты устройства — `install -m 0600 -o root -g\n\
          root`. Убирать это как «лишнее» нельзя: без первого прогон встанет на первой выдаче,\n\
          без второго устройство откажется доверять своим же артефактам. Тот, кто разложит\n\
@@ -709,7 +743,7 @@ fn readme(roles: &[String], device_number: &CheckedDeviceNumber) -> String {
          отказ по рамкам билета (`codes-refusal: ticket_scope_level`).\n\
          \n\
          Эпоха, регион и теги обязаны совпадать в записи устройства, билете и секции\n\
-         `[codes]` конфигурации устройства — их пишет туда `helpers/codes-phone.sh` из\n\
+         `[codes]` конфигурации устройства — их пишет туда `helpers/codes-server.sh` из\n\
          `{manifest}`.\n\
          \n\
          Списка отзыва здесь нет намеренно: прогон начинается с парка, где не отозвано\n\
@@ -824,7 +858,7 @@ pub fn check_target(out: &Path) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "{} существует и не похож на каталог фикстур телефонного канала: \
+        "{} существует и не похож на каталог фикстур канала входа по коду: \
          генератор подменяет каталог целиком и чужой не трогает",
         out.display()
     )
@@ -841,7 +875,7 @@ pub fn check_target(out: &Path) -> Result<()> {
     clippy::too_many_lines
 )]
 mod tests {
-    use super::{build, check_target, names, publish, DEFAULT_ROLES};
+    use super::{build, check_target, names, publish, DEFAULT_ROLES, PAGE_URL};
 
     fn roles() -> Vec<String> {
         DEFAULT_ROLES
@@ -864,11 +898,44 @@ mod tests {
             names::DEVICE_RECORD,
             names::ORGANISATION_ANCHOR,
             names::OWNER_ANCHOR,
+            names::PAGE_URLS,
             names::README,
         ] {
             assert!(names.contains(&expected), "нет файла {expected}");
         }
         assert!(bundle.files.iter().all(|file| !file.bytes.is_empty()));
+    }
+
+    /// Список адресов лежит под тем именем, которое читает продукт, и несёт
+    /// адрес, который парк объявил.
+    ///
+    /// Имя записано в раннере строкой: он не зависит от `tessera_core`. Эта
+    /// проверка и есть то, что не даёт двум написаниям разъехаться — иначе
+    /// комплект клал бы файл, которого проверка конфигурации не видит, и
+    /// `[codes].page_url` отвергался бы у парка, который всё сделал правильно.
+    #[test]
+    fn the_bundle_publishes_the_addresses_under_the_name_the_product_reads() {
+        assert_eq!(
+            names::PAGE_URLS,
+            tessera_core::codes::store::PAGE_URLS_FILENAME,
+            "имя файла адресов разошлось с тем, которое читает продукт"
+        );
+
+        let bundle = build(&roles()).unwrap();
+        let file = bundle
+            .files
+            .iter()
+            .find(|file| file.name == names::PAGE_URLS)
+            .expect("комплект не несёт списка адресов");
+        let text = String::from_utf8(file.bytes.clone()).unwrap();
+        assert!(
+            text.lines().any(|line| line.trim() == PAGE_URL),
+            "в списке нет объявленного адреса: {text}"
+        );
+        assert!(
+            PAGE_URL.starts_with("https://"),
+            "адрес фикстуры не https, а загрузка конфигурации такой отвергнет"
+        );
     }
 
     /// Комплект связен: выдача считает по нему код.
@@ -982,13 +1049,16 @@ mod tests {
         };
 
         let challenge = sign(challenge);
+        // Основание живёт внутри подписанного запроса инженера: второго
+        // экземпляра у выдачи нет, и подать его мимо документа нечем.
+        let signed_request = signed_request_for(&bundle, challenge.challenge());
         let request = IssuanceRequest {
             challenge: &challenge,
+            request: &signed_request,
             record: &record,
             ticket: &ticket,
             params: &params,
             device_scope: Some(&scope),
-            reason: "проверка связности комплекта",
             now,
         };
         let issuance = issue(&request, &anchors, &key).unwrap();
@@ -1011,9 +1081,14 @@ mod tests {
         )
         .unwrap();
         let above = sign(above);
+        // Запрос пересобирается вокруг того же challenge, что подаётся: выдача
+        // сверяет два документа между собой и отказала бы по расхождению
+        // раньше, чем дошла бы до рамок билета.
+        let above_request = signed_request_for(&bundle, above.challenge());
         let refused = issue(
             &IssuanceRequest {
                 challenge: &above,
+                request: &above_request,
                 ..request
             },
             &anchors,
@@ -1022,6 +1097,31 @@ mod tests {
         .unwrap_err();
         assert_eq!(refused.class(), "ticket_scope_level");
         assert!(matches!(refused, Refusal::ScopeLevel { ceiling: 1, .. }));
+    }
+
+    /// Подписанный запрос инженера вокруг challenge комплекта.
+    ///
+    /// Подписывает ключ устройства: выдача подпись инженера в этой сборке не
+    /// проверяет — личность подтверждает сервер, — а отдельного ключа инженера
+    /// в комплекте фикстур нет. Как только он появится, правка будет здесь одна.
+    fn signed_request_for(
+        bundle: &super::Bundle,
+        challenge: &tessera_codes_contract::challenge::Challenge,
+    ) -> tessera_codes_contract::request::SignedRequest {
+        use tessera_codes_contract::request::{
+            EngineerRequest, EngineerSignature, FourEyesDigest, RequestFields, SignedRequest,
+        };
+
+        let request = EngineerRequest::new(RequestFields {
+            challenge: challenge.clone(),
+            grounds: "проверка связности комплекта",
+            grounds_reference: None,
+            requested_at: tessera_codes_contract::time::ClaimedTime::new(super::CERT_NOT_BEFORE),
+            four_eyes: FourEyesDigest::of_policy(b"off"),
+        })
+        .unwrap();
+        let signature = bundle.device_key.sign(&request.encode().unwrap()).unwrap();
+        SignedRequest::new(request, EngineerSignature::Signed(signature))
     }
 
     #[test]

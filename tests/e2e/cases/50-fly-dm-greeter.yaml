@@ -19,7 +19,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: GREET-001
     title: Выключенный по умолчанию баннер не трогает файловую систему
-    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requirement: spec9:platform.FLY-001
     requires: [service-manager]
     # `update_wallpaper` по умолчанию false, и это не просто «ничего не
     # рисуем»: writer обязан не делать никакого файлового ввода-вывода вообще.
@@ -41,7 +41,7 @@ cases:
 
   - id: GREET-002
     title: Первый запуск снимает разовую резервную копию обоев
-    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requirement: spec9:platform.FLY-002
     requires: [service-manager, graphics]
     # Оригинал обоев должен пережить включение функции: рендер идёт поверх
     # цели, и без копии вернуть исходный фон было бы нечем. Копия снимается
@@ -59,7 +59,7 @@ cases:
 
   - id: GREET-003
     title: Повторный запуск не перезаписывает резервную копию
-    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requirement: spec9:platform.FLY-002
     requires: [service-manager, graphics]
     # Идемпотентность здесь — не про аккуратность, а про сохранность
     # оригинала. Если бы копия переснималась на каждом старте, то второй
@@ -91,7 +91,7 @@ cases:
 
   - id: GREET-004
     title: Отказ отрисовки не мешает ни старту демона, ни входу
-    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requirement: spec9:platform.FLY-001
     requires: [service-manager, usb]
     # Баннер — украшение экрана входа, а не часть проверки удостоверения.
     # Единственный режим отказа, допустимый для него, — запись в журнал:
@@ -113,7 +113,7 @@ cases:
       - run: systemctl is-active tessera.service
         expect: { exit_code: 0, stdout_matches: '^active$' }
       - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
-      - run: helpers/pam-drive certauth {{user}} authenticate
+      - run: pam-drive certauth {{user}} authenticate
         stdin: "123456"
         expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
         timeout: 60
@@ -124,7 +124,7 @@ cases:
 
   - id: GREET-005
     title: Включения одного ключа достаточно, чтобы баннер появился на поставочных обоях
-    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requirement: spec9:platform.FLY-003
     requires: [service-manager, graphics]
     # Путь оператора из документации: включить `update_wallpaper` и получить
     # рабочий баннер. `wallpaper_target` намеренно не задаётся — проверяется
@@ -157,7 +157,7 @@ cases:
 
   - id: GREET-006
     title: Отрисовка сохраняет права обоев и не прячет их от экрана входа
-    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requirement: spec9:platform.FLY-003
     requires: [service-manager, graphics]
     # Обои читает greeter, а он работает под своей учётной записью (`fly-dm`),
     # не под `tessera`. Замена файла обязана сохранить права цели: иначе

@@ -37,6 +37,21 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# `webpki-root-certs`, and only that crate: a bundle of root certificates, which
+# is data rather than code and travels under a data licence. Written as an
+# exception rather than as a line in `allow`, because a licence in `allow` is a
+# licence any future dependency may arrive under, and the reasoning below holds
+# for this crate alone.
+#
+# It comes with ureq's `native-tls` feature — the feature the Vault path has to
+# have, since ureq gates every https connection on it — and the Vault adapter
+# never trusts the bundle: it uses the platform verifier or the CA the operator
+# supplied. Allowed because the alternative is either an https path that panics
+# or a fork of ureq's feature graph.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

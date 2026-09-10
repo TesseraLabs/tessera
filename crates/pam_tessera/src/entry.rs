@@ -606,7 +606,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 // `pam_sm_authenticate` returns. The session phase never
                 // re-mounts — by design, the auth context travels via
                 // pam_data instead (see
-                // openspec/specs/cert-authentication-flow/spec.md).
+                // Spec9 authentication-flow requirement).
                 drop(mount);
                 PAM_SUCCESS
             }
@@ -765,7 +765,15 @@ unsafe fn authenticate_by_code_entry(
             cfg.monitor.timeout,
         ));
 
+    // What the challenge is shown on. Chosen in `crate::overlay`, which is
+    // compiled on any unix and covered by tests; this file is Linux-only, so
+    // what is written here has to be plumbing and nothing else. Built before the
+    // dependencies so that it outlives them; nothing about it can fail the login
+    // — see `codes_flow::OverlayPresenter`.
+    let chosen = crate::overlay::choose(codes_config.overlay.as_ref());
+
     let deps = CodeDeps {
+        overlay: chosen.presenter(),
         config: codes_config,
 
         store: &role_stage.store,

@@ -10,7 +10,7 @@ setup: [install-package, deploy-fixtures]
 cases:
   - id: CLI-001
     title: Префлайт на исправной системе завершается успехом и печатает сводку
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: []
     # Предупреждения на исход не влияют: в контейнере всегда есть WARN об
     # отсутствии мандатного контроля, и гейт не должен на нём спотыкаться.
@@ -22,7 +22,7 @@ cases:
 
   - id: CLI-002
     title: Выгрузка идентичностей пробивает все источники и отмечает действующий
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-002
     requires: []
     # Команда намеренно игнорирует список источников из конфигурации: оператор
     # должен видеть всё железо целиком, включая источники, которые сейчас не
@@ -48,7 +48,7 @@ cases:
 
   - id: CLI-003
     title: Снятые подкоманды не воскресают
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-003
     requires: []
     # Подкоманды версии 0.2.x удалены. Возврат любой из них означал бы, что
     # чужой сценарий автоматизации снова начнёт «работать», делая не то, что
@@ -73,7 +73,7 @@ cases:
   # идентификатор зафиксирован спекой, формулировка — нет.
   - id: CLI-004
     title: Настроенный, но недостижимый ГОСТ-движок останавливает префлайт
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: []
     # Путь ведёт на существующий читаемый файл, который движком не является:
     # это единственный способ дойти до попытки ЗАГРУЗКИ. Несуществующий путь
@@ -89,7 +89,7 @@ cases:
 
   - id: CLI-005
     title: Неисправный движок останавливает префлайт, даже когда ГОСТ-подписи не разрешены
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: []
     # Раньше эта комбинация считалась мёртвой настройкой и давала exit 0.
     # Мёртвой она не является: аутентификация грузит движок по самому факту
@@ -108,7 +108,7 @@ cases:
 
   - id: CLI-008
     title: Исправный движок при неразрешённой ГОСТ-подписи проходит префлайт с пометкой
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: [gost-engine]
     # Обратная сторона CLI-005: движок исправен, ГОСТ-OID в whitelist нет.
     # Загрузка удаётся, входу ничто не мешает, и отказывать не за что — но
@@ -125,7 +125,7 @@ cases:
 
   - id: CLI-009
     title: Связка токена с OpenSSL-бэкендом объявляется отказом, а не предупреждением
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: []
     # mode = "pkcs11" вместе с crypto_backend = "openssl" отвергает не только
     # ГОСТ: аутентификация в этой комбинации возвращает отказ для любого
@@ -150,7 +150,7 @@ cases:
 
   - id: CLI-010
     title: Связка токена с OpenSSL-бэкендом отвергается и без всякого ГОСТа
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: []
     # Та же пара режима и бэкенда, но без ГОСТ-OID и без пути к движку —
     # обычная RSA/ECDSA-конфигурация. Вход не работает ровно так же, поэтому
@@ -169,7 +169,7 @@ cases:
 
   - id: CLI-006
     title: Исправная ГОСТ-конфигурация подтверждается, а не молчит
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: [gost-engine]
     # Успех обязан быть виден: администратор, настроивший ГОСТ, должен получить
     # подтверждение, что движок действительно загрузился, а не отсутствие
@@ -185,7 +185,7 @@ cases:
 
   - id: CLI-007
     title: ГОСТ-подпись без пути к движку отвергается до запуска проверок
-    requirement: openspec/specs/gost-crypto/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: []
     # Отдельный от CLI-004 барьер: конфигурация не доходит до startup-check
     # вовсе, поэтому диагностика идёт в stderr как ошибка загрузки, а не
@@ -203,7 +203,7 @@ cases:
 
   - id: CLI-011
     title: Префлайт сообщает, что проверка отзыва выключена
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-001
     requires: []
     # Порчи нет намеренно: `mode = "none"` — это ПОСТАВОЧНОЕ значение
     # (dist/config/config.toml.example), то есть кейс описывает состояние
@@ -237,7 +237,7 @@ cases:
 
   - id: CLI-012
     title: Дамп отмечает активным тот источник, который действительно выбирает демон
-    requirement: openspec/specs/cli-diagnostics/spec.md
+    requirement: spec9:runtime.CLI-002
     requires: []
     # Столбец active_under_current_config — не украшение: по строке `yes`
     # CA-сторона выпускает per-host удостоверение (контракт записан в

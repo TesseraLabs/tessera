@@ -35,13 +35,28 @@ SCRIPTNAME=/etc/init.d/$NAME
 . /lib/init/vars.sh
 . /lib/lsb/init-functions
 
-# /run/tessera is a tmpfs entry created by tmpfiles.d on systemd hosts;
-# on SysV hosts we create it on demand here.
+# /run/tessera and /run/tessera-overlay are tmpfs entries created by tmpfiles.d
+# on systemd hosts; on SysV hosts we create them on demand here.
+#
+# The second one is the directory of QR-overlay attempt sockets, and its modes
+# differ from the first on purpose: 0711 is traversable by everyone and listable
+# by nobody, because the overlay runs as the greeter's account and has to reach
+# a socket whose random name it was given, while nothing else may enumerate the
+# names. See dist/tmpfiles/tessera.conf, which has to say the same thing.
 ensure_runtime_dir() {
     if [ ! -d /run/tessera ]; then
         mkdir -p /run/tessera
         chmod 0750 /run/tessera
-        chown root:root /run/tessera
+        # tessera:tessera, exactly as dist/tmpfiles/tessera.conf says. The
+        # daemon runs as that account and writes here; root:root left it unable
+        # to, and only on hosts without systemd — a difference that shows up as
+        # a daemon that starts everywhere except on this one kind of host.
+        chown tessera:tessera /run/tessera
+    fi
+    if [ ! -d /run/tessera-overlay ]; then
+        mkdir -p /run/tessera-overlay
+        chmod 0711 /run/tessera-overlay
+        chown root:root /run/tessera-overlay
     fi
 }
 

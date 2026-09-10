@@ -17,7 +17,7 @@ setup: [install-package, deploy-fixtures]
 cases:
   - id: BOOT-001
     title: Эталонная раскладка даёт одну и ту же идентичность на любом клоне
-    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requirement: spec9:fleet.BOOT-001
     requires: []
     # Отпечаток закреплён числом намеренно: SHA-256("installation") не зависит
     # ни от железа, ни от клона — в этом весь смысл эталонной раскладки. Если
@@ -34,7 +34,7 @@ cases:
 
   - id: BOOT-002
     title: На узле, уже переведённом на реальные источники, flip ничего не трогает
-    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requirement: spec9:fleet.BOOT-002
     requires: []
     # Идемпотентность здесь не удобство, а требование: скрипт гоняют из
     # ansible по всему парку, и повторный проход по уже переведённой машине
@@ -54,7 +54,7 @@ cases:
 
   - id: BOOT-003
     title: Некогерентная раскладка отвергается, конфиг остаётся нетронутым
-    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requirement: spec9:fleet.BOOT-002
     requires: []
     # `sources = ["override"]` без значения — состояние, из которого нельзя
     # вывести идентичность узла. Спека требует отказа, а не догадки: додуманное
@@ -77,7 +77,7 @@ cases:
 
   - id: BOOT-004
     title: Flip переводит узел на реальные источники и меняет его идентичность
-    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requirement: spec9:fleet.BOOT-002
     requires: []
     # Главный кейс сюиты: та самая атомарная инвалидация. После перевода
     # идентичность узла обязана перестать быть «installation» — именно этим
@@ -116,7 +116,7 @@ cases:
 
   - id: BOOT-005
     title: Провал проверки конфигурации откатывает flip и не трогает демон
-    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requirement: spec9:fleet.BOOT-002
     requires: []
     # Fail-closed на шаге 3. Несуществующий источник задаётся через `--sources`
     # — так порча приходит ровно оттуда, откуда её принёс бы оператор, а не
@@ -140,7 +140,7 @@ cases:
 
   - id: BOOT-006
     title: Без USB-носителя дамп идентичности сохраняется на диск, а не теряется
-    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requirement: spec9:fleet.BOOT-002
     requires: []
     # TSV-дамп — единственное, что связывает устройство с CA: по строке
     # активного источника выпускается per-host удостоверение. Если USB нет,

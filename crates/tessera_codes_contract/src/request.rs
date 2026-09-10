@@ -74,6 +74,93 @@ pub const NO_REFERENCE: &str = "none";
 /// itself would let one signature do the work of two.
 const ENGINEER_LABEL: &str = "tessera-codes-contract/v1/engineer-request";
 
+/// Marker of a request nobody's authenticator signed.
+const UNVERIFIED: &str = "unverified";
+
+/// Separator between that marker and the reason.
+const UNVERIFIED_SEPARATOR: char = ':';
+
+/// What stands where the signature of an engineer goes.
+///
+/// # Why the absence is a variant and not a missing field
+///
+/// Because an issuance served on somebody's word and an issuance served against
+/// a factor they presented are different events, and the difference is read
+/// months later off the document alone. A `None`, an empty signature, or one
+/// made with the key of a stub provider all look like "a signature" to the next
+/// reader — and the reader that matters is the one deciding whether a code
+/// handed out in March can be attributed to a person.
+///
+/// The variant carries its reason for the same reason the registry record does:
+/// "there was no provider" and "the provider refused" are different answers to
+/// the only question an auditor will ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineerSignature {
+    /// The engineer signed the request with their authenticator.
+    Signed(Signature),
+    /// Nobody's authenticator signed it, and this says why.
+    Unverified {
+        /// Why the request carries no signature.
+        reason: String,
+    },
+}
+
+impl EngineerSignature {
+    /// States that a request carries no signature, and why.
+    ///
+    /// # Errors
+    ///
+    /// The wire errors when the reason is empty or carries a character the
+    /// format cannot hold, and [`RequestError::ReasonSeparator`] when it
+    /// carries the separator that divides the marker from the reason.
+    pub fn unverified(reason: &str) -> Result<Self, RequestError> {
+        wire::check_free_text("engineer_signature_reason", reason)?;
+        if reason.contains(UNVERIFIED_SEPARATOR) {
+            return Err(RequestError::ReasonSeparator);
+        }
+        Ok(Self::Unverified {
+            reason: reason.to_owned(),
+        })
+    }
+
+    /// Reports whether an authenticator vouched for this request.
+    #[must_use]
+    pub const fn is_signed(&self) -> bool {
+        matches!(self, Self::Signed(_))
+    }
+
+    /// Renders the field as it travels.
+    ///
+    /// Public for the same reason the wire writer is: a consumer that has to
+    /// assemble this field outside the crate — a stand tool producing a
+    /// document the constructors refuse to build, say — writes it with this and
+    /// not with a second spelling of the same rule.
+    #[must_use]
+    pub fn to_wire_value(&self) -> String {
+        match self {
+            Self::Signed(signature) => hex::encode(signature.as_bytes()),
+            Self::Unverified { reason } => {
+                format!("{UNVERIFIED}{UNVERIFIED_SEPARATOR}{reason}")
+            }
+        }
+    }
+
+    /// Reads the field. Hexadecimal never carries the separator, so the two
+    /// cases are told apart by the parser and not by a length.
+    fn parse(value: &str) -> Result<Self, RequestError> {
+        match value
+            .strip_prefix(UNVERIFIED)
+            .and_then(|rest| rest.strip_prefix(UNVERIFIED_SEPARATOR))
+        {
+            Some(reason) => Self::unverified(reason),
+            None => Ok(Self::Signed(Signature::new(wire::parse_hex(
+                "engineer_signature",
+                value,
+            )?)?)),
+        }
+    }
+}
+
 /// A structured reference to whatever a fleet answers to.
 ///
 /// Deliberately not tied to a system: a kind ("work-order", "ticket") and an
@@ -360,13 +447,13 @@ impl core::fmt::Display for EngineerRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedRequest {
     request: EngineerRequest,
-    engineer_signature: Signature,
+    engineer_signature: EngineerSignature,
 }
 
 impl SignedRequest {
     /// Binds a signature to a request.
     #[must_use]
-    pub const fn new(request: EngineerRequest, engineer_signature: Signature) -> Self {
+    pub const fn new(request: EngineerRequest, engineer_signature: EngineerSignature) -> Self {
         Self {
             request,
             engineer_signature,
@@ -381,7 +468,7 @@ impl SignedRequest {
 
     /// Returns the signature of the engineer.
     #[must_use]
-    pub const fn engineer_signature(&self) -> &Signature {
+    pub const fn engineer_signature(&self) -> &EngineerSignature {
         &self.engineer_signature
     }
 
@@ -399,12 +486,20 @@ impl SignedRequest {
     /// [`RequestError::EngineerSignature`] when the signature does not hold or
     /// the engineer is not anchored.
     pub fn verify(&self, verifier: &impl SignatureVerifier) -> Result<(), RequestError> {
+        // A request nobody signed is refused here rather than passed as
+        // "nothing to check". Whoever calls this is asking whether an engineer
+        // stands behind the request; the honest answer for an unsigned one is
+        // no, and a caller that wants to serve it anyway has to say so in the
+        // journal — see the identity mark of the issuance record.
+        let EngineerSignature::Signed(signature) = &self.engineer_signature else {
+            return Err(RequestError::Unverified);
+        };
         let message = self.request.encode()?;
         verifier
             .verify(
                 SignerRef::Named(self.request.engineer_id()),
                 &message,
-                &self.engineer_signature,
+                signature,
             )
             .map_err(RequestError::EngineerSignature)
     }
@@ -415,7 +510,7 @@ impl SignedRequest {
         let [request, signature] = SIGNED_WIRE_KEYS;
         let fields = [
             (request, hex::encode(self.request.to_wire())),
-            (signature, hex::encode(self.engineer_signature.as_bytes())),
+            (signature, self.engineer_signature.to_wire_value()),
         ];
         wire::render(SIGNED_REQUEST_PREFIX, &fields)
     }
@@ -432,10 +527,7 @@ impl SignedRequest {
         let inner = String::from_utf8(inner)
             .map_err(|_| RequestError::Wire(WireError::UnusableValue { field: "request" }))?;
         let request = EngineerRequest::parse(&inner, params)?;
-        let signature = Signature::new(wire::parse_hex(
-            "engineer_signature",
-            wire::value(&values, 1),
-        )?)?;
+        let signature = EngineerSignature::parse(wire::value(&values, 1))?;
         Ok(Self::new(request, signature))
     }
 }
@@ -455,6 +547,16 @@ pub enum RequestError {
         "the request records no grounds; a request nobody can answer for later is not a request"
     )]
     MissingGrounds,
+    /// The request carries no signature of an engineer.
+    #[error(
+        "the request carries no signature of an engineer: an issuance served on somebody's word \
+         is not one served against a factor they presented"
+    )]
+    Unverified,
+    /// The reason of an unverified request carries the separator that divides
+    /// it from the marker.
+    #[error("the reason for an unsigned request carries the separator `:`")]
+    ReasonSeparator,
     /// The structured reference carries only one of its two halves.
     #[error("the structured reference carries a kind without an identifier, or the reverse")]
     HalfReference,
@@ -488,8 +590,8 @@ pub enum RequestError {
 )]
 pub(crate) mod tests {
     use super::{
-        EngineerRequest, FourEyesDigest, GroundsReference, RequestError, RequestFields,
-        SignedRequest, NO_REFERENCE, REQUEST_PREFIX,
+        EngineerRequest, EngineerSignature, FourEyesDigest, GroundsReference, RequestError,
+        RequestFields, SignedRequest, NO_REFERENCE, REQUEST_PREFIX,
     };
     use crate::canon::Level;
     use crate::challenge::{Challenge, ChallengeFields};
@@ -532,7 +634,74 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn signed_request() -> SignedRequest {
-        SignedRequest::new(request(), Signature::new(vec![0xab, 0xcd]).unwrap())
+        SignedRequest::new(
+            request(),
+            EngineerSignature::Signed(Signature::new(vec![0xab, 0xcd]).unwrap()),
+        )
+    }
+
+    /// A verifier that says yes to everything.
+    ///
+    /// Deliberately the most permissive one that can exist: the point of the
+    /// test below is that an unsigned request is refused BEFORE any verifier is
+    /// consulted, and a strict fixture would have refused it for its own
+    /// reasons and proved nothing.
+    struct AcceptsAnything;
+
+    impl crate::signature::SignatureVerifier for AcceptsAnything {
+        fn verify(
+            &self,
+            _signer: crate::signature::SignerRef<'_>,
+            _message: &[u8],
+            _signature: &Signature,
+        ) -> Result<(), crate::signature::SignatureError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_unsigned_request_is_refused_even_by_a_verifier_that_accepts_everything() {
+        // The whole weight of the explicit variant rests here. An issuance
+        // served on somebody's word and one served against a factor they
+        // presented are different events, and the difference is read months
+        // later off the document alone — so "there is nothing to check" must
+        // never come back as "checked".
+        let unsigned = SignedRequest::new(
+            request(),
+            EngineerSignature::unverified("stub-provider").unwrap(),
+        );
+        assert_eq!(
+            unsigned.verify(&AcceptsAnything),
+            Err(RequestError::Unverified)
+        );
+
+        // And the signed one still passes through the same door.
+        assert_eq!(signed_request().verify(&AcceptsAnything), Ok(()));
+    }
+
+    #[test]
+    fn the_two_cases_do_not_encode_alike() {
+        // A reader tells them apart by the bytes, not by a length or a guess:
+        // hexadecimal never carries the separator the marker uses.
+        let unsigned = SignedRequest::new(
+            request(),
+            EngineerSignature::unverified("stub-provider").unwrap(),
+        );
+        assert_ne!(unsigned.to_wire(), signed_request().to_wire());
+        assert_eq!(
+            SignedRequest::parse(&unsigned.to_wire(), &params()),
+            Ok(unsigned)
+        );
+    }
+
+    #[test]
+    fn a_reason_carrying_the_separator_is_refused() {
+        // Otherwise the reason swallows the marker and a reader can be shown a
+        // document that says two things about who vouched for it.
+        assert_eq!(
+            EngineerSignature::unverified("stub:provider").map(|_| ()),
+            Err(RequestError::ReasonSeparator)
+        );
     }
 
     #[test]

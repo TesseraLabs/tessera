@@ -18,7 +18,7 @@ name = "tessera_cp"
 # The wire types of the credential-provider flow and the protocol client. This
 # is the whole of the provider's coupling to the rest of the workspace: nothing
 # of the verification core reaches the process `LogonUI` loads this DLL into.
-tessera_proto = { path = "../tessera_proto", version = "0.5.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.6.0" }
 tracing = { workspace = true }
 # The log sink. Inside `LogonUI` there is no console to print to and no journal
 # to inherit, so the provider builds its own subscriber over a file.

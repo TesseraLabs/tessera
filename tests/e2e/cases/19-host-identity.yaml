@@ -13,7 +13,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: HOST-001
     title: Первый сработавший источник определяет идентичность
-    requirement: openspec/specs/host-identity/spec.md
+    requirement: spec9:auth.HID-006
     requires: [usb]
     # Перебора источников нет намеренно: правило «совпал хоть один» позволило бы
     # подделать самый слабый из них. Здесь первым стоит внешняя команда, и
@@ -33,7 +33,7 @@ cases:
 
   - id: HOST-002
     title: Сырое значение источника нормализуется до сравнения
-    requirement: openspec/specs/host-identity/spec.md
+    requirement: spec9:auth.HID-006
     requires: [usb]
     # Значения «AA:BB CC» и «aabbcc» — одна и та же идентичность: нормализация
     # убирает двоеточия и пробелы и приводит к нижнему регистру. Префикс
@@ -63,7 +63,7 @@ cases:
 
   - id: HOST-003
     title: Неопределимая идентичность узла закрывает вход
-    requirement: openspec/specs/host-identity/spec.md
+    requirement: spec9:auth.AUTH-002
     requires: [usb]
     # Единственный источник возвращает пустоту. Политика по умолчанию —
     # отказывать: узел, который не смог себя назвать, не получает доступ.

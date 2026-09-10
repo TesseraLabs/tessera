@@ -1,0 +1,2 @@
+{"seq":0,"prev_hash":"5c391eea73cba8a2bb0397ed28467652c00ae4678df93d226bbed28ff92c30a3","ts":1577836800,"op":"codes.refusal","note":"the request was outside the ticket"}
+{"seq":1,"prev_hash":"2fe48a143a2763d9f6a6b59f016c12e3f0102cbb4411aece73655c6c3d0990e0","ts":1577836800,"op":"codes.authorisation","note":"an authorisation was signed"}

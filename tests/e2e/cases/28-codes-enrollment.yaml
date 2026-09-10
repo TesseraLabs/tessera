@@ -1,13 +1,13 @@
 suite: codes-enrollment
 description: >
-  Часть Codes в пакете первичной настройки: устройство получает контейнер ключа,
-  билеты операторов и список их отзыва тем же импортом, что роли и теги. Пакет без
+  Часть Codes в пакете первичной настройки: устройство получает контейнер статической
+  пары, билеты серверов и список их отзыва тем же импортом, что роли и теги. Пакет без
   этой части обязан импортироваться ровно как прежде — парк «только Access» готовится
   тем же процессом.
 setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
 
 # Кейсы написаны ДО реализации (правило «кейс раньше кода»): ожидания взяты из
-# спеки openspec/changes/codes-device-artifacts/specs/device-enrollment/spec.md,
+# требования Spec9 ADR-PLAN-codes-device-artifacts,
 # а не измерены на стенде. Подгонять их под факт нельзя.
 #
 # Чтения пакета с CCID-токена и партионного носителя здесь нет намеренно: этот
@@ -17,7 +17,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
 cases:
   - id: ENRC-001
     title: Пакет с частью Codes раскладывает артефакты метода на устройство
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-035
     requires: []
     # Наблюдаемая гарантия: после импорта устройство несёт контейнер ключа,
     # билеты и анкер — и несёт их под правами, за которыми они и защищены.
@@ -40,7 +40,7 @@ cases:
 
   - id: ENRC-002
     title: Пакет без части Codes импортируется как прежде
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-035
     requires: []
     # Обратная совместимость — не приятная мелочь, а условие того, что парк
     # «только Access» готовится тем же процессом. Импорт обязан пройти, а
@@ -58,7 +58,7 @@ cases:
 
   - id: ENRC-003
     title: Пакет с новой эпохой заменяет ключ устройства
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-039
     requires: [service-manager]
     # Эпоха — единственное, что импорт двигает вперёд: попытки на устройстве не
     # персистятся, обнулять нечего. Настоящий разговор перед вторым пакетом
@@ -68,12 +68,12 @@ cases:
       # Подготовка телефонного канала идёт ПЕРЕД импортом: она приводит устройство
       # к чистому состоянию (включая state/), и после импорта затёрла бы ровно ту
       # эпоху, которую кейс проверяет.
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
       - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
         timeout: 60
       - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 2
@@ -82,12 +82,12 @@ cases:
         timeout: 60
       - expect_file: { path: /var/lib/tessera/codes/state/key.epoch, matches: "^2$" }
     teardown:
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
       - run: helpers/codes-enroll.sh cleanup
 
   - id: ENRC-004
     title: Пакет с эпохой ниже принятой отвергается
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-039
     requires: []
     # Anti-rollback: восстановленный носитель не должен уговорить устройство
     # вернуться к ключу, коды которого уже произнесены вслух. Отказ обязан быть
@@ -107,37 +107,37 @@ cases:
 
   - id: ENRC-005
     title: Повторный импорт той же эпохи проходит и оставляет эпоху на месте
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-039
     requires: [service-manager]
     # Повтор носителя — обычная процедура ремонта: тот же пакет подают второй
     # раз, и он обязан пройти, не сдвинув эпоху и не тронув состояние
     # устройства. До входа по коду и после него результат один и тот же.
     steps:
       # Порядок тот же, что в ENRC-003, и по той же причине.
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
       - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
         timeout: 60
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
     teardown:
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
       - run: helpers/codes-enroll.sh cleanup
 
   - id: ENRC-006
     title: Отзыв билета, привезённый пакетом, закрывает вход в той же попытке
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-040
     requires: [service-manager]
     # Список отзыва билетов едет ритмом CRL и применяется ДО аутентификации:
-    # отозванный оператор перестаёт пускать в той же попытке входа, в которой
+    # отозванный сервер перестаёт пускать в той же попытке входа, в которой
     # список приехал, а не после перезагрузки.
     steps:
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
       - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
@@ -146,21 +146,23 @@ cases:
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
         timeout: 60
     teardown:
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
       - run: helpers/codes-enroll.sh cleanup
 
   - id: ENRC-007
     title: Вывод устройства из парка вытирает артефакты Codes
-    requirement: openspec/specs/device-unenroll/spec.md
+    requirement: spec9:codes.PLAN-042
     requires: []
     # Команда `tessera un-enroll` вводится change'ем device-lifecycle, здесь
-    # проверяется только расширение её wipe-списка: ключ, билеты, список отзыва и
-    # nonce-store обязаны уйти вместе с устройством, а последняя эпоха — попасть
-    # в финальное событие, чтобы владелец знал, какую запись реестра отзывать.
+    # проверяется только расширение её wipe-списка: ключ, билеты и список отзыва
+    # обязаны уйти вместе с устройством, а последняя эпоха — попасть в финальное
+    # событие, чтобы владелец знал, какую запись реестра отзывать. Хранилища
+    # потраченных nonce в списке нет и быть не может: счётчик nonce из контракта
+    # удалён, попытка живёт только в памяти процесса.
     steps:
       - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
       - run: helpers/codes-enroll.sh import
@@ -183,7 +185,7 @@ cases:
 
   - id: ENRC-008
     title: Импорт в ослабленное хранилище не кладёт ни одного артефакта
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-036
     requires: []
     # Самопроверка хранилища — предусловие записи, а не отчёт о ней. Если каталог,
     # в котором лежит хранилище, доступен на запись кому попало, ключ туда класть
@@ -205,7 +207,7 @@ cases:
 
   - id: ENRC-009
     title: Файл части Codes больше потолка отвергается, а не читается целиком
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-041
     requires: []
     # Пакет приезжает на съёмном носителе, и его содержимое — воля того, кто этот
     # носитель собрал. Файл в десятки гигабайт обязан упереться в потолок формата,
@@ -226,7 +228,7 @@ cases:
 
   - id: ENRC-010
     title: Имя из части Codes, ведущее на симлинк, отвергается
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-041
     requires: []
     # Имя внутри секции проверено на «голость», и этого мало: голое имя всё равно
     # разрешается тем, что положил на носитель его хозяин. Симлинк на /dev/zero —
@@ -244,7 +246,7 @@ cases:
 
   - id: ENRC-011
     title: Секция Codes применяется только из подписанных байтов манифеста
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:codes.PLAN-041
     requires: []
     # ЗАГОТОВКА, прогону сегодня не поддаётся — см. BASELINE.md.
     # Гарантия: в managed-пакете секция [codes] называет удостоверяющий центр
@@ -270,9 +272,9 @@ cases:
 
   - id: ENRC-012
     title: Право снимает только список отзыва — набор без билета его переживает
-    requirement: openspec/specs/device-enrollment/spec.md
+    requirement: spec9:fleet.ENR-320
     requires: [service-manager]
-    # Владелец парка может снять право оператору двумя движениями, и они не
+    # Владелец парка может снять право серверу двумя движениями, и они не
     # равны. Внесение билета в список отзыва необратимо: список монотонен, набор
     # старее применённого отвергается, номер остаётся снятым. Сборка нового
     # набора БЕЗ билета права не снимает — набор счётчика версий не имеет, и у
@@ -283,23 +285,23 @@ cases:
     # Кейс проходит обе ветки подряд, потому что порознь ни одна ничего не
     # доказывает: «вход закрылся» после сборки без билета выглядит ровно как
     # отзыв, и отличает их только то, что происходит при повторной подаче
-    # прежнего носителя. Дополняет CODE-007 (`27-codes-phone`), который стережёт
+    # прежнего носителя. Дополняет CODE-007 (`27-codes-server`), который стережёт
     # сам отказ по отозванному билету, и ENRC-006, который стережёт его срок —
     # «в той же попытке входа».
     steps:
-      # Порядок тот же, что в ENRC-003: подготовка телефонного канала приводит
+      # Порядок тот же, что в ENRC-003: подготовка серверного канала приводит
       # устройство к чистому состоянию и потому идёт ПЕРЕД первым импортом.
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
       - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      # Набор без билета: пока он стоит, оператору нечем открыть устройство.
+      # Набор без билета: пока он стоит, серверу нечем открыть устройство.
       - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1 --without-ticket
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
         timeout: 60
       # Прежний носитель — прежний набор. Право вернулось, и это обещанное
@@ -309,7 +311,7 @@ cases:
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
         timeout: 60
       # Теперь настоящий отзыв — списком.
@@ -317,7 +319,7 @@ cases:
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
         timeout: 60
       # Тот же носитель, что вернул билет пять шагов назад. Он несёт набор с
@@ -327,9 +329,45 @@ cases:
       - run: helpers/codes-enroll.sh import
         expect: { exit_code: 0 }
         timeout: 60
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
         timeout: 60
     teardown:
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+      - run: helpers/codes-enroll.sh cleanup
+
+  - id: ENRC-013
+    title: Пакет объявляет аппаратный якорь устройства, даже когда якоря нет
+    requirement: spec9:fleet.ENR-313
+    requires: []
+    # Устройства MVP аппаратного монотонного якоря не имеют, и это предпосылка
+    # среды, а не свойство продукта: парк, снимающий снимки ВМ вместе с памятью,
+    # получает повторный приём кода и перебор откатами. Владелец обязан видеть
+    # фактическую ступень, поэтому поле «аппаратный якорь» существует с первого
+    # дня со значением «отсутствует», а рядом едет потолок уровня для таких
+    # устройств (ADR-FLEET-001, ENR-310; ADR-CODES-001, CODE-230).
+    #
+    # Проверяется именно НАЛИЧИЕ объявления: пакет, где поля нет вовсе, и пакет,
+    # где написано «отсутствует», для владельца различаются полностью, а для
+    # разбора — ничем, если поле необязательно. Отсюда же второй шаг: устройство
+    # без якоря не поднимает потолок уровня выше объявленного парком.
+    steps:
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 0 }
+        timeout: 60
+      - expect_file:
+          path: /var/lib/tessera/codes/params.txt
+          matches: "hardware_anchor=none"
+      - expect_file:
+          path: /var/lib/tessera/codes/params.txt
+          matches: "anchorless_level_ceiling=[0-9]+"
+      # Пакет, в Codes-части которого поля якоря нет, отвергается целиком:
+      # умолчание здесь означало бы, что владелец узнаёт ступень из головы, а не
+      # из пакета.
+      - run: helpers/codes-enroll.sh package {{fixtures}}/codes --epoch 1 --without-anchor-field
+      - run: helpers/codes-enroll.sh import
+        expect: { exit_code: 1 }
+        timeout: 60
+    teardown:
       - run: helpers/codes-enroll.sh cleanup

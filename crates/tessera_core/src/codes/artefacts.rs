@@ -135,6 +135,13 @@ pub struct CodesDelivery {
     pub revocations: Option<Vec<u8>>,
     /// The anchor every ticket is verified against.
     pub ticket_authority: Option<Vec<u8>>,
+    /// The addresses of the engineer's page the fleet publishes, one per line.
+    ///
+    /// The device shows one of them in front of the challenge and composes none
+    /// of its own, so this list is what makes `[codes].page_url` settable at
+    /// all: a configuration naming an address the package never delivered is
+    /// refused when it is loaded.
+    pub page_urls: Option<Vec<u8>>,
 }
 
 impl CodesDelivery {
@@ -145,6 +152,7 @@ impl CodesDelivery {
             && self.tickets.is_none()
             && self.revocations.is_none()
             && self.ticket_authority.is_none()
+            && self.page_urls.is_none()
     }
 }
 
@@ -352,6 +360,13 @@ pub fn apply(
     if let Some(bytes) = &delivery.ticket_authority {
         write_atomic(&paths.ticket_authority, bytes, ARTEFACT_MODE)?;
     }
+    // The addresses of the engineer's page, before the key and before the
+    // state: the configuration is checked against this list when it is loaded,
+    // so a device that took a key and not the list would come up refusing its
+    // own `[codes].page_url`.
+    if let Some(bytes) = &delivery.page_urls {
+        write_atomic(&paths.page_urls, bytes, ARTEFACT_MODE)?;
+    }
     if let Some(bytes) = &delivery.tickets {
         write_atomic(&paths.tickets, bytes, ARTEFACT_MODE)?;
     }
@@ -420,6 +435,7 @@ pub fn wipe(paths: &CodesPaths) -> Result<Wiped, ArtefactError> {
         &paths.tickets,
         &paths.ticket_revocations,
         &paths.ticket_authority,
+        &paths.page_urls,
         &paths.state_dir.join(STATE_FILENAME),
         &paths.state_dir.join(epoch::EPOCH_FILENAME),
     ] {
