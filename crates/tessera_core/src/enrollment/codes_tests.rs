@@ -8,6 +8,7 @@
 
 #![expect(
     clippy::unwrap_used,
+    clippy::panic,
     reason = "a failed setup step in a test should fail the test on the spot"
 )]
 
@@ -580,6 +581,70 @@ fn an_anchor_that_is_not_a_public_key_is_refused_at_the_import() {
 
     assert!(matches!(error, ImportError::CodesSection { .. }));
     assert!(!codes.ticket_authority.exists());
+}
+
+#[test]
+fn a_list_of_page_addresses_with_no_address_in_it_is_refused_at_the_import() {
+    // A file of nothing but comments HAS lines, so a check that only asked
+    // whether the file was blank called it a list. The device would then read
+    // no address out of it and refuse its own configuration — in the field,
+    // hours after the operator who could have fixed it had gone.
+    const PAGE_URLS_FILE: &str = "page-urls.txt";
+    let fixture = CodesFixture::new();
+    let package = standalone_package(Some(&format!(
+        "{}[page_urls]\nfile = \"{PAGE_URLS_FILE}\"\n",
+        CodesFixture::standalone_section()
+    )));
+    fixture.write(package.path());
+    fs::write(
+        package.path().join(PAGE_URLS_FILE),
+        b"# the addresses of this fleet\n#\n\n   \n",
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (install, codes) = device(&root);
+    let pin = SecretString::from(DELIVERY_PIN.to_owned());
+
+    let error = EnrollmentPackage::parse(package.path(), ImportMode::Standalone)
+        .unwrap()
+        .install_with_codes(
+            &install,
+            RoleOs::Linux,
+            None,
+            EnrollAuditIds::default(),
+            Some(&codes_import(&codes, Some(&pin))),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ImportError::CodesSection { .. }),
+        "{error:?}"
+    );
+
+    // And a list with one real address in it, comments and all, goes through:
+    // what was refused above is the absence of an address, not the comments.
+    let package = standalone_package(Some(&format!(
+        "{}[page_urls]\nfile = \"{PAGE_URLS_FILE}\"\n",
+        CodesFixture::standalone_section()
+    )));
+    fixture.write(package.path());
+    fs::write(
+        package.path().join(PAGE_URLS_FILE),
+        b"# the addresses of this fleet\nhttps://codes.fleet.example/e\n",
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (install, codes) = device(&root);
+    EnrollmentPackage::parse(package.path(), ImportMode::Standalone)
+        .unwrap()
+        .install_with_codes(
+            &install,
+            RoleOs::Linux,
+            None,
+            EnrollAuditIds::default(),
+            Some(&codes_import(&codes, Some(&pin))),
+        )
+        .unwrap_or_else(|error| panic!("a list carrying one address was refused: {error:?}"));
 }
 
 #[test]

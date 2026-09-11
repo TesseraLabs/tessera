@@ -63,16 +63,18 @@ use tessera_core::role::{AccountCheck, RoleDenyReason, RoleStore, SessionRolePay
 
 use crate::codes_level::{LevelError, LevelSource};
 
-/// Longest identifier of an issuing side a person may type.
+/// Longest identifier of an issuing side a person may type, in BYTES.
 ///
-/// It is a short name off a label — a value past this is a paste, not a name.
-const MAX_SERVER_ID_LEN: usize = 64;
+/// Taken from the contract rather than chosen here: it is the width the payload
+/// budget reserves for this field, and a prompt that accepted more would take a
+/// value the challenge then refuses — or, before the contract enforced it, draw
+/// a QR nobody can scan. Counted in bytes for the same reason the contract
+/// counts them: sixty-four Cyrillic letters are a hundred and twenty-eight
+/// bytes.
+const MAX_SERVER_ID_LEN: usize = tessera_codes_contract::challenge::MAX_SERVER_ID_BYTES;
 
-/// Longest personal number of an engineer a person may type.
-///
-/// The same bound as the operator identifier, and for the same reason: it is a
-/// number off a badge, not a paste.
-const MAX_ENGINEER_ID_LEN: usize = 64;
+/// Longest personal number of an engineer a person may type, in bytes.
+const MAX_ENGINEER_ID_LEN: usize = tessera_codes_contract::challenge::MAX_ENGINEER_ID_BYTES;
 
 /// Longest code a person may type.
 ///
@@ -96,17 +98,73 @@ const REASON_BOOT_MARKERS: &str = "boot_markers";
 /// Refusal detail: an answer to a prompt was empty or over the bound.
 const REASON_INPUT: &str = "input";
 
+/// Refusal detail: the payload does not fit a symbol a camera can read.
+///
+/// A fleet reaches this by publishing an address long enough to push the URL
+/// past the budget of the payload, and the answer is a refusal at the device
+/// rather than a QR nobody can scan.
+const REASON_QR: &str = "qr_payload_too_long";
+
+/// Refusal detail: the personal number is not one.
+///
+/// Kept apart from the general input refusal because the two are acted on
+/// differently by whoever reads the journal: one says a value was too long or
+/// carried a separator of the wire form, this one says a number did not meet
+/// its own check character, and only the second points at a person retyping
+/// something off a note.
+const REASON_ENGINEER_NUMBER: &str = "engineer_number_malformed";
+
 /// Prompt naming the issuing side this attempt is addressed to.
 const SERVER_PROMPT: &str = "Сервер выдачи: ";
 
 /// Prompt naming the engineer standing at the device.
 const ENGINEER_PROMPT: &str = "Личный номер: ";
 
-/// Prompt for the code the operator read back.
+/// Prompt for the code the engineer brings back.
 const CODE_PROMPT: &str = "Код: ";
+
+/// Line above the QR, telling the engineer what the symbol is for.
+const QR_CAPTION: &str = "Отсканируйте телефоном:";
+
+/// Line under the QR, carrying the payload as text.
+///
+/// Not a courtesy. A console where the half-block glyphs do not render, a
+/// session logged to a file, a camera that will not focus — in every one of
+/// them the text is the only way the challenge reaches the engineer's side, and
+/// it is the same bytes the symbol carries.
+const QR_FALLBACK_CAPTION: &str = "Или введите вручную:";
 
 /// What the engineer is shown when a code did not meet and another may be tried.
 const RETRY_MESSAGE: &str = "Код не принят. Попробуйте ещё раз.";
+
+/// Assembles what is shown above the code prompt: the QR and the payload.
+///
+/// A payload that cannot be drawn refuses the attempt instead of being shown
+/// smaller: a symbol above the version a telephone resolves is drawn, looks
+/// right to a person, and does not read — which costs an engineer a trip rather
+/// than a message.
+fn shown_challenge(
+    payload: &str,
+    pam_user: &str,
+    level: Level,
+    epoch: u32,
+) -> Result<String, CodeFlowError> {
+    let symbol = tessera_core::codes::qr::unicode_blocks(payload).map_err(|_| {
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: level.get(),
+            epoch,
+            ticket_number: None,
+            claimed_engineer_no: None,
+            reason: REASON_QR,
+        });
+        CodeFlowError::Denied
+    })?;
+    Ok(format!(
+        "{QR_CAPTION}\n{symbol}{QR_FALLBACK_CAPTION}\n{payload}\n"
+    ))
+}
 
 /// The conversation with the person at the device.
 ///
@@ -134,6 +192,59 @@ pub trait CodeConversation {
     ///
     /// [`PamConvError`], as [`CodeConversation::prompt_visible`].
     fn prompt_secret(&mut self, prompt: &str) -> Result<SecretString, PamConvError>;
+}
+
+/// Shows the challenge on the screen of a graphical login.
+///
+/// On a text console the challenge travels in the prompt and there is nothing
+/// to do. On a graphical login the greeter owns the screen, and the QR has to
+/// be put on top of it by a separate, unprivileged process — which this branch
+/// starts and stops around the attempt.
+///
+/// # The whole contract is that it cannot fail the login
+///
+/// Every method here is best effort, and that is not politeness: the text path
+/// is the base one and the overlay is the better case on top of it. A device
+/// with no display manager, a greeter that is not running, a socket that could
+/// not be created, an overlay binary that is not installed — each of them must
+/// leave the login exactly as it would have been, same prompts, same verdict.
+/// That is why [`OverlayPresenter::present`] returns an option and not a
+/// result: there is no error for a caller to act on, because there is no action
+/// a caller is allowed to take.
+///
+/// It is also why the symbol is taken down by dropping the handle rather than
+/// by a call the flow has to remember: every exit path of an attempt — accepted,
+/// refused, a conversation that failed halfway — drops it, and a QR left on the
+/// screen of a machine anybody can walk up to is the failure that matters here.
+pub trait OverlayPresenter {
+    /// Put the payload on the screen for the length of the attempt.
+    ///
+    /// [`None`] when there is no screen to put it on, which is the ordinary
+    /// case on a text login and not a failure of anything.
+    fn present(&self, payload: &str) -> Option<Box<dyn OverlayHandle>>;
+}
+
+/// The symbol that is currently on the screen.
+///
+/// Carries no methods on purpose. What a caller does with it is hold it for the
+/// length of the attempt and let it go: the implementation takes the symbol
+/// down when the value is dropped, and a handle that also had a `dismiss` would
+/// be two ways of doing one thing, of which a caller can forget one.
+pub trait OverlayHandle {}
+
+/// An overlay for a device that has no graphical login.
+///
+/// The production default. It is a type rather than an `Option` in the
+/// dependencies because "there is no overlay" and "the overlay did not come up"
+/// have to behave identically, and the surest way to make two paths behave
+/// identically is for there to be one path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoOverlay;
+
+impl OverlayPresenter for NoOverlay {
+    fn present(&self, _payload: &str) -> Option<Box<dyn OverlayHandle>> {
+        None
+    }
 }
 
 /// The two things about the running system this branch cannot make up.
@@ -188,8 +299,9 @@ pub trait CodeMethodApi {
         markers: &BootMarkers,
     ) -> Result<Self::Attempt, CodeLoginError>;
 
-    /// The challenge in the grouped form it is read aloud in.
-    fn spoken_form(&self, attempt: &Self::Attempt) -> String;
+    /// The challenge in the form it travels in: one line of the contract's
+    /// wire form, signature included.
+    fn payload(&self, attempt: &Self::Attempt) -> String;
 
     /// Verify the code that was read back.
     ///
@@ -219,8 +331,8 @@ impl CodeMethodApi for CodeMethod {
         self.begin_with_markers(request, markers)
     }
 
-    fn spoken_form(&self, attempt: &Self::Attempt) -> String {
-        attempt.spoken_form()
+    fn payload(&self, attempt: &Self::Attempt) -> String {
+        attempt.payload(Self::page_url(self))
     }
 
     fn verify(
@@ -325,8 +437,8 @@ pub enum CodeFlowError {
     /// session and so could not end it; here the journal never learned about it
     /// and so cannot attest that it happened. The control over an operator of
     /// the telephone channel *is* the reconciliation between the logins a fleet
-    /// saw and the receipts its operators wrote — a login the journal missed is
-    /// a receipt that reads as unpaired, or worse, an entry into a system that
+    /// saw and the issuances its server recorded — a login the journal missed is
+    /// an issuance that reads as unpaired, or worse, an entry into a system that
     /// left no trace at all.
     ///
     /// Only reachable on a device that has an audit chain. One without a chain
@@ -477,6 +589,12 @@ pub struct CodeDeps<'a> {
     /// Where the session lives, so the daemon can end it when its term runs
     /// out. Derived from `PAM_TTY` by the caller.
     pub pam_target: tessera_proto::SessionTarget,
+    /// What puts the QR on the screen of a graphical login.
+    ///
+    /// [`NoOverlay`] on a device that has none, which is every device that logs
+    /// in over ssh or on a text console. Nothing this value does can change the
+    /// verdict of an attempt — see [`OverlayPresenter`].
+    pub overlay: &'a dyn OverlayPresenter,
 }
 
 /// The login being attempted.
@@ -590,24 +708,7 @@ where
     let role_id = requested_role(pam_user, level, epoch)?;
     ensure_role_account(pam_user, deps.accounts, level, epoch)?;
 
-    let server_id = bounded_answer(
-        &conv.prompt_visible(SERVER_PROMPT)?,
-        MAX_SERVER_ID_LEN,
-        pam_user,
-        level,
-        epoch,
-    )?;
-    // Who is at the keyboard, as opposed to which side answers the request. It
-    // goes into the code, so a code cut for one engineer is useless to the next
-    // person to walk up to this device — and it is what the journal of this
-    // device names, which is otherwise a role account and nothing else.
-    let engineer_id = bounded_answer(
-        &conv.prompt_visible(ENGINEER_PROMPT)?,
-        MAX_ENGINEER_ID_LEN,
-        pam_user,
-        level,
-        epoch,
-    )?;
+    let (server_id, engineer_id) = ask_who_is_asking(conv, pam_user, level, epoch)?;
     let request = AttemptRequest {
         role_id: role_id.as_str(),
         level,
@@ -621,10 +722,19 @@ where
         .begin(&request, &markers)
         .map_err(|error| flow_error(error, epoch))?;
 
-    conv.show_info(&format!(
-        "Передайте выдающей стороне:\n{}",
-        method.spoken_form(&attempt)
-    ));
+    // The challenge travels in the TEXT OF THE PROMPT and not through
+    // `PAM_TEXT_INFO`. On fly-modern an info message becomes a modal warning
+    // box and the QR never reaches the login screen at all (design of
+    // 2026-07-03, §6.1, checked on a live 1.8.4). A method that shows nothing on
+    // the fleet it was built for is a method nobody can use, so the one channel
+    // that does reach every front end is the prompt.
+    let payload = method.payload(&attempt);
+    let shown = shown_challenge(&payload, pam_user, level, epoch)?;
+    // Bound and not used: the handle IS the overlay being on the screen, and it
+    // comes down when this binding goes out of scope at the end of the attempt.
+    // Named rather than `_`, which would drop it here and take the symbol down
+    // before the engineer had seen it.
+    let _overlay = raise_overlay(deps, &payload, pam_user, epoch);
 
     // Nothing is asked for the key container, and nothing holds a password for
     // it either: the key of the device is stored without one, guarded by the
@@ -646,9 +756,20 @@ where
     // spend nothing, which only the method can distinguish because only the
     // method holds the counter.
     let mut accepted: Option<Accepted> = None;
+    let mut first_prompt = true;
     for remaining in (0..deps.config.params.attempts_per_nonce()).rev() {
+        // The symbol goes up once, with the first prompt. Drawing it again on
+        // every retry would scroll the screen and leave the engineer scanning a
+        // half-erased QR — and they are looking at the code they mistyped, not
+        // at the challenge, which has not changed.
+        let prompt = if first_prompt {
+            format!("{shown}{CODE_PROMPT}")
+        } else {
+            CODE_PROMPT.to_owned()
+        };
+        first_prompt = false;
         let typed = bounded_answer(
-            &conv.prompt_visible(CODE_PROMPT)?,
+            &conv.prompt_visible(&prompt)?,
             MAX_CODE_LEN,
             pam_user,
             level,
@@ -687,8 +808,8 @@ where
     // of the level, the role payload, the registration under a strict fail
     // mode — and an event written earlier would record a login that ended in a
     // PAM refusal. The reconciliation this event exists for is between the
-    // logins a fleet saw and the receipts its operators wrote, and a success
-    // that did not happen makes an unpaired receipt look paired.
+    // logins a fleet saw and the issuances its server recorded, and a success
+    // that did not happen makes an unpaired issuance look paired.
     //
     // And this one can refuse. It is the last step before the session exists,
     // which is the only place the refusal is worth anything: the device has a
@@ -718,6 +839,70 @@ where
         auth_ctx,
         registration,
     })
+}
+
+/// Asks which side is expected to issue, and who is standing at the device.
+///
+/// Two prompts and no more, in that order. The second answer is checked as a
+/// number rather than only bounded: it goes into the code, so a code cut for
+/// one engineer is useless to the next person to walk up to this device — and
+/// it is what the journal of this device names, which is otherwise a role
+/// account and nothing else.
+///
+/// # Errors
+///
+/// [`CodeFlowError::Conv`] when the conversation cannot be driven, and
+/// [`CodeFlowError::Input`] for an answer the channel cannot carry.
+fn ask_who_is_asking<C: CodeConversation>(
+    conv: &mut C,
+    pam_user: &str,
+    level: Level,
+    epoch: u32,
+) -> Result<(String, String), CodeFlowError> {
+    let server_id = bounded_answer(
+        &conv.prompt_visible(SERVER_PROMPT)?,
+        MAX_SERVER_ID_LEN,
+        pam_user,
+        level,
+        epoch,
+    )?;
+    let typed = bounded_answer(
+        &conv.prompt_visible(ENGINEER_PROMPT)?,
+        MAX_ENGINEER_ID_LEN,
+        pam_user,
+        level,
+        epoch,
+    )?;
+    let engineer_id = checked_engineer_number(&typed, pam_user, level, epoch)?;
+    Ok((server_id, engineer_id))
+}
+
+/// Puts the same payload on the screen of a graphical login, if there is one.
+///
+/// The value it returns is held, not acted on: the handle takes the symbol down
+/// when it is dropped, which happens on every way out of an attempt — the
+/// accepted code, the spent budget, a conversation that failed at the first
+/// prompt.
+///
+/// Nothing is checked about the result and nothing can be. An overlay that did
+/// not come up leaves the challenge in the prompt, where it was going anyway,
+/// and the login proceeds exactly as it would have on a device with no screen.
+fn raise_overlay(
+    deps: &CodeDeps<'_>,
+    payload: &str,
+    pam_user: &str,
+    epoch: u32,
+) -> Option<Box<dyn OverlayHandle>> {
+    let overlay = deps.overlay.present(payload);
+    if overlay.is_none() {
+        tracing::debug!(
+            target: "tessera.codes",
+            user = pam_user,
+            epoch,
+            "the challenge is shown in the prompt only: no overlay on this device"
+        );
+    }
+    overlay
 }
 
 /// Read the level a second time and refuse a session that changed level.
@@ -820,8 +1005,12 @@ fn bounded_answer(
     epoch: u32,
 ) -> Result<String, CodeFlowError> {
     let trimmed = answer.trim();
+    // Bytes, not characters: the bound belongs to the payload budget, which is
+    // spent in bytes. Counting characters let a value in Cyrillic pass a prompt
+    // and then be refused by the document, which reads to an engineer as the
+    // device breaking rather than as a value being too long.
     if trimmed.is_empty()
-        || trimmed.chars().count() > limit
+        || trimmed.len() > limit
         || !tessera_codes_contract::wire::is_usable_in_a_document(trimmed)
     {
         audit::emit_denied(&audit::Denial {
@@ -836,6 +1025,66 @@ fn bounded_answer(
         return Err(CodeFlowError::Input { limit });
     }
     Ok(trimmed.to_owned())
+}
+
+/// Refuse a personal number whose check character does not meet.
+///
+/// The number carries an organisation segment, a serial part and a check
+/// character over both, and the device checks it before it starts an attempt.
+/// The alternative is worse than it looks: a mistyped number produces a code
+/// that ALMOST met, and the person debugging that stands at a machine on a site
+/// comparing arithmetic, when the answer was a character somebody typed wrong.
+///
+/// Checked here rather than inside the challenge for the same reason the
+/// character set is: this is the engineer's input, they are at the keyboard,
+/// and what they need is to be asked again — not a login that stops until an
+/// administrator looks at it.
+///
+/// The refusal names no more than the others do. Which of the two numbers was
+/// wrong, and how, goes to the journal.
+fn checked_engineer_number(
+    typed: &str,
+    pam_user: &str,
+    level: Level,
+    epoch: u32,
+) -> Result<String, CodeFlowError> {
+    match tessera_codes_contract::engineer_number::EngineerNumber::parse(typed) {
+        // The number as it was TYPED travels on, not the folded form: it is
+        // what the engineer will read back off their own screen, and it is what
+        // the issuing side is about to be shown.
+        Ok(_) => Ok(typed.to_owned()),
+        Err(error) => {
+            tracing::info!(
+                target: "tessera.codes",
+                user = pam_user,
+                epoch,
+                error = %error,
+                "the personal number was refused before an attempt was started"
+            );
+            // What goes into the journal is the string as it was TYPED, and
+            // that is the point rather than an oversight. A refused number is
+            // the only trace an attempt under an unknown identity leaves — the
+            // attempt never starts, so there is no nonce and no challenge to
+            // record — and a journal that stored the folded form, or nothing at
+            // all, would answer "somebody typed something" to the one question
+            // an investigator has. It is bounded before it gets here
+            // (`bounded_answer` at MAX_ENGINEER_ID_LEN), and the journal writes
+            // JSON, so a hostile string is data in a field rather than a line
+            // of its own.
+            audit::emit_denied(&audit::Denial {
+                nonce: None,
+                role_id: pam_user,
+                level: level.get(),
+                epoch,
+                ticket_number: None,
+                claimed_engineer_no: Some(typed),
+                reason: REASON_ENGINEER_NUMBER,
+            });
+            Err(CodeFlowError::Input {
+                limit: MAX_ENGINEER_ID_LEN,
+            })
+        }
+    }
 }
 
 /// Read the boot markers, refusing the login when they cannot be had.

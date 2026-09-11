@@ -10,7 +10,7 @@
 //!
 //! For the telephone channel that stops being a theoretical objection. The
 //! control over an operator there *is* the reconciliation between the logins a
-//! fleet saw and the receipts its operators wrote — a login without a receipt is
+//! fleet saw and the issuances its server recorded — a login without an issuance is
 //! the finding. A reconciliation against a record one side can quietly edit is
 //! not a reconciliation.
 //!

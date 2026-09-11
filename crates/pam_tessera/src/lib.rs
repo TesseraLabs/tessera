@@ -14,6 +14,8 @@ pub mod di;
 pub mod codes_flow;
 pub mod codes_level;
 pub mod flow;
+#[cfg(unix)]
+pub mod overlay;
 pub mod pam_args;
 pub mod panic_guard;
 pub mod role_selection;

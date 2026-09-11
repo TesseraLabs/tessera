@@ -85,10 +85,17 @@ pub enum WireError {
 
 /// Renders a document: the prefix, then the fields in the given order.
 ///
+/// Public so that a consumer assembling a document *of this channel* outside the
+/// crate — the journal record of an issuance, say — writes it with this writer
+/// rather than with a second spelling of the same format. A second spelling is
+/// the failure this module exists to prevent, and it does not become safer for
+/// living in another crate.
+///
 /// The values are expected to have passed [`check_free_text`] or to be produced
 /// by the crate itself; the writer adds no escaping, because a format with an
 /// escape is a format with two spellings of one document.
-pub(crate) fn render(prefix: &str, fields: &[(&'static str, String)]) -> String {
+#[must_use]
+pub fn render(prefix: &str, fields: &[(&'static str, String)]) -> String {
     let mut text = String::from(prefix);
     for (key, value) in fields {
         text.push(FIELD_SEPARATOR);
@@ -106,7 +113,7 @@ pub(crate) fn render(prefix: &str, fields: &[(&'static str, String)]) -> String 
 /// Returns the [`WireError`] describing the first violation: a wrong prefix, a
 /// field count that does not match, a field that is not a `key=value` pair, a
 /// key out of order or unknown, or an empty value.
-pub(crate) fn parse<'a>(
+pub fn parse<'a>(
     text: &'a str,
     prefix: &'static str,
     keys: &[&'static str],
@@ -151,7 +158,8 @@ pub(crate) fn parse<'a>(
 /// The index comes from the field table of the document, which is the same
 /// table [`parse`] was called with, so a value is always there; the total form
 /// avoids a panic path for a branch that cannot be taken.
-pub(crate) fn value<'a>(values: &[&'a str], index: usize) -> &'a str {
+#[must_use]
+pub fn value<'a>(values: &[&'a str], index: usize) -> &'a str {
     values.get(index).copied().unwrap_or_default()
 }
 
@@ -162,7 +170,7 @@ pub(crate) fn value<'a>(values: &[&'a str], index: usize) -> &'a str {
 /// Returns [`WireError::EmptyValue`] for an empty value and
 /// [`WireError::UnusableValue`] when it carries a separator of the format or a
 /// control character.
-pub(crate) fn check_free_text(field: &'static str, value: &str) -> Result<(), WireError> {
+pub fn check_free_text(field: &'static str, value: &str) -> Result<(), WireError> {
     if value.is_empty() {
         return Err(WireError::EmptyValue { field });
     }
@@ -244,7 +252,7 @@ pub(crate) fn parse_u64(field: &'static str, value: &str) -> Result<u64, WireErr
 /// Returns [`WireError::NotHex`] when the value is not an even run of
 /// hexadecimal digits, and [`WireError::EmptyValue`] when it decodes to nothing
 /// — a key or a signature of zero length is not a value any consumer can use.
-pub(crate) fn parse_hex(field: &'static str, value: &str) -> Result<Vec<u8>, WireError> {
+pub fn parse_hex(field: &'static str, value: &str) -> Result<Vec<u8>, WireError> {
     let bytes = hex::decode(value).map_err(|_| WireError::NotHex { field })?;
     if bytes.is_empty() {
         return Err(WireError::EmptyValue { field });

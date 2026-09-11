@@ -160,6 +160,84 @@ impl Confirmation {
     }
 }
 
+/// A grant with everything the issuing side knows and nothing it signs.
+///
+/// The computation of a code and the signature over the grant are performed by
+/// different holders: the code needs the agreement key, the grant needs the
+/// signing key, and in the deployment those two live behind different custody.
+/// The issuing core therefore assembles what it knows — the request it served
+/// and the identifier it served it under — and hands it to whoever holds the
+/// signing key. Making that intermediate state a type of its own is what keeps
+/// a half-built [`Grant`] from existing: there is no value here that could be
+/// mistaken for a grant somebody signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsignedGrant {
+    request: SignedRequest,
+    server_id: String,
+}
+
+impl UnsignedGrant {
+    /// Assembles what the issuing side will sign.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wire errors when the identifier of the issuing side is empty
+    /// or carries a character the format cannot hold — the same check
+    /// [`Grant::new`] performs, made here so a value that cannot become a grant
+    /// never comes into being.
+    pub fn new(request: SignedRequest, server_id: &str) -> Result<Self, GrantError> {
+        wire::check_free_text("server", server_id)?;
+        Ok(Self {
+            request,
+            server_id: server_id.to_owned(),
+        })
+    }
+
+    /// Returns the signed request this grant answers.
+    #[must_use]
+    pub const fn request(&self) -> &SignedRequest {
+        &self.request
+    }
+
+    /// Returns the identifier of the issuing side.
+    #[must_use]
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
+    /// Encodes the message the holder of the signing key signs.
+    ///
+    /// The same bytes [`Grant::server_message`] returns, available before the
+    /// signature exists: the holder of the key signs these and nothing else, so
+    /// it never has to be handed a document to fill in.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the request encoding.
+    pub fn signing_message(&self) -> Result<Vec<u8>, CanonError> {
+        Grant::labelled(SERVER_LABEL, &self.request)
+    }
+
+    /// Turns this into a grant, with the signature of the issuing side.
+    ///
+    /// # Errors
+    ///
+    /// [`GrantError::SelfConfirmation`] when the confirmer is the engineer who
+    /// asked, and the wire errors of [`Grant::new`].
+    pub fn sign(
+        self,
+        server_signature: Signature,
+        confirmation: Option<Confirmation>,
+    ) -> Result<Grant, GrantError> {
+        Grant::new(GrantFields {
+            request: self.request,
+            server_id: &self.server_id,
+            server_signature,
+            confirmation,
+        })
+    }
+}
+
 /// What the issuing side answered a request with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
@@ -185,14 +263,24 @@ impl Grant {
         // would otherwise enforce it does not exist yet, and an invariant
         // nobody can express is an invariant nobody keeps.
         //
-        // What this is NOT: byte equality of identifiers is a necessary rule,
-        // not a sufficient one. Two spellings of one person — a login and a
-        // personal number, the same name in two registers — pass it, and the
-        // four-eyes rule this serves lives where identities are resolved into
-        // keys. This closes the case where the document says outright that one
-        // party did both.
+        // Compared in the FOLDED form, not byte for byte. A personal number
+        // ignores its separators and its case by the rule of its own format, so
+        // `ORG1-0000014` and `org1 000001 4` are one number; comparing what was
+        // typed let an engineer confirm their own request under the second
+        // spelling and produced a document that reads as two people. The device
+        // number in this crate has been compared folded all along — the
+        // confirmer was the one place that was not.
+        //
+        // What this is still NOT: a resolution of identity. Two names for one
+        // person — a login and a personal number, the same human in two
+        // registers — pass it, and the four-eyes rule this serves lives where
+        // identities are resolved into keys. This closes the case where the
+        // document says outright that one party did both.
         if let Some(confirmation) = &fields.confirmation {
-            if confirmation.confirmer_id() == fields.request.request().engineer_id() {
+            let confirmer = crate::number::significant_characters(confirmation.confirmer_id());
+            let engineer =
+                crate::number::significant_characters(fields.request.request().engineer_id());
+            if confirmer == engineer {
                 return Err(GrantError::SelfConfirmation);
             }
         }
@@ -270,7 +358,7 @@ impl Grant {
     }
 
     /// Encodes the request object under a label.
-    fn labelled(label: &str, request: &SignedRequest) -> Result<Vec<u8>, CanonError> {
+    pub(crate) fn labelled(label: &str, request: &SignedRequest) -> Result<Vec<u8>, CanonError> {
         let mut encoder = Encoder::default();
         encoder.push_text("label", label)?;
         encoder.push_bytes("request", &request.request().encode()?)?;
@@ -317,6 +405,33 @@ impl Grant {
                 .map_err(GrantError::ConfirmerSignature)?;
         }
         Ok(())
+    }
+
+    /// Verifies ONLY the signature of the issuing side.
+    ///
+    /// [`Grant::verify`] is the whole document: the engineer's signature, the
+    /// issuing side's, and the confirmer's if there is one. This is the part a
+    /// reader can check when the engineer's identity was never vouched for —
+    /// which, in a release whose identity provider is a stub, is every grant
+    /// there is. Refusing all of them would not be a stricter check; it would
+    /// be a check whose answer says nothing about the document.
+    ///
+    /// What it does NOT say, and a caller must not read into it: that the
+    /// engineer is who the grant names. Only the mark in the issuance record
+    /// speaks to that, and it says nobody vouched.
+    ///
+    /// # Errors
+    ///
+    /// [`GrantError::ServerSignature`] when the signature does not hold, and
+    /// the canonical errors when the message cannot be encoded.
+    pub fn verify_issuing_side(&self, verifier: &impl SignatureVerifier) -> Result<(), GrantError> {
+        verifier
+            .verify(
+                SignerRef::Named(&self.server_id),
+                &self.server_message()?,
+                &self.server_signature,
+            )
+            .map_err(GrantError::ServerSignature)
     }
 
     /// Renders the wire form, summary included.
@@ -460,9 +575,11 @@ pub enum GrantError {
     reason = "a failed setup step in a test should fail the test on the spot"
 )]
 mod tests {
-    use super::{Confirmation, Grant, GrantError, GrantFields, NO_CONFIRMER};
+    use super::{Confirmation, Grant, GrantError, GrantFields, UnsignedGrant, NO_CONFIRMER};
     use crate::request::tests::{params, signed_request};
-    use crate::signature::Signature;
+    use crate::request::EngineerSignature;
+    use crate::request::SignedRequest;
+    use crate::signature::{Signature, SignatureError, SignatureVerifier, SignerRef};
     use crate::wire::WireError;
 
     fn grant() -> Grant {
@@ -486,6 +603,130 @@ mod tests {
             ),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn what_the_issuing_side_signs_is_known_before_it_signs() {
+        // The holder of the signing key never sees a half-built document: it is
+        // handed bytes, and the bytes are the ones the finished grant states as
+        // its own signing message. Were the two to part ways, a grant would
+        // carry a signature over something other than itself and would still
+        // parse.
+        let unsigned = UnsignedGrant::new(signed_request(), "srv-1").unwrap();
+        let message = unsigned.signing_message().unwrap();
+        let signed = unsigned
+            .sign(Signature::new(vec![0x11, 0x22]).unwrap(), None)
+            .unwrap();
+        assert_eq!(signed.server_message().unwrap(), message);
+        assert_eq!(signed, grant());
+    }
+
+    #[test]
+    fn an_issuing_side_the_format_cannot_hold_is_refused_before_anything_is_signed() {
+        assert_eq!(
+            UnsignedGrant::new(signed_request(), "").map(|_| ()),
+            Err(GrantError::Wire(WireError::EmptyValue { field: "server" }))
+        );
+    }
+
+    #[test]
+    fn a_confirmation_by_the_engineer_who_asked_is_refused_at_signing() {
+        let unsigned = UnsignedGrant::new(signed_request(), "srv-1").unwrap();
+        let engineer = unsigned.request().request().engineer_id().to_owned();
+        assert_eq!(
+            unsigned
+                .sign(
+                    Signature::new(vec![0x11, 0x22]).unwrap(),
+                    Some(Confirmation::by(&engineer, Signature::new(vec![0x33]).unwrap()).unwrap()),
+                )
+                .map(|_| ()),
+            Err(GrantError::SelfConfirmation)
+        );
+    }
+
+    /// A verifier that says yes to everything.
+    ///
+    /// The most permissive one that can exist, on purpose: what these tests
+    /// establish is which refusals happen BEFORE anybody is asked, and a strict
+    /// fixture would refuse for its own reasons and prove nothing.
+    struct AcceptsAnything;
+
+    impl SignatureVerifier for AcceptsAnything {
+        fn verify(
+            &self,
+            _signer: SignerRef<'_>,
+            _message: &[u8],
+            _signature: &Signature,
+        ) -> Result<(), SignatureError> {
+            Ok(())
+        }
+    }
+
+    /// A verifier that refuses one named signer and admits the rest.
+    struct RefusesOne(&'static str);
+
+    impl SignatureVerifier for RefusesOne {
+        fn verify(
+            &self,
+            signer: SignerRef<'_>,
+            _message: &[u8],
+            _signature: &Signature,
+        ) -> Result<(), SignatureError> {
+            match signer {
+                SignerRef::Named(name) if name == self.0 => Err(SignatureError::Rejected),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_grant_whose_request_nobody_signed_does_not_verify() {
+        // The order of the claims, and the first of them: the request is what
+        // the engineer asked for. A consumer that checked the issuing side
+        // alone would accept a grant whose request was written by whoever holds
+        // the issuing key — and after the explicit "nobody signed it" variant,
+        // by whoever holds nothing at all.
+        let unsigned = Grant::new(GrantFields {
+            request: SignedRequest::new(
+                signed_request().request().clone(),
+                EngineerSignature::unverified("stub-provider").unwrap(),
+            ),
+            server_id: "srv-1",
+            server_signature: Signature::new(vec![0x11, 0x22]).unwrap(),
+            confirmation: None,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            unsigned.verify(&AcceptsAnything),
+            Err(GrantError::Request(_))
+        ));
+    }
+
+    #[test]
+    fn each_signature_of_a_grant_is_actually_checked() {
+        // Three claims, three refusals, one at a time. Without this every
+        // signature of this document could have gone unchecked and every test
+        // in the file would still have passed: nothing called `verify` at all.
+        assert_eq!(grant().verify(&AcceptsAnything), Ok(()));
+        assert_eq!(confirmed().verify(&AcceptsAnything), Ok(()));
+
+        // The engineer.
+        let engineer = signed_request().request().engineer_id().to_owned();
+        assert!(matches!(
+            grant().verify(&RefusesOne(Box::leak(engineer.into_boxed_str()))),
+            Err(GrantError::Request(_))
+        ));
+        // The issuing side.
+        assert!(matches!(
+            grant().verify(&RefusesOne("srv-1")),
+            Err(GrantError::ServerSignature(_))
+        ));
+        // The second pair of eyes, when there is one.
+        assert!(matches!(
+            confirmed().verify(&RefusesOne("duty-officer")),
+            Err(GrantError::ConfirmerSignature(_))
+        ));
     }
 
     #[test]
@@ -595,7 +836,10 @@ mod tests {
             })
             .unwrap();
             Grant::new(GrantFields {
-                request: SignedRequest::new(request, Signature::new(vec![0xab, 0xcd]).unwrap()),
+                request: SignedRequest::new(
+                    request,
+                    EngineerSignature::Signed(Signature::new(vec![0xab, 0xcd]).unwrap()),
+                ),
                 server_id: "srv-1",
                 server_signature: Signature::new(vec![0x11, 0x22]).unwrap(),
                 confirmation: first.confirmation().cloned(),
@@ -637,6 +881,62 @@ mod tests {
             Grant::parse(&text, &params()),
             Err(GrantError::SelfConfirmation)
         );
+    }
+
+    #[test]
+    fn a_confirmation_under_another_spelling_of_the_same_number_is_still_self_confirmation() {
+        // Byte equality is not identity here. The personal number ignores its
+        // separators and its case by the rule of its own format, so
+        // `ORG1-0000014` and `org1 000001 4` are ONE number — and an engineer
+        // who confirms their own request under the second spelling would have
+        // produced a document that reads as two people.
+        //
+        // The device number in this same crate has been compared in its folded
+        // form all along; the confirmer was the one place that compared what
+        // was typed.
+        let engineer = signed_request().request().engineer_id().to_owned();
+        let respelled = respell(&engineer);
+        assert_ne!(
+            respelled, engineer,
+            "the two spellings must differ as bytes"
+        );
+
+        assert_eq!(
+            Grant::new(GrantFields {
+                request: signed_request(),
+                server_id: "srv-1",
+                server_signature: Signature::new(vec![0x11, 0x22]).unwrap(),
+                confirmation: Some(
+                    Confirmation::by(&respelled, Signature::new(vec![0x33, 0x44]).unwrap())
+                        .unwrap(),
+                ),
+            })
+            .map(|_| ()),
+            Err(GrantError::SelfConfirmation)
+        );
+
+        // And through the wire, because that is how such a document arrives.
+        let text = confirmed()
+            .to_wire()
+            .replace("confirmer=duty-officer", &format!("confirmer={respelled}"));
+        assert_eq!(
+            Grant::parse(&text, &params()),
+            Err(GrantError::SelfConfirmation)
+        );
+    }
+
+    /// The same number written differently: lowercase, with the separators of
+    /// the number moved about.
+    fn respell(number: &str) -> String {
+        let significant: String = crate::number::significant_characters(number).to_lowercase();
+        let mut respelled = String::new();
+        for (index, symbol) in significant.chars().enumerate() {
+            if index == 2 || index == 6 {
+                respelled.push(' ');
+            }
+            respelled.push(symbol);
+        }
+        respelled
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The challenge of the phone channel.
+//! The challenge of an attempt.
 //!
 //! A challenge is what the device states about one attempt: which device, which
 //! key epoch, which nonce, which role at which level, which issuing side it is
@@ -9,17 +9,16 @@
 //! only thing that ties `K` to this attempt and to no other: the issuing side
 //! computes `Z` against it, and a point that arrived out of band would be a
 //! second document nobody checks against the first. It is carried, not read
-//! aloud — see [`Challenge::spoken_form`].
+//! carried whole: a screen, a QR code, a paste buffer.
 //!
-//! Two forms of the same value therefore have to exist and never drift apart:
+//! One form of the value travels: the wire form ([`Challenge::parse`] and
+//! [`core::fmt::Display`]), one line of `key=value` pairs carried by a QR code,
+//! a paste buffer or a log. A second, grouped form existed while a challenge was
+//! read out over a telephone; the channel no longer has a person in that place,
+//! and a rendering nobody reads is a second spelling of the document waiting to
+//! drift from the first.
 //!
-//! - the wire form ([`Challenge::parse`] and [`core::fmt::Display`]) — one line
-//!   of `key=value` pairs, carried by a QR code, a paste buffer or a log;
-//! - the spoken form ([`Challenge::spoken_form`]) — the same values split into
-//!   short groups, because a twenty-two character nonce read as one run is
-//!   mistyped.
-//!
-//! Neither is the input of the MAC. That is the canonical encoding
+//! The wire form is not the input of the MAC. That is the canonical encoding
 //! ([`Challenge::encode`]), written with the same [`Encoder`] as every other
 //! structure of the contract, over the *significant* characters of the device
 //! number — two labels printing one number with different separators must not
@@ -71,6 +70,22 @@ pub const SIGNED_CHALLENGE_FIELD_COUNT: usize = CHALLENGE_FIELD_COUNT + 1;
 /// instead of being read and found to be missing a signature later.
 pub const SIGNED_CHALLENGE_PREFIX: &str = "tessera-codes/v1/signed-challenge";
 
+/// Budget of the whole QR payload, in bytes of the URL.
+///
+/// The number is a property of the camera and the screen, not of this crate: a
+/// QR of version 20 with correction M holds 666 bytes in byte mode, and that is
+/// what a telephone reads off the console of a device or off an overlay. The
+/// budget is stated here because the wire form is what spends it — see
+/// `WORST_CASE_PAYLOAD` for the sum, which is checked rather than asserted in
+/// prose.
+pub const PAYLOAD_BUDGET: usize = 640;
+
+// The sum the specification of the payload states in prose, checked where it
+// cannot drift: at compile time. A change that widens a field — a longer
+// version prefix, a wider nonce, an identifier limit raised — stops the build
+// here instead of producing a QR nobody can read off a screen.
+const _: () = assert!(WORST_CASE_PAYLOAD <= PAYLOAD_BUDGET);
+
 /// Label the signature of a challenge is made under.
 ///
 /// Every signature of the contract is made over a labelled message, so bytes
@@ -90,6 +105,18 @@ const SIGNED_WIRE_KEYS: [&str; SIGNED_CHALLENGE_FIELD_COUNT] = [
     "signature",
 ];
 
+/// Refuses a field wider than the payload budget reserved for it.
+fn bounded(field: &'static str, value: &str, limit: usize) -> Result<(), ChallengeError> {
+    if value.len() > limit {
+        return Err(ChallengeError::FieldTooWide {
+            field,
+            limit,
+            got: value.len(),
+        });
+    }
+    Ok(())
+}
+
 /// Field names of the canonical encoding, in the order they are encoded.
 ///
 /// The order is the contract's, not the declaration order of [`Challenge`]; a
@@ -104,9 +131,6 @@ const CANON_FIELDS: [&str; CHALLENGE_FIELD_COUNT] = [
     "engineer_id",
     "ephemeral_point",
 ];
-
-/// Number of characters in one group of the spoken form.
-const SPOKEN_GROUP: usize = 3;
 
 /// The values a challenge is assembled from.
 ///
@@ -137,7 +161,7 @@ pub struct ChallengeFields<'a> {
     pub ephemeral_point: EphemeralPublicPoint,
 }
 
-/// A phone-channel challenge.
+/// The challenge of one attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Challenge {
     device_number: CheckedDeviceNumber,
@@ -160,6 +184,18 @@ impl Challenge {
     /// character the wire form cannot hold — a separator of the format or a
     /// control character.
     pub fn new(fields: ChallengeFields<'_>) -> Result<Self, ChallengeError> {
+        // The bounds of the payload budget, enforced where the document is
+        // assembled. A caller that checked them itself would be checking them
+        // in characters, or in a place a second caller does not pass through;
+        // here every challenge that exists has already fitted.
+        bounded(
+            "device",
+            fields.device_number.significant(),
+            MAX_DEVICE_NUMBER_BYTES,
+        )?;
+        bounded("role", fields.role_id, MAX_ROLE_ID_BYTES)?;
+        bounded("server", fields.server_id, MAX_SERVER_ID_BYTES)?;
+        bounded("engineer", fields.engineer_id, MAX_ENGINEER_ID_BYTES)?;
         wire::check_free_text("role_id", fields.role_id)?;
         wire::check_free_text("server_id", fields.server_id)?;
         wire::check_free_text("engineer_id", fields.engineer_id)?;
@@ -294,35 +330,6 @@ impl Challenge {
         }
     }
 
-    /// Renders the challenge field by field: the device number and the nonce in
-    /// groups of three characters, the numbers as they are, the identifiers
-    /// verbatim, the ephemeral point in one run of hexadecimal.
-    ///
-    /// The point is not grouped, and it is not something a person reads out:
-    /// it is sixty-five bytes, and the channel it travels — a screen, a QR
-    /// code, a paste buffer — carries it whole. Grouping it would only invite
-    /// somebody to try. Every field is present because the issuing side needs
-    /// every field, and a form that dropped one would make the caller fetch it
-    /// from somewhere else.
-    ///
-    /// The rendering carries no labels on purpose — a library has no business
-    /// choosing the language they are shown in; the caller pairs the fields,
-    /// in the order of [`challenge_field_order`], with its own wording.
-    #[must_use]
-    pub fn spoken_form(&self) -> String {
-        [
-            group(self.device_number.significant()),
-            self.epoch.get().to_string(),
-            group(self.nonce.as_str()),
-            self.role_id.clone(),
-            self.level.get().to_string(),
-            self.server_id.clone(),
-            self.engineer_id.clone(),
-            hex::encode(self.ephemeral_point.as_bytes()),
-        ]
-        .join(" / ")
-    }
-
     /// Returns the device number, check character included.
     #[must_use]
     pub const fn device_number(&self) -> &CheckedDeviceNumber {
@@ -447,17 +454,30 @@ impl SignedChallenge {
         wire::render(SIGNED_CHALLENGE_PREFIX, &fields)
     }
 
-    /// Renders the fields for reading, the signature last.
+    /// Assembles the payload a device shows: the page URL, `#`, and this
+    /// document.
     ///
-    /// Like the ephemeral point beside it, the signature is carried rather than
-    /// dictated — see [`Challenge::spoken_form`].
+    /// The fields of the attempt live in the fragment and nowhere else. That is
+    /// not tidiness: a fragment is not sent when the browser fetches the page,
+    /// so the bundle loads without telling the server anything about the
+    /// attempt, and the challenge reaches the server only when the engineer
+    /// sends it with their grounds.
+    ///
+    /// `base_url` is one of the addresses the enrollment package delivered, and
+    /// the caller is the one that checked it: a device does not compose an
+    /// address out of anything it was told. Without one the payload is the
+    /// document alone — the URL is navigation, the fragment is the channel, and
+    /// a fleet that published no page still shows a scannable challenge.
+    ///
+    /// No percent-encoding is applied. The wire form is restricted to
+    /// characters a fragment carries as they are, and a reader that decoded
+    /// before parsing would be reading other bytes than the device signed.
     #[must_use]
-    pub fn spoken_form(&self) -> String {
-        format!(
-            "{} / {}",
-            self.challenge.spoken_form(),
-            hex::encode(self.signature.as_bytes())
-        )
+    pub fn payload(&self, base_url: Option<&str>) -> String {
+        match base_url {
+            Some(base) => format!("{base}#{}", self.to_wire()),
+            None => self.to_wire(),
+        }
     }
 
     /// Checks the signature against the key the registry holds for this device.
@@ -549,6 +569,23 @@ pub enum ChallengeError {
     /// The device number failed its check character.
     #[error(transparent)]
     DeviceNumber(#[from] DeviceNumberError),
+    /// A field is wider than the payload budget reserved for it.
+    ///
+    /// In bytes, not characters. A name that fits a limit counted in characters
+    /// and spends twice the bytes reserved for it produces a QR nobody can
+    /// scan, on a device that accepted the configuration without complaint.
+    #[error(
+        "the field `{field}` is {got} bytes, over the {limit} the payload budget reserves for \
+         it: a wider one draws a QR a telephone cannot resolve"
+    )]
+    FieldTooWide {
+        /// Name of the offending field.
+        field: &'static str,
+        /// The reserved width, in bytes.
+        limit: usize,
+        /// What arrived, in bytes.
+        got: usize,
+    },
     /// The nonce does not fit the fleet parameters.
     #[error(transparent)]
     Nonce(#[from] NonceError),
@@ -570,16 +607,81 @@ pub enum ChallengeError {
     Signature(#[source] SignatureError),
 }
 
-/// Splits a run of characters into groups for reading aloud.
-fn group(value: &str) -> String {
-    value
-        .chars()
-        .collect::<Vec<_>>()
-        .chunks(SPOKEN_GROUP)
-        .map(|chunk| chunk.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+/// Widest each field of a challenge may be, in BYTES.
+///
+/// The budget of the payload is spent by these fields, so this is where it is
+/// defended. Counting bytes and not characters is the whole point: a limit on
+/// characters lets a name in Cyrillic spend twice what the budget reserved for
+/// it, and the failure shows up as a QR that will not scan on a device that
+/// accepted the configuration happily.
+///
+/// The values are the ones the budget below is computed from. Changing one
+/// without changing the other stops the build — see the assertion under
+/// `WORST_CASE_PAYLOAD`.
+pub const MAX_DEVICE_NUMBER_BYTES: usize = 16;
+// Counted on the number AS WRITTEN by whoever loads a configuration, and on
+// the FOLDED form here. The two differ: the wire carries the separators, the
+// MAC input does not. A caller that bounded only the folded form let a number
+// stretched with separators through — `7-7-0-0-0-1-2-3-S` folds to nine
+// characters and travels as seventeen — and the QR stopped scanning on a
+// device whose configuration had loaded without a word.
+/// Widest a role identifier may be, in bytes. The limit of an account name.
+pub const MAX_ROLE_ID_BYTES: usize = 32;
+/// Widest the identifier of an issuing side may be, in bytes.
+pub const MAX_SERVER_ID_BYTES: usize = 64;
+/// Widest the personal number of an engineer may be, in bytes.
+pub const MAX_ENGINEER_ID_BYTES: usize = 64;
+/// Widest the address in front of the fragment may be, in bytes.
+pub const MAX_BASE_URL_BYTES: usize = 64;
+
+/// Widest a signature of this channel is, in hexadecimal characters.
+///
+/// A DER ECDSA P-256 signature is a SEQUENCE of two INTEGERs, and an INTEGER
+/// carries a leading zero byte when the high bit of its first byte is set: two
+/// bytes of header plus two times thirty-five, so seventy-two bytes at most.
+/// The raw `r‖s` pair is sixty-four, and a budget computed on the raw form
+/// understates the worst case by sixteen characters — in the direction where
+/// the QR stops being readable, not the direction where it is merely larger
+/// than expected.
+const SIGNATURE_HEX_MAX: usize = (2 + 35 + 35) * 2;
+
+/// The raw pair, for the comparison the constant above exists to make.
+const SIGNATURE_HEX_RAW_PAIR: usize = 64 * 2;
+
+// The two are not the same number, and every budget in this channel is written
+// against the first. A build where they became equal would be a build whose
+// signatures stopped being DER.
+const _: () = assert!(SIGNATURE_HEX_MAX > SIGNATURE_HEX_RAW_PAIR);
+
+/// The longest payload the channel can produce, in bytes.
+///
+/// Frame plus values at their upper bounds, plus the longest base URL and the
+/// `#`. The signature is the field the arithmetic is easiest to get wrong: an
+/// ECDSA P-256 signature travels here in DER, which is up to 72 bytes — 144
+/// hexadecimal characters — and **not** the 64 bytes of a raw `r‖s` pair. A
+/// budget computed on the raw form understates the worst case by sixteen
+/// characters, and it understates it in the direction where the QR stops being
+/// readable rather than the direction where it is merely bigger than expected.
+const WORST_CASE_PAYLOAD: usize = {
+    // Frame: the prefix, the nine keys and the eighteen separators.
+    let frame = SIGNED_CHALLENGE_PREFIX.len() + 57 + 18;
+    // Values, at the bounds the fleet and the profile impose: a device number
+    // with its check character, a `u32` epoch, a nonce of 128 bits in base32, a
+    // role identifier no longer than an account name, a level, the identifier
+    // of an issuing side and a personal number at the input limits of the PAM
+    // module, a compressed P-256 point, and a DER signature.
+    let values = MAX_DEVICE_NUMBER_BYTES
+        + 10
+        + 26
+        + MAX_ROLE_ID_BYTES
+        + 3
+        + MAX_SERVER_ID_BYTES
+        + MAX_ENGINEER_ID_BYTES
+        + 66
+        + SIGNATURE_HEX_MAX;
+    // The base URL from the allowlist, and the `#`.
+    frame + values + MAX_BASE_URL_BYTES + 1
+};
 
 #[cfg(test)]
 #[expect(
@@ -735,27 +837,57 @@ mod tests {
     }
 
     #[test]
-    fn the_spoken_form_groups_what_is_read_aloud() {
-        let challenge = challenge();
-        let spoken = challenge.spoken_form();
-        let grouped_number = group_of(challenge.device_number().significant());
-        let mut fields = spoken.split(" / ");
-        assert_eq!(fields.next(), Some(grouped_number.as_str()));
-        assert!(grouped_number.contains(' '), "{grouped_number}");
-        assert_eq!(fields.next(), Some("7"));
-        let grouped_nonce = group_of(challenge.nonce().as_str());
-        assert_eq!(fields.next(), Some(grouped_nonce.as_str()));
-        assert!(grouped_nonce.contains(' '), "{grouped_nonce}");
-        assert_eq!(fields.next(), Some("ops.dc.senior"));
-        assert_eq!(fields.next(), Some("2"));
-        assert_eq!(fields.next(), Some("op-42"));
-        assert_eq!(fields.next(), Some("eng-7"));
-        assert_eq!(fields.next(), Some("04aabb"));
-        assert_eq!(fields.next(), None);
+    fn the_payload_puts_the_document_in_the_fragment_and_nothing_before_it() {
+        let signed = signed_by(challenge(), DEVICE_KEY);
+        let payload = signed.payload(Some("https://codes.fleet.example/e"));
+        let (base, fragment) = payload.split_once('#').unwrap();
+        assert_eq!(base, "https://codes.fleet.example/e");
+        assert_eq!(fragment, signed.to_wire());
+        // Nothing of the attempt before the `#`: that half of the URL is what
+        // the server sees when the page is fetched.
+        for field in ["device", "nonce", "engineer", "signature"] {
+            assert!(
+                !base.contains(field),
+                "`{field}` leaked out of the fragment"
+            );
+        }
     }
 
-    fn group_of(value: &str) -> String {
-        super::group(value)
+    #[test]
+    fn a_fleet_without_a_page_still_shows_the_document() {
+        // The URL is navigation and the fragment is the channel. A device with
+        // no address delivered to it shows a challenge that scans; refusing to
+        // draw one would close the method over a convenience.
+        let signed = signed_by(challenge(), DEVICE_KEY);
+        assert_eq!(signed.payload(None), signed.to_wire());
+    }
+
+    #[test]
+    fn a_field_wider_than_the_budget_reserves_does_not_assemble() {
+        // Bytes, not characters. Sixty-four Cyrillic letters pass a limit
+        // counted in characters and spend a hundred and twenty-eight bytes —
+        // twice what the budget reserved — and the QR that comes out does not
+        // scan on a device that accepted its configuration without complaint.
+        let wide = "я".repeat(64);
+        let refused = Challenge::new(ChallengeFields {
+            device_number: CheckedDeviceNumber::from_body("77-000123").unwrap(),
+            epoch: Epoch::new(7),
+            nonce: Nonce::parse(&"4".repeat(usize::from(params().nonce_width())), &params())
+                .unwrap(),
+            role_id: "ops.dc.senior",
+            level: Level::new(2),
+            server_id: &wide,
+            engineer_id: "eng-7",
+            ephemeral_point: EphemeralPublicPoint::new(vec![0x04, 0xaa, 0xbb]).unwrap(),
+        });
+        assert_eq!(
+            refused.map(|_| ()),
+            Err(ChallengeError::FieldTooWide {
+                field: "server",
+                limit: super::MAX_SERVER_ID_BYTES,
+                got: wide.len()
+            })
+        );
     }
 
     #[test]
@@ -1122,13 +1254,5 @@ mod tests {
         // refused by the reader, and the reverse too.
         assert!(SignedChallenge::parse(&challenge().to_string(), &params()).is_err());
         assert!(Challenge::parse(&wire, &params()).is_err());
-    }
-
-    #[test]
-    fn the_spoken_form_ends_with_the_signature() {
-        let signed = signed_by(challenge(), DEVICE_KEY);
-        let spoken = signed.spoken_form();
-        assert!(spoken.starts_with(&signed.challenge().spoken_form()));
-        assert!(spoken.ends_with("d1"));
     }
 }

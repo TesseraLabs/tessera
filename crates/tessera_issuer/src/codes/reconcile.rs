@@ -1,15 +1,15 @@
 //! Two-sided reconciliation: what the devices saw against what the operators
 //! wrote.
 //!
-//! A receipt says an operator handed out a code. A device journal line says a
+//! A grant says the issuing side handed out a code. A device journal line says a
 //! device was asked to accept one. Neither side is evidence on its own — the
-//! receipts are written by the people whose work they record, and the journals
+//! grants are written by the side that computed the code, and the journals
 //! sit on the machines the codes let people into — so the question an audit
 //! actually asks is where the two sides disagree:
 //!
-//! - a **login without a receipt**: a device answered a challenge nobody wrote
+//! - a **login without a grant**: a device answered a challenge nobody wrote
 //!   down, which is what a code handed out off the books looks like;
-//! - a **receipt without a login**: a code was issued and never used, which is
+//! - a **grant without a login**: a code was issued and never used, which is
 //!   ordinary once and a pattern of stockpiling when it repeats;
 //! - a **series on one nonce**: one device, one epoch, one nonce, and more than
 //!   one issuance or more than one *admission* on it. A nonce belongs to one
@@ -32,7 +32,7 @@
 //!   device it claims to be;
 //! - anyone at all standing at a console can type a role account name and any
 //!   code they like. No code is issued for it, so every one of those refusals
-//!   would be a login without a receipt — the class that describes a code
+//!   would be a login without a grant — the class that describes a code
 //!   handed out off the books, generated at will by a passer-by, in the volume
 //!   it takes to bury a real finding.
 //!
@@ -96,7 +96,7 @@
 //!
 //! A report assembled without the device side is not a clean report with fewer
 //! sources: three of the four classes cannot be computed at all, and the fourth
-//! degrades to "these receipts exist". [`Report::is_complete`] is false there,
+//! degrades to "these grants exist". [`Report::is_complete`] is false there,
 //! and every consumer prints it — an auditor who reads a partial report as a
 //! clean one has been told the fleet is fine by a report that never looked.
 
@@ -108,12 +108,58 @@ use tessera_codes_contract::outcome::{self, Outcome};
 use tessera_codes_contract::params::FleetParams;
 use tessera_hashchain::{verify_lines, ChainPayload, ChainStatus, EntryKind, OP_HEAD_SIGNATURE};
 
+use tessera_codes_contract::revocation::SubjectKind;
+
+use tessera_codes_contract::signature::{Signature, SignatureError, SignatureVerifier, SignerRef};
+
+use crate::codes::agreement::KeyStorage;
+use crate::codes::trust::AnchorKey;
+use crate::codes::{IssuanceRecord, IssuanceRecordError};
+
 /// Operation a code login carries in the device's audit chain.
 ///
 /// It is the `op` of `tessera_core::audit::AuditRecord::CodeLogin`. The name is
 /// matched rather than assumed, so a journal carrying every other record of the
 /// machine reconciles without being filtered first.
 pub const LOGIN_OP: &str = "code_login";
+
+/// Operation an issuance carries in the chain of the issuing side.
+pub const ISSUANCE_OP: &str = "codes.issuance";
+
+/// Field of that line holding the wire form of the record.
+pub const ISSUANCE_RECORD_FIELD: &str = "record";
+
+/// Line the issuing side writes when it refuses to issue.
+pub const REFUSAL_OP: &str = "codes.refusal";
+
+/// Line the issuing side writes when it signs an authorisation.
+pub const AUTHORISATION_OP: &str = "codes.authorisation";
+
+/// Lines the issuing side writes into the same chain beside its issuances.
+///
+/// The list exists to tell two things apart that a reader would otherwise
+/// confuse. A chain made only of these is an issuing side that has not issued
+/// anything YET — a node freshly stood up that has so far only refused — and
+/// reconciling against it is legitimate: every login in the device journal
+/// comes out as a login no issuance accounts for, which is the class the whole
+/// reconciliation exists for.
+///
+/// A chain carrying an op that is on neither list is a different matter: it is
+/// a journal of something else handed over by mistake, and reading it as an
+/// empty issuance side would produce a report that found nothing because it
+/// looked at nothing.
+///
+/// Deliberately a list of names and not a namespace test. `codes.` as a prefix
+/// would accept every op a future version of any component invents, including
+/// the one that turns out to carry issuances under a name this build does not
+/// know — and that failure is silent and looks like a clean reconciliation.
+const KNOWN_NON_ISSUANCE_OPS: [&str; 4] = [
+    REFUSAL_OP,
+    AUTHORISATION_OP,
+    // The chain crate's own two: a signed head and an operator's note.
+    tessera_hashchain::OP_HEAD_SIGNATURE,
+    tessera_hashchain::OP_ANNOTATION,
+];
 
 /// Event name the same login carries in a flat `tracing` export.
 ///
@@ -150,6 +196,14 @@ pub struct LoginEntry {
     pub level: u32,
     /// Ticket the device attributed the attempt to, when it got that far.
     pub ticket_number: Option<String>,
+    /// Personal number the engineer gave at the device, when they had been
+    /// asked for one.
+    ///
+    /// Read because the two sides are supposed to name one person: a grant
+    /// issued to one number and a session opened under another is the class the
+    /// personal number exists to make visible, and a reader that dropped the
+    /// field could not raise it.
+    pub engineer_id: Option<String>,
     /// What the device did with the attempt.
     ///
     /// One of the words of [`tessera_codes_contract::outcome`], as the device
@@ -172,9 +226,9 @@ impl LoginEntry {
     }
 }
 
-/// One issuance, as a receipt recorded it.
+/// One issuance, as a grant recorded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiptEntry {
+pub struct GrantEntry {
     /// Device the code was issued for.
     pub device_number: String,
     /// Key epoch the code was issued under.
@@ -185,9 +239,43 @@ pub struct ReceiptEntry {
     pub role_id: String,
     /// Level of that role.
     pub level: u32,
-    /// Ticket the operator worked under.
+    /// Ticket the issuing side worked under.
     pub ticket_number: String,
-    /// Where the receipt was read from, for a report a human can act on.
+    /// The side that says it issued this grant, as the grant names it.
+    ///
+    /// Its own field rather than a lookup at report time: what an auditor needs
+    /// to be told when no anchor matches is WHICH side was named, and a report
+    /// that could only say "some side you did not anchor" would send them back
+    /// to the file this reader has already read.
+    pub server_id: String,
+    /// Personal number of the engineer the code was issued to.
+    pub engineer_id: String,
+    /// Organisation the device record was signed by.
+    pub organisation_id: String,
+    /// The moment the engineer's side claimed when it asked.
+    ///
+    /// Not a trusted clock and not treated as one: it is what the signed
+    /// request says about itself, and the only thing a reconciliation can put
+    /// beside the moment a right was withdrawn.
+    pub requested_at: u64,
+    /// Custody tier of the agreement key this code was computed with.
+    ///
+    /// In a report rather than in a footnote: a fleet that moves the agreement
+    /// key onto a token has no other way to confirm from the journal that the
+    /// move actually happened, and the confirmation is the whole reason the
+    /// tier is written into every issuance.
+    pub key_storage: KeyStorage,
+    /// What became of the signature of the issuing side on this grant.
+    ///
+    /// The reconciliation reads a file somebody handed it. Until this was
+    /// checked, every signature in that file — the issuing side's on the grant,
+    /// the engineer's on the request — was taken on the word of the file, and a
+    /// grant assembled by anybody at all read exactly like one the issuing side
+    /// signed.
+    pub signature: SignatureState,
+    /// Whether the identity of the engineer was taken on trust.
+    pub identity_unverified: bool,
+    /// Where the grant was read from, for a report a human can act on.
     pub source: String,
 }
 
@@ -200,17 +288,17 @@ pub struct NonceSeries {
     pub epoch: u32,
     /// Nonce that repeated.
     pub nonce: String,
-    /// How many receipts sit on this nonce.
-    pub receipts: u64,
+    /// How many grants sit on this nonce.
+    pub grants: u64,
     /// How many logins sit on this nonce.
     pub logins: u64,
 }
 
-/// A receipt and a login that paired but do not agree.
+/// A grant and a login that paired but do not agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Disagreement {
-    /// The receipt of the pair.
-    pub receipt: ReceiptEntry,
+    /// The grant of the pair.
+    pub grant: GrantEntry,
     /// The login of the pair.
     pub login: LoginEntry,
     /// The fields the two disagree on.
@@ -224,6 +312,18 @@ pub struct Provenance {
     pub chain_verified: bool,
     /// The earliest `seq` from which no head signature covers a journal.
     pub unsigned_from_seq: Option<u64>,
+    /// The `seq` from which no head signature covers the chain of the issuing
+    /// side.
+    ///
+    /// The same caveat as the one above, about the other half of the pair: the
+    /// hash chain proves nothing was edited inside what was handed over, and
+    /// says nothing about what may have been dropped from the end of it.
+    pub server_unsigned_from_seq: Option<u64>,
+    /// Lines of the issuing side's chain that this build could not read.
+    ///
+    /// See [`ServerChain::unread_lines`]. A report carrying any of them is not
+    /// complete, whatever else it found.
+    pub server_unread_lines: usize,
     /// Refusals the journals carried that never got as far as a nonce.
     ///
     /// A device refused before it drew one — no ticket, a role it does not
@@ -242,7 +342,7 @@ pub struct Provenance {
     /// Two kinds land here, and they part company in the report. A word this
     /// build does not know is a caveat: the reader cannot say what happened. An
     /// admission with no nonce is a finding: the device says it opened a
-    /// session and names no attempt, so no receipt can answer for it, and an
+    /// session and names no attempt, so no grant can answer for it, and an
     /// auditor needs the device and the line — not a word in a list.
     pub unpairable_lines: Vec<UnpairableLine>,
 }
@@ -268,29 +368,150 @@ impl Provenance {
         Self {
             chain_verified: false,
             unsigned_from_seq: None,
+            server_unsigned_from_seq: None,
+            server_unread_lines: 0,
             refusals_without_nonce: 0,
             unpairable_lines: Vec::new(),
         }
     }
 }
 
+/// A right the fleet withdrew, and when.
+///
+/// The withdrawal itself is the server's business: an authorisation is checked
+/// at the moment of issuance, and whether it held then is not a question a
+/// reconciliation can reopen. What a reconciliation *can* say, months later and
+/// off the documents alone, is that an issuance is dated after a right was
+/// taken away. That is a lead, not a proof — the moment inside a request is
+/// what the engineer's side claimed — and the report says it in those terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revocation {
+    /// Whose right was withdrawn — a person or an organisation.
+    ///
+    /// Not inferred from the identifier. A fleet may number an organisation and
+    /// a person alike, and a match on the identifier alone would raise the
+    /// alarm against the wrong party — or, worse, silently against both.
+    pub kind: SubjectKind,
+    /// Who lost the right: a personal number of an engineer, or an
+    /// organisation identifier.
+    pub subject: String,
+    /// The moment it was withdrawn, in Unix seconds.
+    pub at: u64,
+}
+
+/// What the fleet says its own issuances should look like.
+///
+/// Both members are statements a fleet makes about itself, and both are only
+/// useful because the issuing side wrote the corresponding fact into every
+/// issuance at the time. A reconciliation that took either from a configuration
+/// file alone would be comparing one opinion with another.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Expectations {
+    /// The custody tier the fleet declares for the agreement key.
+    ///
+    /// `None` means the fleet has not declared one, and the tier is then
+    /// reported without being judged. A tier *below* the declared one is an
+    /// alarm; above it is not — that is a fleet that strengthened its custody,
+    /// and an alarm there would teach an operator to ignore the class.
+    pub declared_key_storage: Option<KeyStorage>,
+    /// Rights the fleet withdrew, with the moment of each.
+    pub revocations: Vec<Revocation>,
+    /// How many of those arrived unsigned — from a command line rather than
+    /// from a published list.
+    ///
+    /// Counted rather than hidden: a report built on withdrawals nobody signed
+    /// cannot call itself complete, and an auditor reading it has to know which
+    /// of the two it is.
+    pub unsigned_revocations: usize,
+    /// The signed list of withdrawals this run read, and its serial.
+    ///
+    /// [`None`] when no list was supplied. The serial is reported, because a
+    /// reader who is told which withdrawals were applied and not which LIST
+    /// they came from has been told half of it.
+    pub revocation_list: Option<RevocationListUsed>,
+}
+
+/// The signed list of withdrawals a run was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevocationListUsed {
+    /// Serial of the list.
+    pub serial: u64,
+    /// The serial the caller declared as already applied, if they declared one.
+    ///
+    /// [`None`] is not "zero". Zero is a caller who says nothing has been
+    /// applied yet; `None` is a caller who did not say, and then ANY correctly
+    /// signed list passes — including yesterday's, which is signed just as
+    /// validly and is the one that still admits whoever was cut off this
+    /// morning. The difference is a caveat in the report.
+    pub waterline: Option<u64>,
+}
+
+/// Orders the custody tiers by how much they withhold from whoever holds the
+/// machine.
+///
+/// One comparison, in one place: "below the declared tier" is the whole
+/// question the class asks, and two spellings of it would eventually disagree.
+const fn custody_rank(storage: KeyStorage) -> u8 {
+    match storage {
+        KeyStorage::Software => 0,
+        KeyStorage::Token => 1,
+    }
+}
+
+/// An issuance whose custody tier is below what the fleet declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyShortfall {
+    /// The issuance.
+    pub grant: GrantEntry,
+    /// The tier the fleet declared.
+    pub declared: KeyStorage,
+}
+
+/// An issuance dated after the right behind it was withdrawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LateGrant {
+    /// The issuance.
+    pub grant: GrantEntry,
+    /// The withdrawal it is dated after.
+    pub revocation: Revocation,
+}
+
 /// The outcome of a reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
-    /// Logins the receipts do not account for.
-    pub logins_without_receipt: Vec<LoginEntry>,
-    /// Receipts no login accounts for.
-    pub receipts_without_login: Vec<ReceiptEntry>,
+    /// Logins the grants do not account for.
+    pub logins_without_grant: Vec<LoginEntry>,
+    /// Grants no login accounts for.
+    pub grants_without_login: Vec<GrantEntry>,
     /// Counters carrying more than one challenge.
     pub series_on_one_nonce: Vec<NonceSeries>,
     /// Pairs that met and then disagreed.
     pub disagreements: Vec<Disagreement>,
+    /// Issuances whose custody tier is below the declared one.
+    pub custody_shortfalls: Vec<CustodyShortfall>,
+    /// Grants the issuing side's own key does not stand behind.
+    pub rejected_signatures: Vec<GrantEntry>,
+    /// Grants naming a side none of the supplied anchors knows.
+    pub unknown_issuers: Vec<GrantEntry>,
+    /// Grants nobody supplied a key for.
+    unchecked_signatures: usize,
+    /// The signed list of withdrawals this run read.
+    revocation_list: Option<RevocationListUsed>,
+    /// Issuances dated after the right behind them was withdrawn.
+    pub late_grants: Vec<LateGrant>,
     /// Whether the device side was present at all.
     device_side: bool,
     /// Whether every device journal read was chain-verified.
     chain_verified: bool,
     /// The earliest `seq` of an unsigned tail across the journals read.
     unsigned_from_seq: Option<u64>,
+    /// The `seq` from which no head signature covers the chain of the issuing
+    /// side.
+    server_unsigned_from_seq: Option<u64>,
+    /// Lines of that chain this build could not read.
+    server_unread_lines: usize,
+    /// Withdrawals that arrived unsigned.
+    unsigned_revocations: usize,
     /// Refused attempts read from the device side.
     ///
     /// Not a finding and not a class: a count, so that lines the report did not
@@ -328,13 +549,22 @@ impl Report {
     #[must_use]
     pub fn statements(&self) -> Vec<Statement<'_>> {
         let Self {
-            logins_without_receipt,
-            receipts_without_login,
+            logins_without_grant,
+            grants_without_login,
             series_on_one_nonce,
             disagreements,
+            custody_shortfalls,
+            rejected_signatures,
+            unknown_issuers,
+            unchecked_signatures,
+            revocation_list,
+            late_grants,
             device_side,
             chain_verified,
             unsigned_from_seq,
+            server_unsigned_from_seq,
+            server_unread_lines,
+            unsigned_revocations,
             refusals_read,
             unknown_outcomes,
             unpairable_lines,
@@ -376,18 +606,52 @@ impl Report {
         if let Some(seq) = *unsigned_from_seq {
             caveats.push(Statement::UnsignedTail(seq));
         }
-
-        for login in logins_without_receipt {
-            findings.push(Statement::LoginWithoutReceipt(login));
+        if let Some(seq) = *server_unsigned_from_seq {
+            caveats.push(Statement::ServerUnsignedTail(seq));
         }
-        for receipt in receipts_without_login {
-            findings.push(Statement::ReceiptWithoutLogin(receipt));
+        if *server_unread_lines > 0 {
+            caveats.push(Statement::UnreadServerLines(*server_unread_lines));
+        }
+        if *unchecked_signatures > 0 {
+            caveats.push(Statement::SignaturesNotChecked(*unchecked_signatures));
+        }
+        // One or the other, never both: the caveat names the serial itself, so
+        // a note beside it would say the same thing twice and put the weaker
+        // sentence under the stronger one.
+        if let Some(used) = revocation_list {
+            if used.waterline.is_none() {
+                caveats.push(Statement::RevocationWaterlineUnset(used.serial));
+            } else {
+                notes.push(Statement::RevocationListRead(*used));
+            }
+        }
+        if *unsigned_revocations > 0 {
+            caveats.push(Statement::UnsignedRevocations(*unsigned_revocations));
+        }
+
+        for login in logins_without_grant {
+            findings.push(Statement::LoginWithoutGrant(login));
+        }
+        for grant in grants_without_login {
+            findings.push(Statement::GrantWithoutLogin(grant));
         }
         for series in series_on_one_nonce {
             findings.push(Statement::SeriesOnOneNonce(series));
         }
         for disagreement in disagreements {
             findings.push(Statement::Disagreement(disagreement));
+        }
+        for shortfall in custody_shortfalls {
+            findings.push(Statement::CustodyBelowDeclared(shortfall));
+        }
+        for grant in rejected_signatures {
+            findings.push(Statement::GrantSignatureRejected(grant));
+        }
+        for grant in unknown_issuers {
+            findings.push(Statement::GrantIssuerUnknown(grant));
+        }
+        for late in late_grants {
+            findings.push(Statement::GrantAfterRevocation(late));
         }
 
         if *refusals_read > 0 {
@@ -499,14 +763,35 @@ pub enum Statement<'a> {
     NoChain,
     /// No head signature covers a journal past this point.
     UnsignedTail(u64),
-    /// A login the receipts do not account for.
-    LoginWithoutReceipt(&'a LoginEntry),
-    /// A receipt no login accounts for.
-    ReceiptWithoutLogin(&'a ReceiptEntry),
+    /// No head signature covers the chain of the issuing side past this point.
+    ServerUnsignedTail(u64),
+    /// Lines of the issuing side's chain the reader could not read.
+    UnreadServerLines(usize),
+    /// Grants whose signature nobody supplied a key for.
+    SignaturesNotChecked(usize),
+    /// A list of withdrawals was taken without a waterline to measure it by.
+    RevocationWaterlineUnset(u64),
+    /// Which list of withdrawals this run applied.
+    RevocationListRead(RevocationListUsed),
+    /// A grant the issuing side's own key does not stand behind.
+    GrantSignatureRejected(&'a GrantEntry),
+    /// A grant naming an issuing side none of the supplied anchors knows.
+    GrantIssuerUnknown(&'a GrantEntry),
+    /// Some withdrawals were taken on a caller's word rather than from a
+    /// published list.
+    UnsignedRevocations(usize),
+    /// A login the grants do not account for.
+    LoginWithoutGrant(&'a LoginEntry),
+    /// A grant no login accounts for.
+    GrantWithoutLogin(&'a GrantEntry),
     /// More than one issuance or admission on one nonce.
     SeriesOnOneNonce(&'a NonceSeries),
     /// A pair that met and then disagreed.
     Disagreement(&'a Disagreement),
+    /// An issuance whose custody tier is below the declared one.
+    CustodyBelowDeclared(&'a CustodyShortfall),
+    /// An issuance dated after the right behind it was withdrawn.
+    GrantAfterRevocation(&'a LateGrant),
     /// How many refusals were read.
     RefusalsRead(u64),
 }
@@ -535,13 +820,22 @@ impl Statement<'_> {
             | Self::UnreadableOutcomes(_)
             | Self::UnreadableLine(_)
             | Self::NoChain
-            | Self::UnsignedTail(_) => StatementKind::Caveat,
+            | Self::UnsignedTail(_)
+            | Self::ServerUnsignedTail(_)
+            | Self::UnreadServerLines(_)
+            | Self::SignaturesNotChecked(_)
+            | Self::RevocationWaterlineUnset(_)
+            | Self::UnsignedRevocations(_) => StatementKind::Caveat,
             Self::AdmissionWithoutNonce(_)
-            | Self::LoginWithoutReceipt(_)
-            | Self::ReceiptWithoutLogin(_)
+            | Self::LoginWithoutGrant(_)
+            | Self::GrantWithoutLogin(_)
             | Self::SeriesOnOneNonce(_)
-            | Self::Disagreement(_) => StatementKind::Finding,
-            Self::RefusalsRead(_) => StatementKind::Note,
+            | Self::Disagreement(_)
+            | Self::CustodyBelowDeclared(_)
+            | Self::GrantAfterRevocation(_)
+            | Self::GrantSignatureRejected(_)
+            | Self::GrantIssuerUnknown(_) => StatementKind::Finding,
+            Self::RefusalsRead(_) | Self::RevocationListRead(_) => StatementKind::Note,
         }
     }
 }
@@ -549,14 +843,22 @@ impl Statement<'_> {
 impl fmt::Display for Statement<'_> {
     /// Writes the one line of this statement.
     ///
+    /// One `match` over every statement there is, and its length is the number
+    /// of statements: splitting it would mean a second place where a variant
+    /// can be forgotten, which is the defect this file is built to prevent.
+    ///
     /// The values are identifiers, numbers and nonces — the same bytes in every
     /// locale; a consumer that heads the report with a caption localizes the
     /// caption.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per statement: a shorter function would be a second place to forget one"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoDeviceSide => write!(
                 f,
-                "incomplete: no device journal was supplied; only receipts were read"
+                "incomplete: no device journal was supplied; only grants were read"
             ),
             Self::UnreadableOutcomes(words) => write!(
                 f,
@@ -578,7 +880,7 @@ impl fmt::Display for Statement<'_> {
             Self::AdmissionWithoutNonce(line) => write!(
                 f,
                 "admission-without-nonce device={} line={} outcome={}: the device says a \
-                 session was opened and names no attempt, so no receipt can answer for it",
+                 session was opened and names no attempt, so no grant can answer for it",
                 line.device_number, line.line, line.outcome
             ),
             Self::NoChain => write!(
@@ -592,9 +894,91 @@ impl fmt::Display for Statement<'_> {
                  signature past this point, so lines could have been dropped from its end; the \
                  signature itself is not checked here"
             ),
-            Self::LoginWithoutReceipt(login) => write!(
+            Self::ServerUnsignedTail(seq) => write!(
                 f,
-                "login-without-receipt device={} epoch={} nonce={} role={} level={} outcome={}",
+                "server-unsigned-tail from={seq}: the issuance chain is not covered by a head \
+                 signature past this point, so issuances could have been dropped from its end; \
+                 the signature itself is not checked here"
+            ),
+            Self::UnreadServerLines(count) => write!(
+                f,
+                "unread-server-lines count={count}: the chain of the issuing side carries \
+                 {count} line(s) written under an operation this build does not know, and what \
+                 they record was not read; a later build may write issuances under a name this \
+                 one has never heard of, so the report cannot claim to have seen everything"
+            ),
+            Self::RevocationWaterlineUnset(serial) => write!(
+                f,
+                "revocation-waterline-unset serial={serial}: no already-applied serial was \
+                 given, so a list of ANY age would have been accepted — a signature stops \
+                 substitution and not replay, and yesterday's list is the one that still admits \
+                 whoever was cut off this morning"
+            ),
+            Self::RevocationListRead(used) => match used.waterline {
+                Some(waterline) => write!(
+                    f,
+                    "revocations-read serial={} above-applied={waterline}",
+                    used.serial
+                ),
+                None => write!(f, "revocations-read serial={}", used.serial),
+            },
+            Self::SignaturesNotChecked(count) => write!(
+                f,
+                "signatures-not-checked count={count}: no key was supplied for the side that \
+                 issued {count} grant(s), so their signatures were read from the file and \
+                 nothing else; a grant assembled by anybody at all reads like one the issuing \
+                 side signed"
+            ),
+            Self::GrantSignatureRejected(grant) => write!(
+                f,
+                "grant-signature-rejected device={} epoch={} nonce={} server-key-says=no \
+                 source={}: the key of the issuing side does not stand behind this grant, so \
+                 whatever wrote it was not that side",
+                grant.device_number,
+                grant.epoch,
+                grant.nonce.as_str(),
+                grant.source
+            ),
+            Self::GrantIssuerUnknown(grant) => write!(
+                f,
+                "grant-issuer-unknown device={} epoch={} nonce={} server={} source={}: keys were \
+                 supplied for the sides that may issue, and this grant names another one; a side \
+                 the fleet never anchored is a side nothing vouches for",
+                grant.device_number,
+                grant.epoch,
+                grant.nonce.as_str(),
+                grant.server_id,
+                grant.source
+            ),
+            Self::UnsignedRevocations(count) => write!(
+                f,
+                "incomplete: {count} withdrawal(s) were taken from the caller rather than from a \
+                 list the fleet signed; an unsigned withdrawal is one anybody on the path can \
+                 replace with none at all"
+            ),
+            Self::CustodyBelowDeclared(shortfall) => write!(
+                f,
+                "custody-below-declared device={} nonce={} declared={} recorded={} file={}",
+                shortfall.grant.device_number,
+                shortfall.grant.nonce.as_str(),
+                shortfall.declared.as_str(),
+                shortfall.grant.key_storage.as_str(),
+                shortfall.grant.source
+            ),
+            Self::GrantAfterRevocation(late) => write!(
+                f,
+                "grant-after-revocation device={} nonce={} subject={} revoked_at={} \
+                 requested_at={} file={}",
+                late.grant.device_number,
+                late.grant.nonce.as_str(),
+                late.revocation.subject,
+                late.revocation.at,
+                late.grant.requested_at,
+                late.grant.source
+            ),
+            Self::LoginWithoutGrant(login) => write!(
+                f,
+                "login-without-grant device={} epoch={} nonce={} role={} level={} outcome={}",
                 login.device_number,
                 login.epoch,
                 login.nonce.as_str(),
@@ -602,29 +986,36 @@ impl fmt::Display for Statement<'_> {
                 login.level,
                 login.outcome
             ),
-            Self::ReceiptWithoutLogin(receipt) => write!(
+            Self::GrantWithoutLogin(grant) => write!(
                 f,
-                "receipt-without-login device={} epoch={} nonce={} role={} level={} ticket={} \
+                "grant-without-login device={} epoch={} nonce={} role={} level={} ticket={} \
+                 key_storage={} identity_unverified={} \
                  file={}",
-                receipt.device_number,
-                receipt.epoch,
-                receipt.nonce.as_str(),
-                receipt.role_id,
-                receipt.level,
-                receipt.ticket_number,
-                receipt.source
+                grant.device_number,
+                grant.epoch,
+                grant.nonce.as_str(),
+                grant.role_id,
+                grant.level,
+                grant.ticket_number,
+                grant.key_storage.as_str(),
+                if grant.identity_unverified {
+                    "yes"
+                } else {
+                    "no"
+                },
+                grant.source
             ),
             Self::SeriesOnOneNonce(series) => write!(
                 f,
-                "series-on-one-nonce device={} epoch={} nonce={} receipts={} logins={}",
-                series.device_number, series.epoch, series.nonce, series.receipts, series.logins
+                "series-on-one-nonce device={} epoch={} nonce={} grants={} logins={}",
+                series.device_number, series.epoch, series.nonce, series.grants, series.logins
             ),
             Self::Disagreement(disagreement) => write!(
                 f,
                 "disagreement device={} epoch={} nonce={} fields={}",
-                disagreement.receipt.device_number,
-                disagreement.receipt.epoch,
-                disagreement.receipt.nonce.as_str(),
+                disagreement.grant.device_number,
+                disagreement.grant.epoch,
+                disagreement.grant.nonce.as_str(),
                 disagreement.fields.join(",")
             ),
             Self::RefusalsRead(count) => write!(
@@ -654,11 +1045,15 @@ impl fmt::Display for Report {
     }
 }
 
-/// Reconciles the receipts of an operator against the journals of the devices.
+/// Reconciles the grants of an operator against the journals of the devices.
 ///
 /// `logins` is [`None`] when the device side was not supplied at all, which is
 /// a different statement from an empty journal: an empty journal says the
 /// devices saw nothing, and its absence says nobody looked.
+///
+/// `expectations` is what the fleet says about itself — the custody tier it
+/// declared and the rights it withdrew. Both are compared against what the
+/// issuing side wrote at the time, never against a second opinion.
 ///
 /// `provenance` says what could be established about the journals behind
 /// `logins`. It is not bookkeeping: a report whose device side could have had
@@ -666,9 +1061,10 @@ impl fmt::Display for Report {
 /// prints the difference.
 #[must_use]
 pub fn reconcile(
-    receipts: &[ReceiptEntry],
+    grants: &[GrantEntry],
     logins: Option<&[LoginEntry]>,
     provenance: &Provenance,
+    expectations: &Expectations,
 ) -> Report {
     // Only the lines that record an admission take part in the four classes:
     // a refusal is an attempt the device turned away, and reading it as a login
@@ -695,13 +1091,40 @@ pub fn reconcile(
     // `statements`, where every other such decision is made.
 
     let mut report = Report {
-        logins_without_receipt: Vec::new(),
-        receipts_without_login: Vec::new(),
-        series_on_one_nonce: series(receipts, &admissions),
+        logins_without_grant: Vec::new(),
+        grants_without_login: Vec::new(),
+        series_on_one_nonce: series(grants, &admissions),
         disagreements: Vec::new(),
+        // Both classes are about the issuances alone: they hold whether or not
+        // a device journal was supplied, and a report that withheld them until
+        // the device side arrived would stay silent about the very thing an
+        // auditor came to the server chain for.
+        custody_shortfalls: custody_shortfalls(grants, expectations),
+        // Read off the entries rather than passed in beside them: the state was
+        // decided where the grant and the key were both in hand, and a second
+        // opinion assembled here could only ever disagree with it.
+        rejected_signatures: grants
+            .iter()
+            .filter(|grant| grant.signature == SignatureState::Rejected)
+            .cloned()
+            .collect(),
+        unknown_issuers: grants
+            .iter()
+            .filter(|grant| grant.signature == SignatureState::IssuerUnknown)
+            .cloned()
+            .collect(),
+        unchecked_signatures: grants
+            .iter()
+            .filter(|grant| grant.signature == SignatureState::NotChecked)
+            .count(),
+        late_grants: late_grants(grants, expectations),
         device_side: logins.is_some(),
         chain_verified: logins.is_some() && provenance.chain_verified,
         unsigned_from_seq: provenance.unsigned_from_seq,
+        server_unsigned_from_seq: provenance.server_unsigned_from_seq,
+        server_unread_lines: provenance.server_unread_lines,
+        unsigned_revocations: expectations.unsigned_revocations,
+        revocation_list: expectations.revocation_list,
         refusals_read,
         unknown_outcomes,
         unpairable_lines: provenance.unpairable_lines.clone(),
@@ -715,7 +1138,7 @@ pub fn reconcile(
     // Every admission on the key, not the last one seen. Two logins on one
     // nonce are a finding of their own — `series_on_one_nonce` raises it — and
     // keeping only one of them would drop the disagreement the other carries:
-    // the first login could name a different role or level than the receipt,
+    // the first login could name a different role or level than the grant,
     // and the report would say the pair agreed.
     let mut by_key: BTreeMap<(String, u32, String), Vec<&LoginEntry>> = BTreeMap::new();
     for login in logins {
@@ -726,17 +1149,17 @@ pub fn reconcile(
     }
 
     let mut paired: BTreeSet<(String, u32, String)> = BTreeSet::new();
-    for receipt in receipts {
-        let receipt_key = key(&receipt.device_number, receipt.epoch, &receipt.nonce);
-        match by_key.get(&receipt_key) {
-            None => report.receipts_without_login.push(receipt.clone()),
+    for grant in grants {
+        let grant_key = key(&grant.device_number, grant.epoch, &grant.nonce);
+        match by_key.get(&grant_key) {
+            None => report.grants_without_login.push(grant.clone()),
             Some(logins) => {
-                paired.insert(receipt_key);
+                paired.insert(grant_key);
                 for login in logins {
-                    let fields = disagreeing_fields(receipt, login);
+                    let fields = disagreeing_fields(grant, login);
                     if !fields.is_empty() {
                         report.disagreements.push(Disagreement {
-                            receipt: receipt.clone(),
+                            grant: grant.clone(),
                             login: (*login).clone(),
                             fields,
                         });
@@ -748,7 +1171,7 @@ pub fn reconcile(
 
     for login in logins {
         if !paired.contains(&key(&login.device_number, login.epoch, &login.nonce)) {
-            report.logins_without_receipt.push(login.clone());
+            report.logins_without_grant.push(login.clone());
         }
     }
     report
@@ -757,7 +1180,7 @@ pub fn reconcile(
 /// Collects the nonces that carry more than one issuance.
 ///
 /// A nonce belongs to one attempt, and an attempt is answered once. Two
-/// receipts on one nonce are two codes handed out for one challenge; two logins
+/// grants on one nonce are two codes handed out for one challenge; two logins
 /// on one nonce are two admissions on an attempt that only ever had one code to
 /// give. Neither can happen on a device that is behaving, so either is worth a
 /// line of the report.
@@ -765,16 +1188,12 @@ pub fn reconcile(
 /// `logins` carries admissions only. Several refusals on one nonce are what an
 /// engineer mistyping a code leaves behind, and the attempt budget of the nonce
 /// exists precisely so that they can happen.
-fn series(receipts: &[ReceiptEntry], logins: &[LoginEntry]) -> Vec<NonceSeries> {
+fn series(grants: &[GrantEntry], logins: &[LoginEntry]) -> Vec<NonceSeries> {
     let mut seen: BTreeMap<(String, u32, String), Bucket> = BTreeMap::new();
-    for receipt in receipts {
-        seen.entry(key_of(
-            &receipt.device_number,
-            receipt.epoch,
-            &receipt.nonce,
-        ))
-        .or_default()
-        .add(Side::Receipt);
+    for grant in grants {
+        seen.entry(key_of(&grant.device_number, grant.epoch, &grant.nonce))
+            .or_default()
+            .add(Side::Grant);
     }
     for login in logins {
         seen.entry(key_of(&login.device_number, login.epoch, &login.nonce))
@@ -788,7 +1207,7 @@ fn series(receipts: &[ReceiptEntry], logins: &[LoginEntry]) -> Vec<NonceSeries> 
             device_number,
             epoch,
             nonce,
-            receipts: bucket.receipts,
+            grants: bucket.grants,
             logins: bucket.logins,
         })
         .collect()
@@ -797,8 +1216,8 @@ fn series(receipts: &[ReceiptEntry], logins: &[LoginEntry]) -> Vec<NonceSeries> 
 /// Which side an entry came from.
 #[derive(Debug, Clone, Copy)]
 enum Side {
-    /// An operator receipt.
-    Receipt,
+    /// A grant of the issuing side.
+    Grant,
     /// A device journal line.
     Login,
 }
@@ -806,8 +1225,8 @@ enum Side {
 /// What one counter of one device and epoch carries.
 #[derive(Debug, Default)]
 struct Bucket {
-    /// Receipts counted on it.
-    receipts: u64,
+    /// Grants counted on it.
+    grants: u64,
     /// Logins counted on it.
     logins: u64,
 }
@@ -816,14 +1235,14 @@ impl Bucket {
     /// Records one entry.
     fn add(&mut self, side: Side) {
         match side {
-            Side::Receipt => self.receipts = self.receipts.saturating_add(1),
+            Side::Grant => self.grants = self.grants.saturating_add(1),
             Side::Login => self.logins = self.logins.saturating_add(1),
         }
     }
 
     /// Reports whether this nonce carries more than one issuance.
     const fn is_a_series(&self) -> bool {
-        self.receipts > 1 || self.logins > 1
+        self.grants > 1 || self.logins > 1
     }
 }
 
@@ -832,23 +1251,109 @@ fn key_of(device_number: &str, epoch: u32, nonce: &Nonce) -> (String, u32, Strin
     (device_number.to_owned(), epoch, nonce.as_str().to_owned())
 }
 
-/// Names the fields a paired receipt and login disagree on.
-fn disagreeing_fields(receipt: &ReceiptEntry, login: &LoginEntry) -> Vec<&'static str> {
+/// Names the fields a paired grant and login disagree on.
+fn disagreeing_fields(grant: &GrantEntry, login: &LoginEntry) -> Vec<&'static str> {
     let mut fields = Vec::new();
-    if receipt.role_id != login.role_id {
+    if grant.role_id != login.role_id {
         fields.push("role");
     }
-    if receipt.level != login.level {
+    if grant.level != login.level {
         fields.push("level");
     }
     // A device that refused before it resolved a ticket recorded none; that is
     // the refusal, not a disagreement about which ticket was used.
     if let Some(ticket) = login.ticket_number.as_deref() {
-        if ticket != receipt.ticket_number {
+        if ticket != grant.ticket_number {
             fields.push("ticket");
         }
     }
+    // The personal number. A line that reaches this comparison is an ADMISSION
+    // — refusals are filtered out before the pairing — so "the device recorded
+    // no number" is not a device that turned somebody away before asking. It is
+    // a session that opened without the device writing down who opened it, and
+    // the whole point of the field is that a login names a person.
+    //
+    // Skipping the comparison read as agreement, which is the worst of the
+    // answers available: "nobody was named" came out of the report as clean.
+    // Compared as numbers of the channel's format, not as bytes: the device
+    // passes the number on as the engineer TYPED it, separators and case
+    // included, while the issuing side writes down whatever it was given. Two
+    // spellings of one number would come out of here as a disagreement between
+    // the two sides — a finding about a person who did nothing but reach for
+    // the space bar.
+    match login.engineer_id.as_deref() {
+        Some(engineer)
+            if tessera_codes_contract::revocation::same_subject(
+                SubjectKind::Engineer,
+                engineer,
+                &grant.engineer_id,
+            ) => {}
+        _ => fields.push("engineer"),
+    }
     fields
+}
+
+/// Issuances whose custody tier is below the one the fleet declared.
+///
+/// Strictly below. An issuance recorded on a token where the fleet declared
+/// software is a fleet that strengthened its custody, and raising an alarm
+/// there would teach an operator to skip the class.
+fn custody_shortfalls(grants: &[GrantEntry], expectations: &Expectations) -> Vec<CustodyShortfall> {
+    let Some(declared) = expectations.declared_key_storage else {
+        return Vec::new();
+    };
+    grants
+        .iter()
+        .filter(|grant| custody_rank(grant.key_storage) < custody_rank(declared))
+        .map(|grant| CustodyShortfall {
+            grant: grant.clone(),
+            declared,
+        })
+        .collect()
+}
+
+/// Issuances dated after the right behind them was withdrawn.
+///
+/// A withdrawal names whose right it took away, and the match uses that pair —
+/// kind and identifier — rather than the identifier alone: a fleet may number an
+/// organisation and a person alike. One issuance can be late against several
+/// withdrawals; each is stated, because "which right" is the first thing
+/// anybody will ask.
+///
+/// # The same second counts as late
+///
+/// Both moments are Unix seconds, so an issuance stamped with the second of the
+/// withdrawal cannot be shown to have happened before it. Reported rather than
+/// dropped: an auditor can look at a line and decide it was legitimate, and has
+/// no way at all to look at a line the report never printed.
+fn late_grants(grants: &[GrantEntry], expectations: &Expectations) -> Vec<LateGrant> {
+    let mut late = Vec::new();
+    for grant in grants {
+        for revocation in &expectations.revocations {
+            // The pair, exactly as the contract's own lookup does it: kind and
+            // identifier together, never the identifier alone.
+            // The same rule the contract's own lookup uses, called rather than
+            // repeated: a personal number is matched by the characters the
+            // format counts. Matching bytes would let the person a withdrawal
+            // names decide whether it applies to them — typing the number with
+            // different separators is enough to make the report clean.
+            let concerns = match revocation.kind {
+                SubjectKind::Engineer => tessera_codes_contract::revocation::same_subject(
+                    SubjectKind::Engineer,
+                    &revocation.subject,
+                    &grant.engineer_id,
+                ),
+                SubjectKind::Organisation => revocation.subject == grant.organisation_id,
+            };
+            if concerns && grant.requested_at >= revocation.at {
+                late.push(LateGrant {
+                    grant: grant.clone(),
+                    revocation: revocation.clone(),
+                });
+            }
+        }
+    }
+    late
 }
 
 /// The key the two sides pair on.
@@ -884,9 +1389,7 @@ impl ChainPayload for DeviceLine {
     }
 
     fn is_structurally_valid(&self) -> bool {
-        // The chain's own rules are checked by the verifier; the only thing
-        // this reader can add is that a line names an operation at all.
-        !self.op.is_empty()
+        head_signature_is_whole(&self.op, &self.fields)
     }
 }
 
@@ -1060,6 +1563,11 @@ pub fn read_journal(
                 field: "level",
             })?,
             ticket_number: text_field("ticket_no").filter(|ticket| ticket != ABSENT),
+            // The device writes the same placeholder here as everywhere else
+            // when it has nothing to put in: a refusal can happen before the
+            // engineer is asked for a number. Read as "not stated", never as a
+            // number somebody could be held to.
+            engineer_id: text_field("claimed_engineer_no").filter(|engineer| engineer != ABSENT),
             outcome,
         });
     }
@@ -1079,6 +1587,367 @@ pub fn read_journal(
         refusals_without_nonce,
         unpairable_lines,
     })
+}
+
+/// Reports whether an open line is well formed beyond parsing.
+///
+/// Both journals keep their payload open — a device writes enrolments and
+/// rotations into the same chain the reconciliation reads, and a reader that
+/// insisted on knowing every variant would break the day one is added — so
+/// "names an operation" is all that can be asked of an ordinary line.
+///
+/// A head signature is the exception, and the reason is what it does: it closes
+/// the unsigned tail, which is the caveat saying lines could have been dropped
+/// from the end. An empty one removes the warning and protects nothing. The
+/// rule lives with the format, in [`tessera_hashchain::HeadSignature`], so the
+/// two journals cannot come to differ about what a signature is.
+fn head_signature_is_whole(op: &str, fields: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if op.is_empty() {
+        return false;
+    }
+    if op != OP_HEAD_SIGNATURE {
+        return true;
+    }
+    serde_json::from_value::<tessera_hashchain::HeadSignature>(serde_json::Value::Object(
+        fields.clone(),
+    ))
+    .is_ok_and(|signature| signature.is_structurally_valid())
+}
+
+/// The chain of the issuing side, as it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerChain {
+    /// The issuances it carries, in the order they were written.
+    pub entries: Vec<GrantEntry>,
+    /// The `seq` from which no head signature covers the chain, when such a
+    /// tail exists.
+    pub unsigned_from_seq: Option<u64>,
+    /// Lines of the chain this build could not read.
+    ///
+    /// Lines whose `op` is neither an issuance nor one of the kinds this build
+    /// knows the issuing side writes beside them. They are counted rather than
+    /// refused, because a chain that also carries issuances IS the journal that
+    /// was asked for — but a report built over it has not looked at everything
+    /// it names, and saying so is the whole of what this number is for.
+    pub unread_lines: usize,
+}
+
+/// What a reconciliation could establish about the signature on a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureState {
+    /// The issuing side signed it, and the anchor says so.
+    Verified,
+    /// The anchor says otherwise. A finding, and a loud one.
+    Rejected,
+    /// No anchor was supplied for the side that issued it.
+    ///
+    /// Not a finding: an auditor who has no key cannot be told that a signature
+    /// is wrong. It is a CAVEAT — the report has not looked at something it
+    /// names — and it keeps that report from calling itself complete.
+    NotChecked,
+    /// Anchors were supplied, and none of them is the side this grant names.
+    ///
+    /// A finding, and not the same one as [`SignatureState::NotChecked`]. An
+    /// auditor who supplied keys HAS said which sides may issue, and a grant
+    /// naming another one is a grant from a side this fleet does not know. Left
+    /// as a caveat it would be worse than silent: whoever assembled the grant
+    /// would choose the diagnosis by inventing a name nobody anchored.
+    IssuerUnknown,
+}
+
+/// One line of the chain of the issuing side, as much of it as this reader
+/// needs.
+///
+/// Open like [`DeviceLine`] and for the same reason: the issuing side writes
+/// its own head signatures and whatever else it keeps into one chain, and a
+/// reader that insisted on knowing every variant would break the day one is
+/// added.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServerLine {
+    /// The operation this line records.
+    pub op: String,
+    /// Everything else the record carries.
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ChainPayload for ServerLine {
+    const GENESIS_PREIMAGE: &'static [u8] = tessera_hashchain::domain::CODES_ISSUANCE;
+
+    fn kind(&self) -> EntryKind {
+        if self.op == OP_HEAD_SIGNATURE {
+            EntryKind::HeadSignature
+        } else {
+            EntryKind::Record
+        }
+    }
+
+    fn is_structurally_valid(&self) -> bool {
+        head_signature_is_whole(&self.op, &self.fields)
+    }
+}
+
+/// Reads the chain of the issuing side into the issuance side of a
+/// reconciliation.
+///
+/// Unlike a device journal, this one is a hash chain always: the issuing side
+/// writes into one by construction, so a file that carries no chain is not a
+/// flat export to be read with a caveat — it is not the journal that was asked
+/// for. That difference is the reason the two readers do not share a body.
+///
+/// Nothing is repaired and nothing is skipped. A record that does not parse
+/// stops the whole reading, because a chain quietly missing half its issuances
+/// reconciles to a clean report, and a clean report is the one answer an
+/// auditor must never be handed by accident.
+///
+/// # Errors
+///
+/// [`ServerChainError`] naming what stopped the reading: a chain that does not
+/// verify, a line that is not JSON, a record that does not parse, or a chain
+/// carrying no issuance at all.
+pub fn read_server_chain(
+    text: &str,
+    params: &FleetParams,
+    anchors: &IssuingAnchors,
+) -> Result<ServerChain, ServerChainError> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // A file with nothing in it is an issuance side that recorded nothing, and
+    // that is a legitimate audit scenario rather than a broken hand-over: the
+    // device journal is then reconciled against an empty set, and every login
+    // in it comes out as a login no issuance accounts for — which is the class
+    // the whole reconciliation exists for. Refusing here made that class
+    // unreachable by any input at all.
+    if lines.is_empty() {
+        return Ok(ServerChain {
+            entries: Vec::new(),
+            unsigned_from_seq: None,
+            unread_lines: 0,
+        });
+    }
+
+    // A file with lines and no framing at all is not an edited chain, and
+    // saying "broken at position 0" about it would send an auditor looking for
+    // a line somebody altered. The issuing side writes a chain by construction,
+    // so the only thing this can be is a different file.
+    if chain_status(&lines).is_none() {
+        return Err(ServerChainError::NotAChain);
+    }
+
+    let report = verify_lines::<ServerLine>(&lines);
+    let unsigned_from_seq = match report.status {
+        ChainStatus::Broken { position } => return Err(ServerChainError::BrokenChain { position }),
+        ChainStatus::IntactUnsignedTail { unsigned_from_seq } => Some(unsigned_from_seq),
+        // Intact, and whatever a later version of the chain crate adds: neither
+        // is a tail this reader has to warn about, and a reader that refused an
+        // unknown status would break on the day one is introduced.
+        _ => None,
+    };
+
+    let mut entries = Vec::new();
+    // Lines this build could not read. The number answers two different
+    // questions, and answering only the first was the defect: with no issuances
+    // at all it decides whether this is a side that has not issued yet or a
+    // journal of something else, and WITH issuances it decides whether a report
+    // built over the chain may call itself complete. A chain of one issuance
+    // and one unknown line used to read as one issuance and a clean report —
+    // which claims to have looked at a file it had only partly read.
+    let mut unread_lines = 0_usize;
+    for (index, line) in lines.iter().enumerate() {
+        let number = index + 1;
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|_| ServerChainError::NotJson { line: number })?;
+        let op = value.get("op").and_then(serde_json::Value::as_str);
+        if op != Some(ISSUANCE_OP) {
+            if !op.is_some_and(|op| KNOWN_NON_ISSUANCE_OPS.contains(&op)) {
+                unread_lines = unread_lines.saturating_add(1);
+            }
+            continue;
+        }
+        let wire = value
+            .get(ISSUANCE_RECORD_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ServerChainError::MissingRecord { line: number })?;
+        let record = IssuanceRecord::parse(wire.trim(), params).map_err(|error| {
+            ServerChainError::MalformedRecord {
+                line: number,
+                error,
+            }
+        })?;
+        entries.push(entry_of(&record, number, check_signature(&record, anchors)));
+    }
+
+    // No issuances, and the question is why. Every line recognised means an
+    // issuing side that has not issued anything yet — a node freshly stood up
+    // that has so far only refused, or only signed authorisations — and
+    // reconciling against it is legitimate: every login the device recorded
+    // comes out as a login no issuance accounts for, which is the class the
+    // whole reconciliation exists for. Refusing that would accuse a side that
+    // was working correctly of having been substituted.
+    //
+    // A line this build does not recognise means the other thing: a journal of
+    // something else, handed over by mistake. Reading THAT as an empty issuance
+    // side would produce a report that found nothing because it looked at
+    // nothing, and it would look exactly like the honest case.
+    if entries.is_empty() && unread_lines > 0 {
+        return Err(ServerChainError::NoIssuances);
+    }
+    Ok(ServerChain {
+        entries,
+        unsigned_from_seq,
+        unread_lines,
+    })
+}
+
+/// The keys of the issuing sides a reconciliation was given.
+///
+/// Empty is the ordinary case and not a failure: an auditor reconciling a
+/// journal they were handed may have no key for the side that issued it, and a
+/// reconciliation that refused to run without one would be a reconciliation
+/// nobody could run. What an empty set costs is stated in the report as a
+/// caveat, not swallowed.
+#[derive(Debug, Default)]
+pub struct IssuingAnchors {
+    keys: BTreeMap<String, AnchorKey>,
+}
+
+impl IssuingAnchors {
+    /// Adds the key of one issuing side, by the identifier it signs under.
+    pub fn insert(&mut self, server_id: String, key: AnchorKey) {
+        self.keys.insert(server_id, key);
+    }
+
+    /// Reports whether any key was supplied at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+/// A verifier over one issuing side's key.
+///
+/// Deliberately narrow. The signature of the ENGINEER is not resolved here and
+/// must not be: in this release nobody signs a request — the identity provider
+/// is a stub by decision, and every record carries the mark that says so — and
+/// a verifier that pretended to resolve an engineer would turn an honest "not
+/// vouched for" into a verification that passed.
+struct IssuingSideOnly<'a> {
+    server_id: &'a str,
+    key: &'a AnchorKey,
+}
+
+impl SignatureVerifier for IssuingSideOnly<'_> {
+    fn verify(
+        &self,
+        signer: SignerRef<'_>,
+        message: &[u8],
+        signature: &Signature,
+    ) -> Result<(), SignatureError> {
+        match signer {
+            SignerRef::Named(name) if name == self.server_id => self.key.verify(message, signature),
+            _ => Err(SignatureError::UnknownSigner),
+        }
+    }
+}
+
+/// Checks the signature of the issuing side on one grant.
+///
+/// Only that one. `Grant::verify` would also demand the engineer's, and in this
+/// release there is never one to demand: refusing every honest record is not a
+/// stricter check, it is a check that cannot be read.
+fn check_signature(record: &IssuanceRecord, anchors: &IssuingAnchors) -> SignatureState {
+    let grant = record.grant();
+    let Some(key) = anchors.keys.get(grant.server_id()) else {
+        // With no anchors at all the caller said nothing about who may issue,
+        // and a reader that turned silence into an accusation would report a
+        // finding against every honest fleet that audits without keys. With
+        // anchors, the caller HAS said it, and this grant names somebody else.
+        return if anchors.keys.is_empty() {
+            SignatureState::NotChecked
+        } else {
+            SignatureState::IssuerUnknown
+        };
+    };
+    let verifier = IssuingSideOnly {
+        server_id: grant.server_id(),
+        key,
+    };
+    match grant.verify_issuing_side(&verifier) {
+        Ok(()) => SignatureState::Verified,
+        Err(_) => SignatureState::Rejected,
+    }
+}
+
+/// Turns one record into the entry a reconciliation pairs on.
+///
+/// Everything comes out of the signed objects: the device, the epoch, the
+/// nonce, the role, the level and the personal number are read out of the
+/// challenge inside the request the engineer signed, not out of fields repeated
+/// beside it. There is nothing here for a writer to get wrong twice.
+fn entry_of(record: &IssuanceRecord, line: usize, signature: SignatureState) -> GrantEntry {
+    let request = record.request().request();
+    let challenge = request.challenge();
+    GrantEntry {
+        device_number: challenge.device_number().significant().to_owned(),
+        epoch: challenge.epoch().get(),
+        nonce: challenge.nonce().clone(),
+        role_id: challenge.role_id().to_owned(),
+        level: challenge.level().get(),
+        ticket_number: record.ticket_number().as_str().to_owned(),
+        server_id: record.grant().server_id().to_owned(),
+        engineer_id: challenge.engineer_id().to_owned(),
+        organisation_id: record.organisation_id().to_owned(),
+        requested_at: request.requested_at().get(),
+        key_storage: record.key_storage(),
+        identity_unverified: record.identity_unverified(),
+        signature,
+        source: format!("line {line}"),
+    }
+}
+
+/// Rejection of the chain of the issuing side.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ServerChainError {
+    /// The file carries lines, but no chain framing.
+    #[error(
+        "the file carries lines that are not a hash chain: the issuing side writes one by \
+         construction, so this is not the journal that was asked for"
+    )]
+    NotAChain,
+    /// A line of the chain is not JSON.
+    #[error("line {line} of the issuance chain is not JSON")]
+    NotJson {
+        /// Number of the offending line, from one.
+        line: usize,
+    },
+    /// The hash chain does not verify.
+    #[error("the issuance chain is broken at position {position}: a line was altered, reordered or removed, and a history that has been edited is not a history")]
+    BrokenChain {
+        /// Zero-based position of the first invalid line.
+        position: u64,
+    },
+    /// An issuance line carries no record.
+    #[error("line {line} of the issuance chain records an issuance without the record itself")]
+    MissingRecord {
+        /// Number of the offending line, from one.
+        line: usize,
+    },
+    /// The record of an issuance does not parse.
+    #[error("the record on line {line} of the issuance chain was rejected: {error}")]
+    MalformedRecord {
+        /// Number of the offending line, from one.
+        line: usize,
+        /// What the record parser said.
+        error: IssuanceRecordError,
+    },
+    /// The chain carries no issuance at all.
+    #[error("the issuance chain carries no issuance: this is not the journal you meant to hand over, and reading it as an empty one would produce a report that found nothing because it looked at nothing")]
+    NoIssuances,
 }
 
 /// Reports whether a line records a code login, in either of the two forms.
@@ -1156,8 +2025,9 @@ pub enum JournalError {
 )]
 mod tests {
     use super::{
-        read_journal, reconcile, JournalError, LoginEntry, Provenance, ReceiptEntry, Report,
-        UnpairableLine, Verdict,
+        read_journal, read_server_chain, reconcile, Expectations, GrantEntry, IssuingAnchors,
+        JournalError, KeyStorage, LoginEntry, Provenance, Report, Revocation, RevocationListUsed,
+        ServerChainError, ServerLine, SignatureState, SubjectKind, UnpairableLine, Verdict,
     };
     use tessera_codes_contract::nonce::Nonce;
     use tessera_codes_contract::outcome;
@@ -1169,6 +2039,8 @@ mod tests {
         Provenance {
             chain_verified: true,
             unsigned_from_seq: None,
+            server_unsigned_from_seq: None,
+            server_unread_lines: 0,
             refusals_without_nonce: 0,
             unpairable_lines: Vec::new(),
         }
@@ -1186,15 +2058,26 @@ mod tests {
         Nonce::parse(&text, &params).unwrap()
     }
 
-    fn receipt(mark: u8) -> ReceiptEntry {
-        ReceiptEntry {
+    fn grant(mark: u8) -> GrantEntry {
+        GrantEntry {
             device_number: "77000123".to_owned(),
             epoch: 7,
             nonce: nonce(mark),
             role_id: "ops.dc.senior".to_owned(),
             level: 2,
             ticket_number: "tk-17".to_owned(),
-            source: format!("receipt-{mark}"),
+            server_id: "issuer-1".to_owned(),
+            engineer_id: "eng-1".to_owned(),
+            organisation_id: "acme".to_owned(),
+            // A healthy run: the key of the issuing side was supplied and it
+            // held. Tests that are ABOUT the signature set this themselves; the
+            // rest are about something else and must not be dragged into a
+            // caveat by their fixture.
+            signature: SignatureState::Verified,
+            requested_at: 1_800_000_000,
+            key_storage: KeyStorage::Software,
+            identity_unverified: true,
+            source: format!("grant-{mark}"),
         }
     }
 
@@ -1215,6 +2098,7 @@ mod tests {
             role_id: "ops.dc.senior".to_owned(),
             level: 2,
             ticket_number: Some("tk-17".to_owned()),
+            engineer_id: Some("eng-1".to_owned()),
             outcome: outcome.to_owned(),
         }
     }
@@ -1232,7 +2116,12 @@ mod tests {
     /// который себя выдаёт», и опечатка на клавиатуре не должна его поднимать.
     #[test]
     fn a_mistyped_code_is_not_a_series_on_one_nonce() {
-        let report = reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), &verified());
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[refused(1), login(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
         assert!(
             report.verdict() != Verdict::Findings,
             "штатная опечатка подняла находку: {report}"
@@ -1249,10 +2138,15 @@ mod tests {
     /// сверка позволяла бы прохожему сгенерировать сколько угодно находок
     /// класса «код выдан мимо книг» и утопить в них настоящую.
     #[test]
-    fn refusals_do_not_become_logins_without_a_receipt() {
-        let report = reconcile(&[], Some(&[refused(1), refused(2)]), &verified());
+    fn refusals_do_not_become_logins_without_a_grant() {
+        let report = reconcile(
+            &[],
+            Some(&[refused(1), refused(2)]),
+            &verified(),
+            &Expectations::default(),
+        );
         assert!(
-            report.logins_without_receipt.is_empty(),
+            report.logins_without_grant.is_empty(),
             "отказ прочитан как вход: {report}"
         );
         assert_ne!(report.verdict(), Verdict::Findings);
@@ -1266,8 +2160,9 @@ mod tests {
             &[],
             Some(&[login_with(1, outcome::OUTCOME_ATTEMPTS_EXHAUSTED)]),
             &verified(),
+            &Expectations::default(),
         );
-        assert!(report.logins_without_receipt.is_empty());
+        assert!(report.logins_without_grant.is_empty());
         assert_eq!(report.refusals_read(), 1);
     }
 
@@ -1297,10 +2192,20 @@ mod tests {
         admission_without_nonce: bool,
         no_chain: bool,
         unsigned_tail: bool,
-        login_without_receipt: bool,
-        receipt_without_login: bool,
+        server_unsigned_tail: bool,
+        unread_server_lines: bool,
+        signatures_not_checked: bool,
+        grant_signature_rejected: bool,
+        grant_issuer_unknown: bool,
+        revocation_waterline_unset: bool,
+        revocations_read: bool,
+        unsigned_revocations: bool,
+        login_without_grant: bool,
+        grant_without_login: bool,
         series_on_one_nonce: bool,
         disagreement: bool,
+        custody_below_declared: bool,
+        grant_after_revocation: bool,
         refusals_read: bool,
     }
 
@@ -1314,10 +2219,20 @@ mod tests {
                 S::AdmissionWithoutNonce(_) => self.admission_without_nonce = true,
                 S::NoChain => self.no_chain = true,
                 S::UnsignedTail(_) => self.unsigned_tail = true,
-                S::LoginWithoutReceipt(_) => self.login_without_receipt = true,
-                S::ReceiptWithoutLogin(_) => self.receipt_without_login = true,
+                S::ServerUnsignedTail(_) => self.server_unsigned_tail = true,
+                S::UnreadServerLines(_) => self.unread_server_lines = true,
+                S::SignaturesNotChecked(_) => self.signatures_not_checked = true,
+                S::RevocationWaterlineUnset(_) => self.revocation_waterline_unset = true,
+                S::RevocationListRead(_) => self.revocations_read = true,
+                S::GrantSignatureRejected(_) => self.grant_signature_rejected = true,
+                S::GrantIssuerUnknown(_) => self.grant_issuer_unknown = true,
+                S::UnsignedRevocations(_) => self.unsigned_revocations = true,
+                S::LoginWithoutGrant(_) => self.login_without_grant = true,
+                S::GrantWithoutLogin(_) => self.grant_without_login = true,
                 S::SeriesOnOneNonce(_) => self.series_on_one_nonce = true,
                 S::Disagreement(_) => self.disagreement = true,
+                S::CustodyBelowDeclared(_) => self.custody_below_declared = true,
+                S::GrantAfterRevocation(_) => self.grant_after_revocation = true,
                 S::RefusalsRead(_) => self.refusals_read = true,
             }
         }
@@ -1331,6 +2246,10 @@ mod tests {
     /// неполным — и здесь это роняет тест, а не остаётся на прочтение
     /// рецензентом. До этой сетки переворот `UnsignedTail` в заметку проходил
     /// всю сюиту зелёным.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture per statement, and the guard below demands they all be here"
+    )]
     fn every_statement_alone() -> Vec<(&'static str, Report, Verdict)> {
         let mut odd = login(1);
         odd.role_id = "ops.dc.junior".to_owned();
@@ -1341,6 +2260,8 @@ mod tests {
                     unpairable_lines: Vec<UnpairableLine>| Provenance {
             chain_verified,
             unsigned_from_seq,
+            server_unsigned_from_seq: None,
+            server_unread_lines: 0,
             refusals_without_nonce,
             unpairable_lines,
         };
@@ -1353,17 +2274,27 @@ mod tests {
         vec![
             (
                 "no-device-side",
-                reconcile(&[], None, &Provenance::absent()),
+                reconcile(&[], None, &Provenance::absent(), &Expectations::default()),
                 Verdict::Incomplete,
             ),
             (
                 "unreadable-outcomes",
-                reconcile(&[], Some(&[login_with(1, "granted")]), &verified()),
+                reconcile(
+                    &[],
+                    Some(&[login_with(1, "granted")]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
                 Verdict::Incomplete,
             ),
             (
                 "unreadable-line",
-                reconcile(&[], Some(&[]), &with(true, None, 0, vec![line("granted")])),
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &with(true, None, 0, vec![line("granted")]),
+                    &Expectations::default(),
+                ),
                 Verdict::Incomplete,
             ),
             (
@@ -1372,45 +2303,1105 @@ mod tests {
                     &[],
                     Some(&[]),
                     &with(true, None, 0, vec![line(outcome::OUTCOME_SUCCESS)]),
+                    &Expectations::default(),
                 ),
                 Verdict::Findings,
             ),
             (
                 "no-chain",
-                reconcile(&[], Some(&[]), &with(false, None, 0, Vec::new())),
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &with(false, None, 0, Vec::new()),
+                    &Expectations::default(),
+                ),
                 Verdict::Incomplete,
             ),
             (
                 "unsigned-tail",
-                reconcile(&[], Some(&[]), &with(true, Some(7), 0, Vec::new())),
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &with(true, Some(7), 0, Vec::new()),
+                    &Expectations::default(),
+                ),
                 Verdict::Incomplete,
             ),
             (
-                "login-without-receipt",
-                reconcile(&[], Some(&[login(1)]), &verified()),
+                "login-without-grant",
+                reconcile(
+                    &[],
+                    Some(&[login(1)]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
                 Verdict::Findings,
             ),
             (
-                "receipt-without-login",
-                reconcile(&[receipt(1)], Some(&[]), &verified()),
+                "grant-without-login",
+                reconcile(
+                    &[grant(1)],
+                    Some(&[]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
                 Verdict::Findings,
             ),
             (
                 "series-on-one-nonce",
-                reconcile(&[receipt(1)], Some(&[login(1), login(1)]), &verified()),
+                reconcile(
+                    &[grant(1)],
+                    Some(&[login(1), login(1)]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
                 Verdict::Findings,
             ),
             (
                 "disagreement",
-                reconcile(&[receipt(1)], Some(&[odd]), &verified()),
+                reconcile(
+                    &[grant(1)],
+                    Some(&[odd]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
+                Verdict::Findings,
+            ),
+            (
+                // Withdrawals taken from a caller rather than from a signed
+                // list: the report says so, because an unsigned withdrawal is
+                // one anybody on the path can replace with none at all.
+                "unsigned-revocations",
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &verified(),
+                    &Expectations {
+                        declared_key_storage: None,
+                        revocations: Vec::new(),
+                        unsigned_revocations: 1,
+                        revocation_list: None,
+                    },
+                ),
+                Verdict::Incomplete,
+            ),
+            (
+                "server-unsigned-tail",
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &Provenance {
+                        server_unsigned_from_seq: Some(3),
+                        server_unread_lines: 0,
+                        ..verified()
+                    },
+                    &Expectations::default(),
+                ),
+                Verdict::Incomplete,
+            ),
+            (
+                // Список отзыва взят без ватерлинии: приняли бы список любого
+                // возраста. Оговорка, и рядом заметка о том, какой список
+                // применён — иначе читатель знает отзывы и не знает, откуда.
+                "revocation-waterline-unset",
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &verified(),
+                    &Expectations {
+                        declared_key_storage: None,
+                        revocations: Vec::new(),
+                        unsigned_revocations: 0,
+                        revocation_list: Some(RevocationListUsed {
+                            serial: 7,
+                            waterline: None,
+                        }),
+                    },
+                ),
+                Verdict::Incomplete,
+            ),
+            (
+                // Ватерлиния названа: остаётся только заметка, вердикт чистый.
+                "revocations-read",
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &verified(),
+                    &Expectations {
+                        declared_key_storage: None,
+                        revocations: Vec::new(),
+                        unsigned_revocations: 0,
+                        revocation_list: Some(RevocationListUsed {
+                            serial: 7,
+                            waterline: Some(6),
+                        }),
+                    },
+                ),
+                Verdict::Clean,
+            ),
+            (
+                // Ключа выдающей стороны никто не дал: подписи прочитаны из
+                // файла и больше ниоткуда. Не находка — аудитору без ключа
+                // нельзя сказать, что подпись неверна, — а оговорка.
+                "signatures-not-checked",
+                reconcile(
+                    &[GrantEntry {
+                        signature: SignatureState::NotChecked,
+                        ..grant(1)
+                    }],
+                    Some(&[login(1)]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
+                Verdict::Incomplete,
+            ),
+            (
+                // Ключ выдающей стороны за грант не ручается: значит написала
+                // его не та сторона. Находка, и громкая.
+                "grant-signature-rejected",
+                reconcile(
+                    &[GrantEntry {
+                        signature: SignatureState::Rejected,
+                        ..grant(1)
+                    }],
+                    Some(&[login(1)]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
+                Verdict::Findings,
+            ),
+            (
+                // Ключи выдающих сторон поданы, а грант называет НЕ ИХ.
+                // Отдельный класс, а не оговорка: оговорка означала бы, что
+                // диагноз выбирает тот, кто собрал грант.
+                "grant-issuer-unknown",
+                reconcile(
+                    &[GrantEntry {
+                        signature: SignatureState::IssuerUnknown,
+                        ..grant(1)
+                    }],
+                    Some(&[login(1)]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
+                Verdict::Findings,
+            ),
+            (
+                // Строки, которые читатель не смог прочесть: отчёт над такой
+                // цепочкой не полон, что бы он ни нашёл.
+                "unread-server-lines",
+                reconcile(
+                    &[],
+                    Some(&[]),
+                    &Provenance {
+                        server_unread_lines: 2,
+                        ..verified()
+                    },
+                    &Expectations::default(),
+                ),
+                Verdict::Incomplete,
+            ),
+            (
+                // Ступень ниже объявленной: пара сошлась, и единственное, что
+                // отчёт говорит, — про кастодию.
+                "custody-below-declared",
+                reconcile(
+                    &[grant(1)],
+                    Some(&[login(1)]),
+                    &verified(),
+                    &Expectations {
+                        declared_key_storage: Some(KeyStorage::Token),
+                        revocations: Vec::new(),
+                        unsigned_revocations: 0,
+                        revocation_list: None,
+                    },
+                ),
+                Verdict::Findings,
+            ),
+            (
+                // Выдача датирована позже отзыва того самого инженера.
+                "grant-after-revocation",
+                reconcile(
+                    &[grant(1)],
+                    Some(&[login(1)]),
+                    &verified(),
+                    &Expectations {
+                        declared_key_storage: None,
+                        revocations: vec![Revocation {
+                            kind: SubjectKind::Engineer,
+                            subject: "eng-1".to_owned(),
+                            at: 1_799_999_999,
+                        }],
+                        unsigned_revocations: 0,
+                        revocation_list: None,
+                    },
+                ),
                 Verdict::Findings,
             ),
             (
                 "refusals-read",
-                reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), &verified()),
+                reconcile(
+                    &[grant(1)],
+                    Some(&[refused(1), login(1)]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
                 Verdict::Clean,
             ),
         ]
+    }
+
+    /// Настоящая цепочка выдач того же вида, какой её пишет служба.
+    ///
+    /// Собирается тем же `tessera_hashchain`, которым её соберёт codes-core:
+    /// строки, набранные руками, доказали бы только то, что читатель понимает
+    /// собственную выдумку.
+    fn server_chain_lines(records: usize) -> Vec<String> {
+        use crate::codes::scope::SiteScope;
+        use crate::codes::tests::fixtures;
+        use crate::codes::{IssuanceRecord, IssuanceRecordFields};
+        use tessera_codes_contract::grant::UnsignedGrant;
+        use tessera_codes_contract::signature::Signature;
+        use tessera_codes_contract::ticket::TicketNumber;
+        use tessera_hashchain::storage::MemoryStorage;
+        use tessera_hashchain::Chain;
+
+        let world = fixtures::world();
+        let mut chain: Chain<MemoryStorage, ServerLine> =
+            Chain::load(MemoryStorage::new()).unwrap();
+        for index in 0..records {
+            let grant = UnsignedGrant::new(fixtures::signed_request(&world), "op-42")
+                .unwrap()
+                .sign(Signature::new(vec![0x11, 0x22]).unwrap(), None)
+                .unwrap();
+            let record = IssuanceRecord::new(IssuanceRecordFields {
+                grant,
+                ticket_number: TicketNumber::parse("tk-17").unwrap(),
+                organisation_id: "acme".to_owned(),
+                key_storage: KeyStorage::Software,
+                site_scope: SiteScope::Checked,
+                // The fixture request is signed, so the mark is clear: the two
+                // have to agree, and the type refuses a record where they do
+                // not.
+                identity_unverified: false,
+            })
+            .unwrap();
+            let line: ServerLine = serde_json::from_value(serde_json::json!({
+                "op": super::ISSUANCE_OP,
+                super::ISSUANCE_RECORD_FIELD: record.to_wire(),
+            }))
+            .unwrap();
+            chain.append(&line, 1_800_000_000 + index as u64).unwrap();
+        }
+        chain.storage().lines()
+    }
+
+    #[test]
+    fn a_chain_of_issuances_reads_back_into_entries() {
+        let chain = read_server_chain(
+            &server_chain_lines(2).join("\n"),
+            &FleetParams::defaults(),
+            &IssuingAnchors::default(),
+        )
+        .unwrap();
+        assert_eq!(chain.entries.len(), 2);
+        // Всё берётся из подписанных объектов, а не из полей рядом с ними.
+        let first = chain.entries.first().unwrap();
+        assert_eq!(first.engineer_id, "eng-1");
+        assert_eq!(first.organisation_id, "acme");
+        assert_eq!(first.key_storage, KeyStorage::Software);
+        // Хвост цепочки не заверен: заверителя на стенде нет, и отчёт обязан
+        // сказать об этом, а не промолчать.
+        assert_eq!(chain.unsigned_from_seq, Some(0));
+    }
+
+    #[test]
+    fn a_chain_of_another_journal_is_not_read_as_this_one() {
+        // Domain separation, checked rather than assumed. The two journals of a
+        // reconciliation are read side by side, and a line carried over from
+        // one into the other must fail at its position instead of blending in.
+        // Both fixtures used to build their chains under one anchor and never
+        // compared them, so replacing the anchor of this reader with the
+        // device's left all forty-five tests green.
+        use tessera_hashchain::storage::MemoryStorage;
+        use tessera_hashchain::Chain;
+
+        // The payload alone, without the framing of the chain it came from:
+        // re-chaining a line together with its old `seq` and `prev_hash` would
+        // break for that reason instead, and the test would pass while saying
+        // nothing about the anchors.
+        let source: serde_json::Value =
+            serde_json::from_str(server_chain_lines(1).first().unwrap()).unwrap();
+        let payload: super::DeviceLine = serde_json::from_value(serde_json::json!({
+            "op": source.get("op").unwrap(),
+            super::ISSUANCE_RECORD_FIELD: source.get(super::ISSUANCE_RECORD_FIELD).unwrap(),
+        }))
+        .unwrap();
+        // The same record, re-chained under the anchor of a device journal.
+        let mut foreign: Chain<MemoryStorage, super::DeviceLine> =
+            Chain::load(MemoryStorage::new()).unwrap();
+        foreign.append(&payload, 1_800_000_000).unwrap();
+
+        assert_eq!(
+            read_server_chain(
+                &foreign.storage().lines().join("\n"),
+                &FleetParams::defaults(),
+                &IssuingAnchors::default(),
+            ),
+            Err(ServerChainError::BrokenChain { position: 0 })
+        );
+    }
+
+    #[test]
+    fn an_empty_head_signature_does_not_close_the_unsigned_tail() {
+        // A line that says `head_signature` and carries neither an algorithm
+        // nor a signature would sign nothing and still take away the caveat
+        // that says lines could have been dropped from the end — removing the
+        // warning and adding no protection.
+        use tessera_hashchain::storage::MemoryStorage;
+        use tessera_hashchain::Chain;
+
+        // Сцепление у строки ПРАВИЛЬНОЕ — её добавляет сама цепочка. Если бы
+        // тест подсовывал строку с выдуманным prev_hash, он краснел бы по
+        // сломанному хешу и о проверке заверения не говорил бы ничего.
+        let mut chain: Chain<MemoryStorage, ServerLine> =
+            Chain::load(MemoryStorage::new()).unwrap();
+        let record: ServerLine = serde_json::from_str(server_chain_lines(1).first().unwrap())
+            .map(|line: serde_json::Value| {
+                serde_json::from_value(serde_json::json!({
+                    "op": line.get("op").unwrap(),
+                    super::ISSUANCE_RECORD_FIELD: line
+                        .get(super::ISSUANCE_RECORD_FIELD)
+                        .unwrap(),
+                }))
+                .unwrap()
+            })
+            .unwrap();
+        chain.append(&record, 1_800_000_000).unwrap();
+        let hollow: ServerLine = serde_json::from_value(serde_json::json!({
+            "op": tessera_hashchain::OP_HEAD_SIGNATURE,
+            "algorithm": "",
+            "signature": "",
+        }))
+        .unwrap();
+        chain.append(&hollow, 1_800_000_001).unwrap();
+
+        assert!(
+            matches!(
+                read_server_chain(
+                    &chain.storage().lines().join("\n"),
+                    &FleetParams::defaults(),
+                    &IssuingAnchors::default(),
+                ),
+                Err(ServerChainError::BrokenChain { .. })
+            ),
+            "a head signature with nothing in it closed the unsigned tail"
+        );
+    }
+
+    #[test]
+    fn an_issuance_removed_from_the_middle_breaks_the_chain() {
+        // Ровно то, ради чего цепочка и заводилась: строку из середины нельзя
+        // уронить, не сломав сцепление. Хвост — другой разговор, и его ведёт
+        // оговорка о незаверённом хвосте.
+        let mut lines = server_chain_lines(3);
+        lines.remove(1);
+        assert_eq!(
+            read_server_chain(
+                &lines.join("\n"),
+                &FleetParams::defaults(),
+                &IssuingAnchors::default(),
+            ),
+            Err(ServerChainError::BrokenChain { position: 1 })
+        );
+    }
+
+    #[test]
+    fn a_record_that_lost_its_custody_tier_stops_the_reading() {
+        // Не «читается с умолчанием»: ступень — это то, что говорит, чем
+        // считался код, и запись без неё не отвечает на вопрос, ради которого
+        // её пишут. Правка ломает и цепочку — сначала о ней и сообщается, —
+        // поэтому запись портится в файле БЕЗ цепочки, где виден именно разбор.
+        let record = server_chain_lines(1)
+            .first()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap()
+                    .get(super::ISSUANCE_RECORD_FIELD)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap()
+                    .to_owned()
+            })
+            .unwrap();
+        let stripped = record.replace(";key_storage=software", "");
+        let line = serde_json::json!({
+            "seq": 0,
+            "op": super::ISSUANCE_OP,
+            super::ISSUANCE_RECORD_FIELD: stripped,
+        })
+        .to_string();
+        assert!(matches!(
+            read_server_chain(&line, &FleetParams::defaults(), &IssuingAnchors::default(),),
+            Err(ServerChainError::BrokenChain { .. } | ServerChainError::MalformedRecord { .. })
+        ));
+    }
+
+    #[test]
+    fn a_file_without_chain_framing_is_named_as_such_and_not_as_a_broken_chain() {
+        // Разные находки и разные действия. «Цепочка сломана на позиции N» шлёт
+        // аудитора искать подменённую строку; «это не цепочка» говорит, что
+        // передан не тот файл. Выдающая сторона пишет цепочку по построению,
+        // поэтому файл вообще без обрамления — второе.
+        let flat = serde_json::json!({ "op": super::ISSUANCE_OP }).to_string();
+        assert!(
+            matches!(
+                read_server_chain(&flat, &FleetParams::defaults(), &IssuingAnchors::default()),
+                Err(ServerChainError::NotAChain)
+            ),
+            "плоский экспорт прочитан не как «не цепочка»"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_an_issuance_side_that_recorded_nothing() {
+        // Not a refusal. This is the audit scenario the first class of the
+        // report exists for: a device journal full of logins beside an issuance
+        // side that has none of them. Refusing here made that class unreachable
+        // by any input at all — the case that named it could never have passed.
+        let chain =
+            read_server_chain("", &FleetParams::defaults(), &IssuingAnchors::default()).unwrap();
+        assert!(chain.entries.is_empty());
+        assert_eq!(chain.unsigned_from_seq, None);
+
+        let report = reconcile(
+            &chain.entries,
+            Some(&[login(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.logins_without_grant.len(), 1, "{report}");
+    }
+
+    /// Цепочка выдач с приписанной строкой, чей `op` этой сборке неизвестен.
+    fn chain_with_an_unknown_line() -> Vec<String> {
+        use crate::codes::scope::SiteScope;
+        use crate::codes::tests::fixtures;
+        use crate::codes::{IssuanceRecord, IssuanceRecordFields};
+        use tessera_codes_contract::grant::UnsignedGrant;
+        use tessera_codes_contract::signature::Signature;
+        use tessera_codes_contract::ticket::TicketNumber;
+        use tessera_hashchain::storage::MemoryStorage;
+        use tessera_hashchain::Chain;
+
+        let world = fixtures::world();
+        let mut chain: Chain<MemoryStorage, ServerLine> =
+            Chain::load(MemoryStorage::new()).unwrap();
+
+        let grant = UnsignedGrant::new(fixtures::signed_request(&world), "op-42")
+            .unwrap()
+            .sign(Signature::new(vec![0x11, 0x22]).unwrap(), None)
+            .unwrap();
+        let record = IssuanceRecord::new(IssuanceRecordFields {
+            grant,
+            ticket_number: TicketNumber::parse("tk-17").unwrap(),
+            organisation_id: "acme".to_owned(),
+            key_storage: KeyStorage::Software,
+            site_scope: SiteScope::Checked,
+            identity_unverified: false,
+        })
+        .unwrap();
+        let issuance: ServerLine = serde_json::from_value(serde_json::json!({
+            "op": super::ISSUANCE_OP,
+            super::ISSUANCE_RECORD_FIELD: record.to_wire(),
+        }))
+        .unwrap();
+        chain.append(&issuance, 1_800_000_000).unwrap();
+
+        let unknown: ServerLine = serde_json::from_value(serde_json::json!({
+            "op": "codes.something-a-later-build-invented",
+            "note": "a line this build cannot read",
+        }))
+        .unwrap();
+        chain.append(&unknown, 1_800_000_001).unwrap();
+        chain.storage().lines()
+    }
+
+    /// Подпись выдающей стороны проверяется НАСТОЯЩИМ ключом.
+    ///
+    /// До этой правки сверка не звала `verify` ни разу: подписи брались на
+    /// слово файла, и грант, собранный кем угодно, читался ровно как
+    /// подписанный выдающей стороной. Здесь чинится именно это, и проверяется
+    /// на цепочке, собранной крейтом цепочки, с подписью, поставленной ключом.
+    #[test]
+    fn a_grant_the_issuing_key_does_not_stand_behind_is_a_finding() {
+        use crate::codes::trust::AnchorKey;
+        use p256::ecdsa::signature::hazmat::PrehashSigner as _;
+        use p256::pkcs8::EncodePublicKey as _;
+        use sha2::{Digest as _, Sha256};
+        use tessera_codes_contract::grant::UnsignedGrant;
+        use tessera_codes_contract::signature::Signature;
+        use tessera_codes_contract::ticket::TicketNumber;
+        use tessera_hashchain::storage::MemoryStorage;
+        use tessera_hashchain::Chain;
+
+        use crate::codes::scope::SiteScope;
+        use crate::codes::tests::fixtures;
+        use crate::codes::{IssuanceRecord, IssuanceRecordFields};
+
+        let world = fixtures::world();
+        let secret = p256::SecretKey::from_slice(&[0x5a; 32]).unwrap();
+        let signing = p256::ecdsa::SigningKey::from(&secret);
+        let anchor_der = secret
+            .public_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        // Собран так, как его собирает выдающая сторона: сначала неподписанный
+        // грант, потом подпись НАД ЕГО каноническими байтами.
+        let unsigned =
+            UnsignedGrant::new(fixtures::signed_request(&world), "codes-core-1").unwrap();
+        let message = unsigned.signing_message().unwrap();
+        let der: p256::ecdsa::Signature = signing.sign_prehash(&Sha256::digest(&message)).unwrap();
+        let honest = unsigned
+            .clone()
+            .sign(
+                Signature::new(der.to_der().as_bytes().to_vec()).unwrap(),
+                None,
+            )
+            .unwrap();
+        let forged = unsigned
+            .sign(Signature::new(vec![0x11, 0x22, 0x33]).unwrap(), None)
+            .unwrap();
+
+        let chain_of = |grant: tessera_codes_contract::grant::Grant| {
+            let record = IssuanceRecord::new(IssuanceRecordFields {
+                grant,
+                ticket_number: TicketNumber::parse("tk-17").unwrap(),
+                organisation_id: "acme".to_owned(),
+                key_storage: KeyStorage::Software,
+                site_scope: SiteScope::Checked,
+                identity_unverified: false,
+            })
+            .unwrap();
+            let mut chain: Chain<MemoryStorage, ServerLine> =
+                Chain::load(MemoryStorage::new()).unwrap();
+            let line: ServerLine = serde_json::from_value(serde_json::json!({
+                "op": super::ISSUANCE_OP,
+                super::ISSUANCE_RECORD_FIELD: record.to_wire(),
+            }))
+            .unwrap();
+            chain.append(&line, 1_800_000_000).unwrap();
+            chain.storage().lines().join("\n")
+        };
+
+        let mut anchors = IssuingAnchors::default();
+        anchors.insert(
+            "codes-core-1".to_owned(),
+            AnchorKey::from_spki_der(&anchor_der).unwrap(),
+        );
+
+        let good =
+            read_server_chain(&chain_of(honest), &FleetParams::defaults(), &anchors).unwrap();
+        assert_eq!(
+            good.entries.first().unwrap().signature,
+            SignatureState::Verified,
+            "a grant the key does stand behind was not accepted"
+        );
+
+        let bad = read_server_chain(&chain_of(forged), &FleetParams::defaults(), &anchors).unwrap();
+        assert_eq!(
+            bad.entries.first().unwrap().signature,
+            SignatureState::Rejected,
+            "a forged grant passed as signed"
+        );
+        let report = reconcile(
+            &bad.entries,
+            Some(&[]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.verdict(), Verdict::Findings, "{report}");
+        assert!(
+            report.to_string().contains("grant-signature-rejected"),
+            "{report}"
+        );
+    }
+
+    /// Неизвестная выдающая сторона — находка, а не оговорка.
+    ///
+    /// Пока чужая сторона давала «подписи не проверены», диагноз выбирал тот,
+    /// кто собрал грант: достаточно было назваться именем, которого никто не
+    /// якорил, и находка превращалась в оговорку. Обратная половина тоже
+    /// проверяется здесь: БЕЗ единого якоря это по-прежнему оговорка — аудитору,
+    /// у которого ключей нет, нельзя сообщать, что подпись неверна.
+    #[test]
+    fn a_grant_from_a_side_nobody_anchored_is_a_finding_of_its_own() {
+        use crate::codes::trust::AnchorKey;
+        use p256::ecdsa::signature::hazmat::PrehashSigner as _;
+        use p256::pkcs8::EncodePublicKey as _;
+        use sha2::{Digest as _, Sha256};
+        use tessera_codes_contract::grant::UnsignedGrant;
+        use tessera_codes_contract::signature::Signature;
+        use tessera_codes_contract::ticket::TicketNumber;
+        use tessera_hashchain::storage::MemoryStorage;
+        use tessera_hashchain::Chain;
+
+        use crate::codes::scope::SiteScope;
+        use crate::codes::tests::fixtures;
+        use crate::codes::{IssuanceRecord, IssuanceRecordFields};
+
+        let world = fixtures::world();
+        let secret = p256::SecretKey::from_slice(&[0x5a; 32]).unwrap();
+        let signing = p256::ecdsa::SigningKey::from(&secret);
+        let anchor_der = secret
+            .public_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        let sign_honestly = || {
+            let unsigned =
+                UnsignedGrant::new(fixtures::signed_request(&world), "codes-core-1").unwrap();
+            let message = unsigned.signing_message().unwrap();
+            let der: p256::ecdsa::Signature =
+                signing.sign_prehash(&Sha256::digest(&message)).unwrap();
+            unsigned
+                .sign(
+                    Signature::new(der.to_der().as_bytes().to_vec()).unwrap(),
+                    None,
+                )
+                .unwrap()
+        };
+
+        let chain_of = |grant: tessera_codes_contract::grant::Grant| {
+            let record = IssuanceRecord::new(IssuanceRecordFields {
+                grant,
+                ticket_number: TicketNumber::parse("tk-17").unwrap(),
+                organisation_id: "acme".to_owned(),
+                key_storage: KeyStorage::Software,
+                site_scope: SiteScope::Checked,
+                identity_unverified: false,
+            })
+            .unwrap();
+            let mut chain: Chain<MemoryStorage, ServerLine> =
+                Chain::load(MemoryStorage::new()).unwrap();
+            let line: ServerLine = serde_json::from_value(serde_json::json!({
+                "op": super::ISSUANCE_OP,
+                super::ISSUANCE_RECORD_FIELD: record.to_wire(),
+            }))
+            .unwrap();
+            chain.append(&line, 1_800_000_000).unwrap();
+            chain.storage().lines().join("\n")
+        };
+
+        // Якорь есть, но он про ДРУГУЮ сторону.
+        let mut elsewhere = IssuingAnchors::default();
+        elsewhere.insert(
+            "codes-core-2".to_owned(),
+            AnchorKey::from_spki_der(&anchor_der).unwrap(),
+        );
+        let stranger = read_server_chain(
+            &chain_of(sign_honestly()),
+            &FleetParams::defaults(),
+            &elsewhere,
+        )
+        .unwrap();
+        assert_eq!(
+            stranger.entries.first().unwrap().signature,
+            SignatureState::IssuerUnknown,
+            "неизвестная выдающая сторона прошла как непроверенная подпись"
+        );
+        let report = reconcile(
+            &stranger.entries,
+            Some(&[]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.verdict(), Verdict::Findings, "{report}");
+        let printed = report.to_string();
+        assert!(printed.contains("grant-issuer-unknown"), "{printed}");
+        // Названа именно та сторона, которую написал грант: отчёт «какая-то
+        // сторона, которую вы не якорили» отправил бы аудитора обратно в файл.
+        assert!(printed.contains("server=codes-core-1"), "{printed}");
+
+        // А без единого якоря это по-прежнему оговорка: аудитору, у которого
+        // ключей нет, нельзя сообщать, что подпись неверна.
+        let unanchored = read_server_chain(
+            &chain_of(sign_honestly()),
+            &FleetParams::defaults(),
+            &IssuingAnchors::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            unanchored.entries.first().unwrap().signature,
+            SignatureState::NotChecked
+        );
+        let report = reconcile(
+            &unanchored.entries,
+            Some(&[]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert!(
+            report.to_string().contains("signatures-not-checked"),
+            "{report}"
+        );
+    }
+
+    /// Непрочитанная строка цепочки не пропадает молча.
+    ///
+    /// Прежняя проверка смотрела на неизвестные `op` ТОЛЬКО когда выдач не
+    /// нашлось вовсе. Цепочка с одной выдачей и приписанной строкой читалась
+    /// как одна выдача и полный отчёт — то есть отчёт утверждал, что посмотрел
+    /// на всё, не прочитав часть файла. Это хуже отказа: отказ разбирают, а
+    /// «находок нет» закрывает вопрос.
+    #[test]
+    fn a_line_the_reader_could_not_read_keeps_the_report_from_calling_itself_complete() {
+        let chain = read_server_chain(
+            &chain_with_an_unknown_line().join("\n"),
+            &FleetParams::defaults(),
+            &IssuingAnchors::default(),
+        )
+        .unwrap_or_else(|error| {
+            unreachable!("a chain that carries issuances was refused: {error}")
+        });
+        assert_eq!(chain.entries.len(), 1, "the issuance is still read");
+        assert_eq!(
+            chain.unread_lines, 1,
+            "the line this build cannot read was not counted"
+        );
+
+        let report = reconcile(
+            &chain.entries,
+            Some(&[login(1)]),
+            &Provenance {
+                server_unread_lines: chain.unread_lines,
+                ..verified()
+            },
+            &Expectations::default(),
+        );
+        assert!(
+            !report.is_complete(),
+            "a report that skipped a line called itself complete: {report}"
+        );
+        assert!(
+            report.to_string().contains("unread-server-lines"),
+            "the report does not say which lines it could not read: {report}"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_something_else_is_refused_rather_than_read_as_empty() {
+        // Lines, but not one of them an issuance. Reading this as an empty
+        // issuance side would produce a report that found nothing because it
+        // looked at nothing — and it would look exactly like the honest empty
+        // case above, which is why the two carry different classes.
+        use tessera_hashchain::storage::MemoryStorage;
+        use tessera_hashchain::Chain;
+
+        let mut chain: Chain<MemoryStorage, ServerLine> =
+            Chain::load(MemoryStorage::new()).unwrap();
+        let other: ServerLine = serde_json::from_value(serde_json::json!({
+            "op": "codes.something-else",
+            "note": "a line of another journal",
+        }))
+        .unwrap();
+        chain.append(&other, 1_800_000_000).unwrap();
+
+        assert_eq!(
+            read_server_chain(
+                &chain.storage().lines().join("\n"),
+                &FleetParams::defaults(),
+                &IssuingAnchors::default(),
+            ),
+            Err(ServerChainError::NoIssuances)
+        );
+    }
+
+    /// Свежая сторона выдачи, которая пока только отказывала, — не подмена.
+    ///
+    /// codes-core пишет в ту же цепочку отказы и авторизации. Узел, который
+    /// ещё ни разу не выдал код, отдаёт файл со строками и без единой выдачи —
+    /// и до этой правки сверка отвечала «это не тот журнал», то есть обвиняла
+    /// в подмене сторону, работавшую правильно. Различие важное: «журнал
+    /// подменили» требует разбирательства, «выдач ещё не было» не требует
+    /// ничего.
+    #[test]
+    fn a_chain_of_known_lines_without_a_single_issuance_is_an_empty_issuance_side() {
+        use tessera_hashchain::storage::MemoryStorage;
+        use tessera_hashchain::Chain;
+
+        let mut chain: Chain<MemoryStorage, ServerLine> =
+            Chain::load(MemoryStorage::new()).unwrap();
+        for op in [super::REFUSAL_OP, super::AUTHORISATION_OP] {
+            let line: ServerLine = serde_json::from_value(serde_json::json!({
+                "op": op,
+                "note": "a line the issuing side writes beside its issuances",
+            }))
+            .unwrap();
+            chain.append(&line, 1_800_000_000).unwrap();
+        }
+
+        let read = read_server_chain(
+            &chain.storage().lines().join("\n"),
+            &FleetParams::defaults(),
+            &IssuingAnchors::default(),
+        );
+        let chain = read.unwrap_or_else(|error| {
+            // A `Result` compared with `assert_eq!` would print the whole
+            // expected value; naming the refusal is what a reader needs.
+            unreachable!("a side that has only refused was called a substituted journal: {error}")
+        });
+        assert!(
+            chain.entries.is_empty(),
+            "no issuance was written, so none may be reported"
+        );
+    }
+
+    /// Ступень ВЫШЕ объявленной тревогой не является.
+    ///
+    /// Это не мелочь формулировки: парк, перенёсший ключ согласования на
+    /// носитель раньше, чем поправил свою декларацию, получил бы тревогу на
+    /// каждой выдаче — и научился бы пропускать класс, ради которого он заведён.
+    #[test]
+    fn a_custody_tier_above_the_declared_one_is_not_an_alarm() {
+        let mut on_token = grant(1);
+        on_token.key_storage = KeyStorage::Token;
+        let report = reconcile(
+            &[on_token],
+            Some(&[login(1)]),
+            &verified(),
+            &Expectations {
+                declared_key_storage: Some(KeyStorage::Software),
+                revocations: Vec::new(),
+                unsigned_revocations: 0,
+                revocation_list: None,
+            },
+        );
+        assert!(report.custody_shortfalls.is_empty());
+        assert_eq!(report.verdict(), Verdict::Clean);
+    }
+
+    /// Отзыв чужого права выдачу не задевает, а отзыв ПОСЛЕ неё — не улика.
+    ///
+    /// Обе половины в одном тесте, потому что порознь каждая проходит на
+    /// реализации, которая поднимает тревогу на всё подряд.
+    #[test]
+    fn a_revocation_that_does_not_concern_the_issuance_is_silent() {
+        let elsewhere = Expectations {
+            declared_key_storage: None,
+            revocations: vec![Revocation {
+                kind: SubjectKind::Engineer,
+                subject: "eng-2".to_owned(),
+                at: 1_799_999_999,
+            }],
+            unsigned_revocations: 0,
+            revocation_list: None,
+        };
+        let report = reconcile(&[grant(1)], Some(&[login(1)]), &verified(), &elsewhere);
+        assert!(report.late_grants.is_empty(), "{report}");
+
+        // Тот же инженер, но право снято ПОЗЖЕ выдачи: в момент выдачи оно
+        // действовало, и говорить тут не о чем.
+        let later = Expectations {
+            declared_key_storage: None,
+            revocations: vec![Revocation {
+                kind: SubjectKind::Engineer,
+                subject: "eng-1".to_owned(),
+                at: 1_800_000_001,
+            }],
+            unsigned_revocations: 0,
+            revocation_list: None,
+        };
+        let report = reconcile(&[grant(1)], Some(&[login(1)]), &verified(), &later);
+        assert!(report.late_grants.is_empty(), "{report}");
+    }
+
+    /// Отзыв догоняет инженера, как бы тот ни написал свой номер.
+    ///
+    /// Уклонение выбирает тот, кого контролируют: устройство передаёт номер
+    /// КАК НАБРАНО, а разделители и регистр в формате незначащи. Побайтовая
+    /// сверка означала бы, что достаточно нажать пробел — и отчёт чист.
+    #[test]
+    fn a_revocation_reaches_the_engineer_whatever_the_spelling() {
+        for spelling in ["ORG1-0000014", "org1 000001 4", "org1.0000014"] {
+            let mut issued = grant(1);
+            issued.engineer_id = spelling.to_owned();
+            let withdrawn = Expectations {
+                declared_key_storage: None,
+                revocations: vec![Revocation {
+                    kind: SubjectKind::Engineer,
+                    subject: "ORG1-0000014".to_owned(),
+                    at: 1_799_999_999,
+                }],
+                unsigned_revocations: 0,
+                revocation_list: None,
+            };
+            let report = reconcile(&[issued], Some(&[login(1)]), &verified(), &withdrawn);
+            assert_eq!(
+                report.late_grants.len(),
+                1,
+                "выдача под написанием {spelling} не связана с отзывом: {report}"
+            );
+        }
+    }
+
+    /// Разное написание одного номера — не расхождение сторон.
+    ///
+    /// Та же причина, обратная сторона: устройство пишет набранное, выдающая
+    /// сторона — полученное, и два написания одного номера не должны выглядеть
+    /// как «стороны называют разных людей».
+    #[test]
+    fn two_spellings_of_one_number_are_not_a_disagreement() {
+        let mut issued = grant(1);
+        issued.engineer_id = "ORG1-0000014".to_owned();
+        let mut admitted = login(1);
+        admitted.engineer_id = Some("org1 000001 4".to_owned());
+
+        let report = reconcile(
+            &[issued],
+            Some(&[admitted]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert!(report.disagreements.is_empty(), "{report}");
+
+        // А другой номер по-прежнему расхождение: сверка не перестала сверять.
+        let mut issued = grant(1);
+        issued.engineer_id = "ORG1-0000014".to_owned();
+        let mut somebody_else = login(1);
+        somebody_else.engineer_id = Some("ORG1-0000022".to_owned());
+        let report = reconcile(
+            &[issued],
+            Some(&[somebody_else]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.disagreements.len(), 1, "{report}");
+    }
+
+    /// Выдача той же секундой, что и отзыв, попадает в отчёт.
+    ///
+    /// Обе отметки — Unix-секунды, поэтому про выдачу, помеченную секундой
+    /// отзыва, НЕЛЬЗЯ сказать, что она была раньше. Аудитор может посмотреть на
+    /// напечатанную строку и признать её законной; на строку, которой в отчёте
+    /// нет, посмотреть нельзя никак.
+    #[test]
+    fn an_issuance_in_the_very_second_of_the_revocation_is_reported() {
+        let same_second = Expectations {
+            declared_key_storage: None,
+            revocations: vec![Revocation {
+                kind: SubjectKind::Engineer,
+                subject: "eng-1".to_owned(),
+                at: 1_800_000_000,
+            }],
+            unsigned_revocations: 0,
+            revocation_list: None,
+        };
+        let report = reconcile(&[grant(1)], Some(&[login(1)]), &verified(), &same_second);
+        assert_eq!(report.late_grants.len(), 1, "{report}");
+        let late = report.late_grants.first().unwrap();
+        assert_eq!(late.revocation.at, 1_800_000_000);
+        assert_ne!(report.verdict(), Verdict::Clean, "{report}");
+    }
+
+    /// Отзыв организации ловится так же, как отзыв инженера.
+    #[test]
+    fn a_revoked_organisation_is_named_too() {
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[login(1)]),
+            &verified(),
+            &Expectations {
+                declared_key_storage: None,
+                revocations: vec![Revocation {
+                    kind: SubjectKind::Organisation,
+                    subject: "acme".to_owned(),
+                    at: 1_799_999_999,
+                }],
+                unsigned_revocations: 0,
+                revocation_list: None,
+            },
+        );
+        assert_eq!(report.late_grants.len(), 1, "{report}");
+        assert_eq!(
+            report.late_grants.first().unwrap().revocation.subject,
+            "acme"
+        );
+    }
+
+    /// Сессия, открытая под чужим личным номером, — расхождение пары.
+    ///
+    /// Класс, ради которого личный номер и стоит в challenge: код выдан одному,
+    /// а вошёл по нему другой. Пара сходится по nonce, и без сравнения номеров
+    /// отчёт назвал бы её согласной.
+    #[test]
+    fn a_login_under_another_personal_number_is_a_disagreement() {
+        let mut other = login(1);
+        other.engineer_id = Some("eng-9".to_owned());
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[other]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.disagreements.len(), 1, "{report}");
+        assert!(report
+            .disagreements
+            .first()
+            .unwrap()
+            .fields
+            .contains(&"engineer"));
+    }
+
+    /// Отказ, случившийся до вопроса о личном номере, расхождением не считается.
+    #[test]
+    fn an_admission_that_named_no_number_is_a_disagreement() {
+        // This test used to assert the opposite, and the reason it did was a
+        // case that cannot happen: "a device that refused before asking has
+        // nothing to disagree with". Refusals never reach the pairing — they
+        // are filtered out before it — so a PAIRED line is always an admission,
+        // and an admission without a personal number is a session opened
+        // without the device recording who opened it.
+        //
+        // Skipping the comparison read as agreement, which is the worst answer
+        // available: the whole point of the field is that a login names a
+        // person, and "nobody was named" came out of the report as clean.
+        let mut nameless = login(1);
+        nameless.engineer_id = None;
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[nameless]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.disagreements.len(), 1, "{report}");
+        assert_eq!(
+            report.disagreements.first().unwrap().fields,
+            vec!["engineer"],
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_named_no_number_is_still_not_a_disagreement() {
+        // The other side of it, and the reason the old assertion existed at
+        // all: a device that turned an attempt away before it asked for a
+        // number recorded none, and that is the refusal rather than a
+        // disagreement. It reaches the report as a counted refusal and nothing
+        // more, so the class stays for the case it is about.
+        let mut nameless = login_with(1, outcome::OUTCOME_DENIED);
+        nameless.engineer_id = None;
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[nameless]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert!(report.disagreements.is_empty(), "{report}");
     }
 
     /// Вид утверждения решает вердикт, и это проверяется на каждом виде.
@@ -1449,6 +3440,8 @@ mod tests {
         let unreadable = Provenance {
             chain_verified: false,
             unsigned_from_seq: Some(4),
+            server_unsigned_from_seq: None,
+            server_unread_lines: 0,
             refusals_without_nonce: 1,
             unpairable_lines: vec![
                 UnpairableLine {
@@ -1467,30 +3460,42 @@ mod tests {
         vec![
             (
                 "без устройства",
-                reconcile(&[receipt(1)], None, &verified()),
+                reconcile(&[grant(1)], None, &verified(), &Expectations::default()),
             ),
             (
                 "чисто",
-                reconcile(&[receipt(1)], Some(&[login(1)]), &verified()),
+                reconcile(
+                    &[grant(1)],
+                    Some(&[login(1)]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
             ),
             (
                 "отказы",
-                reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), &verified()),
+                reconcile(
+                    &[grant(1)],
+                    Some(&[refused(1), login(1)]),
+                    &verified(),
+                    &Expectations::default(),
+                ),
             ),
             (
                 "все оговорки сразу",
                 reconcile(
-                    &[receipt(1)],
+                    &[grant(1)],
                     Some(&[login(1), login_with(4, "granted")]),
                     &unreadable,
+                    &Expectations::default(),
                 ),
             ),
             (
                 "все находки сразу",
                 reconcile(
-                    &[receipt(1), receipt(3)],
+                    &[grant(1), grant(3)],
                     Some(&[odd, login(1), login(2)]),
                     &verified(),
+                    &Expectations::default(),
                 ),
             ),
         ]
@@ -1536,9 +3541,12 @@ mod tests {
             &Provenance {
                 chain_verified: false,
                 unsigned_from_seq: None,
+                server_unsigned_from_seq: None,
+                server_unread_lines: 0,
                 refusals_without_nonce: 0,
                 unpairable_lines: Vec::new(),
             },
+            &Expectations::default(),
         );
         assert_eq!(report.verdict(), Verdict::Incomplete);
         assert!(!report.to_string().contains("no findings"), "{report}");
@@ -1557,6 +3565,8 @@ mod tests {
             &Provenance {
                 chain_verified: true,
                 unsigned_from_seq: None,
+                server_unsigned_from_seq: None,
+                server_unread_lines: 0,
                 refusals_without_nonce: 0,
                 unpairable_lines: vec![UnpairableLine {
                     device_number: "77000123".to_owned(),
@@ -1564,6 +3574,7 @@ mod tests {
                     outcome: outcome::OUTCOME_SUCCESS.to_owned(),
                 }],
             },
+            &Expectations::default(),
         );
 
         assert_eq!(report.verdict(), Verdict::Findings);
@@ -1593,10 +3604,20 @@ mod tests {
             admission_without_nonce,
             no_chain,
             unsigned_tail,
-            login_without_receipt,
-            receipt_without_login,
+            server_unsigned_tail,
+            unread_server_lines,
+            signatures_not_checked,
+            grant_signature_rejected,
+            grant_issuer_unknown,
+            revocation_waterline_unset,
+            revocations_read,
+            unsigned_revocations,
+            login_without_grant,
+            grant_without_login,
             series_on_one_nonce,
             disagreement,
+            custody_below_declared,
+            grant_after_revocation,
             refusals_read,
         } = seen;
 
@@ -1607,10 +3628,20 @@ mod tests {
             ("admission-without-nonce", admission_without_nonce),
             ("no-chain", no_chain),
             ("unsigned-tail", unsigned_tail),
-            ("login-without-receipt", login_without_receipt),
-            ("receipt-without-login", receipt_without_login),
+            ("server-unsigned-tail", server_unsigned_tail),
+            ("unread-server-lines", unread_server_lines),
+            ("signatures-not-checked", signatures_not_checked),
+            ("grant-signature-rejected", grant_signature_rejected),
+            ("grant-issuer-unknown", grant_issuer_unknown),
+            ("revocation-waterline-unset", revocation_waterline_unset),
+            ("revocations-read", revocations_read),
+            ("unsigned-revocations", unsigned_revocations),
+            ("login-without-grant", login_without_grant),
+            ("grant-without-login", grant_without_login),
             ("series-on-one-nonce", series_on_one_nonce),
             ("disagreement", disagreement),
+            ("custody-below-declared", custody_below_declared),
+            ("grant-after-revocation", grant_after_revocation),
             ("refusals-read", refusals_read),
         ] {
             assert!(covered, "ни одна фикстура не порождает {name}");
@@ -1661,7 +3692,12 @@ mod tests {
             );
         }
 
-        let refusals = reconcile(&[receipt(1)], Some(&[refused(1), login(1)]), &verified());
+        let refusals = reconcile(
+            &[grant(1)],
+            Some(&[refused(1), login(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
         assert!(
             refusals
                 .to_string()
@@ -1683,9 +3719,12 @@ mod tests {
             &Provenance {
                 chain_verified: false,
                 unsigned_from_seq: Some(9),
+                server_unsigned_from_seq: None,
+                server_unread_lines: 0,
                 refusals_without_nonce: 0,
                 unpairable_lines: Vec::new(),
             },
+            &Expectations::default(),
         );
         let text = report.to_string();
 
@@ -1712,7 +3751,12 @@ mod tests {
             ("расходящийся первым", vec![odd.clone(), login(1)]),
             ("расходящийся вторым", vec![login(1), odd.clone()]),
         ] {
-            let report = reconcile(&[receipt(1)], Some(&logins), &verified());
+            let report = reconcile(
+                &[grant(1)],
+                Some(&logins),
+                &verified(),
+                &Expectations::default(),
+            );
 
             assert_eq!(report.series_on_one_nonce.len(), 1, "{order}");
             assert_eq!(
@@ -1734,9 +3778,14 @@ mod tests {
     /// строка на этом nonce отказная, сессия не открывалась, и квитанция
     /// остаётся неотоваренной. Иначе отказ прятал бы находку.
     #[test]
-    fn a_refusal_does_not_answer_a_receipt() {
-        let report = reconcile(&[receipt(1)], Some(&[refused(1)]), &verified());
-        assert_eq!(report.receipts_without_login.len(), 1);
+    fn a_refusal_does_not_answer_a_grant() {
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[refused(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.grants_without_login.len(), 1);
         assert!(report.disagreements.is_empty());
         assert_eq!(report.refusals_read(), 1);
     }
@@ -1751,9 +3800,14 @@ mod tests {
     /// «no findings» над журналом, где всё как раз и произошло.
     #[test]
     fn an_outcome_this_reader_does_not_know_makes_the_report_incomplete() {
-        let report = reconcile(&[], Some(&[login_with(1, "granted")]), &verified());
+        let report = reconcile(
+            &[],
+            Some(&[login_with(1, "granted")]),
+            &verified(),
+            &Expectations::default(),
+        );
 
-        assert!(report.logins_without_receipt.is_empty());
+        assert!(report.logins_without_grant.is_empty());
         assert_eq!(
             report.refusals_read(),
             0,
@@ -1782,8 +3836,9 @@ mod tests {
             &[],
             Some(&[login(1), login_with(2, "granted")]),
             &verified(),
+            &Expectations::default(),
         );
-        assert_eq!(report.logins_without_receipt.len(), 1);
+        assert_eq!(report.logins_without_grant.len(), 1);
         assert_eq!(report.verdict(), Verdict::Findings);
         assert!(!report.is_complete());
     }
@@ -1817,14 +3872,17 @@ mod tests {
         );
 
         let report = reconcile(
-            &[receipt(1)],
+            &[grant(1)],
             Some(&journal.entries),
             &Provenance {
                 chain_verified: journal.chain_verified,
                 unsigned_from_seq: None,
+                server_unsigned_from_seq: None,
+                server_unread_lines: 0,
                 refusals_without_nonce: journal.refusals_without_nonce,
                 unpairable_lines: journal.unpairable_lines.clone(),
             },
+            &Expectations::default(),
         );
 
         assert_eq!(report.refusals_read(), 1);
@@ -1902,14 +3960,17 @@ mod tests {
         assert_eq!(journal.refusals_without_nonce, 2);
 
         let report = reconcile(
-            &[receipt(1)],
+            &[grant(1)],
             Some(&journal.entries),
             &Provenance {
                 chain_verified: journal.chain_verified,
                 unsigned_from_seq: None,
+                server_unsigned_from_seq: None,
+                server_unread_lines: 0,
                 refusals_without_nonce: journal.refusals_without_nonce,
                 unpairable_lines: journal.unpairable_lines.clone(),
             },
+            &Expectations::default(),
         );
         assert_ne!(report.verdict(), Verdict::Findings);
         assert_eq!(report.refusals_read(), 2);
@@ -1918,42 +3979,67 @@ mod tests {
 
     #[test]
     fn a_matching_pair_raises_nothing() {
-        let report = reconcile(&[receipt(1)], Some(&[login(1)]), &verified());
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[login(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
         assert!(report.is_complete());
         assert_ne!(report.verdict(), Verdict::Findings);
         assert!(report.to_string().contains("no findings"));
     }
 
     #[test]
-    fn a_login_nobody_wrote_a_receipt_for_is_reported() {
-        let report = reconcile(&[], Some(&[login(1)]), &verified());
-        assert_eq!(report.logins_without_receipt.len(), 1);
-        assert!(report.to_string().contains("login-without-receipt"));
+    fn a_login_nobody_recorded_an_issuance_for_is_reported() {
+        let report = reconcile(
+            &[],
+            Some(&[login(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.logins_without_grant.len(), 1);
+        assert!(report.to_string().contains("login-without-grant"));
     }
 
     #[test]
-    fn a_receipt_no_device_saw_is_reported() {
-        let report = reconcile(&[receipt(1)], Some(&[]), &verified());
-        assert_eq!(report.receipts_without_login.len(), 1);
-        assert!(report.to_string().contains("receipt-without-login"));
+    fn a_grant_no_device_saw_is_reported() {
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[]),
+            &verified(),
+            &Expectations::default(),
+        );
+        assert_eq!(report.grants_without_login.len(), 1);
+        assert!(report.to_string().contains("grant-without-login"));
     }
 
     /// Две выдачи на один nonce — два кода на одну попытку, и это находка
     /// независимо от того, чем они отличаются в остальном.
     #[test]
     fn two_issuances_on_one_nonce_are_reported() {
-        let report = reconcile(&[receipt(1), receipt(1)], Some(&[login(1)]), &verified());
+        let report = reconcile(
+            &[grant(1), grant(1)],
+            Some(&[login(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
         assert_eq!(report.series_on_one_nonce.len(), 1);
         let series = report.series_on_one_nonce.first().unwrap();
-        assert_eq!(series.receipts, 2);
-        assert!(report.to_string().contains("receipts=2"));
+        assert_eq!(series.grants, 2);
+        assert!(report.to_string().contains("grants=2"));
     }
 
     #[test]
     fn two_logins_on_one_nonce_are_reported() {
         // Попытка отвечается один раз: два входа на один nonce значат, что одна
         // из сторон не та, за кого себя выдаёт.
-        let report = reconcile(&[receipt(1)], Some(&[login(1), login(1)]), &verified());
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[login(1), login(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
         assert_eq!(report.series_on_one_nonce.len(), 1);
         assert_eq!(
             report
@@ -1965,8 +4051,13 @@ mod tests {
     }
 
     #[test]
-    fn one_receipt_and_its_login_are_not_a_series() {
-        let report = reconcile(&[receipt(1)], Some(&[login(1)]), &verified());
+    fn one_grant_and_its_login_are_not_a_series() {
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[login(1)]),
+            &verified(),
+            &Expectations::default(),
+        );
         assert!(report.series_on_one_nonce.is_empty());
     }
 
@@ -1974,18 +4065,23 @@ mod tests {
     fn a_pair_that_disagrees_about_the_role_is_reported() {
         let mut login = login(1);
         login.role_id = "ops.dc.root".to_owned();
-        let report = reconcile(&[receipt(1)], Some(&[login]), &verified());
+        let report = reconcile(
+            &[grant(1)],
+            Some(&[login]),
+            &verified(),
+            &Expectations::default(),
+        );
         assert_eq!(report.disagreements.len(), 1);
         assert_eq!(report.disagreements.first().unwrap().fields, vec!["role"]);
     }
 
     #[test]
     fn a_report_without_the_device_side_says_so() {
-        let report = reconcile(&[receipt(1)], None, &verified());
+        let report = reconcile(&[grant(1)], None, &verified(), &Expectations::default());
         assert!(!report.is_complete());
         assert!(report.to_string().contains("incomplete"));
-        assert!(report.logins_without_receipt.is_empty());
-        assert!(report.receipts_without_login.is_empty());
+        assert!(report.logins_without_grant.is_empty());
+        assert!(report.grants_without_login.is_empty());
     }
 
     /// Строит настоящую цепочку устройства: тот же крейт, тот же жанр строки,
@@ -2009,6 +4105,17 @@ mod tests {
     /// Одна строка входа в том виде, в каком её пишет устройство: `op`, а не
     /// `event`, и имя `code_login`.
     fn device_login(nonce: &str, outcome: &str) -> serde_json::Value {
+        // The personal number is written on EVERY line the device emits — on a
+        // success it is what the engineer typed, on a refusal that never got
+        // that far it is `-`. This fixture omitted it, and a fixture whose
+        // comment says it is "the form the device actually writes" must not
+        // leave out a field the device always writes: a report over it looked
+        // healthy while the very case that field exists for went unexamined.
+        let engineer = if outcome == "success" {
+            "eng-1"
+        } else {
+            super::ABSENT
+        };
         serde_json::json!({
             "op": "code_login",
             "nonce_ref": nonce,
@@ -2016,6 +4123,7 @@ mod tests {
             "level": 2,
             "epoch": 7,
             "ticket_no": "tk-17",
+            "claimed_engineer_no": engineer,
             "outcome": outcome,
         })
     }
@@ -2128,9 +4236,12 @@ mod tests {
             &Provenance {
                 chain_verified: journal.chain_verified,
                 unsigned_from_seq: journal.unsigned_from_seq,
+                server_unsigned_from_seq: None,
+                server_unread_lines: 0,
                 refusals_without_nonce: journal.refusals_without_nonce,
                 unpairable_lines: journal.unpairable_lines.clone(),
             },
+            &Expectations::default(),
         );
         assert!(report.to_string().contains("unverified"));
     }
@@ -2150,9 +4261,12 @@ mod tests {
             &Provenance {
                 chain_verified: journal.chain_verified,
                 unsigned_from_seq: journal.unsigned_from_seq,
+                server_unsigned_from_seq: None,
+                server_unread_lines: 0,
                 refusals_without_nonce: journal.refusals_without_nonce,
                 unpairable_lines: journal.unpairable_lines.clone(),
             },
+            &Expectations::default(),
         );
         assert!(report.to_string().contains("unsigned-tail from=0"));
     }

@@ -15,7 +15,7 @@ setup: [build-pam-drive, install-package, deploy-fixtures]
 cases:
   - id: MAC-001
     title: Требование применять метки без названного адаптера отвергается
-    requirement: openspec/specs/mac-integrity/spec.md
+    requirement: spec9:platform.MAC-002
     requires: []
     # `runtime = "required"` — обещание enforcement'а. Без `backend` выполнить
     # его нечем, и принять такой конфиг значило бы выдать заглушку за
@@ -32,7 +32,7 @@ cases:
 
   - id: MAC-002
     title: Требование метки в удостоверении без адаптера отвергается так же
-    requirement: openspec/specs/mac-integrity/spec.md
+    requirement: spec9:platform.MAC-002
     requires: []
     # Вторая половина той же гарантии: `cert_integrity = "required"` — тоже
     # обещание enforcement'а, и оно обязано отвергаться по тому же правилу.
@@ -49,7 +49,7 @@ cases:
 
   - id: MAC-003
     title: Роль, требующая метку целостности, не открывает сессию без адаптера
-    requirement: openspec/specs/mac-integrity/spec.md
+    requirement: spec9:platform.MAC-003
     requires: [service-manager, usb]
     # Ключевой отказ всей открытой сборки. Роль заявляет `mac_mask`, то есть
     # обещает инженеру ограничение целостности; применить его нечем. Открыть
@@ -65,7 +65,7 @@ cases:
                /var/lib/tessera/roles/serv.toml
       - run: systemctl restart tessera.service && sleep 2
       - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
-      - run: helpers/pam-drive certauth {{user}} authenticate acct_mgmt open_session
+      - run: pam-drive certauth {{user}} authenticate acct_mgmt open_session
         stdin: "123456"
         expect:
           exit_code: 7
@@ -85,7 +85,7 @@ cases:
 
   - id: MAC-004
     title: Префлайт называет действительную причину, по которой метки не применяются
-    requirement: openspec/specs/mac-integrity/spec.md
+    requirement: spec9:platform.MAC-002
     requires: [mac, service-manager]
     # Кейс красный. На хосте с активным МКЦ ядра (`parsec.strict_mode=1`,
     # `max_ilev=63`, сессии несут метку целостности) префлайт сообщает

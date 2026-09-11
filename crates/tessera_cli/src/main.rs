@@ -59,7 +59,7 @@ enum Cmd {
     /// is a no-op. Runs `tessera check` after import and exits non-zero if it
     /// fails (fail-closed); the import core guarantees atomic rollback.
     Enroll(EnrollArgs),
-    // Planned (openspec/changes/device-lifecycle/): `un-enroll` subcommand —
+    // Planned (Spec9 ADR-PLAN-device-lifecycle): `un-enroll` subcommand —
     // reverse-flip the config back to `override="installation"` and wipe the
     // per-host cert/keys, tags, role set, `bundle_version` persist, and the
     // local CRL cache, leaving the device bootstrap-ready.

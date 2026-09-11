@@ -205,7 +205,12 @@ impl SignatureVerifier for TicketAnchor {
     ) -> Result<(), SignatureError> {
         match signer {
             SignerRef::TicketAuthority => {}
-            SignerRef::Key(_) | SignerRef::Named(_) => {
+            // The device anchors one key and answers one question with it: did
+            // the fleet root sign this ticket. It holds no authorisation key —
+            // on this transport it never reads an authorisation or a revocation
+            // list, the server does — so being asked about one is a signer it
+            // does not know, not a signature it should try.
+            SignerRef::Key(_) | SignerRef::Named(_) | SignerRef::AuthorisationKey => {
                 return Err(SignatureError::UnknownSigner);
             }
         }
@@ -303,8 +308,8 @@ impl TicketStore {
     ///
     /// For the audit journal alone, and it says nothing about whether the
     /// ticket is any good: a refusal has to carry the ticket number, because a
-    /// login and an operator receipt are reconciled by that number and a nonce,
-    /// and a refusal that names neither cannot be paired with the receipt of
+    /// login and an issuance record are reconciled by that number and a nonce,
+    /// and a refusal that names neither cannot be paired with the record of
     /// the call it belongs to.
     #[must_use]
     pub fn ticket_number_of(&self, server_id: &str) -> Option<&str> {

@@ -10,6 +10,7 @@ members = [
     "crates/pam_tessera",
     "crates/tessera_cli",
     "crates/tessera_cp",
+    "crates/tessera_qr_overlay",
     "crates/tessera_win_service",
     "crates/tessera_test_plugin",
     "crates/xtask",
@@ -27,12 +28,13 @@ default-members = [
     "crates/pam_tessera",
     "crates/tessera_cli",
     "crates/tessera_cp",
+    "crates/tessera_qr_overlay",
     "crates/tessera_win_service",
     "crates/tessera_test_plugin",
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.95"
 # Dual-licensed: AGPL-3.0-only OR commercial (LICENSE.commercial).
@@ -68,7 +70,9 @@ subtle = "2.5"
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive"] }
-nix = { version = "0.31", features = ["user", "signal", "process", "fs", "resource", "mount", "poll"] }
+# `socket` carries the peer-credential option the QR overlay socket is checked
+# with: a mode word says who may connect, and only this says who did.
+nix = { version = "0.31", features = ["user", "signal", "process", "fs", "resource", "mount", "poll", "socket"] }
 libc = "0.2"
 udev = "0.9"
 cryptoki = "0.12"
@@ -128,16 +132,27 @@ rsa = { package = "sad-rsa", version = "=0.2.3", default-features = false, featu
 # Native-only signing adapters for the issuer tooling (behind feature flags).
 # ureq drives Vault Transit signing; base64 (de)serialises DER on the JSON
 # boundaries.
-# native-tls (OS TLS: Security.framework / SChannel / system OpenSSL), no bundled
-# Mozilla roots: trust comes from the host certificate store or an
-# operator-supplied CA bundle. This keeps both `webpki-roots` and
-# `webpki-root-certs` out of the tree and makes a private-CA Vault the default.
+# native-tls (OS TLS: Security.framework / SChannel / system OpenSSL): trust comes
+# from the host certificate store or an operator-supplied CA bundle, and a
+# private-CA Vault is the default. `webpki-roots` stays out of the tree; a
+# consumer that actually opens an https connection has to add ureq's `native-tls`
+# feature on top of this set, because ureq gates the connection on that flag and
+# panics without it — see the dependency in `crates/tessera_issuer/Cargo.toml`.
+# That feature pulls `webpki-root-certs`, which the adapter never trusts.
 ureq = { version = "3", default-features = false, features = [
     "native-tls-no-default",
     "gzip",
     "json",
 ] }
 base64 = "0.22"
+# QR generation for the Codes challenge. `qrcodegen` and not `qrcode`: this code
+# is linked into the PAM module, which lives as a cdylib inside `sshd`, `login`
+# and the display manager, and `qrcodegen` has NO dependencies at all — nothing
+# transitive arrives in those processes with it. The alternative pulls an image
+# stack behind a default feature, and a crate whose safe configuration depends
+# on remembering a flag is a crate that will one day be added without it.
+# Pure Rust either way, so nothing new links a C library into `sshd`.
+qrcodegen = "1.8"
 # Console secret entry with the echo turned off, for the issuer CLI. The three
 # platforms need termios / Console API calls, and the issuer crate denies
 # `unsafe_code`, so the unsafe lives behind this crate instead of being

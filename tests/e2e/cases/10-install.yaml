@@ -5,7 +5,7 @@ setup: [install-package]
 cases:
   - id: INST-001
     title: Пакет раскладывает модуль, бинарь и юнит по штатным путям
-    requirement: openspec/specs/build-release/spec.md
+    requirement: spec9:platform.INST-001
     requires: []
     steps:
       # Пути — из debian/rules (модуль и бинарь ставятся вручную, минуя dh-cargo)
@@ -21,7 +21,7 @@ cases:
 
   - id: INST-002
     title: Пакет создаёт каталоги состояния и кеша
-    requirement: openspec/specs/build-release/spec.md
+    requirement: spec9:platform.INST-002
     requires: []
     steps:
       # Перечень — из debian/tessera.dirs. Каталоги создаёт пакет, а не первый
@@ -34,7 +34,7 @@ cases:
 
   - id: INST-003
     title: Служба не активируется установкой без конфигурации
-    requirement: openspec/specs/daemon-lifecycle/spec.md
+    requirement: spec9:platform.INST-003
     requires: [service-manager]
     steps:
       # Гарантия: установка пакета не поднимает enforcement сама по себе.
@@ -45,7 +45,7 @@ cases:
 
   - id: INST-004
     title: Интеграция в PAM-стек добавляет обе строки и повторно ничего не меняет
-    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requirement: spec9:platform.INST-004
     requires: []
     steps:
       - run: |
@@ -72,7 +72,7 @@ cases:
 
   - id: INST-005
     title: Откат интеграции снимает обе внесённые строки
-    requirement: openspec/specs/cert-authentication-flow/spec.md
+    requirement: spec9:platform.INST-005
     requires: []
     steps:
       - run: |
@@ -90,3 +90,54 @@ cases:
         expect: { exit_code: 1, stdout_matches: '^0$' }
     teardown:
       - run: rm -f /tmp/e2e-pam-revert /tmp/e2e-pam-revert.bak.*
+
+  - id: INST-006
+    title: Пакет ставит оверлей QR и каталог сокетов попыток
+    requirement: spec9:platform.INST-001
+    # Оверлей — не служба и не автозапуск: его на время одной попытки запускает
+    # PAM-модуль от учётной записи греетера. Отсюда и проверяемое: бинарь на
+    # месте, исполним, БЕЗ setuid и setgid (непривилегированность — это решение,
+    # а не побочный эффект сборки), и запускается настолько, чтобы отвергнуть
+    # вызов без сокета. Дисплея в контейнере нет, поэтому дальше разбора
+    # аргументов кейс не идёт — и не должен: он про раскладку пакета.
+    requires: []
+    steps:
+      - expect_file: { path: /usr/bin/tessera-qr-overlay }
+      - run: test -x /usr/bin/tessera-qr-overlay
+        expect: { exit_code: 0 }
+      # `find -perm /6000` печатает путь, только если взведён setuid или setgid.
+      # Пустой вывод — то, что требуется.
+      - run: find /usr/bin/tessera-qr-overlay -perm /6000
+        expect: { exit_code: 0, stdout_matches: '^$' }
+      # Код 2 — «вызов неверен». Он отделяет разобранные аргументы от отказа
+      # дисплея (1): без этого кейс зеленел бы и на бинаре, который не может
+      # запуститься вовсе.
+      - run: /usr/bin/tessera-qr-overlay
+        expect: { exit_code: 2 }
+      # Каталог сокетов попыток заводит пакет, а не первая попытка: модуль
+      # работает от root и создал бы его сам, но тогда права зависели бы от umask
+      # процесса, в который загрузили модуль.
+      - expect_file: { path: /run/tessera-overlay }
+      - run: stat -c '%a %U %G' /run/tessera-overlay
+        expect: { exit_code: 0, stdout_matches: '^711 root root$' }
+      # Права каталога записаны в ДВУХ местах: tmpfiles.d для systemd и
+      # init-скрипт для хостов без него. Разъехавшись, они дали бы парк, где
+      # оверлей поднимается на одном инициализаторе и молча не поднимается на
+      # другом, а различие видно только на живом входе.
+      # Сверяется и ВЛАДЕЛЕЦ, а не только режим: разъехавшийся владелец —
+      # это ровно тот случай, который здесь однажды и жил (init заводил
+      # /run/tessera как root:root, tmpfiles — как tessera:tessera, и демон
+      # под User=tessera не мог туда писать на хостах без systemd).
+      - run: grep -c '0711 root root' /usr/lib/tmpfiles.d/tessera.conf
+        expect: { exit_code: 0, stdout_matches: '^1$' }
+      - run: sh -c 'test -f /etc/init.d/tessera && grep -c "chmod 0711 /run/tessera-overlay" /etc/init.d/tessera || echo 1'
+        expect: { exit_code: 0, stdout_matches: '^1$' }
+      - run: sh -c 'test -f /etc/init.d/tessera && grep -c "chown root:root /run/tessera-overlay" /etc/init.d/tessera || echo 1'
+        expect: { exit_code: 0, stdout_matches: '^1$' }
+      # Каталог самого демона: 0750 tessera tessera в обоих местах.
+      - run: grep -c '0750 tessera tessera' /usr/lib/tmpfiles.d/tessera.conf
+        expect: { exit_code: 0, stdout_matches: '^1$' }
+      - run: sh -c 'test -f /etc/init.d/tessera && grep -c "chown tessera:tessera /run/tessera" /etc/init.d/tessera || echo 1'
+        expect: { exit_code: 0, stdout_matches: '^1$' }
+      - run: stat -c '%a %U %G' /run/tessera
+        expect: { exit_code: 0, stdout_matches: '^750 tessera tessera$' }

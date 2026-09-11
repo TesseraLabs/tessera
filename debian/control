@@ -55,6 +55,9 @@ Description: USB-token PKI authentication PAM module for Astra Linux SE
    * /lib/security/pam_tessera.so  - the PAM module
    * /usr/bin/tessera - userspace CLI (daemon subcommand handles udev/D-Bus)
      events, OCSP/CRL caching, and inter-session screen-lock hooks
+   * /usr/bin/tessera-qr-overlay - draws the QR of a code login over the
+     greeter of a graphical session; started by the PAM module for the
+     duration of one attempt, unprivileged, takes no keyboard input
    * Example configuration under /etc/tessera/
    * A drop-in PAM stack at /etc/pam.d/tessera
  .

@@ -1,15 +1,16 @@
 suite: codes-reconcile
 description: >
-  Сверка квитанций оператора с журналом устройства — шов между двумя половинами
-  телефонного канала. Устройство пишет входы в свою хеш-цепочку, оператор пишет
-  квитанции выдачи, и `issuer codes reconcile` читает и то, и другое. Кейсы здесь
-  проверяют именно шов: что сверка читает тот формат, который устройство пишет на
-  самом деле, и что журнал, из которого что-то изъяли, не выглядит чистым.
+  Сверка записей выдачи с журналом устройства — шов между двумя половинами
+  серверного канала. Устройство пишет входы в свою хеш-цепочку, выдающая сторона
+  пишет запись на каждую выдачу — подписанный запрос инженера, грант и ступень
+  кастодии ключа согласования, — и `issuer codes reconcile` читает и то, и другое.
+  Кейсы здесь проверяют именно шов: что сверка читает тот формат, который устройство
+  пишет на самом деле, и что журнал, из которого что-то изъяли, не выглядит чистым.
 setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
 
 # Шов ломается тихо. Читатель, разбирающий не тот формат, не падает: он находит
 # ноль строк входа, считает множество входов пустым — и объявляет отчёт ПОЛНЫМ.
-# На выходе ни одной находки класса «вход без квитанции» и ни одной пометки
+# На выходе ни одной находки класса «вход без выдачи» и ни одной пометки
 # неполноты, то есть отчёт, неотличимый от честного. Именно так это и жило,
 # пока сверка фильтровала строки по имени tracing-события `qr_code_login`, а
 # цепочка писала `op: code_login`; unit-тесты были зелёными, потому что подавали
@@ -17,36 +18,41 @@ setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
 #
 # Поэтому кейсы этой сюиты берут НАСТОЯЩИЙ журнал, который устройство написало
 # само во время входа по коду, и никогда — выгрузку, собранную стендом.
+#
+# Вторая половина пары сменилась вместе с каналом: там, где телефонная редакция
+# сюиты парила журнал с квитанцией оператора, серверная парит его с записью
+# выдачи. Классы расхождений и разбор исходов остались прежними, поэтому кейсы
+# сохранили свои номера — сменились только имена находок.
 
 cases:
   - id: REC-001
-    title: Вход по коду, на который нет квитанции, находится сверкой
-    requirement: openspec/specs/codes-operator-cli/spec.md
+    title: Вход по коду, на который нет записи выдачи, находится сверкой
+    requirement: spec9:codes.PLAN-049
     requires: [service-manager]
     steps:
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 0 }
         timeout: 120
-      # Каталог квитанций пуст намеренно: это не «нет данных», а сценарий
-      # аудита — журнал устройства сверяется с записями, в которых этих входов
-      # нет. Ровно так выглядит код, выданный мимо записи.
-      - run: helpers/codes-reconcile.sh reconcile --receipts empty
+      # Цепочка выдач пуста намеренно: это не «нет данных», а сценарий аудита —
+      # журнал устройства сверяется с выдачами, среди которых этих входов нет.
+      # Ровно так выглядит код, посчитанный в обход серверной процедуры.
+      - run: helpers/codes-reconcile.sh reconcile --server-chain empty
         expect:
           exit_code: 0
-          stdout_matches: "login-without-receipt device=[0-9A-Z]+ epoch=[0-9]+ nonce=[0-9]+"
+          stdout_matches: "login-without-grant device=[0-9A-Z]+ epoch=[0-9]+ nonce=[0-9]+"
         timeout: 60
     teardown:
       - run: helpers/codes-reconcile.sh cleanup
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
 
   - id: REC-002
     title: Журнал устройства, из которого изъята запись, сверку не проходит
-    requirement: openspec/specs/codes-operator-cli/spec.md
+    requirement: spec9:codes.PLAN-049
     requires: [service-manager]
     steps:
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 0 }
         timeout: 120
       # Изымается строка из СЕРЕДИНЫ: хвост цепочка не ловит (префикс валидной
@@ -59,15 +65,15 @@ cases:
         timeout: 60
     teardown:
       - run: helpers/codes-reconcile.sh cleanup
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
 
   - id: REC-003
     title: Журнал без единого входа отвергается, а не выдаётся за чистый отчёт
-    requirement: openspec/specs/codes-operator-cli/spec.md
+    requirement: spec9:codes.PLAN-049
     requires: [service-manager]
     steps:
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 0 }
         timeout: 120
       # Журнал, в котором строк входа не осталось, — это либо не тот файл, либо
@@ -81,11 +87,11 @@ cases:
         timeout: 60
     teardown:
       - run: helpers/codes-reconcile.sh cleanup
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
 
   - id: REC-005
     title: Опечатка инженера не читается сверкой как компрометация устройства
-    requirement: openspec/specs/codes-operator-cli/spec.md
+    requirement: spec9:server.AUD-021
     # Устройство пишет строку на КАЖДУЮ решённую попытку, отказы включительно.
     # Инженер, ошибившийся в коде один раз и вошедший со второго, оставляет на
     # одном nonce две строки: denied и success. Сверка, не различающая исход,
@@ -98,13 +104,13 @@ cases:
     # прожил три задачи подряд незамеченным.
     requires: [service-manager]
     steps:
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
-      - run: helpers/codes-phone.sh authenticate-mistyping-once {{user}} --level 0
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-mistyping-once {{user}} --level 0
         expect: { exit_code: 0 }
         timeout: 120
-      # Квитанция выдачи на этот вход есть, поэтому находок быть не должно
-      # вовсе. Отказная строка при этом обязана быть посчитана и названа —
-      # молча отброшенная улика хуже неверно истолкованной.
+      # Запись выдачи на этот вход есть, поэтому находок быть не должно вовсе.
+      # Отказная строка при этом обязана быть посчитана и названа — молча
+      # отброшенная улика хуже неверно истолкованной.
       - run: helpers/codes-reconcile.sh reconcile
         expect:
           exit_code: 0
@@ -121,15 +127,15 @@ cases:
         timeout: 60
     teardown:
       - run: helpers/codes-reconcile.sh cleanup
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
 
   - id: REC-004
     title: Отчёт не объявляет отсутствие находок, пока хвост журнала не заверен
-    requirement: openspec/specs/codes-operator-cli/spec.md
+    requirement: spec9:codes.PLAN-049
     requires: [service-manager]
     steps:
-      - run: helpers/codes-phone.sh prepare {{fixtures}}/codes
-      - run: helpers/codes-phone.sh authenticate {{user}} --level 0
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
         expect: { exit_code: 0 }
         timeout: 120
       # Гарантия здесь не про находки, а про то, чего отчёт НЕ имеет права
@@ -144,4 +150,250 @@ cases:
         timeout: 60
     teardown:
       - run: helpers/codes-reconcile.sh cleanup
-      - run: helpers/codes-phone.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: REC-006
+    title: Запись выдачи, которой не отвечает ни один вход, названа в отчёте
+    requirement: spec9:server.AUD-020
+    # Вторая сторона той же пары и отдельный класс тревоги: код выдан и не
+    # использован — запасённое полномочие. На телефонном канале это была
+    # «квитанция без входа»; предмет остался, источник второй половины сменился
+    # на запись выдачи, и имя находки обязано это отражать, иначе отчёт называет
+    # документ, которого больше нет.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Код выдаётся и не вводится: разговор обрывается до промпта кода, запись
+      # выдачи при этом уже написана — выдача пишет её ДО того, как отдаёт код.
+      - run: helpers/codes-server.sh issue-without-login {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      - run: helpers/codes-reconcile.sh reconcile
+        expect:
+          exit_code: 0
+          stdout_matches: "grant-without-login device=[0-9A-Z]+ epoch=[0-9]+ nonce=[0-9]+"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: REC-007
+    title: Ступень кастодии видна у каждой записи отчёта
+    requirement: spec9:server.KC-101
+    # Класс 8 сверки: выдача со ступенью ниже объявленной парком. В MVP
+    # «программная» ожидаема и тревогой не является, но обязана быть НАЗВАНА в
+    # каждой строке отчёта — иначе перенос ключа согласования на аппаратный
+    # носитель нечем будет подтвердить по журналу, а это единственное, что
+    # снимает исключение из KC-001 (ADR-SRV-003).
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh issue-without-login {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      - run: helpers/codes-reconcile.sh reconcile
+        expect:
+          exit_code: 0
+          stdout_matches: "grant-without-login .*key_storage=software"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  # Кейсы REC-010…REC-020 написаны под серверную половину сверки (этап D):
+  # цепочка выдач с заверением головы, тревоги по отзыву и по ступени кастодии,
+  # интерфейс командной строки. Красные до реализации.
+
+  - id: REC-010
+    title: Изъятая середина серверной цепочки поднимает тревогу
+    requirement: spec9:server.AUD-015
+    # Хеш-цепочка держит всё до последнего заверения головы: строку из СЕРЕДИНЫ
+    # уронить нельзя, не сломав сцепление. Кейс изымает именно середину — хвост
+    # ловится не цепочкой, а оговоркой REC-004, и кейс, обрезающий хвост,
+    # проверял бы не то, что обещает заголовок.
+    #
+    # Обещанное поведение: отчёт не собирается вовсе. «Находок нет» над
+    # правленой цепочкой — худший из возможных ответов: он утверждает больше,
+    # чем проверено, и именно ради этого случая цепочка и заводилась.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh issue-without-login {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      - run: helpers/codes-reconcile.sh reconcile --server-chain drop-middle
+        expect:
+          exit_code: 1
+          stderr_matches: "codes-refusal: server_chain_broken"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: REC-011
+    title: Выдача без ступени кастодии до отчёта не доходит
+    requirement: spec9:server.KC-101
+    # Оборотная сторона REC-007. Там ступень обязана быть НАЗВАНА в каждой
+    # строке отчёта; здесь — что запись без неё не читается вовсе, а не
+    # получает умолчание. Умолчание тут страшнее пропуска: «программная» по
+    # умолчанию рядом с настоящей аппаратной выдачей выглядит одинаково, и
+    # владелец парка не отличит перенос ключа на носитель от его отсутствия.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh issue-without-login {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      - run: helpers/codes-reconcile.sh reconcile --server-chain strip-custody
+        expect:
+          exit_code: 1
+          stderr_matches: "codes-refusal: server_chain_malformed"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: REC-012
+    title: Ступень кастодии ниже объявленной парком названа тревогой
+    requirement: spec9:server.KC-103
+    # Класс 8 сверки. Парк объявил, что ключ согласования живёт на носителе;
+    # выдача записала программное хранение. Расхождение не выдумывается сверкой
+    # из конфигурации — оно берётся из того, что записала сама выдача, и потому
+    # проверяемо задним числом. Обратный случай (парк объявил программное, а
+    # выдача записала носитель) тревогой НЕ является: это усиление.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh issue-without-login {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      - run: helpers/codes-reconcile.sh reconcile --declared-custody token
+        expect:
+          exit_code: 0
+          stdout_matches: "custody-below-declared .*declared=token .*recorded=software"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: REC-013
+    title: Грант, выпущенный после отзыва инженера, назван тревогой
+    requirement: spec9:server.AUD-023
+    # Класс 5. Отзыв авторизации исполняет сервер, и в момент выдачи она была
+    # действующей или нет — это вопрос к серверу, а не к сверке. Что сверка
+    # умеет сказать задним числом: выдача датирована позже отзыва. Это улика,
+    # и она обязана быть названа, потому что иначе право, снятое в понедельник,
+    # оставляет во вторник код, за который никто не отвечает.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh issue-without-login {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      # Отзыв датируется моментом ДО выдачи: хелпер берёт время из записи и
+      # отступает назад, чтобы кейс не зависел от часов стенда.
+      - run: helpers/codes-reconcile.sh reconcile --revoke-engineer-before-issuance
+        expect:
+          exit_code: 0
+          stdout_matches: "grant-after-revocation .*subject=eng-"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: REC-020
+    title: Сверка отвечает кодом возврата и устойчивыми префиксами строк
+    requirement: spec9:server.AUD-024
+    # Интерфейс, на который опирается всякий, кто вызывает сверку из скрипта:
+    # код возврата и первое слово строки. Проза переводится и переписывается,
+    # префикс — нет. Кейс проверяет три ответа подряд, потому что порознь ни
+    # один не отличает «сверка отработала» от «сверка не собралась».
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      # 1. Честный прогон: код 0 и явное утверждение о согласии сторон.
+      - run: helpers/codes-reconcile.sh reconcile
+        expect:
+          exit_code: 0
+          stdout_matches: "no findings"
+        timeout: 60
+      # 2. Отсутствующий файл серверной цепочки — сбой стенда, а не вердикт:
+      # код 1 и класс в машинной строке.
+      - run: helpers/codes-reconcile.sh reconcile --server-chain missing
+        expect:
+          exit_code: 1
+          stderr_matches: "codes-refusal: server_chain_malformed"
+        timeout: 60
+      # 3. `--help` не упоминает ни телефона, ни квитанций: подкоманд этого
+      # канала больше нет, и справка обязана это отражать — она единственное,
+      # что читает оператор перед первым вызовом.
+      - run: helpers/codes-reconcile.sh expect-help-without-phone
+        expect: { exit_code: 0 }
+        timeout: 30
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: REC-021
+    title: Журнал выдающей стороны без единой выдачи — не подмена
+    requirement: spec9:server.AUD-022
+    # Свежий узел codes-core пишет в ту же цепочку отказы и авторизации. Пока
+    # он не выдал ни одного кода, его журнал — это строки без выдач, и сверка
+    # до правки отвечала «это не тот журнал», то есть обвиняла в подмене
+    # сторону, работавшую правильно.
+    #
+    # Различие не косметическое: «журнал подменили» поднимает разбирательство,
+    # «выдач ещё не было» не требует ничего. А владелец парка, получивший первое
+    # вместо второго на каждом новом узле, научится пропускать класс, ради
+    # которого он заведён.
+    #
+    # Вход по коду здесь ЕСТЬ, и это существенно: сверка обязана не просто
+    # промолчать, а назвать вход, который ни одна выдача не объясняет, — тот
+    # самый класс, ради которого сверка существует. Пустой ответ на непустой
+    # журнал устройства был бы вторым способом ничего не заметить.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      - run: helpers/codes-reconcile.sh reconcile --server-chain no-issuances
+        expect:
+          exit_code: 0
+          stdout_matches: "login-without-grant device=[0-9A-Z]+ epoch=[0-9]+"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: REC-022
+    title: Другое написание личного номера — не расхождение сторон
+    requirement: spec9:codes.ENG-012
+    # Уклонение, которое выбирает тот, кого контролируют. Устройство передаёт
+    # номер КАК НАБРАНО — так решено осознанно: инженер читает с экрана то, что
+    # ввёл, — а разделители и регистр формат не считает. Пока сверка сравнивала
+    # номера побайтово, достаточно было набрать `org1-0000014` вместо
+    # `ORG1-0000014`, чтобы выдачи перестали связываться с этим человеком: отчёт
+    # выходил чистым, а отзыв его права не догонял.
+    #
+    # Кейс наблюдает более раннюю половину той же гарантии — ту, что видна без
+    # списка отзыва: два написания одного номера не должны выглядеть как
+    # «стороны называют разных людей». Половину со списком отзыва держат
+    # юнит-тесты контракта и сверки: списка отзыва инженеров на стенде пока нет.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0 }
+        timeout: 120
+      - run: helpers/codes-reconcile.sh reconcile --journal respell-engineer
+        expect:
+          exit_code: 0
+          stdout_matches: "no findings"
+        timeout: 60
+    teardown:
+      - run: helpers/codes-reconcile.sh cleanup
+      - run: helpers/codes-server.sh cleanup

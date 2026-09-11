@@ -1,0 +1,27 @@
+{
+  "base_url": "https://codes.fleet.example/e",
+  "code_input": [
+    "device",
+    "epoch",
+    "nonce",
+    "role",
+    "level",
+    "engineer"
+  ],
+  "engineer_number_rule": "organisation segment, serial part, ISO 7064 MOD 37,36 check character",
+  "fields": {
+    "device": "77-000123S",
+    "engineer": "ORG1-0000014",
+    "ephemeral": "0257e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34",
+    "epoch": 7,
+    "level": 1,
+    "nonce": "44444444444444444444444444",
+    "role": "tester",
+    "server": "op-e2e",
+    "signature": "3046022100a7343bd77b9ba74b54f8768d41bd7ae24d2b3b5d0db29f921f993c0867653aba0221009ccc5866815bc36ab0323a4565aa1ccfba943693de55bbd9171cb0fb371c3561"
+  },
+  "fragment": "tessera-codes/v1/signed-challenge;device=77-000123S;epoch=7;nonce=44444444444444444444444444;role=tester;level=1;server=op-e2e;engineer=ORG1-0000014;ephemeral=0257e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34;signature=3046022100a7343bd77b9ba74b54f8768d41bd7ae24d2b3b5d0db29f921f993c0867653aba0221009ccc5866815bc36ab0323a4565aa1ccfba943693de55bbd9171cb0fb371c3561",
+  "payload_budget": 640,
+  "payload_len": 410,
+  "prefix": "tessera-codes/v1/signed-challenge"
+}

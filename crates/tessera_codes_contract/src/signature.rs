@@ -84,6 +84,20 @@ pub enum SignerRef<'a> {
     /// A ticket names no signer: the fleet knows the authority that may issue
     /// them, and the verifier holds its key.
     TicketAuthority,
+    /// The authorisation key of the fleet.
+    ///
+    /// The working key under the fleet root that grants engineers their
+    /// authorisations and publishes the list of withdrawn rights. Named as a
+    /// role rather than by an identifier for the same reason the ticket
+    /// authority is: the fleet knows which key holds this office, and a
+    /// document that named its own signer would let the signer choose.
+    ///
+    /// Kept apart from [`SignerRef::Named`] deliberately. An organisation is a
+    /// named signer; the office that decides what an organisation's people may
+    /// ask for is not, and a verifier that resolved the two through one path
+    /// would let an organisation grant itself a ceiling — or publish a
+    /// revocation list without its own people in it.
+    AuthorisationKey,
 }
 
 /// Rejection of a signature.
@@ -107,8 +121,9 @@ pub enum SignatureError {
 ///
 /// # Obligations of the implementation
 ///
-/// The implementation **must** resolve [`SignerRef::Named`] and
-/// [`SignerRef::TicketAuthority`] against its own trust anchors and return
+/// The implementation **must** resolve [`SignerRef::Named`],
+/// [`SignerRef::TicketAuthority`] and [`SignerRef::AuthorisationKey`] against
+/// its own trust anchors and return
 /// [`SignatureError::UnknownSigner`] when it cannot — accepting a signature
 /// from a key the fleet never anchored is the same as accepting no signature at
 /// all. It must verify the signature over exactly the bytes it was given: the

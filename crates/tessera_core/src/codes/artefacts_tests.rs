@@ -99,6 +99,7 @@ impl Delivery {
             tickets: Some(self.tickets("op-42")),
             revocations: None,
             ticket_authority: Some(self.authority.public_key_pem()),
+            page_urls: Some(b"https://codes.fleet.example/e\n".to_vec()),
         }
     }
 }
@@ -194,6 +195,68 @@ fn a_full_consignment_makes_the_device_ready() {
     assert!(applied.key_replaced);
     assert!(paths.artefacts_present());
     assert_eq!(epoch::read(&paths.state_dir).unwrap(), Some(Epoch::new(3)));
+}
+
+#[test]
+fn the_consignment_lands_the_addresses_the_configuration_is_checked_against() {
+    // Nobody wrote this file before. The reader was there, the check at load
+    // was there, and the changelog said the package delivered it — but no
+    // package did, so `[codes].page_url` could not be set at all without a
+    // device that refused its own configuration on the next boot.
+    //
+    // It arrives with the artefacts because that is what it is: a decision of
+    // the fleet owner, signed into the package and pinned by its hash exactly
+    // like the ticket anchor beside it.
+    let (_dir, paths) = store();
+    apply(
+        &paths,
+        &Delivery::new().full(1),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        paths.page_urls.exists(),
+        "the consignment did not deliver the list of page addresses"
+    );
+    // Read back through the product, not by comparing bytes: what matters is
+    // that the check at load time will find the address in it.
+    let addresses = crate::codes::store::load_page_urls(&paths.page_urls).unwrap();
+    assert_eq!(addresses, vec!["https://codes.fleet.example/e".to_owned()]);
+    assert!(crate::codes::store::page_url_is_allowed(
+        &addresses,
+        "https://codes.fleet.example/e"
+    ));
+    assert_eq!(mode_of(&paths.page_urls), 0o644);
+}
+
+#[test]
+fn a_wipe_takes_the_addresses_with_it() {
+    // Whatever an import wrote, a wipe removes. A list left behind on a retired
+    // device says which fleet it belonged to.
+    let (_dir, paths) = store();
+    apply(
+        &paths,
+        &Delivery::new().full(1),
+        None,
+        StoreCheck::Skipped,
+        None,
+    )
+    .unwrap();
+    assert!(paths.page_urls.exists());
+
+    let wiped = crate::codes::artefacts::wipe(&paths).unwrap();
+    assert!(!paths.page_urls.exists(), "the addresses outlived the wipe");
+    assert!(
+        wiped
+            .removed
+            .iter()
+            .any(|name| name.contains(crate::codes::store::PAGE_URLS_FILENAME)),
+        "the wipe did not name the addresses among what it removed: {:?}",
+        wiped.removed
+    );
 }
 
 #[test]

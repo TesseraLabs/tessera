@@ -140,7 +140,8 @@ PAM service module. Содержит:
 > (`librtpkcs11ecp.so`, `libjcPKCS11.so`) ГОСТ-механизмы **не
 > поддержаны** (crate `cryptoki` не покрывает GOST mechanisms);
 > Рутокен/JaCarta на PKCS#11 применимы для RSA/ECDSA-сертификатов.
-> Поддержка GOST-на-PKCS#11 — proposal `openspec/changes/gost-pkcs11`.
+> Поддержка GOST-на-PKCS#11 отслеживается приватным Spec9 ADR
+> `ADR-PLAN-gost-pkcs11`.
 
 ## 3. Диаграмма зависимостей крейтов
 

@@ -94,7 +94,18 @@ impl AnchorKey {
     }
 
     /// Verifies a signature over `message`.
-    fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), SignatureError> {
+    /// Verifies a signature made by this key.
+    ///
+    /// Public so that a consumer holding exactly one anchor — a command that
+    /// reads one signed document and has no use for a whole trust set — can
+    /// check it without assembling anchors it would then be able to be asked
+    /// the wrong question about.
+    ///
+    /// # Errors
+    ///
+    /// [`SignatureError::Rejected`] when the signature does not hold, and
+    /// [`SignatureError::Backend`] when the verifier itself could not run.
+    pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<(), SignatureError> {
         use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
 
         let digest = Sha256::digest(message);
@@ -128,6 +139,7 @@ pub enum AnchorError {
 #[derive(Debug, Clone)]
 pub struct Anchors {
     ticket_authority: AnchorKey,
+    authorisation_key: Option<AnchorKey>,
     organisations: BTreeMap<String, AnchorKey>,
 }
 
@@ -140,8 +152,24 @@ impl Anchors {
     pub fn new(ticket_authority: AnchorKey) -> Self {
         Self {
             ticket_authority,
+            authorisation_key: None,
             organisations: BTreeMap::new(),
         }
+    }
+
+    /// Anchors the authorisation key of the fleet.
+    ///
+    /// The office that decides what an organisation's people may ask for, and
+    /// that publishes the list of withdrawn rights. Optional here and required
+    /// at the moment of use: a consumer that never reads an authorisation or a
+    /// revocation list has no reason to hold the key, and one that does gets
+    /// [`SignatureError::UnknownSigner`] until it is anchored — which is the
+    /// answer a missing anchor deserves, rather than a document accepted
+    /// because nobody was there to check it.
+    #[must_use]
+    pub fn with_authorisation_key(mut self, key: AnchorKey) -> Self {
+        self.authorisation_key = Some(key);
+        self
     }
 
     /// Anchors an organisation that signs device records.
@@ -180,6 +208,11 @@ impl SignatureVerifier for Anchors {
     ) -> Result<(), SignatureError> {
         match signer {
             SignerRef::TicketAuthority => self.ticket_authority.verify(message, signature),
+            SignerRef::AuthorisationKey => self
+                .authorisation_key
+                .as_ref()
+                .ok_or(SignatureError::UnknownSigner)?
+                .verify(message, signature),
             SignerRef::Named(organisation) => self
                 .organisations
                 .get(organisation)

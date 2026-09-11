@@ -33,6 +33,9 @@ pub(crate) mod fixtures {
         AnchorKind, DeviceRecord, KeyProtection, MonotonicAnchor, PayloadFields, RecordFields,
         RecordPayload, SerialNumber,
     };
+    use tessera_codes_contract::request::{
+        EngineerRequest, EngineerSignature, FourEyesDigest, RequestFields, SignedRequest,
+    };
     use tessera_codes_contract::signature::{PublicKey, Signature};
     use tessera_codes_contract::ticket::{
         ServerTicket, SignedTicket, TicketNumber, TicketScope, TicketScopeInput,
@@ -55,6 +58,10 @@ pub(crate) mod fixtures {
     pub(crate) const OWNER_SEED: u8 = 0x66;
     /// Identifier of that owner.
     pub(crate) const OWNER_ID: &str = "owner-e2e";
+    /// Seed of the engineer who signs requests.
+    pub(crate) const ENGINEER_SEED: u8 = 0x77;
+    /// Grounds every fixture request carries.
+    pub(crate) const GROUNDS: &str = "work order 42";
 
     /// Seed standing in for the ephemeral pair of the fixture attempt.
     ///
@@ -231,6 +238,51 @@ pub(crate) mod fixtures {
     pub(crate) fn signed_by(challenge: Challenge, seed: u8) -> SignedChallenge {
         let signature = signer(seed).sign(&challenge.signing_message().unwrap());
         SignedChallenge::new(challenge, signature)
+    }
+
+    /// Assembles the signed request an engineer would bring for a challenge.
+    ///
+    /// The signature is made with the key of the engineer seed and is not
+    /// checked by the issuing side in this build: which key belongs to which
+    /// personal number is a registry question, and the registry of people is
+    /// held by the server. What the fixture does hold constant is the object
+    /// itself — the challenge inside it and the grounds beside it.
+    pub(crate) fn signed_request_for(challenge: &Challenge, grounds: &str) -> SignedRequest {
+        let request = EngineerRequest::new(RequestFields {
+            challenge: challenge.clone(),
+            grounds,
+            grounds_reference: None,
+            requested_at: NOW,
+            four_eyes: FourEyesDigest::of_policy(b"off"),
+        })
+        .unwrap();
+        let signature = signer(ENGINEER_SEED).sign(&request.encode().unwrap());
+        SignedRequest::new(request, EngineerSignature::Signed(signature))
+    }
+
+    /// The same request, with nobody's authenticator behind it.
+    ///
+    /// What an MVP with a stub provider actually files, and the case the mark
+    /// of the journal record exists for.
+    pub(crate) fn unverified_request(world: &World) -> SignedRequest {
+        let request = EngineerRequest::new(RequestFields {
+            challenge: world.challenge.challenge().clone(),
+            grounds: GROUNDS,
+            grounds_reference: None,
+            requested_at: NOW,
+            four_eyes: FourEyesDigest::of_policy(b"off"),
+        })
+        .unwrap();
+        SignedRequest::new(
+            request,
+            EngineerSignature::unverified("stub-provider").unwrap(),
+        )
+    }
+
+    /// The request of the fixture world: the challenge the device showed, on
+    /// grounds somebody can be asked about later.
+    pub(crate) fn signed_request(world: &World) -> SignedRequest {
+        signed_request_for(world.challenge.challenge(), GROUNDS)
     }
 
     /// Assembles the fixture world.

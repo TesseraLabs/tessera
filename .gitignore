@@ -20,7 +20,6 @@ crates/tessera_core/tests/fixtures/gost/*
 
 # Не для публичного репозитория (open-core split, design D6):
 # клиентский контекст, боевые логи, продуктовая стратегия.
-openspec/.bootstrap-notes/
 docs/PRODUCT_SPEC.md
 
 # Осиротевший сломанный worktree (кандидат на удаление).

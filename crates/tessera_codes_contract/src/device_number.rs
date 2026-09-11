@@ -1,23 +1,14 @@
 //! The device number and its check character.
 //!
-//! A device number travels over a telephone: an engineer reads it aloud, an
+//! A device number travels on a label and on a screen: an engineer reads it, an
 //! operator types it in. The check character catches the two mistakes that
 //! channel produces — one wrong character, and two neighbouring characters
 //! swapped — before the wrong device is ever looked up.
 //!
 //! # Algorithm
 //!
-//! The check character is the ISO 7064 MOD 37,36 character over the significant
-//! characters of the number: digits `0`–`9` and Latin letters `A`–`Z`, taken in
-//! order, with lowercase folded to uppercase. Everything else — dashes, spaces,
-//! dots, any non-ASCII character — is ignored.
-//!
-//! That ignoring is a deliberate limit, not an oversight: the number is printed
-//! with separators that vary between labels and are retyped freely, so a
-//! separator cannot carry meaning. The consequence has to be stated plainly —
-//! **an error confined to an ignored character is not caught**, because to this
-//! algorithm the two spellings are the same number. A test pins that limit so
-//! nobody later reads the guarantee as broader than it is.
+//! In [`crate::number`], which the personal number of an engineer is built on
+//! too. What it catches and what it does not is measured there.
 //!
 //! # Where this lives
 //!
@@ -27,11 +18,7 @@
 //! challenge; the identity work reuses this module rather than writing a second
 //! copy.
 
-/// Number of characters the algorithm counts with: `0`–`9` and `A`–`Z`.
-const RADIX: u32 = 36;
-
-/// Modulus of the hybrid system, one above the radix.
-const MODULUS: u32 = RADIX + 1;
+use crate::number::{self, split_check};
 
 /// A device number carrying its check character.
 ///
@@ -55,16 +42,9 @@ impl CheckedDeviceNumber {
     /// protect — and [`DeviceNumberError::CheckCharacterMismatch`] when the
     /// character does not match the rest of the number.
     pub fn parse(text: &str) -> Result<Self, DeviceNumberError> {
-        let significant = significant_characters(text);
-        let split = significant
-            .len()
-            .checked_sub(1)
-            .filter(|body_len| *body_len > 0)
-            .ok_or(DeviceNumberError::TooShort)?;
-
-        let (body, tail) = significant.split_at(split);
+        let significant = number::significant_characters(text);
+        let (body, got) = split_check(&significant).ok_or(DeviceNumberError::TooShort)?;
         let expected = check_character(body)?;
-        let got = tail.chars().next().ok_or(DeviceNumberError::TooShort)?;
         if got != expected {
             return Err(DeviceNumberError::CheckCharacterMismatch { expected, got });
         }
@@ -86,7 +66,7 @@ impl CheckedDeviceNumber {
         let check = check_character(body)?;
         let mut text = body.to_owned();
         text.push(check);
-        let significant = significant_characters(&text);
+        let significant = number::significant_characters(&text);
         Ok(Self { text, significant })
     }
 
@@ -141,52 +121,16 @@ pub enum DeviceNumberError {
 /// Returns the ISO 7064 MOD 37,36 check character of a number written without
 /// one.
 ///
+/// A device-flavoured name for [`crate::number::check_character`], kept so that
+/// a caller working with device numbers gets device-flavoured errors. The
+/// arithmetic is not written twice.
+///
 /// # Errors
 ///
 /// Returns [`DeviceNumberError::TooShort`] when the input carries no
 /// significant character.
 pub fn check_character(body: &str) -> Result<char, DeviceNumberError> {
-    let significant = significant_characters(body);
-    if significant.is_empty() {
-        return Err(DeviceNumberError::TooShort);
-    }
-
-    // The hybrid system of ISO 7064: the running product is carried modulo 37
-    // while the characters are valued modulo 36, and a sum that lands on zero is
-    // lifted to 36. That pairing is what buys the two guarantees the channel
-    // needs — every single wrong character and every swap of neighbours changes
-    // the result.
-    let mut product = RADIX;
-    for symbol in significant.chars() {
-        let value = char_value(symbol).unwrap_or(0);
-        let mut sum = (product + value) % RADIX;
-        if sum == 0 {
-            sum = RADIX;
-        }
-        product = (sum * 2) % MODULUS;
-    }
-    let check = (MODULUS - product) % RADIX;
-    // `check` is a remainder modulo the radix, so the character always exists;
-    // the fallible form avoids a panic path for a branch that cannot be taken.
-    value_char(check).ok_or(DeviceNumberError::TooShort)
-}
-
-/// Returns the characters the algorithm counts, folded to uppercase.
-fn significant_characters(text: &str) -> String {
-    text.chars()
-        .map(|symbol| symbol.to_ascii_uppercase())
-        .filter(|symbol| symbol.is_ascii_digit() || symbol.is_ascii_uppercase())
-        .collect()
-}
-
-/// Returns the numeric value of a significant character.
-fn char_value(symbol: char) -> Option<u32> {
-    symbol.to_digit(RADIX)
-}
-
-/// Returns the character for a value below the radix.
-fn value_char(value: u32) -> Option<char> {
-    char::from_digit(value, RADIX).map(|symbol| symbol.to_ascii_uppercase())
+    number::check_character(body).map_err(|_| DeviceNumberError::TooShort)
 }
 
 #[cfg(test)]
@@ -239,25 +183,99 @@ mod tests {
         }
     }
 
+    const ALPHABET: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    /// Does the check character survive swapping the two characters of `body`
+    /// at `position`?
+    fn transposition_survives(body: &str, position: usize) -> bool {
+        let mut swapped: Vec<char> = body.chars().collect();
+        swapped.swap(position, position + 1);
+        let swapped: String = swapped.into_iter().collect();
+        check_character(body) == check_character(&swapped)
+    }
+
     #[test]
-    fn a_transposition_of_neighbours_is_caught() {
-        let number = checked("A1B2C3D4");
-        let significant: Vec<char> = number.significant().chars().collect();
-        for position in 0..significant.len() - 2 {
-            let mut damaged = significant.clone();
-            damaged.swap(position, position + 1);
-            if damaged == significant {
-                continue;
+    fn a_transposition_of_neighbours_is_caught_except_for_one_pair_per_state() {
+        // Exhaustive, and it states the exception rather than avoiding it. The
+        // test this replaced swapped neighbours in one number that happened to
+        // be lucky, and it would have gone on passing while the channel refused
+        // one transposition in six hundred and thirty.
+        //
+        // The shape of the exception, measured over every pair and every
+        // running state: exactly ONE unordered pair survives each state of the
+        // running product, and its two characters are always adjacent in value.
+        // With nothing in front, the state is the starting one and the pair is
+        // `I` and `J`.
+        let mut survivors = Vec::new();
+        for left in ALPHABET.chars() {
+            for right in ALPHABET.chars() {
+                if left >= right {
+                    continue;
+                }
+                let body: String = [left, right].into_iter().collect();
+                if transposition_survives(&body, 0) {
+                    survivors.push((left, right));
+                }
             }
-            let text: String = damaged.into_iter().collect();
+        }
+        assert_eq!(
+            survivors,
+            vec![('I', 'J')],
+            "the pair that survives an empty prefix is not the one this build was measured to have"
+        );
+    }
+
+    #[test]
+    fn one_pair_survives_after_every_leading_character_and_it_is_a_consecutive_one() {
+        // The exception is not a property of the first position, which is where
+        // it is easiest to look for and where it was first found. Every state
+        // of the running product has one pair of its own, so a prefix moves the
+        // exception rather than removing it.
+        let values: Vec<char> = ALPHABET.chars().collect();
+        for prefix in ALPHABET.chars() {
+            let mut survivors = Vec::new();
+            for (left_index, left) in values.iter().enumerate() {
+                for right in values.iter().skip(left_index + 1) {
+                    let body: String = [prefix, *left, *right].into_iter().collect();
+                    if transposition_survives(&body, 1) {
+                        survivors.push((*left, *right));
+                    }
+                }
+            }
+            assert_eq!(
+                survivors.len(),
+                1,
+                "after `{prefix}` the surviving pairs are {survivors:?}, and there should be one"
+            );
+            let Some((left, right)) = survivors.first() else {
+                unreachable!("the assertion above established there is one")
+            };
+            // Adjacent around the alphabet, not only along it: one state
+            // admits `0` and `Z`, which are neighbours the way the arithmetic
+            // counts and not the way a reader would.
+            let distance = ALPHABET
+                .find(*right)
+                .zip(ALPHABET.find(*left))
+                .map(|(right, left)| (right + ALPHABET.len() - left) % ALPHABET.len());
             assert!(
-                matches!(
-                    CheckedDeviceNumber::parse(&text),
-                    Err(DeviceNumberError::CheckCharacterMismatch { .. })
-                ),
-                "transposition at {position} slipped through: {text}"
+                distance == Some(1) || distance == Some(ALPHABET.len() - 1),
+                "after `{prefix}` the surviving pair `{left}{right}` is not adjacent in value"
             );
         }
+    }
+
+    #[test]
+    fn the_pair_that_survives_is_named_here_so_that_closing_it_is_noticed() {
+        // A regression pinned by name. If the channel ever moves to a check
+        // character drawn from a wider alphabet, this test goes red, and
+        // somebody removes it deliberately instead of discovering the change by
+        // accident six months later.
+        assert!(transposition_survives("IJ", 0));
+        assert_eq!(check_character("IJ"), check_character("JI"));
+        // And a pair that is adjacent in value but not the one this state
+        // admits is caught, so the test above is not passing on the width of
+        // the alphabet.
+        assert!(!transposition_survives("HI", 0));
     }
 
     #[test]

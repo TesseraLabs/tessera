@@ -32,6 +32,15 @@ pub mod domain {
 
     /// The hash-chained audit journal of a device.
     pub const DEVICE_AUDIT: &[u8] = b"tessera-device-audit/v1/genesis";
+
+    /// The issuance journal of the Codes issuing side.
+    ///
+    /// A separate anchor from the device journal on purpose: the two are
+    /// reconciled against each other, and a line copied from one into the other
+    /// must fail verification rather than blend in — which is the whole point of
+    /// domain separation for a pair of journals that an auditor reads side by
+    /// side.
+    pub const CODES_ISSUANCE: &[u8] = b"tessera-codes-issuance/v1/genesis";
 }
 
 /// The `op` value of a head-signature line.
@@ -98,6 +107,25 @@ pub struct HeadSignature {
     pub algorithm: String,
     /// Base64 of the raw signature over the covered head's 32 bytes.
     pub signature: String,
+}
+
+impl HeadSignature {
+    /// Reports whether this line is a signature at all.
+    ///
+    /// Both fields non-empty, and nothing beyond that: this crate holds no
+    /// keys and cannot say whether a signature holds. What it can say is that a
+    /// line claiming to be one carries the two things a signature is made of.
+    ///
+    /// The distinction is not pedantry. A head signature closes the unsigned
+    /// tail of a journal, which is the caveat that tells an auditor "lines could
+    /// have been dropped from the end of this". A line reading
+    /// `{"op":"head_signature"}` with nothing in it would close that tail while
+    /// signing nothing — removing the warning and adding no protection, which is
+    /// worse than either.
+    #[must_use]
+    pub fn is_structurally_valid(&self) -> bool {
+        !self.algorithm.is_empty() && !self.signature.is_empty()
+    }
 }
 
 /// Writer-defined context, chained like anything else and interpreted by

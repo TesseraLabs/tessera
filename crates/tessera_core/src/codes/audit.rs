@@ -2,8 +2,8 @@
 //!
 //! One event carries the outcome of an attempt, and it is emitted on success
 //! and on refusal alike: the reconciliation an auditor performs is between the
-//! logins a fleet saw and the receipts its operators wrote, and a refusal that
-//! left no line makes an operator receipt look unpaired.
+//! logins a fleet saw and the issuances its server recorded, and a refusal that
+//! left no line makes an issuance record look unpaired.
 //!
 //! The event names the nonce and the ticket number because those are what the
 //! two sides have in common. It never carries the code, the derived key or the
@@ -82,7 +82,7 @@ pub const REASON_ARTEFACTS: &str = "artefacts";
 /// This one returns a [`Result`], and the successful login is the only event of
 /// the method that does. The record is part of the decision to let the engineer
 /// in: the control over an operator is the reconciliation between the logins a
-/// fleet saw and the receipts its operators wrote, and a session that reached
+/// fleet saw and the issuances its server recorded, and a session that reached
 /// no journal is exactly the session an operator would want. So a device that
 /// has a chain and cannot write to it does not grant the session.
 ///
@@ -263,7 +263,7 @@ pub fn emit_attempts_exhausted(
 /// list is long enough for two `&str` of the same shape to be swapped at a call
 /// site without the compiler saying a word — and the two that would be swapped
 /// are the nonce and the ticket number, which are exactly the pair an auditor
-/// reconciles the journal against the operator receipts by.
+/// reconciles the journal against the issuance records by.
 struct Mirrored<'a> {
     /// Nonce of the attempt.
     nonce: &'a str,

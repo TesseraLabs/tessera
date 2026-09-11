@@ -87,7 +87,7 @@ enum Command {
     VerifyJournal(VerifyJournalArgs),
     /// Build a certificate request signed by the engineer's token key.
     Csr(CsrArgs),
-    /// The operator side of the Tessera Codes phone channel.
+    /// The issuing side of Tessera Codes.
     Codes(codes::CodesArgs),
 }
 
@@ -757,7 +757,7 @@ pub enum CliError {
     Usage(String),
     /// The signing backend could not be built or reached.
     Backend(String),
-    /// The phone channel refused the operation (the same refusal the cabinet
+    /// The channel refused the operation (the same refusal the cabinet
     /// gets from [`crate::codes`]).
     ///
     /// The class travels beside the sentence because the sentence is prose: it
@@ -819,7 +819,7 @@ impl CliError {
         }
     }
 
-    /// The stable refusal class, for a refusal of the phone channel.
+    /// The stable refusal class, for a refusal of the channel.
     #[must_use]
     pub const fn refusal_class(&self) -> Option<&'static str> {
         match self {
@@ -4724,12 +4724,9 @@ mod prepare_carrier_tests {
                     message.contains(extra.first().map_or("", String::as_str)),
                     "the refusal must name the flag: {message}"
                 ),
-                other => panic!("{extra:?} must be refused, got {other:?}"),
+                _ => panic!("a token-only flag must be refused as a usage error"),
             }
-            assert!(
-                !media.exists(),
-                "{extra:?}: a refused run must lay nothing out"
-            );
+            assert!(!media.exists(), "a refused run must lay nothing out");
         }
     }
 

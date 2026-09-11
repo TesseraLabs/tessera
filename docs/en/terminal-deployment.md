@@ -62,8 +62,8 @@ operations.
 > commercial МКЦ adapter — the integrity mask `mac_mask` to the session.
 > Groups, `sudo` rules, and limits are defined by the role format and validated,
 > but are not yet applied to the session: OS enforcement for them is under
-> development
-> ([linux-session-enforcement](../../openspec/changes/linux-session-enforcement/proposal.md)).
+> development under the private Spec9 decision
+> `ADR-PLAN-linux-session-enforcement`.
 
 | Operation | `oper` | `serv` | `admin` |
 |---|:---:|:---:|:---:|
@@ -196,8 +196,8 @@ bypassed through DBus or sudo.
 > **Important.** This section describes the target mechanics. In v0.4.0
 > `groups`, `sudo_role`, and `limits` are parsed and validated
 > (`tessera role lint`) but are not applied to the session — the
-> implementation is being carried out in the change
-> [linux-session-enforcement](../../openspec/changes/linux-session-enforcement/proposal.md).
+> implementation is tracked by the private Spec9 decision
+> `ADR-PLAN-linux-session-enforcement`.
 > The examples below are correct as a role format and will work unchanged.
 
 Operator — the minimal profile:

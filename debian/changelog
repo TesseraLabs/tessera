@@ -1,3 +1,104 @@
+tessera (0.6.0-1) unstable; urgency=medium
+
+  * Breaking: the Codes method is issued by a server, not read out over a
+    telephone. The issuance receipt is gone as a document — receipt.rs, the
+    receipt store and the spoken form of a challenge with it — and its place
+    is taken by the signed request of an engineer, the grant answering it,
+    and the journal record of the issuing side. A fleet upgrading keeps its
+    device keys and its tickets; every receipt it holds is now a document
+    this build cannot read, and the reconciliation reads the issuance chain
+    of the server instead.
+  * Breaking: `issue()` returns the code, the grant short of the signature of
+    the issuing side, and the custody tier of the agreement key. The grounds
+    of an issuance live inside the engineer's signed request and have no
+    second copy: `IssuanceRequest` takes the request, not a reason string.
+  * Breaking: an engineer authorisation is signed by the authorisation key of
+    the fleet, not by the organisation that granted it (ENGREG-010). The
+    field and its wire key are `authorisation_signature`. Every authorisation
+    issued before this release is invalid and must be re-issued: the change
+    is not a rename, it is a change of who answers for the document. The
+    registry record of an engineer, and the registry record of a device, are
+    still the organisation's to sign.
+  * Breaking: `SignerRef` carries `AuthorisationKey`. Every implementation of
+    `SignatureVerifier` must resolve it; an organisation is a named signer,
+    and the office that decides what an organisation's people may ask for is
+    not.
+  * New: the list of withdrawn rights is a document of the contract, signed
+    by the authorisation key and refusable as a replay by its serial. An
+    unsigned revocation list is one anybody on the path can replace with an
+    empty one, and an empty list is indistinguishable from "nobody has been
+    cut off" — a control that fails open.
+  * `issuer codes issue` takes `--request`; `issuer codes reconcile` takes
+    `--server-chain`, and optionally `--declared-custody` and `--revoked`.
+    `issuer codes receipt verify` is removed with the document it read.
+  * The reconciliation reads the personal number the device wrote into its
+    journal and pairs it against the grant: a session opened under someone
+    else's number is a discrepancy, which it silently was not before.
+  * Breaking: the challenge is SHOWN, not read out. The code prompt carries a
+    QR of the attempt and the same payload as text under it, in place of the
+    grouped spoken form. The text is not a courtesy: on a console where the
+    half-block glyphs do not render, or in a session logged to a file, it is
+    the only way the challenge reaches the engineer's side.
+    .
+    Sizing note for a fleet that logs in over a serial console: at the widest
+    payload the channel carries, the symbol is 105 characters wide and 53 rows
+    tall with its quiet zone, so it does not fit an 80x24 terminal and a
+    cut-off symbol does not read. The showing is built for the overlay of a
+    graphical login and for the wide terminal of an ssh session. Nothing is
+    lost on a narrow console except convenience: the payload is printed as
+    text under the symbol, and typing it in is the same document by another
+    road.
+  * Fixed: on a host without systemd the init script created `/run/tessera`
+    owned by root, while `tmpfiles.d` creates it owned by `tessera` — the
+    account the daemon runs as. The daemon could not write there, and only on
+    that kind of host. Both places now say `tessera:tessera`, and the install
+    case checks the owner as well as the mode.
+  * New: `[codes].page_url` names the address of the engineer's page the QR
+    points at, and it MUST be one of the addresses the enrolment package
+    delivered — the device composes no address of its own, and the address must
+    be `https`. The package carries the list under `[codes].page_urls` of its
+    manifest, signed with everything else and pinned by hash in a managed
+    package; the import writes it to `page-urls.txt` beside the ticket anchor,
+    and a wipe removes it with them. A configuration naming an address that is
+    not in the list, or one over plain http, is refused when the file is
+    loaded, not when the QR is drawn. Leaving the key unset is legitimate and
+    shows the challenge alone, which still scans.
+    .
+    What this release does NOT ship is a tool that ASSEMBLES an enrolment
+    package: the open core has readers only, and it has never had a writer. A
+    fleet puts the file into its package the way it puts every other artefact
+    there. The stand fixtures carry one, written by `cargo xtask
+    codes-fixtures` and `cargo xtask codes-stand-fixtures`.
+  * Breaking: the personal number of an engineer is checked at the device. It
+    carries an organisation segment, a serial part and an ISO 7064 MOD 37,36
+    check character over both, and a number whose character does not meet is
+    refused before an attempt is started (ENG-010). A fleet whose engineers
+    were issued numbers of any other shape must re-issue them: their logins
+    now stop at the prompt. The check catches every single wrong character and
+    every swap of neighbours except one pair per state of the running product —
+    about one transposition in six hundred and thirty — which is a property of
+    a check character drawn from the same alphabet as the body, not of this
+    implementation.
+  * New: `/usr/bin/tessera-qr-overlay` draws the QR of a code login over the
+    greeter of a graphical session. It is not a service and the package does
+    not start it: the PAM module of an attempt starts it under the greeter's
+    own account, hands it one payload at a time over a socket in
+    /run/tessera-overlay, and it exits with the attempt. It is unprivileged,
+    holds no key, and takes no keyboard input — the code is typed into the
+    greeter's own field. A device with no graphical login never runs it, and
+    its absence does not affect the text path. Turned on by naming the
+    greeter's account in `[codes].overlay_user`; a device that names none shows
+    the challenge in the prompt and nothing else, which is what every ssh login
+    does.
+  * Fixed: Vault Transit signing panicked on every https request — ureq gates
+    the connection on its own `native-tls` feature and the workspace asked
+    only for the library. Plaintext was refused by construction, so the
+    adapter had no working address at all. The integration test now runs
+    against `vault server -dev-tls` and no longer reports a pass when the
+    binary is absent. Affects the issuer agent, which ships the same backend.
+
+ -- Mikhail Korolev <michael443959@gmail.com>  Wed, 09 Sep 2026 01:44:13 +0300
+
 tessera (0.5.0-1) unstable; urgency=medium
 
   * Breaking: the requested role is the login account name. The

@@ -1,8 +1,8 @@
 # Golden vector: a role identifier that arrives decomposed (NFD).
 #
-# Длина кода — восемь: шесть десятичных знаков перестали проходить порог
-# стойкости контракта (19.9 бита против 20), а предмет вектора — нормализация
-# имени роли, а не длина.
+# The code is eight characters long: six decimal digits stopped clearing the
+# strength floor of the contract (19.9 bits against 20), and what this vector is
+# about is the normalisation of a role name, not the length of a code.
 #
 # `role_id_hex` holds the exact input bytes — "ro" + U+0302 + "le-de" + U+0301 +
 # "part" — because a plain-text field would be composed by any editor that

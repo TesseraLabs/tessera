@@ -142,7 +142,8 @@ shipped by the unit
 > (`librtpkcs11ecp.so`, `libjcPKCS11.so`), GOST mechanisms are **not
 > supported** (the `cryptoki` crate does not cover GOST mechanisms);
 > Rutoken/JaCarta over PKCS#11 are usable for RSA/ECDSA certificates.
-> GOST-over-PKCS#11 support is the proposal `openspec/changes/gost-pkcs11`.
+> GOST-over-PKCS#11 support is tracked by the private Spec9 decision
+> `ADR-PLAN-gost-pkcs11`.
 
 ## 3. Crate dependency diagram
 

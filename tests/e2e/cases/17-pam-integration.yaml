@@ -12,7 +12,7 @@ setup: [install-package]
 cases:
   - id: PAMI-001
     title: Три режима различаются control-flag'ом, а не аргументами модуля
-    requirement: openspec/specs/pam-integration/spec.md
+    requirement: spec9:platform.PAMI-001
     requires: []
     steps:
       - run: grep -E '^auth' /etc/pam.d/tessera
@@ -39,7 +39,7 @@ cases:
 
   - id: PAMI-002
     title: В стеке с pam_parsec_mac включение ставится после него
-    requirement: openspec/specs/pam-integration/spec.md
+    requirement: spec9:platform.PAMI-004
     requires: []
     # Иначе `success=done` режима cert-only обрывает auth-стек до
     # pam_parsec_mac, его account- и session-инстансы падают на отсутствии
@@ -55,7 +55,7 @@ cases:
 
   - id: PAMI-003
     title: В стеке без литеральной auth-строки включение ставится перед common-auth
-    requirement: openspec/specs/pam-integration/spec.md
+    requirement: spec9:platform.PAMI-004
     requires: []
     # Стеки sudo и sshd доставляют всю auth-фазу через `@include common-auth`.
     # Пока якорь искал только литеральную строку `auth`, включение дописывалось

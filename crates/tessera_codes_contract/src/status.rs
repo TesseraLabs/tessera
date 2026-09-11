@@ -371,8 +371,129 @@ mod tests {
     use super::{
         AuthorisationStatus, StatusError, StatusToken, StatusTokenFields, STATUS_TOKEN_PREFIX,
     };
+    use crate::signature::{Signature, SignatureError, SignatureVerifier, SignerRef};
     use crate::time::ClaimedTime;
     use crate::wire::WireError;
+
+    /// A verifier that says yes to everything.
+    struct AcceptsAnything;
+
+    impl SignatureVerifier for AcceptsAnything {
+        fn verify(
+            &self,
+            _signer: SignerRef<'_>,
+            _message: &[u8],
+            _signature: &Signature,
+        ) -> Result<(), SignatureError> {
+            Ok(())
+        }
+    }
+
+    /// A verifier bound to one message and one named service.
+    ///
+    /// The token says which service signed it, and the fixture holds the
+    /// service to both: the right name over the right bytes. A verifier that
+    /// only compared bytes would pass a token signed by another service under a
+    /// name a fleet never anchored.
+    struct ServiceBound {
+        service: &'static str,
+        message: Vec<u8>,
+    }
+
+    impl SignatureVerifier for ServiceBound {
+        fn verify(
+            &self,
+            signer: SignerRef<'_>,
+            message: &[u8],
+            _signature: &Signature,
+        ) -> Result<(), SignatureError> {
+            match signer {
+                SignerRef::Named(name) if name == self.service => {
+                    if message == self.message.as_slice() {
+                        Ok(())
+                    } else {
+                        Err(SignatureError::Rejected)
+                    }
+                }
+                _ => Err(SignatureError::UnknownSigner),
+            }
+        }
+    }
+
+    #[test]
+    fn the_signature_of_the_status_service_is_actually_checked() {
+        // Nothing called this at all before: the token is written by a service
+        // and read by a server, and the open core only describes its shape. A
+        // document whose signature nobody ever checked in a test is a document
+        // whose signature can stop being checked in the product without a
+        // single test noticing.
+        let token = token();
+        let signature = Signature::new(vec![0xab, 0xcd]).unwrap();
+
+        assert_eq!(
+            token.verify(
+                &ServiceBound {
+                    service: "status-1",
+                    message: token.encode().unwrap(),
+                },
+                &signature
+            ),
+            Ok(())
+        );
+
+        // Another service under the same anchors: unknown signer, not "close
+        // enough".
+        assert!(matches!(
+            token.verify(
+                &ServiceBound {
+                    service: "status-2",
+                    message: token.encode().unwrap(),
+                },
+                &signature
+            ),
+            Err(StatusError::ServiceSignature(SignatureError::UnknownSigner))
+        ));
+
+        // The right service over other bytes: a token edited after it was
+        // signed. The signature covers the canonical encoding, so a changed
+        // field moves the message.
+        let edited = StatusToken::new(&StatusTokenFields {
+            service_key_id: "status-1",
+            nonce: "4444444444",
+            engineer_key_fingerprint: [0x11; 32],
+            authorisation_digest: [0x22; 32],
+            revocations_head: [0x33; 32],
+            // The one field an attacker would change: a withdrawn
+            // authorisation read as standing.
+            status: AuthorisationStatus::Standing,
+            issued_at: ClaimedTime::new(1_800_000_000),
+            not_after: ClaimedTime::new(1_800_000_600),
+        })
+        .unwrap();
+        assert!(matches!(
+            edited.verify(
+                &ServiceBound {
+                    service: "status-1",
+                    message: token.encode().unwrap(),
+                },
+                &signature
+            ),
+            Err(StatusError::ServiceSignature(SignatureError::Rejected))
+        ));
+    }
+
+    #[test]
+    fn a_token_is_not_taken_on_trust_by_a_permissive_verifier() {
+        // The other direction, stated once so nobody reads the test above as
+        // "verification is optional": with a verifier that accepts everything,
+        // the call succeeds — this crate holds no anchors and cannot refuse on
+        // its own. Whoever supplies the verifier owns that decision, and the
+        // documentation of the trait says so.
+        assert_eq!(
+            token().verify(&AcceptsAnything, &Signature::new(vec![0x01]).unwrap()),
+            Ok(())
+        );
+    }
 
     fn token() -> StatusToken {
         StatusToken::new(&StatusTokenFields {

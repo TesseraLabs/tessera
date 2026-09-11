@@ -1,0 +1,14 @@
+# Golden-вектор QR-payload попытки, редакция 1.
+#
+# Порождён кодом устройства: подпись настоящая, ECDSA над SHA-256 канонического
+# сообщения challenge, ключ — фиксированное зерно ниже. Файл переписывается только
+# вместе с формой документа: он и есть то, что читает страница инженера.
+#
+# Форма: base_url "#" wire-форма подписанного challenge (contracts/codes/qr-payload).
+# Поля попытки живут только во фрагменте — в HTTP-запросе за бандлом их нет.
+device_seed_hex = 3333333333333333333333333333333333333333333333333333333333333333
+ephemeral_seed_hex = 5555555555555555555555555555555555555555555555555555555555555555
+base_url = https://codes.fleet.example/e
+wire = tessera-codes/v1/signed-challenge;device=77-000123S;epoch=7;nonce=44444444444444444444444444;role=tester;level=1;server=op-e2e;engineer=ORG1-0000014;ephemeral=0257e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34;signature=3046022100a7343bd77b9ba74b54f8768d41bd7ae24d2b3b5d0db29f921f993c0867653aba0221009ccc5866815bc36ab0323a4565aa1ccfba943693de55bbd9171cb0fb371c3561
+payload = https://codes.fleet.example/e#tessera-codes/v1/signed-challenge;device=77-000123S;epoch=7;nonce=44444444444444444444444444;role=tester;level=1;server=op-e2e;engineer=ORG1-0000014;ephemeral=0257e977f6db7e33c3fe7acf2842ed987009caf56d458682fca447b7d3d762ab34;signature=3046022100a7343bd77b9ba74b54f8768d41bd7ae24d2b3b5d0db29f921f993c0867653aba0221009ccc5866815bc36ab0323a4565aa1ccfba943693de55bbd9171cb0fb371c3561
+payload_len = 410

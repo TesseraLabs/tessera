@@ -79,9 +79,9 @@ pub enum WhenFull {
 pub enum AuditRecord {
     /// The outcome of a code login attempt — success and refusal alike.
     ///
-    /// A refusal that left no line would make an operator's receipt look
+    /// A refusal that left no line would make an issuance record look
     /// unpaired, and the reconciliation between the logins a fleet saw and the
-    /// receipts its operators wrote is the whole point of the record.
+    /// issuances its server recorded is the whole point of the record.
     #[serde(rename = "code_login")]
     CodeLogin {
         /// The nonce the attempt ran under; a reference, never the code.

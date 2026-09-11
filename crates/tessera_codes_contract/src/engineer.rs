@@ -61,7 +61,7 @@ const AUTHORISATION_KEYS: [&str; AUTHORISATION_FIELD_COUNT] = [
     "roles",
     "max_level",
     "not_after",
-    "organisation_signature",
+    "authorisation_signature",
 ];
 
 /// Label of the proof of possession of an engineer key.
@@ -81,14 +81,98 @@ const AUTHORISATION_LABEL: &str = "tessera-codes-contract/v1/engineer-authorisat
 /// document instead of being expressed by an empty list.
 pub const ALL_ROLES: &str = "*";
 
+/// Separator between the marker of an absent authenticator and its reason.
+const ABSENT_SEPARATOR: char = ':';
+
+/// Marker of a record that carries an authenticator.
+const AUTHENTICATOR_PRESENT: &str = "present";
+
+/// Marker of a record that states there is no authenticator.
+const AUTHENTICATOR_ABSENT: &str = "unverified";
+
+/// The authenticator of an engineer — or the statement that there is none.
+///
+/// # Why this is one type and not two fields
+///
+/// A key without a proof of possession is the hole this document exists to
+/// close: an organisation could register somebody else's public key as an
+/// engineer's, and every request signed with the matching private half would be
+/// attributed to that engineer. Held as two fields, that state is expressible,
+/// and what is expressible eventually gets expressed. Held like this, it is not.
+///
+/// # Why the absence is a variant and not an empty key
+///
+/// Because a fleet in the middle of its rollout has engineers whose identity
+/// nothing vouches for, and the two cases must not read alike. An empty key, a
+/// key of zeros, or a placeholder from a stub provider all parse as "a key" to
+/// the next reader, and the report an auditor sees then says an identity was
+/// checked where nothing checked it. The absence carries its reason for the
+/// same reason: a year later, "there was never a provider" and "the provider
+/// was there and failed" send an auditor to different places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticatorKey {
+    /// The engineer holds a key, and proved it.
+    Present {
+        /// The public half the engineer signs with.
+        key: PublicKey,
+        /// The signature that proves the private half is theirs.
+        possession: Signature,
+    },
+    /// Nothing vouches for this engineer's identity, and this says why.
+    Absent {
+        /// Why there is no authenticator — a stub provider in an MVP, a
+        /// rollout that has not reached this person, a factor withdrawn.
+        reason: String,
+    },
+}
+
+impl AuthenticatorKey {
+    /// States that an engineer has no authenticator, and why.
+    ///
+    /// # Errors
+    ///
+    /// The wire errors when the reason is empty or carries a character the
+    /// format cannot hold, and [`EngineerError::ReasonSeparator`] when it
+    /// carries the separator that divides the marker from the reason.
+    pub fn absent(reason: &str) -> Result<Self, EngineerError> {
+        wire::check_free_text("authenticator_reason", reason)?;
+        if reason.contains(ABSENT_SEPARATOR) {
+            return Err(EngineerError::ReasonSeparator);
+        }
+        Ok(Self::Absent {
+            reason: reason.to_owned(),
+        })
+    }
+
+    /// Reads the pair of wire fields the two cases share.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineerError::HalfAnAuthenticator`] when one field states a key and
+    /// the other states none — a document that says both things about one
+    /// person — and the material errors of a key or a signature.
+    fn parse(key: &str, possession: &str) -> Result<Self, EngineerError> {
+        let absent_key = key
+            .strip_prefix(AUTHENTICATOR_ABSENT)
+            .and_then(|rest| rest.strip_prefix(ABSENT_SEPARATOR));
+        match (absent_key, possession == AUTHENTICATOR_ABSENT) {
+            (Some(reason), true) => Self::absent(reason),
+            (None, false) => Ok(Self::Present {
+                key: PublicKey::new(wire::parse_hex("key", key)?)?,
+                possession: Signature::new(wire::parse_hex("possession_signature", possession)?)?,
+            }),
+            _ => Err(EngineerError::HalfAnAuthenticator),
+        }
+    }
+}
+
 /// A person as the organisation registered them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineerRecord {
     engineer_id: String,
-    authenticator_key: PublicKey,
+    authenticator_key: AuthenticatorKey,
     organisation_id: String,
     organisation_signature: Signature,
-    possession_signature: Signature,
 }
 
 impl EngineerRecord {
@@ -100,10 +184,9 @@ impl EngineerRecord {
     /// character the format cannot hold.
     pub fn new(
         engineer_id: &str,
-        authenticator_key: PublicKey,
+        authenticator_key: AuthenticatorKey,
         organisation_id: &str,
         organisation_signature: Signature,
-        possession_signature: Signature,
     ) -> Result<Self, EngineerError> {
         wire::check_free_text("engineer", engineer_id)?;
         wire::check_free_text("organisation", organisation_id)?;
@@ -112,7 +195,6 @@ impl EngineerRecord {
             authenticator_key,
             organisation_id: organisation_id.to_owned(),
             organisation_signature,
-            possession_signature,
         })
     }
 
@@ -122,10 +204,19 @@ impl EngineerRecord {
         &self.engineer_id
     }
 
-    /// Returns the public key of the authenticator the engineer signs with.
+    /// Returns the authenticator of the engineer, present or explicitly not.
     #[must_use]
-    pub const fn authenticator_key(&self) -> &PublicKey {
+    pub const fn authenticator_key(&self) -> &AuthenticatorKey {
         &self.authenticator_key
+    }
+
+    /// Reports whether this record vouches for a key the engineer holds.
+    ///
+    /// The question every consumer of a record actually asks, answered in one
+    /// place so that nobody answers it by looking at a field and guessing.
+    #[must_use]
+    pub const fn identity_is_verified(&self) -> bool {
+        matches!(self.authenticator_key, AuthenticatorKey::Present { .. })
     }
 
     /// Returns the organisation that registered the engineer.
@@ -140,26 +231,50 @@ impl EngineerRecord {
         &self.organisation_signature
     }
 
-    /// Returns the proof of possession made with the authenticator key.
+    /// Returns the proof of possession, when the record carries a key at all.
     #[must_use]
-    pub const fn possession_signature(&self) -> &Signature {
-        &self.possession_signature
+    pub const fn possession_signature(&self) -> Option<&Signature> {
+        match &self.authenticator_key {
+            AuthenticatorKey::Present { possession, .. } => Some(possession),
+            AuthenticatorKey::Absent { .. } => None,
+        }
     }
 
-    /// Returns the fingerprint of the authenticator key.
+    /// Returns the fingerprint of the authenticator key, when there is one.
     ///
     /// What an authorisation and a status-token name the key by: a fingerprint
     /// travels where a key would be unwieldy, and the two documents must agree
     /// on how it is taken. Here is where that is decided, once.
+    ///
+    /// `None` for a record that states no key. A zero fingerprint, or one taken
+    /// of a placeholder, would let an authorisation bind to a key nobody holds
+    /// and read afterwards exactly like one that binds to a key somebody does.
     #[must_use]
-    pub fn key_fingerprint(&self) -> [u8; DIGEST_LEN] {
-        sha256(self.authenticator_key.as_bytes())
+    pub fn key_fingerprint(&self) -> Option<[u8; DIGEST_LEN]> {
+        match &self.authenticator_key {
+            AuthenticatorKey::Present { key, .. } => Some(sha256(key.as_bytes())),
+            AuthenticatorKey::Absent { .. } => None,
+        }
     }
 
     /// Encodes the body both signatures are taken over.
+    ///
+    /// The absent case is encoded as itself — the marker and the reason — and
+    /// not as an empty key. An organisation signing a record with no key signs
+    /// the statement "this person has no authenticator, because …", and that
+    /// statement is what a reader gets to check afterwards.
     fn body(&self, encoder: &mut Encoder) -> Result<(), CanonError> {
         encoder.push_text("engineer_id", &self.engineer_id)?;
-        encoder.push_bytes("authenticator_key", self.authenticator_key.as_bytes())?;
+        match &self.authenticator_key {
+            AuthenticatorKey::Present { key, .. } => {
+                encoder.push_text("authenticator", AUTHENTICATOR_PRESENT)?;
+                encoder.push_bytes("authenticator_key", key.as_bytes())?;
+            }
+            AuthenticatorKey::Absent { reason } => {
+                encoder.push_text("authenticator", AUTHENTICATOR_ABSENT)?;
+                encoder.push_text("authenticator_reason", reason)?;
+            }
+        }
         encoder.push_text("organisation_id", &self.organisation_id)?;
         Ok(())
     }
@@ -213,31 +328,46 @@ impl EngineerRecord {
                 &self.organisation_signature,
             )
             .map_err(EngineerError::OrganisationSignature)?;
-        verifier
-            .verify(
-                SignerRef::Key(&self.authenticator_key),
-                &self.possession_message()?,
-                &self.possession_signature,
-            )
-            .map_err(EngineerError::PossessionSignature)?;
+        // A proof of possession exists only where a key does. A record that
+        // states no authenticator is verified when the organisation signed that
+        // statement — and it is still a record of somebody whose identity
+        // nothing here vouches for, which is what
+        // [`EngineerRecord::identity_is_verified`] is for and what the journal
+        // of an issuance carries as its own field.
+        if let AuthenticatorKey::Present { key, possession } = &self.authenticator_key {
+            verifier
+                .verify(SignerRef::Key(key), &self.possession_message()?, possession)
+                .map_err(EngineerError::PossessionSignature)?;
+        }
         Ok(())
     }
 
     /// Renders the wire form.
     #[must_use]
     pub fn to_wire(&self) -> String {
+        let (key, possession) = match &self.authenticator_key {
+            AuthenticatorKey::Present { key, possession } => (
+                hex::encode(key.as_bytes()),
+                hex::encode(possession.as_bytes()),
+            ),
+            // The marker carries the reason with it, so a reader that sees no
+            // key also sees why there is none. Hexadecimal never contains the
+            // separator, so the two cases are told apart by the parser rather
+            // than by a length or a guess.
+            AuthenticatorKey::Absent { reason } => (
+                format!("{AUTHENTICATOR_ABSENT}{ABSENT_SEPARATOR}{reason}"),
+                AUTHENTICATOR_ABSENT.to_owned(),
+            ),
+        };
         let fields = [
             ("engineer", self.engineer_id.clone()),
-            ("key", hex::encode(self.authenticator_key.as_bytes())),
+            ("key", key),
             ("organisation", self.organisation_id.clone()),
             (
                 "organisation_signature",
                 hex::encode(self.organisation_signature.as_bytes()),
             ),
-            (
-                "possession_signature",
-                hex::encode(self.possession_signature.as_bytes()),
-            ),
+            ("possession_signature", possession),
         ];
         wire::render(ENGINEER_RECORD_PREFIX, &fields)
     }
@@ -251,17 +381,15 @@ impl EngineerRecord {
     /// target type cannot hold.
     pub fn parse(text: &str) -> Result<Self, EngineerError> {
         let values = wire::parse(text, ENGINEER_RECORD_PREFIX, &RECORD_KEYS)?;
+        let authenticator_key =
+            AuthenticatorKey::parse(wire::value(&values, 1), wire::value(&values, 4))?;
         Self::new(
             wire::value(&values, 0),
-            PublicKey::new(wire::parse_hex("key", wire::value(&values, 1))?)?,
+            authenticator_key,
             wire::value(&values, 2),
             Signature::new(wire::parse_hex(
                 "organisation_signature",
                 wire::value(&values, 3),
-            )?)?,
-            Signature::new(wire::parse_hex(
-                "possession_signature",
-                wire::value(&values, 4),
             )?)?,
         )
     }
@@ -291,8 +419,8 @@ pub struct AuthorisationFields<'a> {
     pub max_level: Level,
     /// When the authorisation stops.
     pub not_after: ClaimedTime,
-    /// Signature of the organisation over the authorisation.
-    pub organisation_signature: Signature,
+    /// Signature of the fleet's authorisation key over the authorisation.
+    pub authorisation_signature: Signature,
 }
 
 /// What an engineer may ask for, and until when.
@@ -314,7 +442,7 @@ pub struct EngineerAuthorisation {
     roles: Vec<String>,
     max_level: Level,
     not_after: ClaimedTime,
-    organisation_signature: Signature,
+    authorisation_signature: Signature,
 }
 
 impl EngineerAuthorisation {
@@ -354,7 +482,7 @@ impl EngineerAuthorisation {
             roles: fields.roles,
             max_level: fields.max_level,
             not_after: fields.not_after,
-            organisation_signature: fields.organisation_signature,
+            authorisation_signature: fields.authorisation_signature,
         })
     }
 
@@ -400,10 +528,10 @@ impl EngineerAuthorisation {
         self.not_after
     }
 
-    /// Returns the signature of the organisation.
+    /// Returns the signature of the fleet's authorisation key.
     #[must_use]
-    pub const fn organisation_signature(&self) -> &Signature {
-        &self.organisation_signature
+    pub const fn authorisation_signature(&self) -> &Signature {
+        &self.authorisation_signature
     }
 
     /// Reports whether the authorisation covers `role`.
@@ -440,7 +568,7 @@ impl EngineerAuthorisation {
         Ok(sha256(&self.encode()?))
     }
 
-    /// Encodes the message the organisation signs.
+    /// Encodes the message the authorisation key signs.
     ///
     /// # Errors
     ///
@@ -459,21 +587,29 @@ impl EngineerAuthorisation {
         Ok(encoder.finish())
     }
 
-    /// Verifies the signature of the organisation.
+    /// Verifies the signature of the fleet's authorisation key.
+    ///
+    /// **Not the organisation's.** The organisation is named in the document
+    /// and its ceiling comes from its certificate, not from its signature: an
+    /// organisation that could sign this would be granting its own people
+    /// whatever it liked, and the ceiling the fleet set for it would be a
+    /// suggestion. The office that signs authorisations is a separate key under
+    /// the fleet root, held apart from the organisations and from the key that
+    /// signs grants.
     ///
     /// # Errors
     ///
     /// [`EngineerError::Canon`] when the authorisation cannot be encoded and
-    /// [`EngineerError::OrganisationSignature`] when the signature does not
-    /// hold or the organisation is not anchored.
+    /// [`EngineerError::AuthorisationSignature`] when the signature does not
+    /// hold or the authorisation key is not anchored.
     pub fn verify(&self, verifier: &impl SignatureVerifier) -> Result<(), EngineerError> {
         verifier
             .verify(
-                SignerRef::Named(&self.organisation_id),
+                SignerRef::AuthorisationKey,
                 &self.encode()?,
-                &self.organisation_signature,
+                &self.authorisation_signature,
             )
-            .map_err(EngineerError::OrganisationSignature)
+            .map_err(EngineerError::AuthorisationSignature)
     }
 
     /// Renders the wire form.
@@ -488,8 +624,8 @@ impl EngineerAuthorisation {
             ("max_level", self.max_level.get().to_string()),
             ("not_after", self.not_after.get().to_string()),
             (
-                "organisation_signature",
-                hex::encode(self.organisation_signature.as_bytes()),
+                "authorisation_signature",
+                hex::encode(self.authorisation_signature.as_bytes()),
             ),
         ];
         wire::render(AUTHORISATION_PREFIX, &fields)
@@ -522,8 +658,8 @@ impl EngineerAuthorisation {
             roles: split_list(wire::value(&values, 4)),
             max_level: Level::new(wire::parse_u32("max_level", wire::value(&values, 5))?),
             not_after: ClaimedTime::new(wire::parse_u64("not_after", wire::value(&values, 6))?),
-            organisation_signature: Signature::new(wire::parse_hex(
-                "organisation_signature",
+            authorisation_signature: Signature::new(wire::parse_hex(
+                "authorisation_signature",
                 wire::value(&values, 7),
             )?)?,
         })
@@ -598,8 +734,25 @@ pub enum EngineerError {
     #[error(transparent)]
     Material(#[from] SignatureError),
     /// The organisation signature was rejected.
+    ///
+    /// The registry record of an engineer: that one an organisation does sign,
+    /// because it is a statement about its own people. An authorisation is not
+    /// — see [`EngineerError::AuthorisationSignature`].
     #[error("the organisation signature was rejected: {0}")]
     OrganisationSignature(SignatureError),
+    /// The signature of the fleet's authorisation key was rejected.
+    #[error("the authorisation was not signed by the authorisation key of the fleet: {0}")]
+    AuthorisationSignature(SignatureError),
+    /// The reason of an absent authenticator carries the separator that divides
+    /// it from the marker.
+    #[error("the reason for an absent authenticator carries the separator `:`")]
+    ReasonSeparator,
+    /// One field states a key and the other states there is none.
+    #[error(
+        "the record states a key and states there is none: a document that says both things \
+         about one person is not a record of either"
+    )]
+    HalfAnAuthenticator,
     /// The proof of possession was rejected.
     #[error("the proof of possession was rejected: {0}")]
     PossessionSignature(SignatureError),
@@ -612,8 +765,8 @@ pub enum EngineerError {
 )]
 mod tests {
     use super::{
-        AuthorisationFields, EngineerAuthorisation, EngineerError, EngineerRecord, ALL_ROLES,
-        AUTHORISATION_PREFIX, ENGINEER_RECORD_PREFIX,
+        AuthenticatorKey, AuthorisationFields, EngineerAuthorisation, EngineerError,
+        EngineerRecord, ALL_ROLES, AUTHORISATION_PREFIX, ENGINEER_RECORD_PREFIX,
     };
     use crate::canon::Level;
     use crate::signature::{PublicKey, Signature, SignatureError, SignatureVerifier, SignerRef};
@@ -637,7 +790,9 @@ mod tests {
             let expected = match signer {
                 SignerRef::Named(_) => &self.organisation,
                 SignerRef::Key(_) => &self.possession,
-                SignerRef::TicketAuthority => return Err(SignatureError::UnknownSigner),
+                SignerRef::TicketAuthority | SignerRef::AuthorisationKey => {
+                    return Err(SignatureError::UnknownSigner)
+                }
             };
             if message == expected.as_slice() {
                 Ok(())
@@ -650,10 +805,12 @@ mod tests {
     fn record() -> EngineerRecord {
         EngineerRecord::new(
             "eng-7",
-            PublicKey::new(vec![0x04, 0xaa, 0xbb]).unwrap(),
+            AuthenticatorKey::Present {
+                key: PublicKey::new(vec![0x04, 0xaa, 0xbb]).unwrap(),
+                possession: Signature::new(vec![0x02]).unwrap(),
+            },
             "acme",
             Signature::new(vec![0x01]).unwrap(),
-            Signature::new(vec![0x02]).unwrap(),
         )
         .unwrap()
     }
@@ -662,12 +819,12 @@ mod tests {
         EngineerAuthorisation::new(AuthorisationFields {
             engineer_id: "eng-7",
             organisation_id: "acme",
-            key_fingerprint: record().key_fingerprint(),
+            key_fingerprint: record().key_fingerprint().unwrap(),
             tags: vec!["dc-1".to_owned(), "hq".to_owned()],
             roles: vec!["ops.dc.senior".to_owned()],
             max_level: Level::new(2),
             not_after: ClaimedTime::new(1_800_000_000),
-            organisation_signature: Signature::new(vec![0x03]).unwrap(),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
         .unwrap()
     }
@@ -704,9 +861,106 @@ mod tests {
         // One decision about how a key is named, in one place: an authorisation
         // that computed it differently would name a key nobody holds.
         assert_eq!(
-            &record().key_fingerprint(),
-            authorisation().key_fingerprint()
+            record().key_fingerprint().as_ref(),
+            Some(authorisation().key_fingerprint())
         );
+    }
+
+    /// A verifier that holds the fleet's authorisation key and the
+    /// organisations, and never confuses the two.
+    ///
+    /// The fixture exists for one question, and it is the question this
+    /// document changed: WHICH key vouches for what an engineer may ask for.
+    struct OfficeBound {
+        /// The bytes the authorisation key is willing to have signed.
+        authorisation: Vec<u8>,
+    }
+
+    impl SignatureVerifier for OfficeBound {
+        fn verify(
+            &self,
+            signer: SignerRef<'_>,
+            message: &[u8],
+            _signature: &Signature,
+        ) -> Result<(), SignatureError> {
+            match signer {
+                SignerRef::AuthorisationKey if message == self.authorisation.as_slice() => Ok(()),
+                SignerRef::AuthorisationKey => Err(SignatureError::Rejected),
+                // An organisation is anchored — the fixture stands for a fleet
+                // that trusts it for what it may sign — and it is still not the
+                // office that grants authorisations.
+                SignerRef::Named(_) | SignerRef::Key(_) | SignerRef::TicketAuthority => {
+                    Err(SignatureError::UnknownSigner)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_authorisation_is_vouched_for_by_the_fleet_and_not_by_the_organisation() {
+        // The defect this rename closes: while the authorisation was verified
+        // against the organisation that granted it, an organisation could write
+        // its own people any ceiling it liked, and the ceiling the fleet set for
+        // it in its certificate was a suggestion.
+        let authorisation = authorisation();
+        let office = OfficeBound {
+            authorisation: authorisation.encode().unwrap(),
+        };
+        assert_eq!(authorisation.verify(&office), Ok(()));
+
+        // The same document offered to a fleet that anchors organisations and
+        // no authorisation key: nobody who may sign this has signed it.
+        let organisations_only = MessageBound {
+            organisation: authorisation.encode().unwrap(),
+            possession: Vec::new(),
+        };
+        assert!(matches!(
+            authorisation.verify(&organisations_only),
+            Err(EngineerError::AuthorisationSignature(
+                SignatureError::UnknownSigner
+            ))
+        ));
+    }
+
+    #[test]
+    fn an_authorisation_edited_after_it_was_signed_does_not_verify() {
+        // The signature covers the canonical bytes, so raising the ceiling
+        // moves them. Without this the rename would be a rename and nothing
+        // more.
+        let signed = authorisation();
+        let office = OfficeBound {
+            authorisation: signed.encode().unwrap(),
+        };
+        let raised = EngineerAuthorisation::new(AuthorisationFields {
+            engineer_id: "eng-7",
+            organisation_id: "acme",
+            key_fingerprint: record().key_fingerprint().unwrap(),
+            tags: vec!["dc-1".to_owned(), "hq".to_owned()],
+            roles: vec!["ops.dc.senior".to_owned()],
+            max_level: Level::new(3),
+            not_after: ClaimedTime::new(1_800_000_000),
+            authorisation_signature: signed.authorisation_signature().clone(),
+        })
+        .unwrap();
+        assert!(matches!(
+            raised.verify(&office),
+            Err(EngineerError::AuthorisationSignature(
+                SignatureError::Rejected
+            ))
+        ));
+    }
+
+    #[test]
+    fn the_registry_record_is_still_the_organisations_to_sign() {
+        // The other half of the rule, and the reason this is a rename of one
+        // document and not of two: who a person is inside an organisation is
+        // the organisation's statement; what they may ask for is not.
+        let record = record();
+        let verifier = MessageBound {
+            organisation: record.organisation_message().unwrap(),
+            possession: record.possession_message().unwrap(),
+        };
+        assert_eq!(record.verify(&verifier), Ok(()));
     }
 
     #[test]
@@ -741,7 +995,7 @@ mod tests {
                 roles: vec![ALL_ROLES.to_owned()],
                 max_level: Level::new(2),
                 not_after: ClaimedTime::new(1_800_000_000),
-                organisation_signature: Signature::new(vec![0x03]).unwrap(),
+                authorisation_signature: Signature::new(vec![0x03]).unwrap(),
             }
         })
         .unwrap();
@@ -755,7 +1009,7 @@ mod tests {
             roles: vec![ALL_ROLES.to_owned(), "ops.dc.senior".to_owned()],
             max_level: Level::new(2),
             not_after: ClaimedTime::new(1_800_000_000),
-            organisation_signature: Signature::new(vec![0x03]).unwrap(),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         });
         assert_eq!(mixed, Err(EngineerError::MarkerBesideNames));
     }
@@ -770,7 +1024,7 @@ mod tests {
             roles: Vec::new(),
             max_level: Level::new(2),
             not_after: ClaimedTime::new(1_800_000_000),
-            organisation_signature: Signature::new(vec![0x03]).unwrap(),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         });
         assert_eq!(no_roles, Err(EngineerError::NoRoles));
 
@@ -793,12 +1047,12 @@ mod tests {
         let wider = EngineerAuthorisation::new(AuthorisationFields {
             engineer_id: "eng-7",
             organisation_id: "acme",
-            key_fingerprint: record().key_fingerprint(),
+            key_fingerprint: record().key_fingerprint().unwrap(),
             tags: vec!["dc-1".to_owned(), "hq".to_owned()],
             roles: vec!["ops.dc.senior".to_owned()],
             max_level: Level::new(3),
             not_after: ClaimedTime::new(1_800_000_000),
-            organisation_signature: Signature::new(vec![0x03]).unwrap(),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
         .unwrap();
         assert_ne!(wider.encode().unwrap(), base);
@@ -806,12 +1060,12 @@ mod tests {
         let longer = EngineerAuthorisation::new(AuthorisationFields {
             engineer_id: "eng-7",
             organisation_id: "acme",
-            key_fingerprint: record().key_fingerprint(),
+            key_fingerprint: record().key_fingerprint().unwrap(),
             tags: vec!["dc-1".to_owned(), "hq".to_owned()],
             roles: vec!["ops.dc.senior".to_owned()],
             max_level: Level::new(2),
             not_after: ClaimedTime::new(1_900_000_000),
-            organisation_signature: Signature::new(vec![0x03]).unwrap(),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
         .unwrap();
         assert_ne!(longer.encode().unwrap(), base);
@@ -830,7 +1084,7 @@ mod tests {
             roles: vec!["r".to_owned()],
             max_level: Level::new(2),
             not_after: ClaimedTime::new(1_800_000_000),
-            organisation_signature: Signature::new(vec![0x03]).unwrap(),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
         .unwrap();
         let right = EngineerAuthorisation::new(AuthorisationFields {
@@ -841,7 +1095,7 @@ mod tests {
             roles: vec!["r".to_owned()],
             max_level: Level::new(2),
             not_after: ClaimedTime::new(1_800_000_000),
-            organisation_signature: Signature::new(vec![0x03]).unwrap(),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
         .unwrap();
         assert_ne!(left.encode().unwrap(), right.encode().unwrap());
@@ -851,7 +1105,7 @@ mod tests {
     fn a_fingerprint_of_the_wrong_width_does_not_parse() {
         let text = authorisation()
             .to_wire()
-            .replace(&hex::encode(record().key_fingerprint()), "0a0b");
+            .replace(&hex::encode(record().key_fingerprint().unwrap()), "0a0b");
         assert_eq!(
             EngineerAuthorisation::parse(&text),
             Err(EngineerError::DigestWidth {

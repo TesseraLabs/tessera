@@ -1,0 +1,54 @@
+[package]
+name = "tessera_qr_overlay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Draws the QR of a login attempt over the greeter of a graphical login."
+
+[[bin]]
+name = "tessera-qr-overlay"
+path = "src/main.rs"
+
+[dependencies]
+# The frames and the states of the conversation, and the QR itself. Nothing of
+# the protocol is written a second time here: the overlay is the side that has
+# no reason to have an opinion about it.
+tessera_core = { path = "../tessera_core", version = "0.6.0" }
+thiserror = { workspace = true }
+# The X client. Pure Rust rather than bindings to libX11: this is pre-auth code
+# on a machine anybody can walk up to, and a C library parsing a protocol on its
+# behalf is the surface this crate exists to avoid.
+x11rb = { version = "0.14", default-features = false }
+# Waiting on two descriptors at once. The overlay has to hear the module and
+# the display at the same time, and `std` has no way to wait on more than one
+# thing; `poll` behind a safe wrapper keeps `unsafe_code = "deny"` intact.
+nix = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
+panic_in_result_fn = "deny"
+let_underscore_must_use = "deny"
+let_underscore_lock = "deny"
+indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+transmute_ptr_to_ptr = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+ref_as_ptr = "warn"
+exit = "warn"
