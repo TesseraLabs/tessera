@@ -200,3 +200,70 @@ cases:
           stderr_matches: 'gost_engine_path is required'
     teardown:
       - run: helpers/config-mutate.sh restore
+
+  - id: CLI-011
+    title: Префлайт сообщает, что проверка отзыва выключена
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # Порчи нет намеренно: `mode = "none"` — это ПОСТАВОЧНОЕ значение
+    # (dist/config/config.toml.example), то есть кейс описывает состояние
+    # свежеустановленного узла, а не подстроенное. Первый шаг это состояние
+    # утверждает: если поставочный дефолт когда-нибудь сменят, кейс упадёт на
+    # проверке предпосылки, а не станет молча проверять пустоту.
+    #
+    # Ожидание взято из требования `tessera check`: команда выполняет
+    # префлайт-валидацию и выводит строки `[INFO]/[WARN]/[ERROR]` в stdout.
+    # Валидация такое предупреждение выдаёт (`validated.rs`, target
+    # `tessera.config`, «Surface this loudly so an operator who opted out
+    # cannot forget they are running without revocation»), но до отчёта
+    # `check` оно не доходит: подписчика tracing ставит только демон, а отчёт
+    # собирается из StartupCheckRecord. Оператор видит `0 error` и вводит узел
+    # в эксплуатацию с непроверяемым отзывом — отозванное удостоверение
+    # пустит. Кейс красный намеренно.
+    #
+    # Спека сегодня перечисляет шаги pipeline, но не говорит явно, что
+    # предупреждения ВАЛИДАЦИИ обязаны попадать в отчёт. Это отдельный пробел
+    # спеки, и его стоит закрыть требованием — иначе дефект чинится, а гарантия
+    # так и остаётся незаписанной.
+    steps:
+      - run: grep -A12 '^\[trust.revocation\]' /etc/tessera/config.toml
+        expect:
+          exit_code: 0
+          stdout_matches: 'mode = "none"'
+      - run: tessera check
+        expect:
+          exit_code: 0
+          stdout_matches: '\[WARN \].*revocation.*NOT checked'
+
+  - id: CLI-012
+    title: Дамп отмечает активным тот источник, который действительно выбирает демон
+    requirement: openspec/specs/cli-diagnostics/spec.md
+    requires: []
+    # Столбец active_under_current_config — не украшение: по строке `yes`
+    # CA-сторона выпускает per-host удостоверение (контракт записан в
+    # clone-image-bootstrap). Шапка самого дампа обещает, что `yes` отмечает
+    # «the source the daemon currently picks».
+    #
+    # На эталонной раскладке образа (`sources = ["override"]`) обещание не
+    # выполняется: активной не отмечена НИ ОДНА строка. Причина в коде —
+    # `dump-host-id` берёт активный источник из
+    # `HostIdentityResolver::from_validated(...).resolve()`, а эта цепочка
+    # Override не строит вовсе (`HostIdSourceKind::Override => {}` в
+    # host_identity/chain.rs). При `sources = ["override"]` цепочка пуста,
+    # resolve() падает, active_kind = None. PAM-путь при этом Override
+    # обрабатывает отдельным коротким замыканием (pam_tessera/src/lib.rs) и
+    # вход по такой конфигурации работает — что подтверждает HOST-002.
+    #
+    # Замерено на стенде: при fallback = "deny" активных строк нет ни одной;
+    # при fallback = "allow" строка override отмечается `yes` — то есть флаг
+    # зависит от политики отказа, а не от того, какой источник выбирает демон.
+    # Кейс закрепляет безопасную настройку (`deny`, она же в поставке).
+    # Красный намеренно.
+    steps:
+      - run: helpers/config-mutate.sh host-override-install
+      - run: tessera dump-host-id
+        expect:
+          exit_code: 0
+          stdout_matches: 'override\tok\t\S+\t\S+\tinstallation\tinstallation\tyes\t'
+    teardown:
+      - run: helpers/config-mutate.sh restore

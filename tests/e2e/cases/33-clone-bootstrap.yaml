@@ -1,0 +1,166 @@
+suite: clone-bootstrap
+description: Раскатка парка из клонированного образа — эталонная раскладка и однопроходный flip
+setup: [install-package, deploy-fixtures]
+
+# Эталонный образ живёт с одной и той же идентичностью на всех клонах
+# (`sources = ["override"]`), и bootstrap-удостоверение подходит к каждому.
+# Первый запуск на железе обязан атомарно перевести узел на настоящие
+# источники — и тем самым убить bootstrap-удостоверение на этом хосте.
+# Цена ошибки здесь выше обычной: недоделанный flip оставляет в парке машины,
+# на которые подходит ОДНО удостоверение, и это ровно то, от чего продукт
+# защищает.
+#
+# Скрипт flip'а приезжает в пакете как /usr/share/tessera/finish-bootstrap.sh
+# (debian/install). Кейсы зовут его оттуда, а не из рабочего дерева: проверять
+# надо то, что получил заказчик.
+
+cases:
+  - id: BOOT-001
+    title: Эталонная раскладка даёт одну и ту же идентичность на любом клоне
+    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requires: []
+    # Отпечаток закреплён числом намеренно: SHA-256("installation") не зависит
+    # ни от железа, ни от клона — в этом весь смысл эталонной раскладки. Если
+    # значение разойдётся, bootstrap-удостоверение перестанет подходить к
+    # свежеразвёрнутым машинам, и узнать об этом надо здесь, а не в парке.
+    steps:
+      - run: helpers/config-mutate.sh host-override-install
+      - run: tessera dump-host-id
+        expect:
+          exit_code: 0
+          stdout_matches: 'override\tok\t561f0a3d84e3c5cf22f379912b7513b40c4e08edd60dc8b936a407db52b9579c\t561f0a3d\tinstallation\tinstallation\t'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: BOOT-002
+    title: На узле, уже переведённом на реальные источники, flip ничего не трогает
+    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requires: []
+    # Идемпотентность здесь не удобство, а требование: скрипт гоняют из
+    # ansible по всему парку, и повторный проход по уже переведённой машине
+    # обязан быть безвредным. Конфиг сверяется побайтно — «ничего не изменил»
+    # проверяется фактом, а не отсутствием жалоб в выводе.
+    steps:
+      - run: cp /etc/tessera/config.toml /tmp/boot002-before
+      - run: /usr/share/tessera/finish-bootstrap.sh --non-interactive
+        expect:
+          exit_code: 0
+          stdout_matches: 'Nothing to do'
+      - run: cmp /etc/tessera/config.toml /tmp/boot002-before
+        expect:
+          exit_code: 0
+    teardown:
+      - run: rm -f /tmp/boot002-before
+
+  - id: BOOT-003
+    title: Некогерентная раскладка отвергается, конфиг остаётся нетронутым
+    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requires: []
+    # `sources = ["override"]` без значения — состояние, из которого нельзя
+    # вывести идентичность узла. Спека требует отказа, а не догадки: додуманное
+    # значение раскатилось бы по парку молча. Отдельно проверяется, что после
+    # отказа конфиг не полуправлен — иначе следующий запуск пошёл бы уже от
+    # испорченного состояния.
+    steps:
+      - run: helpers/config-mutate.sh host-override-novalue
+      - run: cp /etc/tessera/config.toml /tmp/boot003-before
+      - run: /usr/share/tessera/finish-bootstrap.sh --non-interactive
+        expect:
+          exit_code: 1
+          stderr_matches: 'Refusing to flip'
+      - run: cmp /etc/tessera/config.toml /tmp/boot003-before
+        expect:
+          exit_code: 0
+    teardown:
+      - run: rm -f /tmp/boot003-before
+      - run: helpers/config-mutate.sh restore
+
+  - id: BOOT-004
+    title: Flip переводит узел на реальные источники и меняет его идентичность
+    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requires: []
+    # Главный кейс сюиты: та самая атомарная инвалидация. После перевода
+    # идентичность узла обязана перестать быть «installation» — именно этим
+    # bootstrap-удостоверение и убивается на данном хосте. Проверяются все три
+    # наблюдаемых следствия: снят backup, обе замены в конфиге сделаны,
+    # идентичность сменилась.
+    #
+    # Демон здесь рестартится по-настоящему (шаг 4 требования), поэтому
+    # teardown его ОСТАНАВЛИВАЕТ: профиль astra-vm не одноразовый, а
+    # оставленная активной служба валит INST-003 следующего прогона.
+    steps:
+      - run: helpers/config-mutate.sh host-override-install
+      - run: /usr/share/tessera/finish-bootstrap.sh --non-interactive --no-dump
+        expect:
+          exit_code: 0
+          stdout_matches: 'bootstrap flip complete'
+        timeout: 90
+      - run: grep '^sources' /etc/tessera/config.toml
+        expect:
+          exit_code: 0
+          stdout_matches: 'sources = \["dmi_board_serial", "machine_id"\]'
+      - run: grep '^# override' /etc/tessera/config.toml
+        expect:
+          exit_code: 0
+      - run: ls /etc/tessera/config.toml.bak.*
+        expect:
+          exit_code: 0
+      - run: tessera dump-host-id
+        expect:
+          exit_code: 0
+          stdout_matches: 'dmi_board_serial\tok\t\S+\t\S+\t\S*\t\S*\tyes\t'
+    teardown:
+      - run: systemctl stop tessera.service
+      - run: rm -f /etc/tessera/config.toml.bak.*
+      - run: helpers/config-mutate.sh restore
+
+  - id: BOOT-005
+    title: Провал проверки конфигурации откатывает flip и не трогает демон
+    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requires: []
+    # Fail-closed на шаге 3. Несуществующий источник задаётся через `--sources`
+    # — так порча приходит ровно оттуда, откуда её принёс бы оператор, а не
+    # подкладывается в конфиг мимо скрипта. Проверяется не только код возврата,
+    # но и то, что конфиг вернулся к bootstrap-раскладке: недооткаченный
+    # конфиг оставил бы узел без работающей идентичности вообще.
+    steps:
+      - run: helpers/config-mutate.sh host-override-install
+      - run: /usr/share/tessera/finish-bootstrap.sh --non-interactive --no-dump --sources nonexistent_source
+        expect:
+          exit_code: 1
+          stderr_matches: 'Daemon NOT restarted'
+        timeout: 90
+      - run: grep '^sources' /etc/tessera/config.toml
+        expect:
+          exit_code: 0
+          stdout_matches: 'sources = \["override"\]'
+    teardown:
+      - run: rm -f /etc/tessera/config.toml.bak.*
+      - run: helpers/config-mutate.sh restore
+
+  - id: BOOT-006
+    title: Без USB-носителя дамп идентичности сохраняется на диск, а не теряется
+    requirement: openspec/specs/clone-image-bootstrap/spec.md
+    requires: []
+    # TSV-дамп — единственное, что связывает устройство с CA: по строке
+    # активного источника выпускается per-host удостоверение. Если USB нет,
+    # дамп обязан лечь на диск, а не пропасть — иначе оператор уносит от
+    # машины пустые руки и узнаёт об этом уже у стойки CA.
+    #
+    # Шаг заведомо долгий: скрипт опрашивает USB 60 секунд, прежде чем уйти в
+    # запасной путь. Это поведение требования, а не медлительность стенда.
+    steps:
+      - run: helpers/config-mutate.sh host-override-install
+      - run: /usr/share/tessera/finish-bootstrap.sh --non-interactive --no-restart
+        expect:
+          exit_code: 0
+          stdout_matches: 'No USB stick after 60s; falling back to local file'
+        timeout: 180
+      - run: cat /var/lib/tessera/host-ids-*.tsv
+        expect:
+          exit_code: 0
+          stdout_matches: 'active_under_current_config'
+    teardown:
+      - run: rm -f /var/lib/tessera/host-ids-*.tsv
+      - run: rm -f /etc/tessera/config.toml.bak.*
+      - run: helpers/config-mutate.sh restore

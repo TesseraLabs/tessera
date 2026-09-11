@@ -1,0 +1,23 @@
+# Role-store fixture — Service Engineer (serv), Astra.
+#
+# Отличается от ../store/serv.toml только осью ОС: payload среза astra несёт
+# `mac_mask` (метку МКЦ) и не имеет права нести `groups`/`sudo_role` — схемы
+# payload'а для linux и astra не пересекаются, а база — всегда одна ОС.
+#
+# Нужен кейсам mac-integrity: на открытой сборке enforcement-адаптер
+# отсутствует, и срез с `mac_mask` обязан закрывать сессию, а не открывать её
+# без обещанной метки. Устройство считается astra, когда в конфиге задан
+# `[mac].backend = "parsec"` (см. config-mutate.sh, операция mac-backend).
+
+role = "serv"
+version = 1
+os = "astra"
+name = "Service Engineer"
+level = 5
+description = "Service engineer with an МКЦ integrity mask."
+
+[payload]
+mac_mask = "0x3f"          # МКЦ-маска; на открытой сборке разбирается, но не применяется
+
+[session]
+max_ttl_seconds = 14400    # 4h
