@@ -77,6 +77,8 @@ config-mutate.sh <операция>
   host-override-clean  идентичность узла из override, значение уже нормализованное
   host-first-wins      первым источником — команда с чужим значением
   host-all-fail        единственный источник ничего не возвращает
+  host-override-install  эталонная раскладка образа: override = "installation"
+  host-override-novalue  sources = ["override"] без значения override
 
   hook-session-open    хук стадии открытия сессии, создающий файл-отметку
   hook-relative-command хук с неабсолютным command[0]
@@ -91,6 +93,14 @@ config-mutate.sh <операция>
   gost-engine-real     ГОСТ разрешён, путь ведёт на настоящий gost-engine
   gost-pkcs11-openssl  mode = "pkcs11" вместе с crypto_backend = "openssl"
   gost-without-path    ГОСТ разрешён, gost_engine_path отсутствует
+
+  mac-required         [mac].runtime = "required" без backend
+  mac-cert-required    [mac].cert_integrity = "required" без backend
+  mac-backend          [mac].backend = "parsec" (плагина на открытой сборке нет)
+
+  greeter-on           баннер включён, цель — поставочная (по умолчанию)
+  greeter-on-writable  баннер включён, цель — в каталоге состояния демона
+  greeter-on-nowhere   баннер включён, цель — в несуществующем каталоге
 
   restore              вернуть исходный конфиг
 EOF
@@ -260,6 +270,14 @@ custom_command = "/usr/bin/hostname"' ;;
     host-all-fail)       replace_host_identity 'sources = ["custom_command"]
 custom_command = "/usr/bin/true"
 fallback = "deny"' ;;
+    # Эталонная раскладка образа: одно и то же значение на всех клонах.
+    # `installation` — сырая UTF8String из спеки clone-image-bootstrap, без
+    # префикса sha256:.
+    host-override-install) replace_host_identity 'sources = ["override"]
+override = "installation"' ;;
+    # Раскладка, объявленная спекой некогерентной: источник назван, значения
+    # нет. Скрипт flip'а обязан на ней отказать, а не додумать значение.
+    host-override-novalue) replace_host_identity 'sources = ["override"]' ;;
     # Хуки. Отметка создаётся в /tmp: кейс наблюдает факт запуска хука, а не
     # его содержимое, и не трогает состояние продукта.
     hook-session-open)  append_section '[[hooks]]
@@ -277,6 +295,52 @@ on_failure = "warn"' ;;
     # тот же формат, что печатает lsusb.
     usb-allow-foreign)  insert_top_level 'usb_allowed_devices = ["ffff:ffff"]' ;;
     usb-allow-actual)   insert_top_level 'usb_allowed_devices = ["0951:1666"]' ;;
+
+    # МКЦ. Открытая сборка не несёт enforcement-адаптера, поэтому каждая
+    # операция задаёт ровно ту политику, отказ по которой проверяет кейс.
+    #
+    # `required`-политики без `backend` обязаны отвергаться валидацией: без
+    # названного адаптера требование «применять метки» выполнить нечем, и
+    # принять такой конфиг значило бы обещать enforcement, которого нет.
+    mac-required)       append_section '[mac]
+runtime = "required"' ;;
+    mac-cert-required)  append_section '[mac]
+cert_integrity = "required"' ;;
+
+    # Адаптер назван, но на открытой сборке его файла нет — политика остаётся
+    # `auto`, поэтому конфиг валиден, а рантайм откатывается на заглушку.
+    # Этой же настройкой устройство объявляется astra (см. entry.rs): без неё
+    # срезы ролей с `mac_mask` отвергаются как чужие по ОС.
+    mac-backend)        append_section '[mac]
+backend = "parsec"' ;;
+
+    # Баннер host_id на экране входа. Секция дописывается в конец: у неё нет
+    # соседей, порядок относительно других секций значения не имеет.
+    #
+    # `greeter-on` НЕ задаёт wallpaper_target намеренно — проверяется путь,
+    # которым пойдёт оператор по документации: включить один ключ и получить
+    # рабочий баннер на поставочной цели.
+    greeter-on)         append_section '[fly_dm_greeter]
+update_wallpaper = true' ;;
+
+    # Цель в каталоге состояния демона: он и так в ReadWritePaths юнита и
+    # принадлежит демону, поэтому песочница и владелец каталога заведомо не
+    # мешают. Нужно, чтобы отделить вопрос «сохраняются ли права цели» от
+    # вопроса «может ли демон вообще писать в поставочную цель».
+    greeter-on-writable)
+        append_section '[fly_dm_greeter]
+update_wallpaper = true
+wallpaper_target = "/var/lib/tessera/daemon/e2e-wallpaper.jpg"'
+        ;;
+
+    # Заведомо недостижимая цель: проверяется, что отказ writer'а не роняет
+    # ни старт демона, ни вход. Каталога нет и не будет — ошибка гарантирована
+    # и не зависит ни от прав, ни от песочницы.
+    greeter-on-nowhere)
+        append_section '[fly_dm_greeter]
+update_wallpaper = true
+wallpaper_target = "/nonexistent/e2e/wallpaper.jpg"'
+        ;;
 
     # ГОСТ. Базовый конфиг прогона идёт с пустым allow-list и без пути к
     # движку, поэтому каждая операция добавляет ровно то, что проверяет кейс.

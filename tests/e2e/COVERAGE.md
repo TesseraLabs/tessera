@@ -15,9 +15,9 @@
 |---|---|
 | Спек в `openspec/specs/` | 32 |
 | Сценариев в них | 338 |
-| Кейсов в реестре | 127 |
-| Спек, к которым привязан хотя бы один кейс | 26 |
-| Спек без единого кейса | 6 |
+| Кейсов в реестре | 145 |
+| Спек, к которым привязан хотя бы один кейс | 29 |
+| Спек без единого кейса | 3 |
 
 ## Спеки, к которым привязаны кейсы
 
@@ -25,13 +25,16 @@
 |---|---:|---:|
 | configuration | 19 | 13 |
 | device-enrollment | 5 | 13 |
-| cli-diagnostics | 3 | 9 |
+| cli-diagnostics | 3 | 11 |
 | revocation | 19 | 6 |
 | cert-authentication-flow | 15 | 6 |
+| clone-image-bootstrap | 5 | 6 |
+| fly-dm-greeter | 4 | 6 |
 | trust-chain-validation | 14 | 5 |
 | issuer-signing | 15 | 4 |
 | pam-module-runtime | 9 | 4 |
 | device-tags | 6 | 4 |
+| mac-integrity | 6 | 4 |
 | role-selection | 19 | 3 |
 | cert-issuance | 16 | 3 |
 | logging-audit | 14 | 3 |
@@ -57,9 +60,6 @@
 | token-pkcs11 | 26 |
 | windows-privileged-path | 10 |
 | windows-removable-media | 8 |
-| mac-integrity | 6 |
-| clone-image-bootstrap | 5 |
-| fly-dm-greeter | 4 |
 
 ## Спеки, ещё не синкнутые из предложений
 

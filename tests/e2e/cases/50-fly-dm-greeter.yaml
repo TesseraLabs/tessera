@@ -1,0 +1,187 @@
+suite: fly-dm-greeter
+description: Баннер host_id на экране входа — впечатывание в обои
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Единственная поверхность, на которой продукт может показать host_id оператору
+# на экране входа fly-dm: тема `fly-modern` держит в headline захардкоженный
+# MAC-статус, а `PAM_TEXT_INFO` fly-dm не показывает вовсе (спека, требование
+# «Контекст платформы»). Отсюда и механизм — текст впечатывается в JPG-фон,
+# на который смотрит `settings.ini`.
+#
+# Writer работает на старте демона, поэтому каждый кейс здесь перезапускает
+# службу и смотрит журнал юнита: другого наблюдаемого следа у него нет.
+#
+# `graphics` объявляется там, где кейс опирается на ПОСТАВОЧНУЮ цель
+# (`/usr/share/wallpapers/fly-default-light.jpg`): без fly-dm этого файла на
+# машине нет, и кейс проверял бы не продукт, а комплектность образа. Кейсы со
+# своей целью в `graphics` не нуждаются и объявляют только `service-manager`.
+
+cases:
+  - id: GREET-001
+    title: Выключенный по умолчанию баннер не трогает файловую систему
+    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requires: [service-manager]
+    # `update_wallpaper` по умолчанию false, и это не просто «ничего не
+    # рисуем»: writer обязан не делать никакого файлового ввода-вывода вообще.
+    # Продукт, который «на всякий случай» снимает backup при выключенной
+    # функции, уже изменил чужой файл — на боевом терминале это чужие обои.
+    #
+    # Проверяется отсутствием следа на диске, а не строкой в журнале:
+    # `expect_journal` смотрит назад на 10 минут, и запись о выключенном
+    # writer'е повторяется при каждом перезапуске службы, поэтому такая
+    # проверка зеленела бы и от чужого следа в окне.
+    steps:
+      - run: rm -f /var/lib/tessera/daemon/wallpaper.orig.jpg
+      - run: systemctl restart tessera.service && sleep 2
+      - expect_file:
+          path: /var/lib/tessera/daemon/wallpaper.orig.jpg
+          exists: false
+    teardown:
+      - run: systemctl stop tessera.service
+
+  - id: GREET-002
+    title: Первый запуск снимает разовую резервную копию обоев
+    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requires: [service-manager, graphics]
+    # Оригинал обоев должен пережить включение функции: рендер идёт поверх
+    # цели, и без копии вернуть исходный фон было бы нечем. Копия снимается
+    # один раз — она и есть источник для всех последующих рендеров.
+    steps:
+      - run: rm -f /var/lib/tessera/daemon/wallpaper.orig.jpg
+      - run: helpers/config-mutate.sh greeter-on
+      - run: systemctl restart tessera.service && sleep 2
+      - expect_file:
+          path: /var/lib/tessera/daemon/wallpaper.orig.jpg
+          exists: true
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: systemctl stop tessera.service
+
+  - id: GREET-003
+    title: Повторный запуск не перезаписывает резервную копию
+    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requires: [service-manager, graphics]
+    # Идемпотентность здесь — не про аккуратность, а про сохранность
+    # оригинала. Если бы копия переснималась на каждом старте, то второй
+    # запуск сохранил бы поверх оригинала уже отрендеренный фон с баннером,
+    # и исходные обои были бы потеряны безвозвратно.
+    #
+    # Цель берётся своя, в каталоге состояния демона: «копия не переснята»
+    # наблюдаемо только через `backed_up: false` в исходе УСПЕШНОЙ записи, а
+    # на поставочной цели запись не проходит вовсе (см. GREET-005). На
+    # поставочной цели этот кейс проверял бы не идемпотентность, а тот же
+    # отказ записи, что и GREET-005.
+    steps:
+      - run: rm -f /var/lib/tessera/daemon/wallpaper.orig.jpg
+      - run: install -m 0644 /usr/share/wallpapers/fly-default-light.jpg
+               /var/lib/tessera/daemon/e2e-wallpaper.jpg
+      - run: helpers/config-mutate.sh greeter-on-writable
+      - run: systemctl restart tessera.service && sleep 2
+      - run: systemctl restart tessera.service && sleep 2
+      # Копия обязана остаться нетронутым оригиналом. Если бы её пересняли
+      # после первого рендера, в ней лежал бы уже фон с баннером и она
+      # перестала бы совпадать с исходным файлом.
+      - run: cmp -s /var/lib/tessera/daemon/wallpaper.orig.jpg
+               /usr/share/wallpapers/fly-default-light.jpg
+        expect: { exit_code: 0 }
+    teardown:
+      - run: rm -f /var/lib/tessera/daemon/e2e-wallpaper.jpg
+      - run: helpers/config-mutate.sh restore
+      - run: systemctl stop tessera.service
+
+  - id: GREET-004
+    title: Отказ отрисовки не мешает ни старту демона, ни входу
+    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requires: [service-manager, usb]
+    # Баннер — украшение экрана входа, а не часть проверки удостоверения.
+    # Единственный режим отказа, допустимый для него, — запись в журнал:
+    # инженер с валидным удостоверением обязан войти на устройство, где
+    # обои не отрисовались.
+    #
+    # Недостижимая цель выбрана намеренно: ошибка не зависит ни от прав, ни
+    # от песочницы юнита, поэтому кейс проверяет обработку отказа, а не его
+    # конкретную причину.
+    steps:
+      - run: helpers/config-mutate.sh greeter-on-nowhere
+      - run: systemctl restart tessera.service && sleep 2
+      # Путь цели входит в текст ошибки и уникален для этого кейса — иначе
+      # проверка ловила бы отказ соседнего кейса из десятиминутного окна
+      # `expect_journal`.
+      - expect_journal:
+          unit: tessera
+          matches: 'wallpaper update failed \(continuing\).*/nonexistent/e2e'
+      - run: systemctl is-active tessera.service
+        expect: { exit_code: 0, stdout_matches: '^active$' }
+      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
+      - run: helpers/pam-drive certauth {{user}} authenticate
+        stdin: "123456"
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: helpers/config-mutate.sh restore
+      - run: systemctl stop tessera.service
+
+  - id: GREET-005
+    title: Включения одного ключа достаточно, чтобы баннер появился на поставочных обоях
+    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requires: [service-manager, graphics]
+    # Путь оператора из документации: включить `update_wallpaper` и получить
+    # рабочий баннер. `wallpaper_target` намеренно не задаётся — проверяется
+    # ровно поставочное значение по умолчанию, оно же пример в
+    # docs/ru/fly-dm-greeter.md.
+    #
+    # Кейс красный: демон работает под непривилегированным `tessera` и в
+    # песочнице юнита (`ProtectSystem=strict`, `ReadWritePaths` без каталога
+    # обоев), поэтому запись в поставочную цель невозможна — ни drop-in'а,
+    # ни упоминания в документации к функции нет. Ожидание описывает
+    # обещанное поведение, а не наблюдаемое.
+    #
+    # Результат проверяется файлом, а не журналом. `expect_journal` смотрит
+    # назад на 10 минут (умолчание раннера), и строка об успешной записи
+    # ничем не привязана к цели — соседний кейс со своей, доступной на запись
+    # целью оставляет в окне такую же запись, и проверка зеленеет от чужого
+    # следа. Сравнение с резервной копией привязано именно к этой цели:
+    # копия — нетронутый оригинал, поэтому отличие от неё и означает, что
+    # баннер лёг на поставочные обои.
+    steps:
+      - run: rm -f /var/lib/tessera/daemon/wallpaper.orig.jpg
+      - run: helpers/config-mutate.sh greeter-on
+      - run: systemctl restart tessera.service && sleep 2
+      - run: cmp -s /usr/share/wallpapers/fly-default-light.jpg
+               /var/lib/tessera/daemon/wallpaper.orig.jpg
+        expect: { exit_code: 1 }
+    teardown:
+      - run: helpers/config-mutate.sh restore
+      - run: systemctl stop tessera.service
+
+  - id: GREET-006
+    title: Отрисовка сохраняет права обоев и не прячет их от экрана входа
+    requirement: openspec/specs/fly-dm-greeter/spec.md
+    requires: [service-manager, graphics]
+    # Обои читает greeter, а он работает под своей учётной записью (`fly-dm`),
+    # не под `tessera`. Замена файла обязана сохранить права цели: иначе
+    # отрисованный баннер существует, но экран входа его не видит — отказ,
+    # который ничем себя не проявляет.
+    #
+    # Цель берётся в каталоге состояния демона, чтобы отделить этот вопрос от
+    # GREET-005: песочница и владелец каталога здесь заведомо не мешают, и
+    # красным кейс останется только из-за прав самого файла.
+    #
+    # Эталон 0644 — режим поставочных обоев Astra, то есть то, что здесь и
+    # заменяется в боевом сценарии. Оттуда же берётся исходный JPEG: писателю
+    # нужен разбираемый файл-источник, а не пустышка, — поэтому `graphics`
+    # объявлен, хотя сама цель кейса лежит вне владений fly-dm.
+    steps:
+      - run: rm -f /var/lib/tessera/daemon/wallpaper.orig.jpg
+      - run: install -m 0644 /usr/share/wallpapers/fly-default-light.jpg
+               /var/lib/tessera/daemon/e2e-wallpaper.jpg
+      - run: helpers/config-mutate.sh greeter-on-writable
+      - run: systemctl restart tessera.service && sleep 2
+      - expect_file:
+          path: /var/lib/tessera/daemon/e2e-wallpaper.jpg
+          mode: "0644"
+    teardown:
+      - run: rm -f /var/lib/tessera/daemon/e2e-wallpaper.jpg
+      - run: helpers/config-mutate.sh restore
+      - run: systemctl stop tessera.service

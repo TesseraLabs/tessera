@@ -1,0 +1,108 @@
+suite: mac-integrity
+description: МКЦ — политика и гейты открытой сборки
+setup: [build-pam-drive, install-package, deploy-fixtures]
+
+# Открытая сборка НЕ несёт применения меток к ядру: адаптер (parsec FFI) —
+# коммерческая поставка, и без него активен `StubBackend`. Проверяется здесь
+# ровно то, что открыто: политика, гейты и аудит. Само применение метки
+# проверить на этой сборке нечем, и подменять его заглушкой нельзя — кейс
+# зеленел бы там, где enforcement'а нет.
+#
+# Отсюда же граница ответственности suite: «метка легла на сессию» тут не
+# проверяется вовсе, а «роль, требующая метку, не пускает без адаптера» —
+# проверяется обязательно, потому что это отказ, а не применение.
+
+cases:
+  - id: MAC-001
+    title: Требование применять метки без названного адаптера отвергается
+    requirement: openspec/specs/mac-integrity/spec.md
+    requires: []
+    # `runtime = "required"` — обещание enforcement'а. Без `backend` выполнить
+    # его нечем, и принять такой конфиг значило бы выдать заглушку за
+    # применение меток. Отказ обязан наступить при разборе конфигурации, до
+    # первого входа.
+    steps:
+      - run: helpers/config-mutate.sh mac-required
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'required MAC policy requires \[mac\]\.backend'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: MAC-002
+    title: Требование метки в удостоверении без адаптера отвергается так же
+    requirement: openspec/specs/mac-integrity/spec.md
+    requires: []
+    # Вторая половина той же гарантии: `cert_integrity = "required"` — тоже
+    # обещание enforcement'а, и оно обязано отвергаться по тому же правилу.
+    # Проверяется отдельным кейсом, потому что это отдельный ключ: закрытый
+    # гейт на одном из них ничего не говорит о втором.
+    steps:
+      - run: helpers/config-mutate.sh mac-cert-required
+      - run: tessera check
+        expect:
+          exit_code: 1
+          stderr_matches: 'required MAC policy requires \[mac\]\.backend'
+    teardown:
+      - run: helpers/config-mutate.sh restore
+
+  - id: MAC-003
+    title: Роль, требующая метку целостности, не открывает сессию без адаптера
+    requirement: openspec/specs/mac-integrity/spec.md
+    requires: [service-manager, usb]
+    # Ключевой отказ всей открытой сборки. Роль заявляет `mac_mask`, то есть
+    # обещает инженеру ограничение целостности; применить его нечем. Открыть
+    # сессию «как есть» значило бы выдать роль без обещанного ограничения —
+    # ровно то молчаливое сужение прав, которое инварианты запрещают.
+    #
+    # Фазы гоняются одной командой намеренно: гейт живёт в открытии сессии, а
+    # не в аутентификации. Проверка только `authenticate` вернула бы
+    # PAM_SUCCESS и выглядела бы зелёной, ничего не проверив.
+    steps:
+      - run: helpers/config-mutate.sh mac-backend
+      - run: install -m 0644 -o root -g root {{roles}}/store-astra/serv.toml
+               /var/lib/tessera/roles/serv.toml
+      - run: systemctl restart tessera.service && sleep 2
+      - run: helpers/usb-loop.sh attach {{roles}}/accounts/acct-serv.p12
+      - run: helpers/pam-drive certauth {{user}} authenticate acct_mgmt open_session
+        stdin: "123456"
+        expect:
+          exit_code: 7
+          stdout_matches: 'open_session: PAM_AUTH_ERR \(7\)'
+        timeout: 60
+      # Отказ обязан быть назван в аудите: без записи о причине оператор видит
+      # только «сессия не открылась» и ищет проблему во входе, а не в том, что
+      # на устройстве нет адаптера для заявленной ролью метки.
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'F_event="mac_runtime_required"'
+    teardown:
+      - run: helpers/usb-loop.sh detach
+      - run: helpers/config-mutate.sh restore
+      - run: helpers/setup/deploy-fixtures.sh
+      - run: systemctl stop tessera.service
+
+  - id: MAC-004
+    title: Префлайт называет действительную причину, по которой метки не применяются
+    requirement: openspec/specs/mac-integrity/spec.md
+    requires: [mac, service-manager]
+    # Кейс красный. На хосте с активным МКЦ ядра (`parsec.strict_mode=1`,
+    # `max_ilev=63`, сессии несут метку целостности) префлайт сообщает
+    # «kernel parsec absent (parsec.mac=0?)». Оба утверждения для такого
+    # хоста ложны, а подсказка ведёт на чужую ось: `parsec.mac` включает МРД
+    # (конфиденциальность), тогда как продукт работает с МКЦ (целостность) и
+    # системы с активным МРД прямо объявляет неподдерживаемыми. Оператор,
+    # последовавший подсказке, уводит стенд в неподдерживаемую конфигурацию,
+    # а настоящая причина — отсутствие enforcement-адаптера — лечится совсем
+    # иначе.
+    #
+    # Ожидаемая формулировка не выдумана: ровно её продукт печатает в рантайме
+    # для этого же состояния — `selected enforcement plugin is not active`
+    # (событие `mac_runtime_fallback` в фазе сессии). Расходится только
+    # префлайт.
+    steps:
+      - run: tessera check
+        expect:
+          exit_code: 0
+          stdout_matches: 'enforcement plugin is not active'
