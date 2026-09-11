@@ -1,8 +1,9 @@
 //! Детерминированный комплект фикстур серверного стенда.
 //!
-//! Пять документов, которых стенду не хватало, чтобы пройти путь целиком:
-//! сертификат организации с потолком делегирования, её список отзыва,
-//! запись реестра инженера, его авторизация и подписанный список отзыва прав.
+//! Документы, которых стенду не хватало, чтобы пройти путь целиком: сертификат
+//! организации с потолком делегирования, её список отзыва, запись реестра
+//! инженера, его авторизация, подписанный список отзыва прав и запись
+//! устройства под якорями этого комплекта.
 //!
 //! # Почему отдельный комплект, а не тот, что собирает `codes-fixtures`
 //!
@@ -34,6 +35,7 @@ use tessera_codes_contract::canon::Level;
 use tessera_codes_contract::engineer::{
     AuthenticatorKey, AuthorisationFields, EngineerAuthorisation, EngineerRecord,
 };
+use tessera_codes_contract::registry::{DeviceRecord, RecordFields};
 use tessera_codes_contract::revocation::{
     RevocationList, RevocationListFields, SignedRevocationList,
 };
@@ -43,6 +45,7 @@ use tessera_codes_contract::ticket::{
 };
 use tessera_codes_contract::time::ClaimedTime;
 use tessera_ext::delegation::DelegationConstraints;
+use tessera_issuer::codes::trust::{AnchorKey, Anchors};
 use tessera_issuer::crl::{issue_crl, CrlRequest};
 use tessera_issuer::journal::Journal;
 use tessera_issuer::sign::{KeyId, SignatureAlgorithm};
@@ -57,6 +60,13 @@ const ROOT_SEED: [u8; 32] = [0x11; 32];
 const AUTHORISATION_SEED: [u8; 32] = [0x22; 32];
 /// Зерно ключа организации-подрядчика.
 const ORGANISATION_SEED: [u8; 32] = [0x33; 32];
+/// Зерно ключа владельца реестра, который заверяет записи устройств.
+///
+/// Владелец — отдельная сторона, а не вторая роль организации: подпись
+/// организации накрывает тело записи, подпись владельца — ещё и подпись
+/// организации. Переподписать одну, оставив другую, нельзя, поэтому стендовая
+/// запись несёт обе свои, и владелец здесь свой.
+const OWNER_SEED: [u8; 32] = [0x77; 32];
 
 /// Зерно ключа удостоверяющей стороны билетов.
 const TICKET_AUTHORITY_SEED: [u8; 32] = [0x44; 32];
@@ -108,8 +118,15 @@ const PAGE_URL: &str = "https://codes.fleet.example/e";
 const NOT_BEFORE: u64 = 1_577_836_800;
 /// Момент, до которого они действительны.
 const NOT_AFTER: u64 = 1_924_905_600;
-/// Потолок TTL сессии в рамках делегирования.
-const MAX_TTL_SECS: u64 = 3_600;
+/// Предельный ОСТАВШИЙСЯ срок авторизации инженера в рамках делегирования.
+///
+/// codes-core читает это поле именно так (`authorisation_envelope`:
+/// `not_after − now`), а не как TTL одной сессии. Авторизация комплекта
+/// действует до `NOT_AFTER`, поэтому потолок взят равным всему окну
+/// сертификатов: при любом `now` внутри окна оставшийся срок в него укладывается
+/// по построению. Меньшее значение отвергало бы авторизацию комплекта ступенью
+/// `organisation_ceiling` — и тем ближе к началу окна, чем оно меньше.
+const MAX_TTL_SECS: u64 = NOT_AFTER - NOT_BEFORE;
 /// Версия профиля расширений.
 const PROFILE_VERSION: u32 = 1;
 
@@ -132,6 +149,13 @@ mod names {
     /// Открытая половина ключа авторизаций — якорь для проверки авторизаций и
     /// списка отзыва прав.
     pub const AUTHORISATION_ANCHOR: &str = "authorisation-key.pub.pem";
+    /// Якорь владельца реестра — им проверяется подпись владельца в записи
+    /// устройства.
+    pub const OWNER_ANCHOR: &str = "owner-key.pub.pem";
+    /// Запись устройства, переподписанная организацией и владельцем комплекта.
+    ///
+    /// Имя то же, что у исходной записи: стенду подменяется файл, а не формат.
+    pub const DEVICE_RECORD: &str = "device-record.txt";
     /// Запись реестра инженера.
     pub const ENGINEER_RECORD: &str = "engineer-record.txt";
     /// Авторизация инженера.
@@ -161,12 +185,57 @@ mod names {
 ///
 /// # Errors
 ///
-/// Не собирается документ, не подписывается сертификат, не пишется файл.
+/// Не читается или не разбирается исходная запись устройства, не собирается
+/// документ, не подписывается сертификат, не пишется файл.
 pub fn codes_stand_fixtures(args: &CodesStandFixturesArgs) -> Result<i32> {
-    let bundle = build()?;
+    let source_path = source_record_path(args)?;
+    let source = read_source_record(&source_path)?;
+    let bundle = build(&source)?;
     publish(&args.out, &bundle)?;
     println!("комплект стенда: {}", args.out.display());
+    println!("запись устройства взята из {}", source_path.display());
     Ok(0)
+}
+
+/// Путь к записи устройства, от которой берётся стендовая.
+///
+/// Умолчание — каталог уровнем выше `--out`: стендовый комплект лежит
+/// подкаталогом устройственного, и держать один и тот же путь дважды (в
+/// раннере и в команде) значит дать им разъехаться.
+fn source_record_path(args: &CodesStandFixturesArgs) -> Result<PathBuf> {
+    if let Some(path) = args.device_record.clone() {
+        return Ok(path);
+    }
+    let parent = args.out.parent().with_context(|| {
+        format!(
+            "у каталога {} нет родителя — укажите запись устройства явно, \
+             --device-record <путь>",
+            args.out.display()
+        )
+    })?;
+    // Родитель относительного пути из одного сегмента пуст, и это не отсутствие
+    // родителя, а текущий каталог: `--out stand` из каталога фикстур ищет
+    // соседа `./device-record.txt`.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    Ok(parent.join(names::DEVICE_RECORD))
+}
+
+/// Читает исходную запись устройства.
+fn read_source_record(path: &Path) -> Result<DeviceRecord> {
+    let text = fs::read_to_string(path).with_context(|| {
+        format!(
+            "чтение записи устройства {} — комплект переподписывает её, \
+             своей записи он не сочиняет",
+            path.display()
+        )
+    })?;
+    DeviceRecord::parse(text.trim())
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .with_context(|| format!("разбор записи устройства {}", path.display()))
 }
 
 /// Ключ комплекта: детерминированная пара и подписи ею.
@@ -250,10 +319,12 @@ struct Bundle {
 }
 
 /// Собирает все документы комплекта.
-fn build() -> Result<Bundle> {
+fn build(source_record: &DeviceRecord) -> Result<Bundle> {
     let root = StandKey::from_seed(&ROOT_SEED)?;
     let authorisation = StandKey::from_seed(&AUTHORISATION_SEED)?;
     let organisation = StandKey::from_seed(&ORGANISATION_SEED)?;
+    let owner = StandKey::from_seed(&OWNER_SEED)?;
+    let device_record = device_record(source_record, &organisation, &owner)?;
 
     let Certificates {
         root: root_cert,
@@ -321,15 +392,123 @@ fn build() -> Result<Bundle> {
                 )
                 .into_bytes(),
             ),
+            (
+                names::OWNER_ANCHOR,
+                fixture_pem(
+                    "Якорь владельца реестра выдуманного парка",
+                    owner.spki_pem()?.as_bytes(),
+                )
+                .into_bytes(),
+            ),
+            (names::DEVICE_RECORD, line(&device_record.to_wire())),
             (names::ENGINEER_RECORD, line(&record.to_wire())),
             (
                 names::ENGINEER_AUTHORISATION,
                 line(&authorisation_doc.to_wire()),
             ),
             (names::RIGHTS_REVOCATIONS, line(&rights.to_wire())),
-            (names::README, readme(&engineer_id).into_bytes()),
+            (
+                names::README,
+                readme(&engineer_id, device_record.owner_id()).into_bytes(),
+            ),
         ],
     })
+}
+
+/// Та же запись устройства, переподписанная ключами комплекта.
+///
+/// Тело записи берётся у исходной побайтно: номер, ключ, эпоха, серийники и
+/// всё остальное. Меняются только подписи сторон, потому что стенд проверяет
+/// их своими якорями, а приватных половин устройственного комплекта нет ни у
+/// кого — ключи там случайные и не сохраняются.
+///
+/// Подменить подписи безопасно ровно потому, что за пределами реестра байты
+/// записи ни во что не входят: устройство свою запись подписью организации не
+/// проверяет, а в контекст вывода кода идут номер устройства и хеш билета.
+/// Доказательство владения остаётся исходным — оно сделано ключом устройства
+/// над телом, а тело не тронуто.
+///
+/// Подписи ставятся по шагам: подпись организации накрывает тело и
+/// доказательство владения, подпись владельца — ещё и подпись организации.
+fn device_record(
+    source: &DeviceRecord,
+    organisation: &StandKey,
+    owner: &StandKey,
+) -> Result<DeviceRecord> {
+    // Организацию комплект не переписывает, а наследует: запись чужой
+    // организации переподписалась бы здесь молча, а стенд отверг бы её по CN
+    // сертификата — и причина была бы уже не видна.
+    anyhow::ensure!(
+        source.organisation_id() == ORGANISATION_ID,
+        "запись устройства принадлежит организации `{}`, а комплект подписывает \
+         от имени `{ORGANISATION_ID}` — стенд знает только её сертификат",
+        source.organisation_id()
+    );
+
+    let placeholder =
+        Signature::new(vec![0x00]).map_err(|error| anyhow::anyhow!("подпись пуста: {error}"))?;
+    let assemble = |organisation_signature: Signature, owner_signature: Signature| {
+        DeviceRecord::new(RecordFields {
+            payload: source.payload().clone(),
+            organisation_id: source.organisation_id(),
+            owner_id: source.owner_id(),
+            possession_signature: source.possession_signature().clone(),
+            organisation_signature,
+            owner_signature,
+        })
+        .map_err(|error| anyhow::anyhow!("сборка записи устройства: {error}"))
+    };
+
+    let draft = assemble(placeholder.clone(), placeholder.clone())?;
+    let organisation_signature = organisation.sign(
+        &draft
+            .organisation_message()
+            .context("сообщение подписи организации")?,
+    )?;
+
+    let with_organisation = assemble(organisation_signature.clone(), placeholder)?;
+    let owner_signature = owner.sign(
+        &with_organisation
+            .owner_message()
+            .context("сообщение подписи владельца")?,
+    )?;
+
+    let record = assemble(organisation_signature, owner_signature)?;
+    check_record(&record, organisation, owner)?;
+    Ok(record)
+}
+
+/// Читает запись обратно из её же проводной формы и проверяет все три подписи.
+///
+/// Запись с несходящейся подписью выглядит на диске как настоящая, а стенд
+/// отвергает её на шаге, где причина уже не видна. Проверка идёт через разбор
+/// проводной формы, потому что стенд получит именно её, а не собранный здесь
+/// объект.
+/// Якоря собираются продуктовым `Anchors` — тем же, которым запись проверяет
+/// codes-core. Своя проверка рядом с продуктовой ошибалась бы независимо от
+/// неё, и комплект зеленел бы там, где стенд отказывает.
+fn check_record(record: &DeviceRecord, organisation: &StandKey, owner: &StandKey) -> Result<()> {
+    let wire = record.to_wire();
+    let parsed = DeviceRecord::parse(&wire)
+        .map_err(|error| anyhow::anyhow!("запись не читается обратно: {error}"))?;
+
+    // Удостоверяющая сторона билетов в проверке записи не участвует, но у
+    // `Anchors` она обязательна: билет подписан авторитетом парка или не билет.
+    // Берётся ключ комплекта, а не ключ организации: подставленный сюда чужой
+    // якорь однажды окажется тем, чем проверяют.
+    let ticket_authority = StandKey::from_seed(&TICKET_AUTHORITY_SEED)?;
+    let anchors = Anchors::new(anchor_key(&ticket_authority)?)
+        .with_organisation(record.organisation_id(), anchor_key(organisation)?)
+        .with_owner(record.owner_id(), anchor_key(owner)?);
+
+    parsed
+        .verify(&anchors)
+        .map_err(|error| anyhow::anyhow!("подписи записи устройства не сходятся: {error}"))
+}
+
+/// Открытая половина ключа комплекта в форме якоря.
+fn anchor_key(key: &StandKey) -> Result<AnchorKey> {
+    AnchorKey::from_spki_der(&key.spki_der()?).context("якорь ключа комплекта")
 }
 
 /// Билет выдающей стороны, на котором посчитан вектор кода.
@@ -549,7 +728,7 @@ fn certificates(root: &StandKey, organisation: &StandKey) -> Result<Certificates
     .context("самоподписанный сертификат корня парка")?;
 
     let organisation_request = CaRequest {
-        subject: format!("CN=tessera stand organisation {ORGANISATION_ID}"),
+        subject: format!("CN={ORGANISATION_ID}"),
         subject_spki_der: organisation.spki_der()?,
         validity: Validity {
             not_before: NOT_BEFORE,
@@ -751,8 +930,41 @@ fn line(text: &str) -> Vec<u8> {
     format!("{text}\n").into_bytes()
 }
 
+/// Раздел описи про запись устройства.
+fn readme_device_record(owner_id: &str) -> String {
+    format!(
+        "## Запись устройства\n\
+         \n\
+         - `{device_record}` — ТА ЖЕ запись устройства, что лежит в каталоге\n\
+           уровнем выше, переподписанная организацией `{organisation}` и\n\
+           владельцем реестра этого комплекта. Тело записи взято побайтно:\n\
+           номер, ключ, эпоха, серийники, партия, отпечаток базиса. Заменены\n\
+           только подписи сторон — приватных половин соседнего комплекта нет ни\n\
+           у кого, его ключи случайны и не сохраняются, а стенд проверяет запись\n\
+           якорями этого комплекта.\n\
+         - `{owner_anchor}` — открытая половина ключа владельца реестра. Стенд\n\
+           берёт якоря из секции `[fleet]` своего TOML, и владельца нужно\n\
+           объявить там: `owner_id = \"{owner}\"` и\n\
+           `owner_key = \"<комплект>/{owner_anchor}\"` (PEM читается как есть).\n\
+           Подпись владельца накрывает подпись организации, поэтому\n\
+           переподписать одну, оставив другую, нельзя — комплект несёт обе\n\
+           свои.\n\
+         \n\
+         Доказательство владения в записи осталось исходным: его сделал ключ\n\
+         устройства над телом, а тело не тронуто. Подмена подписей сторон\n\
+         безопасна потому, что за пределами реестра байты записи ни во что не\n\
+         входят: устройство свою запись подписью организации не проверяет, а в\n\
+         контекст вывода кода идут номер устройства и хеш билета.\n\
+         \n",
+        device_record = names::DEVICE_RECORD,
+        owner_anchor = names::OWNER_ANCHOR,
+        organisation = ORGANISATION_ID,
+        owner = owner_id,
+    )
+}
+
 /// Опись комплекта.
-fn readme(engineer_id: &str) -> String {
+fn readme(engineer_id: &str, owner_id: &str) -> String {
     format!(
         "# Комплект фикстур серверного стенда\n\
          \n\
@@ -762,8 +974,8 @@ fn readme(engineer_id: &str) -> String {
          \n\
          - `{root}` — самоподписанный корень парка.\n\
          - `{org}` — сертификат организации `{organisation}` под корнем, с потолком\n\
-           делегирования: роли {roles:?}, уровень {level}, TTL {ttl} с, метка\n\
-           `{tag_key}={tag_value}`.\n\
+           делегирования: роли {roles:?}, уровень {level}, предельный оставшийся\n\
+           срок авторизации {ttl} с, метка `{tag_key}={tag_value}`.\n\
          - `{crl}` — список отзыва сертификатов организации: ПУСТОЙ, но подписанный\n\
            корнем. Пустой список — документ, а не отсутствие документа.\n\
          - `{anchor}` — открытая половина ключа авторизаций парка. Им проверяются\n\
@@ -776,6 +988,7 @@ fn readme(engineer_id: &str) -> String {
            организации: одна роль из двух, тот же уровень, та же метка.\n\
          - `{rights}` — подписанный список отзыва прав, пустой, серийный номер 1.\n\
          \n\
+         {device_record_section}\
          ## Вектор кода\n\
          \n\
          Четыре файла ниже описывают одну попытку целиком, чтобы ожидаемый код\n\
@@ -825,6 +1038,7 @@ fn readme(engineer_id: &str) -> String {
         record = names::ENGINEER_RECORD,
         authorisation = names::ENGINEER_AUTHORISATION,
         rights = names::RIGHTS_REVOCATIONS,
+        device_record_section = readme_device_record(owner_id),
         organisation = ORGANISATION_ID,
         roles = CEILING_ROLES,
         level = CEILING_LEVEL,
@@ -855,6 +1069,17 @@ fn publish(out: &Path, bundle: &Bundle) -> Result<()> {
 mod tests {
     use super::{build, engineer_number, names, publish};
 
+    /// Исходная запись устройства — вход генератора.
+    ///
+    /// Берётся та, что лежит в дереве: комплект переподписывает её, а не
+    /// сочиняет свою, и тест обязан работать с тем же входом, что и команда.
+    fn source_record() -> tessera_codes_contract::registry::DeviceRecord {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tessera_core/tests/fixtures/codes")
+            .join(names::DEVICE_RECORD);
+        super::read_source_record(&path).unwrap()
+    }
+
     /// Повторная сборка даёт те же байты.
     ///
     /// Это и есть свойство, ради которого комплект собран отдельно от того, что
@@ -862,8 +1087,8 @@ mod tests {
     /// прогону, не годится ни для сравнения, ни для отладки чужого стенда.
     #[test]
     fn a_second_build_produces_the_same_bytes() {
-        let first = build().unwrap();
-        let second = build().unwrap();
+        let first = build(&source_record()).unwrap();
+        let second = build(&source_record()).unwrap();
         assert_eq!(first.files.len(), second.files.len());
         for ((name, left), (_, right)) in first.files.iter().zip(second.files.iter()) {
             assert_eq!(left, right, "файл {name} разошёлся между двумя сборками");
@@ -882,7 +1107,7 @@ mod tests {
             tessera_core::codes::store::PAGE_URLS_FILENAME
         );
 
-        let bundle = build().unwrap();
+        let bundle = build(&source_record()).unwrap();
         let file = bundle
             .files
             .iter()
@@ -908,7 +1133,7 @@ mod tests {
     /// имён такой файл просто не заметил бы.
     #[test]
     fn every_pem_of_the_bundle_says_it_is_a_fixture_first() {
-        let bundle = build().unwrap();
+        let bundle = build(&source_record()).unwrap();
         let pems: Vec<&(&str, Vec<u8>)> = bundle
             .files
             .iter()
@@ -918,7 +1143,7 @@ mod tests {
                     .is_some_and(|ext| ext == "pem")
             })
             .collect();
-        assert_eq!(pems.len(), 6, "в комплекте {} PEM, а не шесть", pems.len());
+        assert_eq!(pems.len(), 7, "в комплекте {} PEM, а не семь", pems.len());
 
         for (name, bytes) in pems {
             let text = String::from_utf8(bytes.clone()).unwrap();
@@ -940,7 +1165,7 @@ mod tests {
     /// собой, причём выглядеть будет ровно так же, как настоящий.
     #[test]
     fn the_bundle_does_not_write_the_expected_code() {
-        let bundle = build().unwrap();
+        let bundle = build(&source_record()).unwrap();
         assert!(
             !bundle
                 .files
@@ -956,7 +1181,7 @@ mod tests {
     fn the_vector_ticket_verifies_and_its_hash_is_the_one_the_inputs_declare() {
         use tessera_codes_contract::ticket::SignedTicket;
 
-        let bundle = build().unwrap();
+        let bundle = build(&source_record()).unwrap();
         let file = |name: &str| {
             String::from_utf8(
                 bundle
@@ -1032,7 +1257,7 @@ mod tests {
             }
         }
 
-        let bundle = build().unwrap();
+        let bundle = build(&source_record()).unwrap();
         let file = |name: &str| {
             String::from_utf8(
                 bundle
@@ -1112,17 +1337,108 @@ mod tests {
         }
     }
 
+    /// Запись устройства комплекта — та же, что у соседнего, и проверяется
+    /// ключами этого комплекта.
+    ///
+    /// Две половины одной гарантии: тело обязано совпасть с исходным до байта
+    /// (иначе стенд получил бы другое устройство), а подписи — сойтись под
+    /// якорями комплекта (иначе стенд отверг бы запись ровно так же, как
+    /// отвергал исходную).
+    #[test]
+    fn the_device_record_is_the_neighbouring_one_resigned_by_this_bundle() {
+        use tessera_codes_contract::registry::DeviceRecord;
+
+        let bundle = build(&source_record()).unwrap();
+        let text = String::from_utf8(
+            bundle
+                .files
+                .iter()
+                .find(|(name, _)| *name == names::DEVICE_RECORD)
+                .expect("комплект не несёт записи устройства")
+                .1
+                .clone(),
+        )
+        .unwrap();
+        let record = DeviceRecord::parse(text.trim()).unwrap();
+        let source = source_record();
+
+        assert_eq!(record.payload(), source.payload(), "тело записи разошлось");
+        assert_eq!(record.organisation_id(), source.organisation_id());
+        assert_eq!(record.owner_id(), source.owner_id());
+        assert_eq!(
+            record.possession_signature(),
+            source.possession_signature(),
+            "доказательство владения переподписано, а ключа устройства у комплекта нет"
+        );
+        assert_ne!(
+            record.organisation_signature(),
+            source.organisation_signature(),
+            "подпись организации осталась исходной — стенд отвергнет запись"
+        );
+
+        let organisation = super::StandKey::from_seed(&super::ORGANISATION_SEED).unwrap();
+        let owner = super::StandKey::from_seed(&super::OWNER_SEED).unwrap();
+        super::check_record(&record, &organisation, &owner).unwrap();
+    }
+
+    /// Запись чужой организации комплект не переподписывает.
+    ///
+    /// Молчаливое переподписывание выглядело бы удачей: файл собрался, подписи
+    /// сошлись. Отказал бы стенд — сертификата той организации у него нет.
+    #[test]
+    fn a_record_of_another_organisation_is_refused() {
+        use tessera_codes_contract::registry::{DeviceRecord, RecordFields};
+
+        let source = source_record();
+        let foreign = DeviceRecord::new(RecordFields {
+            payload: source.payload().clone(),
+            organisation_id: "not-acme",
+            owner_id: source.owner_id(),
+            possession_signature: source.possession_signature().clone(),
+            organisation_signature: source.organisation_signature().clone(),
+            owner_signature: source.owner_signature().clone(),
+        })
+        .unwrap();
+
+        let error = match build(&foreign) {
+            Ok(_) => panic!("комплект переподписал запись чужой организации"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("not-acme") && error.contains(super::ORGANISATION_ID),
+            "отказ не называет обе организации: {error}"
+        );
+    }
+
+    /// `--out` из одного сегмента ищет соседа в текущем каталоге.
+    ///
+    /// У такого пути родитель пуст, и принять пустоту за отсутствие родителя
+    /// значит отказать там, где сосед лежит рядом.
+    #[test]
+    fn a_single_segment_out_looks_for_the_record_next_to_itself() {
+        let args = crate::cli::CodesStandFixturesArgs {
+            out: std::path::PathBuf::from("stand"),
+            device_record: None,
+        };
+        assert_eq!(
+            super::source_record_path(&args).unwrap(),
+            std::path::Path::new(".").join(names::DEVICE_RECORD)
+        );
+    }
+
     /// Комплект кладётся на диск целиком.
     #[test]
     fn the_bundle_lands_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("stand");
-        publish(&out, &build().unwrap()).unwrap();
+        publish(&out, &build(&source_record()).unwrap()).unwrap();
         for name in [
             names::ROOT_CERT,
             names::ORGANISATION_CERT,
             names::ORGANISATION_CRL,
             names::AUTHORISATION_ANCHOR,
+            names::OWNER_ANCHOR,
+            names::DEVICE_RECORD,
             names::ENGINEER_RECORD,
             names::ENGINEER_AUTHORISATION,
             names::RIGHTS_REVOCATIONS,
