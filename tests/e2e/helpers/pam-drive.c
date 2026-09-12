@@ -7,8 +7,23 @@
  * от «auth отказала» — эти два исхода означают разные дефекты продукта.
  *
  * Использование:
- *     pam-drive [--show-creds] [--answers-per-prompt] <service> <user> <phase> [<phase> ...]
+ *     pam-drive [--show-creds] [--answers-per-prompt] [--no-user]
+ *               [--xdisplay <display>] [--xauthdata <name>:<hex>]
+ *               <service> <user> <phase> [<phase> ...]
  *     phase ∈ { authenticate, acct_mgmt, open_session, close_session }
+ *
+ * `--no-user` ведёт разговор без имени учётной записи: pam_start получает NULL,
+ * и добыть имя обязан стек. Так работает штатный греетер fly-dm с плагином
+ * modern — он не задаёт PAM_USER и отвечает именем из формы на первый промпт с
+ * эхом. Позиционный аргумент <user> всё равно обязателен (запись кейса остаётся
+ * одинаковой), но в pam_start не уходит.
+ *
+ * `--xdisplay` и `--xauthdata` выставляют items PAM_XDISPLAY и PAM_XAUTHDATA —
+ * тот единственный канал, которым дисплей-менеджер называет модулю свой дисплей
+ * и права на него. У процесса самого fly-dm переменных DISPLAY и XAUTHORITY нет,
+ * поэтому разговор, ведущийся через окружение, проверял бы не тот путь. Данные
+ * куки задаются шестнадцатеричной строкой: в ней есть непечатаемые байты, и
+ * аргументом командной строки они не проезжают.
  *
  * Пароль/PIN читается со stdin (одна строка). Терминала нет: conversation-функция
  * отвечает на PAM_PROMPT_ECHO_OFF/ON заранее прочитанным значением, а информационные
@@ -236,9 +251,39 @@ static void wipe_answers(void)
     g_answer_count = 0;
 }
 
+/* Разбирает шестнадцатеричную строку в байты. Возвращает NULL на нечётной длине
+ * и на любом не-hex символе: молча принятая половина куки дала бы «оверлей не
+ * поднялся» вместо ошибки стенда. Длина результата — в *out_len. */
+static unsigned char *parse_hex(const char *hex, size_t *out_len)
+{
+    size_t len = strlen(hex);
+    if (len == 0 || len % 2 != 0) {
+        return NULL;
+    }
+    unsigned char *bytes = calloc(len / 2, 1);
+    if (bytes == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < len / 2; i++) {
+        unsigned int value = 0;
+        char pair[3] = { hex[2 * i], hex[2 * i + 1], '\0' };
+        char *end = NULL;
+        value = (unsigned int)strtoul(pair, &end, 16);
+        if (end == NULL || *end != '\0') {
+            free(bytes);
+            return NULL;
+        }
+        bytes[i] = (unsigned char)value;
+    }
+    *out_len = len / 2;
+    return bytes;
+}
+
 static void usage(FILE *out)
 {
-    fputs("usage: pam-drive [--show-creds] [--answers-per-prompt] <service> <user> <phase> [<phase> ...]\n"
+    fputs("usage: pam-drive [--show-creds] [--answers-per-prompt] [--no-user]\n"
+          "                 [--xdisplay <display>] [--xauthdata <name>:<hex>]\n"
+          "                 <service> <user> <phase> [<phase> ...]\n"
           "  phase: authenticate | acct_mgmt | open_session | close_session\n"
           "  secret (password/PIN) is read as a single line from stdin\n"
           "  output: one line per phase, e.g. \"auth: PAM_SUCCESS (0)\"\n"
@@ -249,6 +294,11 @@ static void usage(FILE *out)
           "                answering the i-th prompt with the i-th line; a prompt met with\n"
           "                end of input ends the conversation with an error rather than an\n"
           "                empty answer\n"
+          "  --no-user: start the transaction with no user name at all (NULL), the way a\n"
+          "                display manager greeter does; the positional <user> is then only\n"
+          "                the name the case is written about\n"
+          "  --xdisplay <display>: set PAM_XDISPLAY, as a display manager does\n"
+          "  --xauthdata <name>:<hex>: set PAM_XAUTHDATA, e.g. MIT-MAGIC-COOKIE-1:0a1b...\n"
           "  exit: 0 if all phases succeeded, otherwise the code of the first failure\n",
           out);
 }
@@ -432,6 +482,9 @@ int main(int argc, char **argv)
      * собираются в свой список. Так `--show-creds` можно поставить где угодно,
      * и уже написанные вызовы без флага разбираются ровно как раньше. */
     int show_creds = 0;
+    int no_user = 0;
+    const char *xdisplay = NULL;
+    const char *xauthdata = NULL;
     const char **args = calloc((size_t)argc, sizeof(*args));
     if (args == NULL) {
         fprintf(stderr, "pam-drive: out of memory\n");
@@ -443,6 +496,22 @@ int main(int argc, char **argv)
             show_creds = 1;
         } else if (strcmp(argv[i], "--answers-per-prompt") == 0) {
             g_per_prompt = 1;
+        } else if (strcmp(argv[i], "--no-user") == 0) {
+            no_user = 1;
+        } else if (strcmp(argv[i], "--xdisplay") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "pam-drive: --xdisplay без значения\n");
+                free(args);
+                return EXIT_USAGE;
+            }
+            xdisplay = argv[++i];
+        } else if (strcmp(argv[i], "--xauthdata") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "pam-drive: --xauthdata без значения\n");
+                free(args);
+                return EXIT_USAGE;
+            }
+            xauthdata = argv[++i];
         } else {
             args[nargs++] = argv[i];
         }
@@ -480,7 +549,9 @@ int main(int argc, char **argv)
     struct pam_conv conv = { conv_fn, NULL };
     pam_handle_t *pamh = NULL;
 
-    int rc = pam_start(service, user, &conv, &pamh);
+    /* NULL, а не пустая строка: это два разных состояния транзакции, и греетер
+     * modern оставляет именно первое — имени нет вовсе, добыть его обязан стек. */
+    int rc = pam_start(service, no_user ? NULL : user, &conv, &pamh);
     if (rc != PAM_SUCCESS) {
         /* Сообщение об ошибке берём у PAM, но handle ещё нет — pam_strerror
          * с NULL допустим и даёт общий текст. */
@@ -489,6 +560,62 @@ int main(int argc, char **argv)
         wipe_answers();
         free(args);
         return EXIT_INTERNAL;
+    }
+
+    /* Items выставляются до первой фазы: модуль читает их в начале разговора,
+     * а выставленные позже они описывали бы уже не тот разговор. Сбой установки
+     * — ошибка стенда (кейс просил именно этот канал), а не вердикт продукта. */
+    if (xdisplay != NULL) {
+        rc = pam_set_item(pamh, PAM_XDISPLAY, xdisplay);
+        if (rc != PAM_SUCCESS) {
+            fprintf(stderr, "pam-drive: pam_set_item(PAM_XDISPLAY) failed: %s (%d)\n",
+                    pam_code_name(rc), rc);
+            pam_end(pamh, rc);
+            wipe_answers();
+            free(args);
+            return EXIT_INTERNAL;
+        }
+    }
+    if (xauthdata != NULL) {
+        const char *colon = strchr(xauthdata, ':');
+        if (colon == NULL) {
+            fprintf(stderr, "pam-drive: --xauthdata ожидает <name>:<hex>\n");
+            pam_end(pamh, PAM_ABORT);
+            wipe_answers();
+            free(args);
+            return EXIT_USAGE;
+        }
+        size_t name_len = (size_t)(colon - xauthdata);
+        char *name = strndup(xauthdata, name_len);
+        size_t data_len = 0;
+        unsigned char *data = parse_hex(colon + 1, &data_len);
+        if (name == NULL || data == NULL) {
+            fprintf(stderr, "pam-drive: --xauthdata: имя или шестнадцатеричные данные негодны\n");
+            free(name);
+            free(data);
+            pam_end(pamh, PAM_ABORT);
+            wipe_answers();
+            free(args);
+            return EXIT_USAGE;
+        }
+        struct pam_xauth_data xauth = {
+            .namelen = (int)name_len,
+            .name = name,
+            .datalen = (int)data_len,
+            .data = (char *)data,
+        };
+        /* PAM копирует структуру себе, поэтому буферы освобождаются сразу. */
+        rc = pam_set_item(pamh, PAM_XAUTHDATA, &xauth);
+        free(name);
+        free(data);
+        if (rc != PAM_SUCCESS) {
+            fprintf(stderr, "pam-drive: pam_set_item(PAM_XAUTHDATA) failed: %s (%d)\n",
+                    pam_code_name(rc), rc);
+            pam_end(pamh, rc);
+            wipe_answers();
+            free(args);
+            return EXIT_INTERNAL;
+        }
     }
 
     int first_failure = 0;

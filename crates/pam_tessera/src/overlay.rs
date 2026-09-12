@@ -103,7 +103,7 @@
 #![cfg(unix)]
 
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -233,7 +233,69 @@ fn context(step: &'static str, error: &std::io::Error) -> std::io::Error {
 /// An X client cannot find a display without the first two, and cannot find a
 /// program without the third. Everything else the host process carries stays
 /// with the host process.
+///
+/// The first two are the FALLBACK, taken from the environment only when the
+/// application named no display of its own — `sshd` with a forwarded display,
+/// a test driver, `login` under an X session. A display manager names the
+/// display through PAM instead, and then [`XChannel`] supplies both values and
+/// the host's environment is not consulted for them at all.
 const PASSED_ENV: [&str; 3] = ["DISPLAY", "XAUTHORITY", "PATH"];
+
+/// The display of a graphical login and the credential that opens it.
+///
+/// Comes from the items `PAM_XDISPLAY` and `PAM_XAUTHDATA`, which is the only
+/// channel a display manager has for saying it: the process the module is
+/// loaded into — `fly-dm` on the target fleet — carries neither `DISPLAY` nor
+/// `XAUTHORITY` in its own environment. Those two variables belong to the
+/// greeter's child process, which is not where PAM runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XChannel {
+    /// Value of `PAM_XDISPLAY`, e.g. `:0`.
+    pub display: String,
+    /// Scheme name of `PAM_XAUTHDATA`, e.g. `MIT-MAGIC-COOKIE-1`.
+    pub scheme: String,
+    /// The credential bytes. Not a string: a cookie is binary.
+    pub cookie: Vec<u8>,
+}
+
+/// Family of an `Xauthority` entry that matches any display address.
+///
+/// `FamilyWild` of the X protocol. The entry the module writes carries no
+/// address and no display number, and libXau's matching treats both as
+/// wildcards — so the cookie is found whichever way the client spells the
+/// display it was given (`:0`, `unix/:0`, the host's own name). Spelling the
+/// address out instead would mean guessing the hostname the X client is about
+/// to compute, and a guess that misses reads to everyone as "the overlay did
+/// not come up".
+///
+/// The file this goes into is readable by one account, holds one cookie and
+/// is removed with the attempt, so the wildcard widens nothing that the file
+/// itself does not already bound.
+const XAUTH_FAMILY_WILD: u16 = 0xFFFF;
+
+/// Lay out one `Xauthority` entry the way the format wants it.
+///
+/// Five fields, each a big-endian length followed by its bytes, with the
+/// family first: family, address, display number, scheme name, credential.
+/// Address and number are left empty on purpose — see [`XAUTH_FAMILY_WILD`].
+fn xauth_entry(scheme: &str, cookie: &[u8]) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+        // Truncation is impossible for the values this is called with — a
+        // scheme name and a cookie, both well under 64 KiB — and saturating
+        // keeps the function total rather than adding a panic to a path that
+        // runs inside a login.
+        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(bytes.get(..len as usize).unwrap_or_default());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&XAUTH_FAMILY_WILD.to_be_bytes());
+    put(&mut out, b"");
+    put(&mut out, b"");
+    put(&mut out, scheme.as_bytes());
+    put(&mut out, cookie);
+    out
+}
 
 /// How long the module waits for the overlay to connect.
 ///
@@ -260,6 +322,7 @@ pub struct SpawningOverlay {
     socket_dir: PathBuf,
     owner: Owner,
     handshake: Duration,
+    x: Option<XChannel>,
 }
 
 /// The account the overlay runs as, and the socket belongs to.
@@ -281,7 +344,19 @@ impl SpawningOverlay {
             socket_dir,
             owner,
             handshake: HANDSHAKE,
+            x: None,
         }
+    }
+
+    /// The same overlay, told which display to draw on.
+    ///
+    /// Without this the overlay looks for a display in the host's environment,
+    /// which is right for `sshd` and a test driver and wrong for every display
+    /// manager — see [`XChannel`].
+    #[must_use]
+    pub fn with_x_channel(mut self, x: Option<XChannel>) -> Self {
+        self.x = x;
+        self
     }
 
     /// The same overlay, waiting a different length of time to be connected to.
@@ -325,6 +400,20 @@ impl SpawningOverlay {
             .map_err(|error| context("mode", &error))?;
         chown(&path, self.owner).map_err(|error| context("chown", &error))?;
 
+        // The credential of the display, when the application named one. It
+        // goes to disk because that is the only way an X client takes it: the
+        // client reads `XAUTHORITY`. It lands beside the socket — a directory
+        // this module has already vouched for — with the mode and the owner of
+        // the socket, and it is removed when the attempt ends, whichever way it
+        // ends (`PathGuard`).
+        let xauth = match self.x.as_ref() {
+            Some(channel) => Some(
+                self.write_xauth(&attempt, channel)
+                    .map_err(|error| context("xauth", &error))?,
+            ),
+            None => None,
+        };
+
         let mut command = Command::new(&self.binary);
         command
             .arg("--socket")
@@ -355,9 +444,20 @@ impl SpawningOverlay {
             .stdin(Stdio::null())
             .stdout(Stdio::null());
         for name in PASSED_ENV {
+            // A display named through PAM wins over the environment, and wins
+            // even when the environment holds nothing: an inherited `DISPLAY`
+            // from `sshd` beside a greeter's display would send the symbol to
+            // the wrong screen, and that screen belongs to somebody else.
+            if self.x.is_some() && (name == "DISPLAY" || name == "XAUTHORITY") {
+                continue;
+            }
             if let Ok(value) = std::env::var(name) {
                 command.env(name, value);
             }
+        }
+        if let (Some(channel), Some(file)) = (self.x.as_ref(), xauth.as_ref()) {
+            command.env("DISPLAY", &channel.display);
+            command.env("XAUTHORITY", &file.path);
         }
         let child = command.spawn().map_err(|error| context("spawn", &error))?;
         let mut child = ChildGuard { child: Some(child) };
@@ -392,7 +492,43 @@ impl SpawningOverlay {
             stream,
             child,
             _path: guard,
+            _xauth: xauth,
         })
+    }
+
+    /// Writes the credential of the display where the overlay can read it.
+    ///
+    /// One entry, one file, one attempt. Created with the mode BEFORE anything
+    /// is written to it — a file that is briefly world-readable and holds a
+    /// cookie is a cookie anybody on the machine has — and handed to the
+    /// account the overlay runs as, which is the only account that reads it.
+    ///
+    /// # Errors
+    ///
+    /// The underlying failure to create, write or hand over the file. Every one
+    /// of them ends as every other overlay failure does: the challenge stays in
+    /// the prompt and the login proceeds.
+    fn write_xauth(
+        &self,
+        attempt: &AttemptId,
+        channel: &XChannel,
+    ) -> Result<PathGuard, std::io::Error> {
+        use std::io::Write as _;
+
+        let path = self
+            .socket_dir
+            .join(format!("{}.xauth", attempt.socket_name()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let guard = PathGuard { path: path.clone() };
+        file.write_all(&xauth_entry(&channel.scheme, &channel.cookie))?;
+        file.sync_all()?;
+        drop(file);
+        chown(&path, self.owner)?;
+        Ok(guard)
     }
 }
 
@@ -501,8 +637,8 @@ impl Chosen {
 /// the account a fleet named, both get [`Chosen::Absent`] — and so does every
 /// device without a display manager, which is most of them.
 #[must_use]
-pub fn choose(settings: Option<&OverlaySettings>) -> Chosen {
-    from_settings(settings).map_or(Chosen::Absent(NoOverlay), Chosen::Spawning)
+pub fn choose(settings: Option<&OverlaySettings>, x: Option<XChannel>) -> Chosen {
+    from_settings(settings, x).map_or(Chosen::Absent(NoOverlay), Chosen::Spawning)
 }
 
 /// Builds the overlay a fleet configured, if it configured one.
@@ -512,7 +648,10 @@ pub fn choose(settings: Option<&OverlaySettings>) -> Chosen {
 /// but it is reported to a journal, not to a login: a device whose overlay
 /// account was deleted still lets its engineers in through the prompt.
 #[must_use]
-pub fn from_settings(settings: Option<&OverlaySettings>) -> Option<SpawningOverlay> {
+pub fn from_settings(
+    settings: Option<&OverlaySettings>,
+    x: Option<XChannel>,
+) -> Option<SpawningOverlay> {
     let settings = settings?;
     let account = match nix::unistd::User::from_name(&settings.user) {
         Ok(Some(account)) => account,
@@ -537,14 +676,17 @@ pub fn from_settings(settings: Option<&OverlaySettings>) -> Option<SpawningOverl
         }
     };
 
-    Some(SpawningOverlay::new(
-        settings.binary.clone(),
-        PathBuf::from(SOCKET_DIRECTORY),
-        Owner {
-            uid: account.uid.as_raw(),
-            gid: account.gid.as_raw(),
-        },
-    ))
+    Some(
+        SpawningOverlay::new(
+            settings.binary.clone(),
+            PathBuf::from(SOCKET_DIRECTORY),
+            Owner {
+                uid: account.uid.as_raw(),
+                gid: account.gid.as_raw(),
+            },
+        )
+        .with_x_channel(x),
+    )
 }
 
 impl OverlayPresenter for SpawningOverlay {
@@ -577,6 +719,9 @@ struct SpawnedOverlay {
     stream: UnixStream,
     child: Child,
     _path: PathGuard,
+    /// The credential file of the display, for as long as the attempt lasts.
+    /// Held rather than used: dropping it removes the cookie from disk.
+    _xauth: Option<PathGuard>,
 }
 
 impl SpawnedOverlay {
@@ -640,7 +785,10 @@ impl Drop for SpawnedOverlay {
     }
 }
 
-/// Removes the socket when the attempt is over, whichever way it ended.
+/// Removes the file it names when the attempt is over, whichever way it ended.
+///
+/// Two of them exist per graphical attempt: the socket and the credential of
+/// the display. Neither outlives the login it belongs to.
 struct PathGuard {
     path: PathBuf,
 }

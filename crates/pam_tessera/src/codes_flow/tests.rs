@@ -1027,7 +1027,13 @@ fn the_session_opens_when_the_cert_integrity_policy_is_required() {
 
 #[test]
 fn the_challenge_is_shown_in_the_text_of_the_code_prompt() {
-    let harness = Harness::new();
+    // A device with no overlay, which is the text login: a console, `login`,
+    // ssh. The symbol has nowhere else to go, so it goes into the prompt. The
+    // graphical case is the test below.
+    let harness = Harness {
+        overlay: ScriptedOverlay::absent(),
+        ..Harness::new()
+    };
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
     let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
@@ -1254,15 +1260,69 @@ fn the_bound_on_an_answer_is_counted_in_bytes_and_not_in_characters() {
 }
 
 #[test]
-fn an_empty_answer_is_refused() {
+fn a_symbol_already_on_the_screen_keeps_the_glyph_wall_out_of_the_prompt() {
+    // The graphical login. The overlay is showing the symbol, so the prompt
+    // asks for the code and nothing else: the greeter of the target fleet draws
+    // the module's text in a single inline panel, and forty lines of half-block
+    // glyphs pushed through it leave the person with no readable question.
+    //
+    // Keyed on the overlay being UP rather than on a display being named: a
+    // display named where the overlay failed to start still needs the text
+    // form, and that is the case this distinction exists for.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["   "]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+
+    harness.run(&method, &mut conv, &probe, ROLE).unwrap();
+
+    let code_prompt = conv.asked.get(2).cloned().expect("the code is asked for");
+    assert_eq!(
+        code_prompt,
+        super::CODE_PROMPT,
+        "the prompt carried more than the question while the overlay was up",
+    );
+}
+
+#[test]
+fn an_empty_answer_is_refused_once_asking_again_has_not_helped() {
+    // Asked twice, refused after that. The repeat exists because the standard
+    // greeter answers this prompt with an unfilled password field; a channel
+    // that answers every prompt with nothing gets a verdict instead of another
+    // question, or the attempt would be held open by a conversation that cannot
+    // produce an answer.
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new(["   ", ""]);
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
 
     assert!(matches!(error, CodeFlowError::Input { .. }));
+    assert_eq!(
+        conv.asked,
+        vec![
+            super::SERVER_PROMPT.to_owned(),
+            super::SERVER_PROMPT.to_owned()
+        ],
+        "the empty answer was not asked for again, or was asked for more than once",
+    );
+}
+
+#[test]
+fn an_empty_first_answer_does_not_end_the_login() {
+    // The whole reason the repeat exists: on the target fleet the first visible
+    // prompt of the conversation is answered with the contents of the greeter's
+    // password field, which on this method nobody fills. The repeat is drawn by
+    // the greeter itself and reaches the person at the device.
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new(["", "op-42", ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+
+    harness
+        .run(&method, &mut conv, &probe, ROLE)
+        .expect("an unfilled form field ended the login");
 }
 
 #[test]
@@ -1353,7 +1413,7 @@ fn an_empty_personal_number_is_refused() {
     // of who came in. It is bounded exactly like the operator's.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", "   "]);
+    let mut conv = ScriptedConversation::new(["op-42", "   ", ""]);
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -1363,6 +1423,7 @@ fn an_empty_personal_number_is_refused() {
         conv.asked,
         vec![
             super::SERVER_PROMPT.to_owned(),
+            super::ENGINEER_PROMPT.to_owned(),
             super::ENGINEER_PROMPT.to_owned()
         ],
         "the refusal comes at the personal number, before any challenge exists",

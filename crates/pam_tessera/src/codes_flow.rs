@@ -114,6 +114,23 @@ const REASON_QR: &str = "qr_payload_too_long";
 /// something off a note.
 const REASON_ENGINEER_NUMBER: &str = "engineer_number_malformed";
 
+/// How many times an empty answer to a visible prompt is asked for again.
+///
+/// One, and both halves of that are deliberate.
+///
+/// Asking again at all: the standard greeter of the target fleet answers the
+/// second prompt of a conversation with the contents of its password field,
+/// which on this method nobody fills — so the answer to the first visible
+/// prompt arrives empty through no fault of the person at the device. From the
+/// third prompt onwards the greeter draws the module's own text, and the
+/// repeat reaches them.
+///
+/// Not asking forever: a channel that returns an empty string for every prompt
+/// exists too, and a login that keeps asking holds the attempt lock open with
+/// nothing to show for it. A non-empty answer that is wrong is refused as
+/// before — this is about an answer nobody gave, not about a bad one.
+pub(crate) const EMPTY_ANSWER_RETRIES: usize = 1;
+
 /// Prompt naming the issuing side this attempt is addressed to.
 const SERVER_PROMPT: &str = "Сервер выдачи: ";
 
@@ -735,6 +752,17 @@ where
     // Named rather than `_`, which would drop it here and take the symbol down
     // before the engineer had seen it.
     let _overlay = raise_overlay(deps, &payload, pam_user, epoch);
+    // Whether the symbol is already on a screen. The text form goes into the
+    // prompt only when it is not: on a graphical login the person is looking at
+    // the overlay, and the greeter of the target fleet draws the module's text
+    // in a one-line inline panel, where forty lines of half-block glyphs are
+    // not a fallback but a prompt nobody can read the code request out of.
+    //
+    // Asked of the overlay rather than of the items PAM set: the items say a
+    // display was NAMED, the handle says a symbol is SHOWN. An overlay that
+    // did not come up on a named display leaves the challenge in the prompt,
+    // where it was going anyway.
+    let symbol_on_screen = _overlay.is_some();
 
     // Nothing is asked for the key container, and nothing holds a password for
     // it either: the key of the device is stored without one, guarded by the
@@ -762,7 +790,7 @@ where
         // every retry would scroll the screen and leave the engineer scanning a
         // half-erased QR — and they are looking at the code they mistyped, not
         // at the challenge, which has not changed.
-        let prompt = if first_prompt {
+        let prompt = if first_prompt && !symbol_on_screen {
             format!("{shown}{CODE_PROMPT}")
         } else {
             CODE_PROMPT.to_owned()
@@ -841,6 +869,31 @@ where
     })
 }
 
+/// Asks a visible prompt, and asks it again when the answer comes back empty.
+///
+/// The last answer is returned whatever it is: what an empty or unusable value
+/// costs is decided by [`bounded_answer`], in one place, for every prompt. This
+/// only decides how many times the question is put — see
+/// [`EMPTY_ANSWER_RETRIES`] for why it is put more than once and why not
+/// indefinitely.
+///
+/// # Errors
+///
+/// [`CodeFlowError::Conv`] when the conversation cannot be driven at all.
+fn ask_visible<C: CodeConversation>(
+    conv: &mut C,
+    prompt: &str,
+) -> Result<String, CodeFlowError> {
+    let mut answer = conv.prompt_visible(prompt)?;
+    for _ in 0..EMPTY_ANSWER_RETRIES {
+        if !answer.trim().is_empty() {
+            break;
+        }
+        answer = conv.prompt_visible(prompt)?;
+    }
+    Ok(answer)
+}
+
 /// Asks which side is expected to issue, and who is standing at the device.
 ///
 /// Two prompts and no more, in that order. The second answer is checked as a
@@ -860,14 +913,14 @@ fn ask_who_is_asking<C: CodeConversation>(
     epoch: u32,
 ) -> Result<(String, String), CodeFlowError> {
     let server_id = bounded_answer(
-        &conv.prompt_visible(SERVER_PROMPT)?,
+        &ask_visible(conv, SERVER_PROMPT)?,
         MAX_SERVER_ID_LEN,
         pam_user,
         level,
         epoch,
     )?;
     let typed = bounded_answer(
-        &conv.prompt_visible(ENGINEER_PROMPT)?,
+        &ask_visible(conv, ENGINEER_PROMPT)?,
         MAX_ENGINEER_ID_LEN,
         pam_user,
         level,

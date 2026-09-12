@@ -19,6 +19,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
+use crate::overlay::XChannel;
+
 /// Errors raised by [`pam_get_user_string`] / [`pam_get_item_string`].
 #[derive(Debug, thiserror::Error)]
 pub enum PamHelperError {
@@ -36,6 +38,30 @@ pub enum PamHelperError {
 const PAM_SUCCESS: c_int = pam_sys::PAM_SUCCESS as c_int;
 const PAM_SERVICE: c_int = pam_sys::PAM_SERVICE as c_int;
 const PAM_TTY: c_int = pam_sys::PAM_TTY as c_int;
+/// `PAM_USER`, for the one call that supplies a name where there was none.
+const PAM_USER: c_int = pam_sys::PAM_USER as c_int;
+/// The display a graphical login runs on, as the application named it.
+///
+/// Spelled out rather than taken from `pam_sys`: the crate's bindings do not
+/// carry the X items, and the numbers are fixed by the Linux-PAM ABI
+/// (`_pam_types.h`) — changing them would break every module ever compiled.
+const PAM_XDISPLAY: c_int = 11;
+/// The credential for that display: a scheme name and its bytes.
+const PAM_XAUTHDATA: c_int = 13;
+
+/// The X authorisation data of a graphical login, as libpam lays it out.
+///
+/// Mirrors `struct pam_xauth_data` of `_pam_types.h` field for field. Declared
+/// here for the same reason as the item numbers above: the binding crate does
+/// not carry it, and its shape is part of the ABI.
+#[repr(C)]
+struct PamXauthData {
+    namelen: c_int,
+    name: *mut c_char,
+    datalen: c_int,
+    data: *mut c_char,
+}
+
 
 extern "C" {
     /// Re-declared with a stable signature; bindgen generates this with
@@ -50,6 +76,16 @@ extern "C" {
     ///
     /// Re-declared for the same reason as the calls above.
     fn pam_fail_delay(pamh: *mut pam_sys::pam_handle_t, usec: std::os::raw::c_uint) -> c_int;
+
+    /// Sets one item of the transaction.
+    ///
+    /// Re-declared for the same reason as the calls above. Used for exactly
+    /// one item — see [`pam_set_user_string`].
+    fn pam_set_item(
+        pamh: *mut pam_sys::pam_handle_t,
+        item_type: c_int,
+        item: *const c_void,
+    ) -> c_int;
 
     /// Same rationale as [`pam_get_user`] above.
     fn pam_get_item(
@@ -79,9 +115,40 @@ extern "C" {
 pub unsafe fn pam_get_user_string(
     pamh: *mut pam_sys::pam_handle_t,
 ) -> Result<String, PamHelperError> {
+    // SAFETY: same contract as this function's own (caller supplies the live
+    // handle); a NULL prompt leaves the choice of wording to libpam.
+    unsafe { pam_get_user_prompted(pamh, None) }
+}
+
+/// The same read, carrying the prompt to show if PAM has to ask.
+///
+/// libpam asks the application for the name when the transaction was started
+/// without one, which is how a display manager greeter behaves: it holds the
+/// name in a form field and hands it over on the first visible prompt. The
+/// prompt travels through libpam so that the name libpam stores and the name
+/// this module acts on are the same string with no window between them.
+///
+/// # Safety
+///
+/// See [`pam_get_user_string`].
+///
+/// # Errors
+///
+/// See [`pam_get_user_string`]; additionally [`PamHelperError::PamRc`] with
+/// `rc=-1` for a prompt carrying an interior NUL byte.
+pub unsafe fn pam_get_user_prompted(
+    pamh: *mut pam_sys::pam_handle_t,
+    prompt: Option<&str>,
+) -> Result<String, PamHelperError> {
+    let prompt = match prompt {
+        Some(text) => Some(CString::new(text).map_err(|_| PamHelperError::PamRc(-1))?),
+        None => None,
+    };
+    let prompt_ptr = prompt.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let mut user_ptr: *const c_char = std::ptr::null();
-    // SAFETY: `pamh` is owned by PAM; `user_ptr` is a valid out-pointer.
-    let rc = unsafe { pam_get_user(pamh, &raw mut user_ptr, std::ptr::null()) };
+    // SAFETY: `pamh` is owned by PAM; `user_ptr` is a valid out-pointer; the
+    // prompt, when there is one, outlives the call.
+    let rc = unsafe { pam_get_user(pamh, &raw mut user_ptr, prompt_ptr) };
     if rc != PAM_SUCCESS {
         return Err(PamHelperError::PamRc(rc));
     }
@@ -209,6 +276,121 @@ pub unsafe fn pam_get_env_string(
     } else {
         Ok(Some(s))
     }
+}
+
+/// Supply PAM_USER for a transaction that was started without a name.
+///
+/// This is the one identity-writing call in the module, and the narrowness of
+/// it is the point. The module never rewrites a name the stack already read —
+/// the difference between the name before and after such a rewrite is exactly
+/// what other modules can observe (the polkit CVE-2021-3560 class). What this
+/// does is fill an EMPTY item, which is what libpam itself does when it has to
+/// ask the application for a name. Callers MUST establish that PAM_USER is
+/// empty first.
+///
+/// Without it the name would exist only inside this module: every
+/// post-authentication phase checks PAM_USER against the account the
+/// certificate or the code admitted, and an empty item fails that check —
+/// so a login through a greeter that supplies no name would authenticate and
+/// then be refused a session.
+///
+/// # Safety
+///
+/// See [`pam_get_user_string`].
+///
+/// # Errors
+///
+/// * [`PamHelperError::PamRc`] when libpam refuses the call, or the name
+///   carries an interior NUL byte (`rc=-1`).
+pub unsafe fn pam_set_user_string(
+    pamh: *mut pam_sys::pam_handle_t,
+    user: &str,
+) -> Result<(), PamHelperError> {
+    let value = CString::new(user).map_err(|_| PamHelperError::PamRc(-1))?;
+    // SAFETY: `pamh` is owned by PAM; `value` is a NUL-terminated C string
+    // that outlives the call, and libpam copies what it is given.
+    let rc = unsafe { pam_set_item(pamh, PAM_USER, value.as_ptr().cast::<c_void>()) };
+    if rc == PAM_SUCCESS {
+        Ok(())
+    } else {
+        Err(PamHelperError::PamRc(rc))
+    }
+}
+
+/// Read the display of a graphical login and the credential for it.
+///
+/// Returns `Ok(None)` when the application named no display, which is every
+/// text login and is not a failure of anything. A display named without a
+/// credential also returns `None`: an X client cannot open a display it has no
+/// cookie for, and starting one to watch it fail costs a login the wait.
+///
+/// The items are the only channel a display manager has for this. The process
+/// the module runs inside — `fly-dm` on the target fleet — carries neither
+/// `DISPLAY` nor `XAUTHORITY` in its environment, so a module reading the
+/// environment finds nothing there and shows no symbol at all.
+///
+/// # Safety
+///
+/// See [`pam_get_user_string`].
+///
+/// # Errors
+///
+/// * [`PamHelperError::PamRc`] when a `pam_get_item` call fails outright.
+/// * [`PamHelperError::NonUtf8`] for a display or scheme name that is not
+///   UTF-8. The cookie itself is bytes and is never decoded.
+pub unsafe fn pam_get_x_channel(
+    pamh: *mut pam_sys::pam_handle_t,
+) -> Result<Option<XChannel>, PamHelperError> {
+    let mut item_ptr: *const c_void = std::ptr::null();
+    // SAFETY: `pamh` is owned by PAM; `item_ptr` is a valid out-pointer.
+    let rc = unsafe { pam_get_item(pamh, PAM_XDISPLAY, &raw mut item_ptr) };
+    if rc != PAM_SUCCESS {
+        return Err(PamHelperError::PamRc(rc));
+    }
+    if item_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: for PAM_XDISPLAY the item is a `const char *` valid for the
+    // lifetime of `pamh`.
+    let display = unsafe { CStr::from_ptr(item_ptr.cast::<c_char>()) }
+        .to_str()
+        .map_err(|_| PamHelperError::NonUtf8)?
+        .to_owned();
+    if display.is_empty() {
+        return Ok(None);
+    }
+
+    let mut xauth_ptr: *const c_void = std::ptr::null();
+    // SAFETY: as above.
+    let rc = unsafe { pam_get_item(pamh, PAM_XAUTHDATA, &raw mut xauth_ptr) };
+    if rc != PAM_SUCCESS {
+        return Err(PamHelperError::PamRc(rc));
+    }
+    if xauth_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: for PAM_XAUTHDATA the item points at a `struct pam_xauth_data`
+    // owned by PAM and valid for the lifetime of `pamh`.
+    let xauth = unsafe { &*xauth_ptr.cast::<PamXauthData>() };
+    let namelen = usize::try_from(xauth.namelen).unwrap_or(0);
+    let datalen = usize::try_from(xauth.datalen).unwrap_or(0);
+    if namelen == 0 || datalen == 0 || xauth.name.is_null() || xauth.data.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: the two buffers are `namelen`/`datalen` bytes long by the
+    // contract of the item, and are read without being kept.
+    let scheme_bytes = unsafe { std::slice::from_raw_parts(xauth.name.cast::<u8>(), namelen) };
+    // SAFETY: as above.
+    let cookie = unsafe { std::slice::from_raw_parts(xauth.data.cast::<u8>(), datalen) }.to_vec();
+    let scheme = std::str::from_utf8(scheme_bytes)
+        .map_err(|_| PamHelperError::NonUtf8)?
+        .to_owned();
+
+    Ok(Some(XChannel {
+        display,
+        scheme,
+        cookie,
+    }))
 }
 
 /// Build a NUL-terminated `CString` for a PAM data key, panicking only on

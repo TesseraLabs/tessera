@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use tessera_core::codes::overlay_ipc::{decode, Message, HEADER_LEN};
 
-use super::{Owner, SpawningOverlay};
+use super::{Owner, SpawningOverlay, XChannel};
 use crate::codes_flow::OverlayPresenter as _;
 
 const PAYLOAD: &str = "https://codes.example/#tessera-codes/v1/signed-challenge;device=77-000123X";
@@ -305,7 +305,7 @@ fn a_fleet_that_named_no_account_shows_the_challenge_in_the_prompt_only() {
     // does. It also has to be reachable from the line the PAM entry point
     // writes, which is compiled only for Linux — so the choosing lives here,
     // where a machine that is not Linux can still hold it to something.
-    let chosen = super::choose(None);
+    let chosen = super::choose(None, None);
     assert!(matches!(chosen, super::Chosen::Absent(_)));
     assert!(
         chosen.presenter().present(PAYLOAD).is_none(),
@@ -323,7 +323,7 @@ fn an_account_this_device_does_not_have_is_not_an_overlay_either() {
         user: "no-such-account-on-this-device".to_owned(),
         binary: PathBuf::from(tessera_core::codes::DEFAULT_OVERLAY_BINARY),
     };
-    let chosen = super::choose(Some(&settings));
+    let chosen = super::choose(Some(&settings), None);
     assert!(matches!(chosen, super::Chosen::Absent(_)));
 }
 
@@ -333,7 +333,7 @@ fn an_account_this_device_does_have_gets_an_overlay() {
         user: current_account_name(),
         binary: PathBuf::from("/usr/bin/tessera-qr-overlay"),
     };
-    let chosen = super::choose(Some(&settings));
+    let chosen = super::choose(Some(&settings), None);
     assert!(
         matches!(chosen, super::Chosen::Spawning(_)),
         "an account this device has was not resolved"
@@ -754,4 +754,65 @@ fn the_overlay_is_told_the_attempt_is_over() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A display named the way a display manager names one.
+fn x_channel() -> XChannel {
+    XChannel {
+        display: ":0".to_owned(),
+        scheme: "MIT-MAGIC-COOKIE-1".to_owned(),
+        cookie: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+    }
+}
+
+#[test]
+fn the_credential_file_is_laid_out_the_way_an_x_client_reads_it() {
+    // The format is not ours and cannot be checked against our own reading of
+    // it: what an X client does is match family, address and display number,
+    // then take the scheme and the bytes. The entry claims the wildcard family
+    // with neither address nor number, which is what makes it match whichever
+    // way the client spells the display it was handed.
+    let channel = x_channel();
+    let bytes = super::xauth_entry(&channel.scheme, &channel.cookie);
+
+    let mut expected = vec![0xFF, 0xFF];
+    expected.extend_from_slice(&[0x00, 0x00]); // address: empty
+    expected.extend_from_slice(&[0x00, 0x00]); // display number: empty
+    expected.extend_from_slice(&[0x00, 0x12]); // scheme: 18 bytes
+    expected.extend_from_slice(channel.scheme.as_bytes());
+    expected.extend_from_slice(&[0x00, 0x06]); // cookie: 6 bytes
+    expected.extend_from_slice(&channel.cookie);
+
+    assert_eq!(bytes, expected);
+}
+
+#[test]
+fn the_credential_of_the_display_is_written_for_one_account_and_removed_after() {
+    // Two properties, and the second is the one a person can walk up to: while
+    // the attempt lasts the cookie is on disk readable by the overlay's account
+    // alone, and when the attempt ends it is gone. A cookie left behind is a
+    // key to the screen of an unattended machine.
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("recorded.bin");
+    let binary = recording_overlay(dir.path(), &record, false);
+    let overlay = overlay_from(binary, dir.path()).with_x_channel(Some(x_channel()));
+
+    let handle = overlay.present(PAYLOAD);
+    assert!(handle.is_some(), "the overlay did not come up");
+
+    let files: Vec<PathBuf> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "xauth"))
+        .collect();
+    assert_eq!(files.len(), 1, "expected exactly one credential file");
+    let mode = std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the credential of the display was readable by others");
+
+    drop(handle);
+    assert!(
+        !files[0].exists(),
+        "the credential of the display outlived the attempt"
+    );
 }

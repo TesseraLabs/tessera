@@ -145,6 +145,15 @@ ENGINEER_ID="${TESSERA_E2E_ENGINEER_ID:-ORG1-0000014}"
 # чужой номер, а не то, что негодный номер отвергается формой.
 OTHER_ENGINEER_ID="${TESSERA_E2E_OTHER_ENGINEER_ID:-ORG1-0000022}"
 
+# Чем запускается драйвер, каким именем открывается транзакция и что отвечается
+# до промпта сервера выдачи. Для текстового входа — пусто и имя как есть: он и
+# есть базовый путь. Команды графического входа наполняют это перед разговором
+# (см. greeter_modern_channel).
+DRIVER_FLAGS=()
+LEADING_ANSWERS=()
+DRIVER_USER=""
+GREETER_CHANNEL=0
+
 die() {
     echo "codes-server: $*" >&2
     exit "$EXIT_INTERNAL"
@@ -177,6 +186,15 @@ usage: codes-server.sh <command> [args]
   authenticate <user> --level N
                         полный вход по коду: снять challenge, получить код у
                         `issuer codes issue`, подать его
+  authenticate-as-greeter <user> --level N [--start empty|none]
+                        тот же вход, но каналом штатного греетера fly-dm с
+                        плагином modern: имя из формы первым ответом, пустое
+                        поле пароля вторым. --start задаёт, чем открыта
+                        транзакция: пустым именем (по умолчанию, так делает
+                        живой греетер) или отсутствующим вовсе
+  expect-empty-answers-refused <user> [level]
+                        на промпт сервера выдачи дважды приходит пустая строка;
+                        0 только на явный отказ входа, не на зависание
   authenticate-mistyping-once <user> --level N
                         вход, где первый код набран неверно, а второй верно:
                         журнал устройства получает отказ и успех на ОДИН nonce
@@ -823,6 +841,12 @@ level_prefix() {
 # устройства), `other-name` (посчитать на чужой личный номер), `wrong`
 # (заведомо неверный), либо `fixed:<код>`; $4 — сколько раз отвечать на промпт
 # кода.
+#
+# Разговор графического входа отличается от текстового не кодом, а КАНАЛОМ, и
+# отличия задаются двумя массивами, которые команда выставляет перед вызовом:
+# DRIVER_FLAGS — чем запускается драйвер (нет имени учётной записи, items с
+# дисплеем), LEADING_ANSWERS — ответы, которые греетер отдаёт ДО ответа про
+# сервер выдачи (имя из формы, пустое поле пароля).
 run_conversation() {
     local user="$1" level="$2" source="$3" code_answers="$4"
     local prefix
@@ -835,8 +859,22 @@ run_conversation() {
     rm -f "$fifo" "$out" "$err"
     mkfifo -m 0600 "$fifo"
 
+    # Окружение дисплея снимается ровно тогда, когда разговор идёт каналом
+    # греетера: у процесса fly-dm этих переменных нет, и разговор, который
+    # унаследовал бы их от прогона кейса, проверял бы запасной путь вместо
+    # проверяемого.
+    local -a scrub=()
+    if [ "$GREETER_CHANNEL" = "1" ]; then
+        scrub=(env -u DISPLAY -u XAUTHORITY)
+    fi
+    # Имя, которым открывается транзакция. У греетера оно не то, под которым
+    # идёт вход: он открывает транзакцию пустым именем и называет учётную
+    # запись ответом на промпт.
+    local driver_user="${DRIVER_USER-$user}"
+
     # shellcheck disable=SC2086  # prefix — команда с аргументами, разбиение намеренно
-    $prefix pam-drive --answers-per-prompt "$PAM_SERVICE_NAME" "$user" authenticate \
+    "${scrub[@]}" $prefix pam-drive "${DRIVER_FLAGS[@]}" --answers-per-prompt \
+        "$PAM_SERVICE_NAME" "$driver_user" authenticate \
         < "$fifo" > "$out" 2> "$err" &
     local driver=$!
     DRIVER_PID="$driver"
@@ -845,6 +883,10 @@ run_conversation() {
     # конца разговора: закрытый дескриптор — это EOF, а EOF на промпте драйвер
     # считает ошибкой разговора.
     exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
     printf '%s\n' "$SERVER_ID" >&3
     printf '%s\n' "$ENGINEER_ID" >&3
     printf '%s\n' "$DEVICE_KEY_PIN" >&3
@@ -1004,6 +1046,119 @@ cmd_authenticate() {
 
     load_prepared
     run_conversation "$user" "$level" issue 1
+}
+
+# Наполняет DRIVER_FLAGS и LEADING_ANSWERS так, как разговор выглядит из-под
+# штатного греетера fly-dm с плагином modern.
+#
+# Что именно воспроизводится (снято зондом на живой 1.8.4): транзакция стартует
+# без имени учётной записи вовсе; первый промпт с эхом получает содержимое поля
+# «Имя пользователя»; второй промпт любого стиля получает поле «Пароль» —
+# пустую строку, когда оно не заполнено; третий и дальнейшие промпты рисуются
+# инлайн-панелью и доходят до человека как есть.
+#
+# Пустое имя и отсутствующее имя — РАЗНЫЕ состояния транзакции, и путь модуля у
+# них разный: отсутствующее имя добывает сама libpam, пустое она отдаёт как
+# готовый ответ. Зонд на живой машине увидел пустое, поэтому оно и по умолчанию;
+# второй вариант проверяется тем же кейсом с `--start none`, потому что греетер,
+# обновлённый до другого поведения, обязан работать так же.
+#
+# $1 — имя учётной записи, которым отвечает форма; $2 — `empty` (по умолчанию)
+# или `none`.
+greeter_modern_channel() {
+    local user="$1" start="${2:-empty}"
+    GREETER_CHANNEL=1
+    DRIVER_FLAGS=()
+    case "$start" in
+        empty) DRIVER_USER="" ;;
+        none)  DRIVER_FLAGS=(--no-user); DRIVER_USER="$user" ;;
+        *)     usage_error "неизвестный режим старта транзакции: $start" ;;
+    esac
+    LEADING_ANSWERS=("$user" "")
+    if [ -n "${TESSERA_E2E_PAM_XDISPLAY:-}" ]; then
+        DRIVER_FLAGS+=(--xdisplay "$TESSERA_E2E_PAM_XDISPLAY")
+    fi
+    if [ -n "${TESSERA_E2E_PAM_XAUTHDATA:-}" ]; then
+        DRIVER_FLAGS+=(--xauthdata "$TESSERA_E2E_PAM_XAUTHDATA")
+    fi
+}
+
+# Полный вход по коду через канал греетера modern.
+cmd_authenticate_as_greeter() {
+    local user="${1:-}" level="" start="empty"
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --level)
+                level="${2:-}"
+                shift 2 || usage_error "--level без значения"
+                ;;
+            --start)
+                start="${2:-}"
+                shift 2 || usage_error "--start без значения"
+                ;;
+            *) usage_error "неизвестный аргумент authenticate-as-greeter: $1" ;;
+        esac
+    done
+    [ -n "$user" ] && [ -n "$level" ] \
+        || usage_error "usage: codes-server.sh authenticate-as-greeter <user> --level N [--start empty|none]"
+
+    load_prepared
+    greeter_modern_channel "$user" "$start"
+    run_conversation "$user" "$level" issue 1
+}
+
+# Разговор, в котором на промпт сервера выдачи дважды приходит пустая строка.
+#
+# Проверяется не отказ сам по себе, а то, что переспрос ОГРАНИЧЕН: канал, где
+# пустое поле формы приходит на каждый промпт, не должен ни пускать, ни
+# спрашивать бесконечно. Поэтому 0 отдаётся только на вердикт отказа, а
+# зависание кейс ловит своим таймаутом.
+cmd_expect_empty_answers_refused() {
+    local user="${1:-}" level="${2:-0}"
+    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-empty-answers-refused <user> [level]"
+
+    load_prepared
+    greeter_modern_channel "$user"
+    # Ещё одна пустая строка сверх двух ведущих: первый промпт сервера выдачи
+    # съедает пустое поле пароля, переспрос получает эту.
+    LEADING_ANSWERS+=("")
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    local prefix
+    prefix="$(level_prefix "$level")"
+    # shellcheck disable=SC2086  # prefix — команда с аргументами, разбиение намеренно
+    env -u DISPLAY -u XAUTHORITY $prefix pam-drive "${DRIVER_FLAGS[@]}" \
+        --answers-per-prompt "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
+    # Дальше разговор не ведётся: продолжать его означало бы проверять уже
+    # другой сценарий. Закрытый stdin даёт драйверу явную ошибку разговора, если
+    # модуль спросит что-то ещё, и она отличима от вердикта отказа.
+    exec 3>&-
+
+    local rc=0
+    wait "$DRIVER_PID" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+    cat "$out"
+    cat "$err" >&2
+
+    grep -qE 'auth: PAM_AUTH_ERR \(7\)' "$out" \
+        || die "ожидался отказ входа на пустых ответах, а пришло другое (см. $out)"
+    echo "empty-answers: refused"
 }
 
 # Тот же вход, но код приходит аргументом и подаётся как есть: выдача не
@@ -2210,6 +2365,8 @@ main() {
     case "$cmd" in
         prepare)              cmd_prepare "$@" ;;
         authenticate)         cmd_authenticate "$@" ;;
+        authenticate-as-greeter) cmd_authenticate_as_greeter "$@" ;;
+        expect-empty-answers-refused) cmd_expect_empty_answers_refused "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
         authenticate-mistyping-once) cmd_authenticate_mistyping_once "$@" ;;
         authenticate-with-device-key) cmd_authenticate_with_device_key "$@" ;;

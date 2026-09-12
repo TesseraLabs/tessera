@@ -1,0 +1,105 @@
+suite: greeter-modern
+description: >
+  Вход по коду через ШТАТНЫЙ греетер fly-dm с плагином modern — тот, что стоит по
+  умолчанию на Astra 1.8. Канал этого плагина отличается от текстового входа тремя
+  вещами, и каждая из них ломает вход по-своему: транзакция открывается пустым
+  именем учётной записи, второй промпт получает содержимое поля пароля (пустую
+  строку, если оно не заполнено), а дисплей называется модулю items PAM, потому
+  что переменных DISPLAY и XAUTHORITY у процесса греетера нет.
+setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
+
+# Канал снят зондом (одноразовый PAM-модуль, ответы в syslog) на живой Astra
+# 1.8.4 12.09.2026, а не выведен из документации: fly-dm документирует из этого
+# ровно ничего.
+#
+# Кейсы воспроизводят канал драйвером, а не греетером: набрать в чужой форме
+# стенд не умеет. Поэтому проверяется то, что от греетера ЗАВИСИТ — имя, которого
+# в транзакции нет, пустой ответ, items с дисплеем, — а не разметка его окна.
+#
+# Прежний путь (имя задано приложением, дисплей в окружении) остаётся под
+# кейсами сюиты codes-server: CODE-001 — вход целиком, QR-005 — порядок промптов.
+# Второго такого кейса здесь нет намеренно; он проверял бы то же самое.
+
+cases:
+  - id: GRM-001
+    title: Вход по коду проходит через греетер, не задавший имя учётной записи
+    requirement: spec9:auth.UI-006
+    # Имя ролевой учётной записи — вход в весь метод: по нему выбирается роль и
+    # решается, ролевая ли это учётная запись вообще. Греетер modern оставляет
+    # его пустым и отдаёт содержимое поля первым ответом с эхом, поэтому модуль
+    # обязан спросить имя сам — иначе на целевом парке метод отказывает до
+    # первого промпта, и отказывает молча.
+    #
+    # Уровень 0: кейс про канал, а не про мандатный механизм. Требование `mac`
+    # закрыло бы его на контейнерных профилях, где канал проверяется ровно так же.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-as-greeter {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 90
+      # Вердикт PAM сам по себе не говорит, что вход записан как вход по коду:
+      # запись в цепочке — то, по чему этот вход потом сверяется с выдачей.
+      - expect_journal: { identifier: pam_tessera, matches: 'qr_code_login' }
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-002
+    title: Пустое поле формы не пускает и не оставляет попытку висеть
+    requirement: spec9:auth.UI-007
+    # Переспрос ограничен — в этом весь кейс. Канал, где пустая строка приходит
+    # на каждый промпт, обязан кончиться вердиктом: инженер, у которого вход
+    # висит без объяснения, звонит по телефону, а устройство тем временем держит
+    # замок попытки.
+    #
+    # Отказ именно PAM_AUTH_ERR: пустой ответ — негодный ввод, а не отсутствие
+    # метода (PAM_AUTHINFO_UNAVAIL) и не исчерпанный бюджет (PAM_MAXTRIES).
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-empty-answers-refused {{user}} 0
+        expect: { exit_code: 0, stdout_matches: 'empty-answers: refused' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-003
+    title: Оверлей находит дисплей греетера без переменных окружения
+    requirement: spec9:auth.UI-008
+    # Единственный способ показать QR на графическом входе — оверлей поверх
+    # греетера, а поднять его можно, только зная дисплей и права на него. У
+    # процесса fly-dm нет ни DISPLAY, ни XAUTHORITY: он называет дисплей items
+    # PAM_XDISPLAY и PAM_XAUTHDATA. Модуль, читающий только окружение, на
+    # целевом парке не поднимает оверлей никогда.
+    #
+    # Наблюдение — экран, а не журнал: символ, прочитанный сторонним декодером,
+    # и есть то, ради чего оверлей существует. Проверка «в журнале нет строки
+    # про неподнявшийся оверлей» зеленела бы и на устройстве без дисплея.
+    requires: [service-manager, graphics]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-overlay.sh expect-overlay-from-pam-items {{user}}
+        expect:
+          exit_code: 0
+          stdout_matches: "overlay: shown, code accepted, overlay closed"
+        timeout: 300
+    teardown:
+      - run: helpers/codes-overlay.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-004
+    title: Транзакция, открытая вовсе без имени, пускает так же
+    requirement: spec9:auth.UI-006
+    # Пустое имя и отсутствующее имя — разные состояния PAM, и путь у них
+    # разный: отсутствующее добывает сама libpam, пустое она отдаёт модулю как
+    # готовый ответ. Зонд увидел на живой машине первое, но обещание дано не
+    # про версию греетера, а про вход: обновлённый греетер, перешедший на
+    # второе поведение, обязан работать так же.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-as-greeter {{user}} --level 0 --start none
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup

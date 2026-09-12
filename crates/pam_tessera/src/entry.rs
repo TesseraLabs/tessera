@@ -323,6 +323,83 @@ unsafe fn verified_session_account(
     }
 }
 
+/// What the person at the keyboard is asked when nobody has named the account.
+///
+/// Wording follows the terminology of the product: the thing being named is a
+/// role account, and the greeter's own field says the same in its own words.
+#[cfg(target_os = "linux")]
+const LOGIN_PROMPT: &str = "Имя учётной записи: ";
+
+/// Establish the account this login is for.
+///
+/// Three applications, one answer. `login`, `sudo` and `sshd` name the account
+/// when they start the transaction, and then libpam hands it back unchanged and
+/// nothing is asked. A display manager greeter may start the transaction with
+/// no name at all, holding it in a form field: libpam then asks the application
+/// for it through the conversation, stores what came back, and this reads the
+/// same string every later phase will read.
+///
+/// The third case is the one the target fleet produces and the reason this
+/// function exists: a greeter that starts the transaction with an EMPTY name
+/// rather than none. libpam has a name — the empty one — so it asks nothing,
+/// and the method would refuse a login before showing a single prompt. Here the
+/// empty answer is asked for once, and only then is PAM_USER supplied with what
+/// came back. Supplying it is what keeps the module honest about identity: the
+/// post-authentication phases refuse to act under a name that differs from
+/// PAM_USER, and a name known only inside this module would fail that check.
+///
+/// # Safety
+///
+/// `pamh` must be the live PAM handle for the current callback.
+///
+/// # Errors
+///
+/// [`PamHelperError`] when PAM cannot be asked at all, and
+/// [`PamHelperError::Null`] when every answer was empty — a login whose account
+/// nobody will name is refused rather than guessed at.
+#[cfg(target_os = "linux")]
+unsafe fn resolve_login_account(
+    pamh: *mut pam_sys::pam_handle_t,
+) -> Result<String, crate::pam_helpers::PamHelperError> {
+    // SAFETY: `pamh` is the live PAM handle (caller contract).
+    let named = unsafe { crate::pam_helpers::pam_get_user_prompted(pamh, Some(LOGIN_PROMPT)) }?;
+    if !named.trim().is_empty() {
+        return Ok(named);
+    }
+
+    for _ in 0..=crate::codes_flow::EMPTY_ANSWER_RETRIES {
+        // SAFETY: as above; the prompt does not outlive this call.
+        let typed = match unsafe { crate::pam_conv::prompt_visible(pamh, LOGIN_PROMPT) } {
+            Ok(answer) => answer,
+            Err(err) => {
+                tracing::warn!(
+                    target: "tessera.auth",
+                    error = %err,
+                    "the login account could not be asked for",
+                );
+                return Err(crate::pam_helpers::PamHelperError::Null);
+            }
+        };
+        let typed = typed.trim().to_owned();
+        if typed.is_empty() {
+            continue;
+        }
+        // The name enters the transaction, not just this module: everything
+        // after authentication compares against PAM_USER, and the stack
+        // above us has to see the same account. Filling an empty item is not
+        // rewriting one — see `pam_helpers::pam_set_user_string`.
+        // SAFETY: as above.
+        unsafe { crate::pam_helpers::pam_set_user_string(pamh, &typed) }?;
+        return Ok(typed);
+    }
+
+    tracing::warn!(
+        target: "tessera.auth",
+        "no login account was given after asking; refusing the login",
+    );
+    Err(crate::pam_helpers::PamHelperError::Null)
+}
+
 /// Generate a cryptographically random session id by hex-encoding 16 bytes
 /// from the OS RNG (`getrandom`/`OsRng`).
 ///
@@ -425,10 +502,14 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
         // 2. PAM_USER / PAM_SERVICE.
         // SAFETY: `pamh` is the live PAM handle for this callback.
-        let pam_user = match unsafe { crate::pam_helpers::pam_get_user_string(pamh) } {
+        let pam_user = match unsafe { resolve_login_account(pamh) } {
             Ok(s) => s,
             Err(err) => {
-                tracing::warn!(target: "tessera.auth", error = %err, "pam_get_user failed");
+                tracing::warn!(
+                    target: "tessera.auth",
+                    error = %err,
+                    "the login account could not be established",
+                );
                 return PAM_AUTH_ERR;
             }
         };
@@ -770,7 +851,20 @@ unsafe fn authenticate_by_code_entry(
     // what is written here has to be plumbing and nothing else. Built before the
     // dependencies so that it outlives them; nothing about it can fail the login
     // — see `codes_flow::OverlayPresenter`.
-    let chosen = crate::overlay::choose(codes_config.overlay.as_ref());
+    //
+    // The display comes from the items the application set, not from the
+    // environment of this process: under a display manager there is nothing in
+    // the environment to find — see `pam_helpers::pam_get_x_channel`.
+    // SAFETY: `pamh` is the live PAM handle of the enclosing callback.
+    let x_channel = unsafe { crate::pam_helpers::pam_get_x_channel(pamh) }.unwrap_or_else(|err| {
+        tracing::debug!(
+            target: "tessera.codes",
+            error = %err,
+            "the display of this login could not be read from PAM; falling back to the environment",
+        );
+        None
+    });
+    let chosen = crate::overlay::choose(codes_config.overlay.as_ref(), x_channel);
 
     let deps = CodeDeps {
         overlay: chosen.presenter(),
