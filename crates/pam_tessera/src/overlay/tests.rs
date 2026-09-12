@@ -879,6 +879,8 @@ fn an_overlay_that_never_says_it_drew_is_no_overlay() {
     // decision is whether to leave the challenge out of the prompt — and an
     // engineer facing a bare code prompt with the challenge nowhere cannot
     // finish the login at all.
+    const BUDGET: Duration = Duration::from_secs(2);
+
     let dir = tempfile::tempdir().unwrap();
     let binary = mute_overlay(dir.path());
     // A SHORT budget on purpose, and the only test here that sets its own. The
@@ -887,7 +889,6 @@ fn an_overlay_that_never_says_it_drew_is_no_overlay() {
     // long one would keep a thread of the suite for twenty seconds while every
     // other test competes for the machine. What is asserted is the bound, and a
     // bound is a bound at any size.
-    const BUDGET: Duration = Duration::from_secs(2);
     let overlay =
         SpawningOverlay::new(binary, dir.path().to_path_buf(), owner()).with_handshake(BUDGET);
 
