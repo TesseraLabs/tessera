@@ -403,7 +403,6 @@ pub unsafe fn pam_get_x_channel(
     // one claim the item contract makes — that this address holds an
     // initialised value of that shape — and four integers and pointers that are
     // read from a local copy below, in safe code.
-    // codeql[rust/access-invalid-pointer]: the address is PAM's own item, checked non-NULL above.
     let xauth: PamXauthData = unsafe { std::ptr::read_unaligned(xauth_ptr.cast::<PamXauthData>()) };
     let namelen = usize::try_from(xauth.namelen).unwrap_or(0);
     let datalen = usize::try_from(xauth.datalen).unwrap_or(0);
