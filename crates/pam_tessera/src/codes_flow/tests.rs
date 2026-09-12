@@ -1339,10 +1339,16 @@ fn a_side_no_ticket_names_is_refused_before_a_challenge_exists() {
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
 
     assert!(matches!(error, CodeFlowError::Denied), "{error:?}");
+    // Both prompts are asked whatever the answer: stopping after the first
+    // would answer, by the shape of the dialogue, whether this device holds a
+    // ticket of the side that was named.
     assert_eq!(
         conv.asked,
-        vec![super::SERVER_PROMPT.to_owned()],
-        "the conversation went on after a side the device holds no ticket of",
+        vec![
+            super::SERVER_PROMPT.to_owned(),
+            super::ENGINEER_PROMPT.to_owned()
+        ],
+        "the sequence of prompts gave away whether a ticket exists",
     );
     assert!(
         method.presented.borrow().is_empty(),

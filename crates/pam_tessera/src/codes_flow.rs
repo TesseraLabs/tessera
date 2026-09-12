@@ -1014,7 +1014,22 @@ fn ask_who_is_asking<C: CodeConversation>(
     // Refused without being echoed, and not asked for again: what it is cannot
     // be told from here, and the one answer worth repeating a question for is
     // an empty one (see `ask_visible`).
-    if !knows_issuer(&server_id) {
+    //
+    // The verdict is taken now and ACTED ON below, after the next prompt. The
+    // order of the questions is the same for every answer either way: a
+    // conversation that stopped here would tell whoever is typing whether this
+    // device holds a ticket of the side they named — a fact about the device,
+    // answered by the shape of the dialogue rather than by anything anybody was
+    // allowed to ask.
+    let issuer_known = knows_issuer(&server_id);
+    let typed = bounded_answer(
+        ask_visible(conv, ENGINEER_PROMPT)?.as_str(),
+        MAX_ENGINEER_ID_LEN,
+        pam_user,
+        level,
+        epoch,
+    )?;
+    if !issuer_known {
         tracing::info!(
             target: "tessera.codes",
             user = pam_user,
@@ -1032,15 +1047,10 @@ fn ask_who_is_asking<C: CodeConversation>(
             reason: REASON_ISSUER_UNKNOWN,
         });
         wipe(&mut server_id);
+        // Still before the challenge, and still without spending anything: no
+        // attempt was started, so no budget was touched and no nonce exists.
         return Err(CodeFlowError::Denied);
     }
-    let typed = bounded_answer(
-        ask_visible(conv, ENGINEER_PROMPT)?.as_str(),
-        MAX_ENGINEER_ID_LEN,
-        pam_user,
-        level,
-        epoch,
-    )?;
     let engineer_id = checked_engineer_number(&typed, pam_user, level, epoch)?;
     Ok((server_id, engineer_id))
 }
