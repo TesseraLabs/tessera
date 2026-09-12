@@ -365,7 +365,15 @@ pub unsafe fn pam_get_x_channel(
         .to_str()
         .map_err(|_| PamHelperError::NonUtf8)?
         .to_owned();
-    if display.is_empty() {
+    if !is_local_display(&display) {
+        // A display this module will not act on. The value travels into the
+        // environment of a process started as the greeter's account, and the
+        // form `host:0` sends the cookie of that display over TCP to whatever
+        // `host` resolves to. A login on this device draws on this device.
+        tracing::warn!(
+            target: "tessera.codes",
+            "the display named by the application is not a local one; the overlay will not be started",
+        );
         return Ok(None);
     }
 
@@ -402,6 +410,30 @@ pub unsafe fn pam_get_x_channel(
     }))
 }
 
+/// Whether a display name is the local form this module will act on.
+///
+/// `:N` or `:N.M`, and nothing else. Everything else is refused rather than
+/// sanitised, and the two worth naming are the reason: `host:0` is a display on
+/// another machine, and an X client handed it opens a TCP connection and sends
+/// the cookie of the login screen across it; a name with a path or a space in it
+/// is not a display at all and would be passed to a process this module starts.
+///
+/// Not a parser of the X display syntax — a predicate. The value is only ever
+/// handed back to X clients, which do their own parsing; what is decided here is
+/// whether this module touches it at all.
+#[must_use]
+fn is_local_display(display: &str) -> bool {
+    let Some(rest) = display.strip_prefix(':') else {
+        return false;
+    };
+    let (number, screen) = match rest.split_once('.') {
+        Some((number, screen)) => (number, Some(screen)),
+        None => (rest, None),
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    digits(number) && screen.is_none_or(digits)
+}
+
 /// Build a NUL-terminated `CString` for a PAM data key, panicking only on
 /// programmer error (interior NUL, which never happens for our static keys).
 ///
@@ -435,6 +467,28 @@ mod tests {
         assert_eq!(PAM_XAUTHDATA, 12);
         assert_eq!(pam_sys::PAM_AUTHTOK_TYPE as c_int, 13);
         assert_ne!(PAM_XAUTHDATA, pam_sys::PAM_AUTHTOK_TYPE as c_int);
+    }
+
+    #[test]
+    fn only_a_local_display_is_acted_on() {
+        // The form that matters is the one that is refused: `host:0` would have
+        // the overlay open a TCP connection to another machine and hand it the
+        // cookie of this login screen.
+        assert!(is_local_display(":0"));
+        assert!(is_local_display(":1"));
+        assert!(is_local_display(":0.0"));
+        assert!(is_local_display(":10.2"));
+
+        assert!(!is_local_display("host:0"));
+        assert!(!is_local_display("192.0.2.1:0"));
+        assert!(!is_local_display("localhost:0.0"));
+        assert!(!is_local_display(""));
+        assert!(!is_local_display(":"));
+        assert!(!is_local_display(":x"));
+        assert!(!is_local_display(":0."));
+        assert!(!is_local_display(":0.x"));
+        assert!(!is_local_display(" :0"));
+        assert!(!is_local_display("unix/:0"));
     }
 
     #[test]
