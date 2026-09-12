@@ -311,11 +311,16 @@ fn xauth_entry(scheme: &str, cookie: &[u8]) -> Vec<u8> {
     out
 }
 
-/// How long the module waits for the overlay to connect.
+/// How long the module waits for EACH of the two things it waits for.
 ///
-/// Short on purpose: it is time added to every graphical login before the
-/// engineer sees a prompt, and the thing being waited for is a process that
-/// either starts immediately or is not going to start at all.
+/// The two are the overlay connecting to the socket and the overlay saying the
+/// first symbol is on the screen. One budget for both, so a fleet or a test has
+/// one number to change — and the worst case is therefore TWICE this: a process
+/// that connects at the last moment and then never draws. That is the bound on
+/// what a graphical login pays before the engineer sees a prompt.
+///
+/// Short on purpose: what is being waited for is a process that either does its
+/// job at once or is not going to do it at all.
 const HANDSHAKE: Duration = Duration::from_secs(2);
 
 /// How often the wait for a connection looks again.
@@ -373,21 +378,27 @@ impl SpawningOverlay {
         self
     }
 
-    /// The same overlay, waiting a different length of time to be connected to.
+    /// The same overlay, waiting a different length of time for each step.
     ///
-    /// The default is short because the wait is added to every graphical login
-    /// (see `HANDSHAKE`). It is adjustable for two reasons that are really
-    /// one: a machine under load starts processes slowly, and a test harness
-    /// running eight of them at once is such a machine.
+    /// Sets both budgets — connecting and the drawn byte — because they are the
+    /// same number by construction (see `HANDSHAKE`). The default is short
+    /// because the wait is added to every graphical login. It is adjustable for
+    /// two reasons that are really one: a machine under load starts processes
+    /// slowly, and a test harness running eight of them at once is such a
+    /// machine.
     #[must_use]
     pub fn with_handshake(mut self, handshake: Duration) -> Self {
         self.handshake = handshake;
         self
     }
 
-    /// The process identifier of the overlay, once it is running.
+    /// How long each of the two waits of one attempt may take.
+    ///
+    /// Named rather than read from the field directly at both call sites: the
+    /// two waits are the same budget on purpose, and a reader who sees one name
+    /// twice can tell that from a reader who sees a field twice.
     #[must_use]
-    fn wait_for_connection(&self) -> Duration {
+    fn step_budget(&self) -> Duration {
         self.handshake
     }
 
@@ -466,7 +477,7 @@ impl SpawningOverlay {
         let child = command.spawn().map_err(|error| context("spawn", &error))?;
         let mut child = ChildGuard { child: Some(child) };
 
-        let stream = accept_one(&listener, child.child.as_mut(), self.wait_for_connection())
+        let stream = accept_one(&listener, child.child.as_mut(), self.step_budget())
             .map_err(|error| context("accept", &error))?;
         check_peer(&stream, self.owner).map_err(|error| context("peer", &error))?;
         let frame = module::challenge(attempt, payload)
@@ -478,8 +489,7 @@ impl SpawningOverlay {
         // display after connecting, so everything up to this line is true of an
         // overlay that never drew anything. An overlay that does not answer is
         // treated exactly as an absent one.
-        wait_for_drawn(&stream, self.wait_for_connection())
-            .map_err(|error| context("ack", &error))?;
+        wait_for_drawn(&stream, self.step_budget()).map_err(|error| context("ack", &error))?;
         // Down for good now, and this is where the one-way rule resumes: the
         // byte above is the whole of what this direction ever carries.
         stream
