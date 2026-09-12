@@ -151,8 +151,28 @@ OTHER_ENGINEER_ID="${TESSERA_E2E_OTHER_ENGINEER_ID:-ORG1-0000022}"
 # (см. greeter_modern_channel).
 DRIVER_FLAGS=()
 LEADING_ANSWERS=()
-DRIVER_USER=""
 GREETER_CHANNEL=0
+# DRIVER_USER намеренно НЕ задан: «имени нет» и «имя пустое» — разные состояния
+# транзакции, и пустая строка здесь открывала бы КАЖДЫЙ разговор так, как это
+# делает греетер. Текстовый вход тогда шёл бы чужим каналом, а кейсы, ничего не
+# знающие про греетер, получали бы лишний промпт имени. Значение появляется
+# только в greeter_modern_channel.
+
+# Пакет первичной настройки, которым на устройство кладётся ключевой материал,
+# и файл PIN контейнера доставки. Оба живут только на время `prepare`.
+ENROLL_DIR="$RUN_DIR/enroll-package"
+PIN_FILE="$RUN_DIR/container.pin"
+
+# Что импорт перезаписывает помимо части Codes. Снимается до импорта и
+# возвращается сразу после: этому хелперу от импорта нужен ТОЛЬКО ключевой
+# материал метода, а ролевое хранилище кладёт подготовка suite — и вход по коду
+# ищет роль именно в нём. Импорт, оставленный как есть, заменяет хранилище
+# срезом пакета, и следующий кейс получает отказ `role_unknown` там, где
+# проверяется совсем другое.
+DEVICE_BACKUP="$RUN_DIR/device-backup"
+ROLES_DIR="${TESSERA_E2E_ROLES_DIR:-/var/lib/tessera/roles}"
+TAGS_FILE="${TESSERA_E2E_TAGS_FILE:-/etc/tessera/device-tags.toml}"
+HOST_P12="${TESSERA_E2E_HOST_P12:-/var/lib/tessera/host.p12}"
 
 # Оверлей графического входа: чьей учётной записью он бежит и откуда берётся.
 # Учётная запись — та же, под которой работает греетер; на Astra это `fly-dm`.
@@ -457,16 +477,12 @@ deploy_artefacts() {
     # каталог закрыт. Ослабленные права продукт обязан заметить сам, и кейс,
     # стартовавший с 0644, проверял бы поведение стенда.
     install -d -m 0700 -o root -g root "$CODES_DIR"
-    # ВНИМАНИЕ: этот шаг устарел и будет красным. Устройство больше не открывает
-    # контейнер паролем — `[codes].key_password` убран, ключ в хранилище лежит
-    # БЕЗ пароля, а PIN остался формой доставки. `device.p12` из комплекта фикстур
-    # закрыт PIN'ом (DEVICE_KEY_PIN), поэтому положенный сюда как есть он не
-    # откроется, и кейсы CODE-* упадут на материале ключа, а не на проверяемой
-    # гарантии. Чинится одним из двух способов, оба вне этой волны: раскладывать
-    # ключ продуктовым импортом (`tessera enroll --codes-pin-file`), как это
-    # делает helpers/codes-enroll.sh, либо научить `cargo xtask codes-fixtures`
-    # класть рядом хранимую форму контейнера (без пароля). Записано в BASELINE.md.
-    install -m 0600 -o root -g root "$src/device.p12" "$CODES_DIR/device.p12"
+    # Контейнера ключа здесь НЕТ намеренно: его кладёт продукт, импортом пакета
+    # первичной настройки (см. import_device_key). `device.p12` комплекта закрыт
+    # PIN'ом доставки, а устройство читает хранимую форму — без пароля, — и
+    # положенный сюда как есть он не открылся бы. Прежний контейнер снимается:
+    # прогон начинается с устройства, которому ключ ещё не выдан.
+    rm -f "$CODES_DIR/device.p12"
     install -m 0644 -o root -g root "$src/tickets.txt" "$CODES_DIR/tickets.txt"
     install -m 0644 -o root -g root "$src/ticket-authority.pem" \
         "$CODES_DIR/ticket-authority.pem"
@@ -551,6 +567,104 @@ EOF
 # вовсе, и проверка сторожит будущее: ключ, появившийся со значением по
 # умолчанию, тихо превратил бы кейс «устройство без серверной конфигурации» в
 # кейс про устройство с ней.
+# Контрольная сумма файла в форме, которой ждёт манифест пакета.
+sha256_of() {
+    sha256sum "$1" | awk '{print $1}'
+}
+
+# Кладёт ключевой материал метода на устройство ПРОДУКТОМ, а не копированием.
+#
+# Почему не копией: контейнер комплекта закрыт PIN'ом доставки, а хранимая форма
+# пароля не имеет — их различает сам продукт, и единственный поддерживаемый путь
+# от первой ко второй — импорт пакета первичной настройки. Стенд, подделавший
+# хранимую форму, проверял бы собственную реализацию формата вместо продуктовой.
+#
+# Что пакет несёт: удостоверение узла, теги и часть Codes. Ролевого среза в нём
+# НЕТ — роли на устройстве уже разложила подготовка suite, и вход по коду ищет
+# роль именно там. Импорт всё равно трогает роли, теги и удостоверение узла,
+# поэтому все три снимаются до него и возвращаются сразу после: этому хелперу от
+# импорта нужен только ключ.
+import_device_key() {
+    require_tool tessera
+    require_tool sha256sum
+    local src="$FIXTURES_CODES_DIR"
+
+    install -d -m 0700 "$RUN_DIR"
+    rm -rf "$ENROLL_DIR"
+    install -d -m 0700 "$ENROLL_DIR"
+
+    install -m 0600 "$src/device.p12" "$ENROLL_DIR/host.p12"
+    cat >"$ENROLL_DIR/tags.toml" <<EOF
+[tags]
+region = "$REGION"
+EOF
+    install -m 0600 "$src/device.p12" "$ENROLL_DIR/codes-device.p12"
+    install -m 0644 "$src/tickets.txt" "$ENROLL_DIR/codes-tickets.txt"
+    install -m 0644 "$src/ticket-authority.pem" \
+        "$ENROLL_DIR/codes-ticket-authority.pem"
+    {
+        echo "epoch = $EPOCH"
+        echo "key_container = { file = \"codes-device.p12\", sha256 = \"$(sha256_of "$ENROLL_DIR/codes-device.p12")\" }"
+        echo "tickets = { file = \"codes-tickets.txt\", sha256 = \"$(sha256_of "$ENROLL_DIR/codes-tickets.txt")\" }"
+        echo "ticket_authority = { file = \"codes-ticket-authority.pem\", sha256 = \"$(sha256_of "$ENROLL_DIR/codes-ticket-authority.pem")\" }"
+    } >"$ENROLL_DIR/codes.toml"
+
+    # PIN уходит в файл, а не в argv: аргументы видны всей машине в списке
+    # процессов. Фикстурный он или нет — привычка одна.
+    ( umask 077; printf '%s' "$DEVICE_KEY_PIN" >"$PIN_FILE" )
+
+    snapshot_device_state
+    local output status=0
+    output="$(tessera enroll --standalone --import "$ENROLL_DIR" --skip-check \
+        --codes-pin-file "$PIN_FILE" 2>&1)" || status=$?
+    restore_device_state
+    rm -rf "$ENROLL_DIR"
+    rm -f "$PIN_FILE"
+    if [ "$status" != "0" ]; then
+        echo "$output" >&2
+        die "продуктовый импорт ключевого материала не прошёл (код $status)"
+    fi
+}
+
+# Снимок путей, которые перепишет импорт. Отсутствующий путь — не ошибка:
+# устройство может не иметь ни ролей, ни тегов, ни удостоверения узла.
+snapshot_device_state() {
+    rm -rf "$DEVICE_BACKUP"
+    install -d -m 0700 "$DEVICE_BACKUP"
+    if [ -d "$ROLES_DIR" ]; then
+        cp -a "$ROLES_DIR" "$DEVICE_BACKUP/roles"
+    fi
+    if [ -f "$TAGS_FILE" ]; then
+        cp -a "$TAGS_FILE" "$DEVICE_BACKUP/device-tags.toml"
+    fi
+    if [ -f "$HOST_P12" ]; then
+        cp -a "$HOST_P12" "$DEVICE_BACKUP/host.p12"
+    fi
+}
+
+# Возвращает снятое. Путь, которого до импорта не было, УДАЛЯЕТСЯ: оставленный
+# срез пакета — это чужая роль на устройстве, которую следующий кейс примет за
+# своё окружение.
+restore_device_state() {
+    if [ -d "$DEVICE_BACKUP/roles" ]; then
+        rm -rf "$ROLES_DIR"
+        cp -a "$DEVICE_BACKUP/roles" "$ROLES_DIR"
+    else
+        rm -rf "$ROLES_DIR"
+    fi
+    if [ -f "$DEVICE_BACKUP/device-tags.toml" ]; then
+        cp -a "$DEVICE_BACKUP/device-tags.toml" "$TAGS_FILE"
+    else
+        rm -f "$TAGS_FILE"
+    fi
+    if [ -f "$DEVICE_BACKUP/host.p12" ]; then
+        cp -a "$DEVICE_BACKUP/host.p12" "$HOST_P12"
+    else
+        rm -f "$HOST_P12"
+    fi
+    rm -rf "$DEVICE_BACKUP"
+}
+
 assert_no_codes_url() {
     if sed -n '/^\[codes\]/,/^\[/p' "$CONFIG" | grep -qiE '^[^#]*url'; then
         die "в секции [codes] есть Codes-URL, а кейс проверяет работу без него"
@@ -593,6 +707,9 @@ cmd_prepare() {
 
     deploy_artefacts
     deploy_config
+    # После конфигурации: импорт кладёт ключ в ТО хранилище, которое названо в
+    # `[codes].dir`, и до её появления положил бы его в умолчание.
+    import_device_key
     [ "$WITHOUT_CODES_URL" -eq 0 ] || assert_no_codes_url
     deploy_pam_service
 
