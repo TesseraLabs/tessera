@@ -315,7 +315,7 @@ fn a_fleet_that_named_no_account_shows_the_challenge_in_the_prompt_only() {
     // does. It also has to be reachable from the line the PAM entry point
     // writes, which is compiled only for Linux — so the choosing lives here,
     // where a machine that is not Linux can still hold it to something.
-    let chosen = super::choose(None, None);
+    let chosen = super::choose(None, super::Display::Unnamed);
     assert!(matches!(chosen, super::Chosen::Absent(_)));
     assert!(
         chosen.presenter().present(PAYLOAD).is_none(),
@@ -333,8 +333,34 @@ fn an_account_this_device_does_not_have_is_not_an_overlay_either() {
         user: "no-such-account-on-this-device".to_owned(),
         binary: PathBuf::from(tessera_core::codes::DEFAULT_OVERLAY_BINARY),
     };
-    let chosen = super::choose(Some(&settings), None);
+    let chosen = super::choose(Some(&settings), super::Display::Unnamed);
     assert!(matches!(chosen, super::Chosen::Absent(_)));
+}
+
+#[test]
+fn a_refused_display_leaves_no_overlay_even_with_one_in_the_environment() {
+    // The environment is the fall-back for a login that named NO display: ssh
+    // with a forwarded one, a developer's shell. A login that named one this
+    // module refuses — `host:0`, whose cookie would go across a network — must
+    // not fall back to it: the overlay would then start on whatever screen the
+    // host process happens to point at, which is the opposite of refusing.
+    //
+    // Held at the choosing rather than at the reading: whether the environment
+    // has a display is a property of the machine the test runs on, and this is
+    // the line where the two answers part.
+    let settings = tessera_core::codes::OverlaySettings {
+        user: current_account_name(),
+        binary: PathBuf::from("/usr/bin/tessera-qr-overlay"),
+    };
+    let chosen = super::choose(Some(&settings), super::Display::Refused);
+    assert!(
+        matches!(chosen, super::Chosen::Absent(_)),
+        "a refused display still produced an overlay"
+    );
+    assert!(
+        chosen.presenter().present(PAYLOAD).is_none(),
+        "a refused display drew something"
+    );
 }
 
 #[test]
@@ -343,7 +369,7 @@ fn an_account_this_device_does_have_gets_an_overlay() {
         user: current_account_name(),
         binary: PathBuf::from("/usr/bin/tessera-qr-overlay"),
     };
-    let chosen = super::choose(Some(&settings), None);
+    let chosen = super::choose(Some(&settings), super::Display::Unnamed);
     assert!(
         matches!(chosen, super::Chosen::Spawning(_)),
         "an account this device has was not resolved"

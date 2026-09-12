@@ -728,13 +728,42 @@ impl Chosen {
     }
 }
 
+/// What the application said about the display of this login.
+///
+/// Three states and not two, because "nothing was named" and "what was named is
+/// not a display this module will act on" lead to opposite places. The first is
+/// every text login: there is no display item, and the environment of the host
+/// process is the only source there is (`sshd` with a forwarded display, a
+/// developer's shell). The second is a refusal, and a refusal that fell back to
+/// the environment would start an overlay anyway — on the display of whoever
+/// exported `DISPLAY` into that process — which is exactly what refusing a
+/// display was for.
+#[derive(Debug)]
+pub enum Display {
+    /// The application named a display this module will act on.
+    Named(XChannel),
+    /// The application named no display at all.
+    Unnamed,
+    /// The application named something this module will not act on.
+    Refused,
+}
+
 /// Chooses what this device shows its challenges on.
 ///
-/// Never fails: a fleet that named no account, and a device that does not have
-/// the account a fleet named, both get [`Chosen::Absent`] — and so does every
-/// device without a display manager, which is most of them.
+/// Never fails: a fleet that named no account, a device that does not have the
+/// account a fleet named, and a display this module refuses all get
+/// [`Chosen::Absent`] — and so does every device without a display manager,
+/// which is most of them.
 #[must_use]
-pub fn choose(settings: Option<&OverlaySettings>, x: Option<XChannel>) -> Chosen {
+pub fn choose(settings: Option<&OverlaySettings>, display: Display) -> Chosen {
+    let x = match display {
+        Display::Named(channel) => Some(channel),
+        Display::Unnamed => None,
+        // No overlay at all, and NOT a fall back to the environment: the
+        // display that was named is refused, and starting the overlay on
+        // another one would be this module choosing a screen nobody named.
+        Display::Refused => return Chosen::Absent(NoOverlay),
+    };
     from_settings(settings, x).map_or(Chosen::Absent(NoOverlay), Chosen::Spawning)
 }
 

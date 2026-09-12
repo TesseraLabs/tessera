@@ -962,20 +962,20 @@ unsafe fn authenticate_by_code_entry(
     // environment of this process: under a display manager there is nothing in
     // the environment to find — see `pam_helpers::pam_get_x_channel`.
     // SAFETY: `pamh` is the live PAM handle of the enclosing callback.
-    let x_channel = unsafe { crate::pam_helpers::pam_get_x_channel(pamh) }.unwrap_or_else(|err| {
+    let display = unsafe { crate::pam_helpers::pam_get_x_channel(pamh) }.unwrap_or_else(|err| {
         tracing::debug!(
             target: "tessera.codes",
             error = %err,
             "the display of this login could not be read from PAM; falling back to the environment",
         );
-        None
+        crate::overlay::Display::Unnamed
     });
     // Said out loud, and for a reason a journal can act on: when this line is
     // absent on a graphical login, the overlay is about to look for a display
     // in an environment that has none, and the engineer will see no symbol at
     // all. The scheme is named, the cookie is not — it opens the screen of the
     // machine somebody is standing at.
-    if let Some(channel) = x_channel.as_ref() {
+    if let crate::overlay::Display::Named(channel) = &display {
         tracing::info!(
             target: "tessera.codes",
             display = %channel.display,
@@ -983,7 +983,7 @@ unsafe fn authenticate_by_code_entry(
             "the display of this login came from PAM; the overlay will not read the environment",
         );
     }
-    let chosen = crate::overlay::choose(codes_config.overlay.as_ref(), x_channel);
+    let chosen = crate::overlay::choose(codes_config.overlay.as_ref(), display);
 
     let deps = CodeDeps {
         overlay: chosen.presenter(),

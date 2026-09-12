@@ -45,6 +45,17 @@ impl Answer {
     /// builds these in [`crate::pam_conv`] from the PAM response, and the
     /// scripted conversations of the tests build them from string literals.
     /// Nothing outside this crate has an answer to hold.
+    ///
+    /// Only the Linux build has a live conversation to build these from; on any
+    /// other target the type is carried by the cross-platform flow and
+    /// constructed by tests alone.
+    #[cfg_attr(
+        not(any(target_os = "linux", test)),
+        expect(
+            dead_code,
+            reason = "the live conversation this builds from is Linux-only"
+        )
+    )]
     pub(crate) fn new(value: String) -> Self {
         Self(Zeroizing::new(value))
     }

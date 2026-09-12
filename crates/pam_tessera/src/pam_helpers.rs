@@ -19,7 +19,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
-use crate::overlay::XChannel;
+use crate::overlay::{Display, XChannel};
 
 /// Errors raised by [`pam_get_user_string`] / [`pam_get_item_string`].
 #[derive(Debug, thiserror::Error)]
@@ -328,10 +328,15 @@ pub unsafe fn pam_set_user_string(
 
 /// Read the display of a graphical login and the credential for it.
 ///
-/// Returns `Ok(None)` when the application named no display, which is every
-/// text login and is not a failure of anything. A display named without a
-/// credential also returns `None`: an X client cannot open a display it has no
-/// cookie for, and starting one to watch it fail costs a login the wait.
+/// Returns [`Display::Unnamed`] when the application named no display, which is
+/// every text login and is not a failure of anything — there the environment of
+/// the host process is the only source there is.
+///
+/// Returns [`Display::Refused`] when a display WAS named and this module will
+/// not act on it: a form that is not local (`host:0` sends the cookie of a
+/// login screen across a network), or a credential that is missing or unusable.
+/// A refusal must not become a fall back to the environment: that would start
+/// the overlay on a display nobody named, which is the opposite of refusing.
 ///
 /// The items are the only channel a display manager has for this. The process
 /// the module runs inside — `fly-dm` on the target fleet — carries neither
@@ -349,7 +354,7 @@ pub unsafe fn pam_set_user_string(
 ///   UTF-8. The cookie itself is bytes and is never decoded.
 pub unsafe fn pam_get_x_channel(
     pamh: *mut pam_sys::pam_handle_t,
-) -> Result<Option<XChannel>, PamHelperError> {
+) -> Result<Display, PamHelperError> {
     let mut item_ptr: *const c_void = std::ptr::null();
     // SAFETY: `pamh` is owned by PAM; `item_ptr` is a valid out-pointer.
     let rc = unsafe { pam_get_item(pamh, PAM_XDISPLAY, &raw mut item_ptr) };
@@ -357,7 +362,7 @@ pub unsafe fn pam_get_x_channel(
         return Err(PamHelperError::PamRc(rc));
     }
     if item_ptr.is_null() {
-        return Ok(None);
+        return Ok(Display::Unnamed);
     }
     // SAFETY: for PAM_XDISPLAY the item is a `const char *` valid for the
     // lifetime of `pamh`.
@@ -374,7 +379,7 @@ pub unsafe fn pam_get_x_channel(
             target: "tessera.codes",
             "the display named by the application is not a local one; the overlay will not be started",
         );
-        return Ok(None);
+        return Ok(Display::Refused);
     }
 
     let mut xauth_ptr: *const c_void = std::ptr::null();
@@ -384,7 +389,10 @@ pub unsafe fn pam_get_x_channel(
         return Err(PamHelperError::PamRc(rc));
     }
     if xauth_ptr.is_null() {
-        return Ok(None);
+        // A display was named and no credential came with it. The environment
+        // is not an answer to that: its cookie belongs to another display, and
+        // this one cannot be opened without the one the application withheld.
+        return Ok(Display::Refused);
     }
     // SAFETY: for PAM_XAUTHDATA the item points at a `struct pam_xauth_data`
     // owned by PAM and valid for the lifetime of `pamh`.
@@ -392,7 +400,8 @@ pub unsafe fn pam_get_x_channel(
     let namelen = usize::try_from(xauth.namelen).unwrap_or(0);
     let datalen = usize::try_from(xauth.datalen).unwrap_or(0);
     if namelen == 0 || datalen == 0 || xauth.name.is_null() || xauth.data.is_null() {
-        return Ok(None);
+        // As above: named display, unusable credential.
+        return Ok(Display::Refused);
     }
     // SAFETY: the two buffers are `namelen`/`datalen` bytes long by the
     // contract of the item, and are read without being kept.
@@ -403,7 +412,7 @@ pub unsafe fn pam_get_x_channel(
         .map_err(|_| PamHelperError::NonUtf8)?
         .to_owned();
 
-    Ok(Some(XChannel {
+    Ok(Display::Named(XChannel {
         display,
         scheme,
         cookie,
