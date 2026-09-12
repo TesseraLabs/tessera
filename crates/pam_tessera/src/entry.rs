@@ -341,7 +341,9 @@ const LOGIN_PROMPT: &str = "Имя учётной записи: ";
 ///
 /// The third case is the one the target fleet produces and the reason this
 /// function exists: a greeter that starts the transaction with an EMPTY name
-/// rather than none. libpam has a name — the empty one — so it asks nothing,
+/// rather than none. Empty is the word: a name of blank space was named by the
+/// application, and this module refuses it rather than asking for another one —
+/// asking would end with the item the application set being written over. libpam has a name — the empty one — so it asks nothing,
 /// and the method would refuse a login before showing a single prompt. The
 /// answer is ONE prompt, and only then is PAM_USER supplied with what came
 /// back. Supplying it is what keeps the module honest about identity: the
@@ -390,7 +392,22 @@ unsafe fn resolve_login_account(
 ) -> Result<String, crate::pam_helpers::PamHelperError> {
     // SAFETY: `pamh` is the live PAM handle (caller contract).
     let named = unsafe { crate::pam_helpers::pam_get_user_prompted(pamh, Some(LOGIN_PROMPT)) }?;
-    if !named.trim().is_empty() {
+    // EMPTY, not "blank". The two are different facts about a transaction and
+    // only the first one means nobody has named an account: a name of spaces
+    // was named — badly — by the application, and asking a person for another
+    // one would end with this module writing over an item the application set.
+    // That is the substitution the whole class of CVE-2021-3560 is about:
+    // modules before and after this one would see different identities, and
+    // neither would know it.
+    if !named.is_empty() {
+        if named.trim().is_empty() {
+            tracing::warn!(
+                target: "tessera.auth",
+                name_len = named.len(),
+                "the application named an account of blank space; refusing without replacing it",
+            );
+            return Err(crate::pam_helpers::PamHelperError::NoUser);
+        }
         return Ok(named);
     }
 
