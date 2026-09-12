@@ -11,7 +11,7 @@
 # объекте. Ради исключения этого заведён контрактный крейт, и хелпер этой
 # границы не переходит.
 #
-#   codes-server.sh prepare <fixtures>/codes [--without-codes-url]
+#   codes-server.sh prepare <fixtures>/codes [--without-codes-url] [--with-overlay]
 #   codes-server.sh authenticate <user> --level N
 #   codes-server.sh authenticate-with-code <user> --level N --code <код>
 #   codes-server.sh authenticate-with-device-key <user> --level N
@@ -154,6 +154,13 @@ LEADING_ANSWERS=()
 DRIVER_USER=""
 GREETER_CHANNEL=0
 
+# Оверлей графического входа: чьей учётной записью он бежит и откуда берётся.
+# Учётная запись — та же, под которой работает греетер; на Astra это `fly-dm`.
+# Секция конфигурации пишется только по `prepare --with-overlay`.
+WITH_OVERLAY=0
+OVERLAY_USER="${TESSERA_E2E_OVERLAY_USER:-fly-dm}"
+OVERLAY_BINARY="${TESSERA_E2E_OVERLAY_BINARY:-/usr/bin/tessera-qr-overlay}"
+
 die() {
     echo "codes-server: $*" >&2
     exit "$EXIT_INTERNAL"
@@ -180,9 +187,10 @@ usage_error() {
 usage() {
     cat >&2 <<'EOF'
 usage: codes-server.sh <command> [args]
-  prepare <fixtures>/codes [--without-codes-url]
+  prepare <fixtures>/codes [--without-codes-url] [--with-overlay]
                         разложить артефакты Codes, включить [codes] и завести
-                        PAM-сервис codeauth
+                        PAM-сервис codeauth; --with-overlay дописывает учётную
+                        запись и бинарь оверлея графического входа
   authenticate <user> --level N
                         полный вход по коду: снять challenge, получить код у
                         `issuer codes issue`, подать его
@@ -518,6 +526,17 @@ tags = [$tags_toml]
 # умолчание контракта не должно расходиться с тем, что считает хелпер.
 attempts_per_nonce = $ATTEMPTS_PER_NONCE
 EOF
+        # Оверлей описывается только там, где кейс его проверяет. Без секции
+        # модуль показывает challenge текстом — это и есть поведение устройства
+        # без графического входа, на котором стоит большинство кейсов сюиты.
+        if [ "$WITH_OVERLAY" = "1" ]; then
+            cat <<EOF
+
+[codes.overlay]
+user = "$OVERLAY_USER"
+binary = "$OVERLAY_BINARY"
+EOF
+        fi
     } > "$staging"
     chmod --reference="$CONFIG" "$staging"
     chown --reference="$CONFIG" "$staging"
@@ -557,6 +576,7 @@ cmd_prepare() {
     for flag in "$@"; do
         case "$flag" in
             --without-codes-url) WITHOUT_CODES_URL=1 ;;
+            --with-overlay) WITH_OVERLAY=1 ;;
             -*) usage_error "неизвестный флаг prepare: $flag" ;;
             *)
                 [ -z "$dir" ] || usage_error "prepare принимает один каталог фикстур"
@@ -564,7 +584,7 @@ cmd_prepare() {
                 ;;
         esac
     done
-    [ -n "$dir" ] || usage_error "usage: codes-server.sh prepare <fixtures>/codes [--without-codes-url]"
+    [ -n "$dir" ] || usage_error "usage: codes-server.sh prepare <fixtures>/codes [--without-codes-url] [--with-overlay]"
 
     require_root
     require_tool install

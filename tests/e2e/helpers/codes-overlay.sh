@@ -36,6 +36,20 @@ RUN_DIR="${TESSERA_E2E_STATE_DIR:-/run/tessera-e2e}/codes-overlay"
 OVERLAY_DISPLAY="${TESSERA_E2E_DISPLAY:-:0}"
 OVERLAY_XAUTHORITY="${TESSERA_E2E_XAUTHORITY:-}"
 
+# Файл прав на дисплей, если его не назвали снаружи, БЕРЁТСЯ У ЖИВОГО X-СЕРВЕРА:
+# путь стоит в его собственной командной строке (`-auth`), меняется от загрузки
+# к загрузке и на разных дистрибутивах лежит в разных каталогах. Список
+# вероятных путей вместо этого — тот самый «угаданный путь», который даёт
+# «оверлея нет» вместо ответа.
+#
+# Ничего не печатает и ничем не кончается при неудаче: вызывающая команда сама
+# решает, что делать с пустым значением.
+discover_xauthority() {
+    local line
+    line="$(ps -eo args= 2>/dev/null | grep -m1 -E '(^|/)(X|Xorg)( |$)' || true)"
+    printf '%s' "$line" | sed -n 's/.*-auth \([^ ]*\).*/\1/p'
+}
+
 # Имя процесса оверлея. Совпадает с бинарём пакета; расхождение выглядит как
 # «оверлей не поднялся» и разбирается по журналу модуля.
 OVERLAY_PROCESS="${TESSERA_E2E_OVERLAY_PROCESS:-tessera-qr-overlay}"
@@ -104,9 +118,9 @@ cmd_expect_overlay_login() {
     require_tool pgrep
     [ -x "$CODES_SERVER" ] || die "нет $CODES_SERVER — разговор вести нечем"
 
-    XAUTH="$OVERLAY_XAUTHORITY"
+    XAUTH="${OVERLAY_XAUTHORITY:-$(discover_xauthority)}"
     if [ -z "$XAUTH" ]; then
-        die "не задан TESSERA_E2E_XAUTHORITY: без прав на дисплей греетера снимок экрана невозможен, а угаданный путь дал бы «оверлея нет» вместо ответа"
+        die "прав на дисплей греетера не нашлось: TESSERA_E2E_XAUTHORITY не задан, а у живого X-сервера нет аргумента -auth"
     fi
     [ -r "$XAUTH" ] || die "нет доступа к $XAUTH"
 
@@ -154,9 +168,9 @@ cmd_expect_overlay_from_pam_items() {
     require_tool xauth
     [ -x "$CODES_SERVER" ] || die "нет $CODES_SERVER — разговор вести нечем"
 
-    XAUTH="$OVERLAY_XAUTHORITY"
+    XAUTH="${OVERLAY_XAUTHORITY:-$(discover_xauthority)}"
     if [ -z "$XAUTH" ]; then
-        die "не задан TESSERA_E2E_XAUTHORITY: без прав на дисплей греетера снимок экрана невозможен, а угаданный путь дал бы «оверлея нет» вместо ответа"
+        die "прав на дисплей греетера не нашлось: TESSERA_E2E_XAUTHORITY не задан, а у живого X-сервера нет аргумента -auth"
     fi
     [ -r "$XAUTH" ] || die "нет доступа к $XAUTH"
 

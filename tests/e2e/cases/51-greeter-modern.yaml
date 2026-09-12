@@ -77,7 +77,9 @@ cases:
     # про неподнявшийся оверлей» зеленела бы и на устройстве без дисплея.
     requires: [service-manager, graphics]
     steps:
-      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # С оверлеем: остальные кейсы сюиты идут текстовым показом, и секция
+      # конфигурации, написанная им всем, проверялась бы там, где графики нет.
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes --with-overlay
       - run: helpers/codes-overlay.sh expect-overlay-from-pam-items {{user}}
         expect:
           exit_code: 0
