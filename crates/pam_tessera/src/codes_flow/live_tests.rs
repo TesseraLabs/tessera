@@ -64,10 +64,14 @@
 
 #[cfg(unix)]
 use std::cell::RefCell;
-
-use crate::answer::Answer;
 #[cfg(unix)]
 use std::time::Duration;
+
+// Everything this module builds an answer for is a `#[cfg(unix)]` conversation,
+// so the import carries the same condition the rest of them do — a plain one
+// is an unused import on Windows, where the tests below do not exist.
+#[cfg(unix)]
+use crate::answer::Answer;
 
 #[cfg(unix)]
 use openssl::bn::{BigNum, BigNumContext};
