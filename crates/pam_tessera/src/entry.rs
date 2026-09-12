@@ -359,14 +359,20 @@ const LOGIN_PROMPT: &str = "Имя учётной записи: ";
 /// nothing can be struck out afterwards. An empty answer is therefore a
 /// refusal, not an occasion to ask again.
 ///
-/// # Why the answer is checked against the passwd database here
+/// # Why the answer is checked twice before it becomes PAM_USER
 ///
 /// Everything downstream names the account in its logs and its audit records —
 /// a refused role writes the name it refused. A value typed into a prompt is
-/// not an account until something says so, and the cheapest thing that can say
-/// so is NSS. A name that resolves to no account is refused here, and the value
-/// itself is not written anywhere: what an unverified string turns out to be is
-/// exactly what must not be recorded.
+/// not an account until something says so, and two things have to say it: the
+/// role-id contract (`^[a-z][a-z0-9-]{0,15}$`), which is the only shape a role
+/// account name can have at all, and NSS, which says this device has one. The
+/// contract goes first because it is the cheaper question and because it is the
+/// one that admits nothing else: a password does not look like a role id.
+///
+/// Neither refusal names the value, and the answer is overwritten in place
+/// before it is dropped. What an unverified string turns out to be is exactly
+/// what must not be recorded — and what must not be left in the module's memory
+/// for a core dump to carry out.
 ///
 /// # Safety
 ///
@@ -400,7 +406,7 @@ unsafe fn resolve_login_account(
             return Err(crate::pam_helpers::PamHelperError::NoUser);
         }
     };
-    let typed = typed.trim().to_owned();
+    let mut typed = typed.trim().to_owned();
     if typed.is_empty() {
         tracing::warn!(
             target: "tessera.auth",
@@ -408,15 +414,25 @@ unsafe fn resolve_login_account(
         );
         return Err(crate::pam_helpers::PamHelperError::NoUser);
     }
+    // Neither branch below names the value, and that is the whole point: what
+    // was typed may be a password the greeter put into a field this module
+    // asked something else for, and a journal that recorded it would keep it.
+    if tessera_core::role::RoleId::new(&typed).is_err() {
+        tracing::warn!(
+            target: "tessera.auth",
+            answer_len = typed.len(),
+            "what was typed at the account prompt cannot be a role account name; refusing",
+        );
+        typed.zeroize();
+        return Err(crate::pam_helpers::PamHelperError::NoUser);
+    }
     if !account_exists(&typed) {
-        // The value is NOT in this line, and that is the whole point of the
-        // check: what was typed may be a password the greeter put into the
-        // second field, and a journal that recorded it would keep it.
         tracing::warn!(
             target: "tessera.auth",
             answer_len = typed.len(),
             "what was typed at the account prompt names no account on this device; refusing",
         );
+        typed.zeroize();
         return Err(crate::pam_helpers::PamHelperError::NoUser);
     }
     // The name enters the transaction, not just this module: everything
@@ -426,6 +442,32 @@ unsafe fn resolve_login_account(
     // SAFETY: as above.
     unsafe { crate::pam_helpers::pam_set_user_string(pamh, &typed) }?;
     Ok(typed)
+}
+
+/// Overwrite a string that turned out not to be an account name.
+///
+/// A `String` is not wiped when it is dropped: the allocation goes back to the
+/// allocator with the bytes still in it. The answers to the other prompts of
+/// this conversation are wiped where PAM allocated them (`pam_conv`), and an
+/// answer that reached this module has to be wiped here.
+#[cfg(target_os = "linux")]
+trait WipeInPlace {
+    /// Overwrite the bytes in place, then empty the string.
+    fn zeroize(&mut self);
+}
+
+#[cfg(target_os = "linux")]
+impl WipeInPlace for String {
+    fn zeroize(&mut self) {
+        use zeroize::Zeroize as _;
+        // The bytes of the buffer, not the buffer itself: the capacity stays,
+        // which is what keeps this an overwrite rather than a new allocation
+        // with the old one left behind.
+        // SAFETY: the string is filled with zeros, which is valid UTF-8, and
+        // it is truncated to nothing immediately afterwards.
+        unsafe { self.as_mut_vec() }.zeroize();
+        self.clear();
+    }
 }
 
 /// Whether this device has an account of that name.
@@ -555,11 +597,14 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         };
 
         // Role selection happens inside the flow: the account being logged
-        // into IS the requested role, so `pam_user` below is its only source
-        // and the module never rewrites `PAM_USER`. The name the rest of the
-        // stack sees is the name we act on, with no window between the two
-        // (polkit CVE-2021-3560 class). A name that cannot be a role id at all
-        // is refused by the flow before any credential material is touched.
+        // into IS the requested role, so `pam_user` below is its only source.
+        // The name the rest of the stack sees is the name we act on, with no
+        // window between the two (polkit CVE-2021-3560 class) — the one write
+        // this module makes fills an EMPTY item and only after the answer has
+        // been checked against the role-id contract and the passwd database,
+        // which is what `resolve_login_account` above is. A name that cannot be
+        // a role id at all is refused before any credential material is
+        // touched.
         // SAFETY: `pamh` is the live PAM handle for this callback.
         let pam_service = unsafe { crate::pam_helpers::pam_get_service_string(pamh) }
             .unwrap_or_else(|err| {

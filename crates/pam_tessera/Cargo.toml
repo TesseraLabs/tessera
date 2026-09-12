@@ -33,6 +33,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 secrecy = { workspace = true }
+zeroize = { workspace = true }
 openssl = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
