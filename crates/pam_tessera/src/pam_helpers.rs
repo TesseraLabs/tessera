@@ -49,18 +49,21 @@ const PAM_TTY: c_int = pam_sys::PAM_TTY as c_int;
 const PAM_USER: c_int = pam_sys::PAM_USER as c_int;
 /// The display a graphical login runs on, as the application named it.
 ///
-/// Spelled out rather than taken from `pam_sys`: the crate's bindings do not
-/// carry the X items, and the numbers are fixed by the Linux-PAM ABI
-/// (`_pam_types.h`) — changing them would break every module ever compiled.
-const PAM_XDISPLAY: c_int = 11;
+/// Taken from the bindings, which `bindgen` generates from the very header
+/// libpam was built with — never written out as a number here. A number typed
+/// by hand was wrong once already: `PAM_XAUTHDATA` was given as 13, which is
+/// `PAM_AUTHTOK_TYPE`, so the X channel was never read at all and a stack that
+/// had set the authtok type handed this module a `char *` to dereference as a
+/// struct.
+const PAM_XDISPLAY: c_int = pam_sys::PAM_XDISPLAY as c_int;
 /// The credential for that display: a scheme name and its bytes.
-const PAM_XAUTHDATA: c_int = 13;
+const PAM_XAUTHDATA: c_int = pam_sys::PAM_XAUTHDATA as c_int;
 
 /// The X authorisation data of a graphical login, as libpam lays it out.
 ///
-/// Mirrors `struct pam_xauth_data` of `_pam_types.h` field for field. Declared
-/// here for the same reason as the item numbers above: the binding crate does
-/// not carry it, and its shape is part of the ABI.
+/// Mirrors `struct pam_xauth_data` of `_pam_types.h` field for field. Unlike
+/// the item numbers, the struct is NOT in the bindings — `bindgen` leaves it
+/// out — so its shape is written here, and the shape is part of the ABI.
 #[repr(C)]
 struct PamXauthData {
     namelen: c_int,
@@ -419,6 +422,20 @@ pub fn data_key_cstring(key: &str) -> Result<CString, PamHelperError> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_x_items_are_the_numbers_the_header_gives_them() {
+        // The values are asserted against the ABI, not against the bindings
+        // they come from: a test that compared them with themselves would pass
+        // for any pair of numbers, which is exactly how 13 got in here. The
+        // literals below are `_pam_types.h` — X display 11, X auth data 12, and
+        // 13 is the type for `pam_get_authtok`, which is a `char *` and would
+        // be dereferenced as a struct by a module that confused the two.
+        assert_eq!(PAM_XDISPLAY, 11);
+        assert_eq!(PAM_XAUTHDATA, 12);
+        assert_eq!(pam_sys::PAM_AUTHTOK_TYPE as c_int, 13);
+        assert_ne!(PAM_XAUTHDATA, pam_sys::PAM_AUTHTOK_TYPE as c_int);
+    }
 
     #[test]
     fn data_key_round_trip() {

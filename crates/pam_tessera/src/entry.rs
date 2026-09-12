@@ -864,6 +864,19 @@ unsafe fn authenticate_by_code_entry(
         );
         None
     });
+    // Said out loud, and for a reason a journal can act on: when this line is
+    // absent on a graphical login, the overlay is about to look for a display
+    // in an environment that has none, and the engineer will see no symbol at
+    // all. The scheme is named, the cookie is not — it opens the screen of the
+    // machine somebody is standing at.
+    if let Some(channel) = x_channel.as_ref() {
+        tracing::info!(
+            target: "tessera.codes",
+            display = %channel.display,
+            scheme = %channel.scheme,
+            "the display of this login came from PAM; the overlay will not read the environment",
+        );
+    }
     let chosen = crate::overlay::choose(codes_config.overlay.as_ref(), x_channel);
 
     let deps = CodeDeps {
