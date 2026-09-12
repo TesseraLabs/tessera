@@ -457,21 +457,11 @@ impl SpawningOverlay {
             // Its input is closed: nothing is ever typed at it.
             .stdin(Stdio::null())
             .stdout(Stdio::null());
-        for name in PASSED_ENV {
-            // A display named through PAM wins over the environment, and wins
-            // even when the environment holds nothing: an inherited `DISPLAY`
-            // from `sshd` beside a greeter's display would send the symbol to
-            // the wrong screen, and that screen belongs to somebody else.
-            if self.x.is_some() && (name == "DISPLAY" || name == "XAUTHORITY") {
-                continue;
-            }
-            if let Ok(value) = std::env::var(name) {
-                command.env(name, value);
-            }
-        }
-        if let (Some(channel), Some(file)) = (self.x.as_ref(), xauth.as_ref()) {
-            command.env("DISPLAY", &channel.display);
-            command.env("XAUTHORITY", &file.path);
+        let display = xauth
+            .as_ref()
+            .and_then(|file| self.x.as_ref().map(|channel| (channel, file)));
+        for (name, value) in child_environment(display, |name| std::env::var(name).ok()) {
+            command.env(name, value);
         }
         let child = command.spawn().map_err(|error| context("spawn", &error))?;
         let mut child = ChildGuard { child: Some(child) };
@@ -548,6 +538,39 @@ impl SpawningOverlay {
         chown(&path, self.owner)?;
         Ok(guard)
     }
+}
+
+/// What the overlay is started with, given a display and a host environment.
+///
+/// A function of its two inputs and nothing else, because the rule it holds is
+/// worth a test and the process environment is not something a test may set:
+/// `DISPLAY` and `XAUTHORITY` come from the display the APPLICATION named, when
+/// it named one, and from the host's environment only when it did not. An
+/// inherited `DISPLAY` — `sshd` with a forwarded display, a developer's shell —
+/// beside a greeter's own would send the symbol to the wrong screen, and that
+/// screen belongs to somebody else.
+///
+/// `PATH` always comes from the host: it is how a process finds a program, and
+/// no display names it.
+fn child_environment(
+    display: Option<(&XChannel, &PathGuard)>,
+    host: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::with_capacity(PASSED_ENV.len());
+    for name in PASSED_ENV {
+        let named_by_application = display.is_some() && (name == "DISPLAY" || name == "XAUTHORITY");
+        if named_by_application {
+            continue;
+        }
+        if let Some(value) = host(name) {
+            out.push((name, value));
+        }
+    }
+    if let Some((channel, file)) = display {
+        out.push(("DISPLAY", channel.display.clone()));
+        out.push(("XAUTHORITY", file.path.to_string_lossy().into_owned()));
+    }
+    out
 }
 
 /// Waits for the overlay to say the symbol is on the screen.

@@ -251,6 +251,22 @@ static void wipe_answers(void)
     g_answer_count = 0;
 }
 
+/* Значение одной шестнадцатеричной цифры либо -1. Регистр любой; больше
+ * ничего не принимается. */
+static int hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
 /* Разбирает шестнадцатеричную строку в байты. Возвращает NULL на нечётной длине
  * и на любом не-hex символе: молча принятая половина куки дала бы «оверлей не
  * поднялся» вместо ошибки стенда. Длина результата — в *out_len. */
@@ -265,15 +281,16 @@ static unsigned char *parse_hex(const char *hex, size_t *out_len)
         return NULL;
     }
     for (size_t i = 0; i < len / 2; i++) {
-        unsigned int value = 0;
-        char pair[3] = { hex[2 * i], hex[2 * i + 1], '\0' };
-        char *end = NULL;
-        value = (unsigned int)strtoul(pair, &end, 16);
-        if (end == NULL || *end != '\0') {
+        /* Посимвольно, а не strtoul: тот принимает ведущие пробелы и знак, то
+         * есть " f" и "+f" прошли бы как байты, и куки молча поехала бы другая.
+         * Стенд обязан спотыкаться на своём аргументе, а не подменять его. */
+        int high = hex_digit(hex[2 * i]);
+        int low = hex_digit(hex[2 * i + 1]);
+        if (high < 0 || low < 0) {
             free(bytes);
             return NULL;
         }
-        bytes[i] = (unsigned char)value;
+        bytes[i] = (unsigned char)((high << 4) | low);
     }
     *out_len = len / 2;
     return bytes;

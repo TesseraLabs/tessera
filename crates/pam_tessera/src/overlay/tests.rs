@@ -796,6 +796,55 @@ time.sleep(30)
 }
 
 #[test]
+fn the_display_named_through_pam_wins_over_the_one_in_the_environment() {
+    // Both can be present at once, and the wrong choice sends the symbol to
+    // somebody else's screen: a login over ssh with X forwarding carries
+    // `DISPLAY` in the environment of the host process, while the display a
+    // greeter names through PAM is the one the person is standing in front of.
+    //
+    // Asserted over the function that decides it rather than over a child
+    // process: what a child inherits depends on the environment of the test
+    // binary, which a test must not set.
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = super::PathGuard {
+        path: dir.path().join("attempt.xauth"),
+    };
+    let channel = x_channel();
+    let host = |name: &str| match name {
+        "DISPLAY" => Some(":99".to_owned()),
+        "XAUTHORITY" => Some("/nonexistent/inherited-cookie".to_owned()),
+        "PATH" => Some("/usr/bin".to_owned()),
+        _ => None,
+    };
+
+    let named = super::child_environment(Some((&channel, &cookie)), host);
+    assert_eq!(value_of(&named, "DISPLAY").as_deref(), Some(":0"));
+    assert_eq!(
+        value_of(&named, "XAUTHORITY").as_deref(),
+        cookie.path.to_str(),
+    );
+    // And the one name a display never supplies still comes from the host.
+    assert_eq!(value_of(&named, "PATH").as_deref(), Some("/usr/bin"));
+
+    // Without a display named by the application the environment is the only
+    // source there is — that is the ssh path and the developer's shell.
+    let inherited = super::child_environment(None, host);
+    assert_eq!(value_of(&inherited, "DISPLAY").as_deref(), Some(":99"));
+    assert_eq!(
+        value_of(&inherited, "XAUTHORITY").as_deref(),
+        Some("/nonexistent/inherited-cookie"),
+    );
+}
+
+/// The value of one name in what the child would be started with.
+fn value_of(environment: &[(&'static str, String)], name: &str) -> Option<String> {
+    environment
+        .iter()
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.clone())
+}
+
+#[test]
 fn an_overlay_that_never_says_it_drew_is_no_overlay() {
     // The difference between "a process connected" and "a symbol is on the
     // screen". The real overlay opens the display after connecting, so a wrong
