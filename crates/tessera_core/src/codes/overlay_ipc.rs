@@ -28,9 +28,33 @@
 //! as root; the overlay is unprivileged. A reverse direction would be the one
 //! place where root parses a stream produced by an unprivileged process on a
 //! machine anybody can walk up to — a whole state machine's worth of parsing,
-//! for the sake of telling a journal *why* a symbol could not be drawn. The
-//! module shuts down the read half of the socket, so there is nothing to parse
-//! and nothing to get wrong.
+//! for the sake of telling a journal *why* a symbol could not be drawn.
+//!
+//! # The one byte that comes back, and why it is not a state machine
+//!
+//! There is exactly one exception, [`DRAWN`]: a single byte the overlay writes
+//! after the FIRST symbol is on the screen. Nothing else ever travels upwards,
+//! and this one is not parsed — it is compared with a constant, once, under a
+//! deadline, and then the read half of the socket goes down for good.
+//!
+//! It exists because of what the module does with the answer. The challenge is
+//! shown one of two ways: as half-block glyphs in the text of the code prompt,
+//! or by the overlay. Choosing between them needs the answer to "is the symbol
+//! on a screen" — and the events a module can observe without this byte answer
+//! a different question. A process that connected to the socket has not drawn
+//! anything yet: the real overlay opens the display AFTER connecting, and a
+//! wrong cookie or a dead X server takes it down between the two. Treating
+//! "connected" as "drawn" leaves an engineer with a bare `Код:` prompt, no
+//! symbol and no text form of the challenge anywhere — a login nobody can
+//! finish, at a device somebody travelled to.
+//!
+//! What the exception costs, stated rather than implied: root reads one byte
+//! from a descriptor an unprivileged process holds. What bounds it: a fixed
+//! length, no allocation, a value compared to a constant with any difference
+//! meaning "no overlay", a deadline, and a socket whose read half is shut down
+//! the moment the byte is in. There is no second byte, no length prefix and
+//! nothing the peer can say that changes what happens next — it can only fail
+//! to say it, which leaves the text path, exactly as a missing overlay does.
 //!
 //! What the overlay does when it cannot draw: it writes the reason to its
 //! standard error, which lands wherever the greeter's own does, and exits. The
@@ -124,6 +148,14 @@ pub const SOCKET_DIRECTORY: &str = "/run/tessera-overlay";
 
 /// Permission bits of [`SOCKET_DIRECTORY`].
 pub const SOCKET_DIRECTORY_MODE: u32 = 0o711;
+
+/// The single byte the overlay sends once the first symbol is on the screen.
+///
+/// Not a frame: no magic, no header, no body. A frame would be a parser, and a
+/// parser is the thing the one-way rule exists to avoid — see the module docs.
+/// The value is arbitrary and fixed; what matters is that anything else, and
+/// nothing at all, both mean "no overlay".
+pub const DRAWN: u8 = 0x2A;
 
 const KIND_CHALLENGE: u8 = 1;
 const KIND_REFRESH: u8 = 2;

@@ -75,6 +75,11 @@ fn fake_overlay(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
 /// into a Rust string literal loses its indentation to the line continuations,
 /// and a Python program without indentation is a Python program that does not
 /// run. That cost an hour once; it costs a file now.
+///
+/// It also sends the drawn byte after the first frame, because that is what a
+/// real overlay does once a symbol is on the screen — and without it the module
+/// treats this stand-in as an overlay that never drew anything. The stand-in
+/// that deliberately stays quiet is [`mute_overlay`].
 fn recording_overlay(
     dir: &std::path::Path,
     record: &std::path::Path,
@@ -93,12 +98,16 @@ import socket, sys
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 out = open(sys.argv[2], \"wb\")
+acked = False
 while True:
     data = s.recv(4096)
     if not data:
         break
     out.write(data)
     out.flush()
+    if not acked:
+        s.sendall(b\"\\x2a\")
+        acked = True
 "
     } else {
         // Reads the challenge and then waits, which is what a real overlay does
@@ -109,6 +118,7 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 data = s.recv(4096)
 open(sys.argv[2], \"wb\").write(data)
+s.sendall(b\"\\x2a\")
 time.sleep(30)
 "
     };
@@ -369,6 +379,7 @@ out.flush()
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 s.recv(4096)
+s.sendall(b\"\\x2a\")
 out.write(\"connected\\n\")
 out.close()
 ",
@@ -477,16 +488,18 @@ fn await_text(path: &std::path::Path, marker: &str, wait: Duration) -> String {
 }
 
 #[test]
-fn nothing_the_overlay_writes_reaches_the_module() {
-    // The security property of this whole join. The module runs as root inside
-    // `sshd` or a display manager; the overlay does not. Root reading a stream
-    // that side produced would be the one place where a privileged process
-    // parses an unprivileged one's output — so the read half is shut down
-    // before the first byte goes out, and there is nothing to parse.
+fn nothing_the_overlay_writes_after_the_drawn_byte_reaches_the_module() {
+    // The security property of this whole join, as it stands now. The module
+    // runs as root inside `sshd` or a display manager; the overlay does not.
+    // Root parsing a stream that side produced would be the one place where a
+    // privileged process reads an unprivileged one's output — so exactly one
+    // byte is read, the one that says a symbol is on the screen, and the read
+    // half goes down the moment it is in. Everything after it is refused or
+    // discarded.
     //
     // Asserted from the OVERLAY's side, which is where it is observable: a
-    // stand-in that writes into the socket after connecting gets its bytes
-    // refused, and the module never sees them.
+    // stand-in that floods the socket after acknowledging gets its bytes
+    // refused or dropped, and the module never sees them.
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("wrote.txt");
     let program = dir.path().join("talk-back.py");
@@ -498,6 +511,7 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 s.recv(4096)
 out = open(sys.argv[2], \"w\")
+s.sendall(b\"\\x2a\")
 try:
     s.sendall(b\"XXXX\" * 64)
     out.write(\"sent\\n\")
@@ -754,6 +768,58 @@ fn the_overlay_is_told_the_attempt_is_over() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A stand-in that connects, takes the frame and never says it drew anything.
+///
+/// The failure the real overlay produces when the display will not open: it is
+/// already connected by then, and it either dies or sits there. Held as a
+/// separate stand-in rather than a flag on [`recording_overlay`] because it
+/// stands for the opposite outcome.
+fn mute_overlay(dir: &std::path::Path) -> PathBuf {
+    let program = dir.join("mute.py");
+    std::fs::write(
+        &program,
+        "import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.recv(4096)
+time.sleep(30)
+",
+    )
+    .unwrap();
+    fake_overlay(
+        dir,
+        "overlay-mute",
+        &format!("exec python3 {} \"$2\"", program.display()),
+    )
+}
+
+#[test]
+fn an_overlay_that_never_says_it_drew_is_no_overlay() {
+    // The difference between "a process connected" and "a symbol is on the
+    // screen". The real overlay opens the display after connecting, so a wrong
+    // cookie or a dead X server leaves exactly this: a peer on the socket with
+    // nothing on the screen. Reported as no overlay, because the caller's next
+    // decision is whether to leave the challenge out of the prompt — and an
+    // engineer facing a bare code prompt with the challenge nowhere cannot
+    // finish the login at all.
+    let dir = tempfile::tempdir().unwrap();
+    let binary = mute_overlay(dir.path());
+    let overlay = overlay_from(binary, dir.path());
+
+    let started = Instant::now();
+    assert!(
+        overlay.present(PAYLOAD).is_none(),
+        "a silent overlay was taken for one that had drawn"
+    );
+    // And the wait is bounded by the same budget as the handshake: a login must
+    // not hang on an overlay that will never answer.
+    let waited = started.elapsed();
+    assert!(
+        waited < TEST_HANDSHAKE * 3,
+        "the login waited {waited:?} on an overlay that said nothing"
+    );
 }
 
 /// A display named the way a display manager names one.

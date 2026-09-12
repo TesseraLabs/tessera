@@ -14,17 +14,29 @@
 //! where it was going anyway. There is no error return, because there is no
 //! action a caller is allowed to take — see [`OverlayPresenter`].
 //!
-//! # The wire runs one way, and root never reads it
+//! # The wire runs one way, except for one byte
 //!
-//! The module writes; the overlay draws. Nothing comes back, and the read half
-//! of the socket is shut down before the first byte goes out.
+//! The module writes; the overlay draws. What comes back is a single byte,
+//! [`DRAWN`], sent once the first symbol is on the screen; the read
+//! half of the socket is shut down the moment it arrives, or the moment the
+//! deadline for it passes.
 //!
-//! This is the property worth the most in this file. The module is a cdylib
-//! inside `sshd`, `login` or a display manager and runs as root; the overlay
-//! is unprivileged code on a machine anybody can walk up to. A reverse
-//! direction would be the one place where root parses a stream that side
-//! produced — and it would exist so that a journal could say *why* a symbol
-//! was not drawn. The overlay says that on its own standard error instead.
+//! The direction is worth the most in this file, so the exception is stated
+//! precisely. The module is a cdylib inside `sshd`, `login` or a display
+//! manager and runs as root; the overlay is unprivileged code on a machine
+//! anybody can walk up to. A reverse direction carrying MESSAGES would be the
+//! one place where root parses a stream that side produced, and it would exist
+//! so that a journal could say *why* a symbol was not drawn — the overlay says
+//! that on its own standard error instead.
+//!
+//! This byte is not that. It is read once, with a fixed length, compared with a
+//! constant, and never used as data: anything other than exactly that value —
+//! silence, a different byte, a closed socket — means "no overlay", which is
+//! the same answer as a device that has none. What it buys is the difference
+//! between "a process connected" and "a symbol is on a screen": the overlay
+//! opens the display AFTER connecting, and without the byte the module would
+//! take the challenge out of the prompt for an overlay that never drew it,
+//! leaving the engineer a bare code prompt with the challenge nowhere.
 //!
 //! # The socket
 //!
@@ -113,7 +125,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tessera_core::codes::overlay_ipc::{
-    module, AttemptId, ATTEMPT_ID_LEN, SOCKET_DIRECTORY, SOCKET_DIRECTORY_MODE,
+    module, AttemptId, ATTEMPT_ID_LEN, DRAWN, SOCKET_DIRECTORY, SOCKET_DIRECTORY_MODE,
 };
 use tessera_core::codes::OverlaySettings;
 
@@ -467,18 +479,22 @@ impl SpawningOverlay {
         let stream = accept_one(&listener, child.child.as_mut(), self.wait_for_connection())
             .map_err(|error| context("accept", &error))?;
         check_peer(&stream, self.owner).map_err(|error| context("peer", &error))?;
-        // The read half is shut down before a single byte is written, and this
-        // is the security property of the whole join, not a tidiness: the
-        // module runs as root inside `sshd` or a display manager, the overlay
-        // is unprivileged, and this is the one place where the two touch. With
-        // nothing to read there is nothing to parse and nothing to get wrong.
-        stream
-            .shutdown(std::net::Shutdown::Read)
-            .map_err(|error| context("shutdown-read", &error))?;
-
         let frame = module::challenge(attempt, payload)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         send_frame(&stream, &frame).map_err(|error| context("write", &error))?;
+
+        // The symbol has to be ON A SCREEN before the caller may leave it out
+        // of the prompt, and only the overlay can say that: it opens the
+        // display after connecting, so everything up to this line is true of an
+        // overlay that never drew anything. An overlay that does not answer is
+        // treated exactly as an absent one.
+        wait_for_drawn(&stream, self.wait_for_connection())
+            .map_err(|error| context("ack", &error))?;
+        // Down for good now, and this is where the one-way rule resumes: the
+        // byte above is the whole of what this direction ever carries.
+        stream
+            .shutdown(std::net::Shutdown::Read)
+            .map_err(|error| context("shutdown-read", &error))?;
 
         // Taken out of the guard now that the handle owns it. The guard is what
         // kills a child that was started and then could not be handed on — a
@@ -531,6 +547,52 @@ impl SpawningOverlay {
         drop(file);
         chown(&path, self.owner)?;
         Ok(guard)
+    }
+}
+
+/// Waits for the overlay to say the symbol is on the screen.
+///
+/// One byte, fixed length, compared with a constant. Nothing about the value is
+/// interpreted: it either is [`DRAWN`] or the overlay is treated as
+/// absent — see the module docs for what bounds this direction.
+///
+/// # Errors
+///
+/// [`std::io::ErrorKind::TimedOut`] when the deadline passed with nothing on
+/// the socket (which is also what a `WouldBlock` from the read timeout means),
+/// [`std::io::ErrorKind::InvalidData`] for any other byte, and
+/// [`std::io::ErrorKind::UnexpectedEof`] for an overlay that closed instead of
+/// answering. Every one of them ends the same way for the caller.
+fn wait_for_drawn(stream: &UnixStream, budget: Duration) -> Result<(), std::io::Error> {
+    use std::io::Read as _;
+
+    stream.set_read_timeout(Some(budget))?;
+    let mut byte = [0u8; 1];
+    let read = (&*stream).read(&mut byte);
+    // The timeout is cleared whatever happened: the same socket carries the
+    // cancel frame on the way out, and a read timeout left on it belongs to
+    // nothing.
+    let _ignored = stream.set_read_timeout(None);
+    match read {
+        Ok(1) if byte.first() == Some(&DRAWN) => Ok(()),
+        Ok(1) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the overlay answered with something other than the drawn byte",
+        )),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the overlay closed the socket instead of drawing",
+        )),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the overlay did not say the symbol was drawn",
+            ))
+        }
+        Err(error) => Err(error),
     }
 }
 
