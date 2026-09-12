@@ -1260,7 +1260,7 @@ fn the_bound_on_an_answer_is_counted_in_bytes_and_not_in_characters() {
 }
 
 #[test]
-fn a_symbol_already_on_the_screen_keeps_the_glyph_wall_out_of_the_prompt() {
+fn a_symbol_already_on_the_screen_keeps_the_glyph_wall_out_of_the_prompt_but_not_the_address() {
     // The graphical login. The overlay is showing the symbol, so the prompt
     // asks for the code and nothing else: the greeter of the target fleet draws
     // the module's text in a single inline panel, and forty lines of half-block
@@ -1277,10 +1277,20 @@ fn a_symbol_already_on_the_screen_keeps_the_glyph_wall_out_of_the_prompt() {
     harness.run(&method, &mut conv, &probe, ROLE).unwrap();
 
     let code_prompt = conv.asked.get(2).cloned().expect("the code is asked for");
-    assert_eq!(
-        code_prompt,
-        super::CODE_PROMPT,
-        "the prompt carried more than the question while the overlay was up",
+    assert!(
+        !code_prompt.contains(super::QR_CAPTION),
+        "the drawing went into the prompt while the overlay was up: {code_prompt:?}",
+    );
+    // The address stays. The overlay draws the symbol and nothing else, and a
+    // camera that will not focus — or a room where telephones with cameras are
+    // not allowed — leaves typing it by hand as the only way across.
+    assert!(
+        code_prompt.contains("77-000123M"),
+        "the prompt carried no address to type: {code_prompt:?}",
+    );
+    assert!(
+        code_prompt.ends_with(super::CODE_PROMPT),
+        "the prompt does not end with its own question: {code_prompt:?}",
     );
 }
 

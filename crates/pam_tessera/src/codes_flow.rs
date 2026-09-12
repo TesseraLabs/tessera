@@ -114,7 +114,16 @@ const REASON_QR: &str = "qr_payload_too_long";
 /// something off a note.
 const REASON_ENGINEER_NUMBER: &str = "engineer_number_malformed";
 
-/// How many times an empty answer to a visible prompt is asked for again.
+/// How many times an empty answer to a visible prompt of THIS branch is asked
+/// for again.
+///
+/// The prompts this governs are the issuing side and the personal number.
+/// The account name is not among them and never asks twice: the second visible
+/// prompt of the greeter's channel receives its password field, and a name
+/// asked for again would be that password — see `entry::resolve_login_account`.
+/// These two are different: they are not identity, they are checked against the
+/// contract of the channel before anything is done with them, and a value that
+/// is merely wrong is refused rather than recorded.
 ///
 /// One, and both halves of that are deliberate.
 ///
@@ -181,6 +190,22 @@ fn shown_challenge(
     Ok(format!(
         "{QR_CAPTION}\n{symbol}{QR_FALLBACK_CAPTION}\n{payload}\n"
     ))
+}
+
+/// What goes above the code prompt when the symbol is already on a screen.
+///
+/// One line of text and the payload, and neither is decoration. The overlay
+/// draws the SYMBOL and nothing else: a camera that will not focus, glare on a
+/// screen, a room where telephones with cameras are not allowed — in every one
+/// of them the address typed by hand is the only way the challenge reaches the
+/// engineer's side, and there is nowhere else on a graphical login to read it
+/// from.
+///
+/// What is left out is the half-block drawing: it is forty lines, the greeter
+/// of the target fleet renders the module's text in a one-line inline panel,
+/// and the symbol it would duplicate is already on the screen behind it.
+fn typed_challenge(payload: &str) -> String {
+    format!("{QR_FALLBACK_CAPTION}\n{payload}\n")
 }
 
 /// The conversation with the person at the device.
@@ -790,10 +815,10 @@ where
         // every retry would scroll the screen and leave the engineer scanning a
         // half-erased QR — and they are looking at the code they mistyped, not
         // at the challenge, which has not changed.
-        let prompt = if first_prompt && !symbol_on_screen {
-            format!("{shown}{CODE_PROMPT}")
-        } else {
-            CODE_PROMPT.to_owned()
+        let prompt = match (first_prompt, symbol_on_screen) {
+            (true, false) => format!("{shown}{CODE_PROMPT}"),
+            (true, true) => format!("{}{CODE_PROMPT}", typed_challenge(&payload)),
+            (false, _) => CODE_PROMPT.to_owned(),
         };
         first_prompt = false;
         let typed = bounded_answer(
