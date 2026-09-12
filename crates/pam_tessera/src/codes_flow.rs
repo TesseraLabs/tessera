@@ -61,6 +61,7 @@ use tessera_core::pam_conv::PamConvError;
 use tessera_core::pam_data::AuthContext;
 use tessera_core::role::{AccountCheck, RoleDenyReason, RoleStore, SessionRolePayload};
 
+use crate::answer::Answer;
 use crate::codes_level::{LevelError, LevelSource};
 
 /// Longest identifier of an issuing side a person may type, in BYTES.
@@ -231,11 +232,18 @@ pub trait CodeConversation {
 
     /// Ask for a value that is meant to be visible while it is typed.
     ///
+    /// The answer comes back inside [`Answer`], which overwrites itself when it
+    /// is dropped. That is not tidiness: the greeter of the target fleet answers
+    /// the second prompt of a conversation with its password field whatever the
+    /// prompt asked for, so every answer here may be a password — including the
+    /// ones this branch refuses, throws away to ask again, or never looks at
+    /// after bounding it.
+    ///
     /// # Errors
     ///
     /// [`PamConvError`] when the conversation cannot be driven or the answer
     /// is not text.
-    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError>;
+    fn prompt_visible(&mut self, prompt: &str) -> Result<Answer, PamConvError>;
 
     /// Ask for a value that must not be echoed.
     ///
@@ -849,18 +857,23 @@ where
         };
         first_prompt = false;
         let typed = bounded_answer(
-            &conv.prompt_visible(&prompt)?,
+            conv.prompt_visible(&prompt)?.as_str(),
             MAX_CODE_LEN,
             pam_user,
             level,
             epoch,
         )?;
-        let code = normalise_code(&typed);
+        // The typed answer wipes itself at the end of this pass; the
+        // normalised copy made from it does not, and it is the code — so it is
+        // overwritten as soon as the verdict is in, below.
+        let mut code = normalise_code(&typed);
         // Markers are read afresh for every verification: an attempt that did
         // not survive a reboot must be refused by the reboot, not by whatever
         // the branch remembered from before it.
         let markers = read_markers(probe, pam_user, level, epoch)?;
-        match method.verify(&mut attempt, &code, &markers) {
+        let verdict = method.verify(&mut attempt, &code, &markers);
+        wipe(&mut code);
+        match verdict {
             Ok(value) => {
                 accepted = Some(value);
                 break;
@@ -921,13 +934,13 @@ where
     })
 }
 
-/// Overwrite an answer this branch is about to drop.
+/// Overwrite a copy this branch made of an answer.
 ///
-/// A `String` hands its allocation back with the bytes still in it. The answers
-/// to these prompts are wiped where PAM allocated them (`pam_conv`), and a copy
-/// this branch made has to be wiped where it made it — a value refused here may
-/// be a password the greeter put into a field this method asked something else
-/// for.
+/// Three layers, and this is the third. PAM's own buffer is wiped where PAM
+/// allocated it (`pam_conv`); the answer handed back wipes itself when it is
+/// dropped ([`Answer`]); and a copy this branch chose to keep — a bounded
+/// value, a normalised code — is this function's to overwrite, because nothing
+/// else knows it was made.
 fn wipe(value: &mut String) {
     use zeroize::Zeroize as _;
     // SAFETY: the bytes are overwritten with zeros, which is valid UTF-8, and
@@ -947,12 +960,16 @@ fn wipe(value: &mut String) {
 /// # Errors
 ///
 /// [`CodeFlowError::Conv`] when the conversation cannot be driven at all.
-fn ask_visible<C: CodeConversation>(conv: &mut C, prompt: &str) -> Result<String, CodeFlowError> {
+fn ask_visible<C: CodeConversation>(conv: &mut C, prompt: &str) -> Result<Answer, CodeFlowError> {
     let mut answer = conv.prompt_visible(prompt)?;
     for _ in 0..EMPTY_ANSWER_RETRIES {
         if !answer.trim().is_empty() {
             break;
         }
+        // The discarded answer is wiped by being dropped here. An empty one on
+        // this fleet is an unfilled form field — but a channel that answers
+        // every prompt with the same field would put a password in this
+        // variable, and nothing downstream would ever look at it again.
         answer = conv.prompt_visible(prompt)?;
     }
     Ok(answer)
@@ -978,7 +995,7 @@ fn ask_who_is_asking<C: CodeConversation>(
     epoch: u32,
 ) -> Result<(String, String), CodeFlowError> {
     let mut server_id = bounded_answer(
-        &ask_visible(conv, SERVER_PROMPT)?,
+        ask_visible(conv, SERVER_PROMPT)?.as_str(),
         MAX_SERVER_ID_LEN,
         pam_user,
         level,
@@ -1018,7 +1035,7 @@ fn ask_who_is_asking<C: CodeConversation>(
         return Err(CodeFlowError::Denied);
     }
     let typed = bounded_answer(
-        &ask_visible(conv, ENGINEER_PROMPT)?,
+        ask_visible(conv, ENGINEER_PROMPT)?.as_str(),
         MAX_ENGINEER_ID_LEN,
         pam_user,
         level,
@@ -1835,7 +1852,7 @@ impl CodeConversation for PamCodeConversation {
         }
     }
 
-    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
+    fn prompt_visible(&mut self, prompt: &str) -> Result<Answer, PamConvError> {
         // SAFETY: `self.pamh` is the live PAM handle of the enclosing frame.
         unsafe { crate::pam_conv::prompt_visible(self.pamh, prompt) }
     }

@@ -17,12 +17,15 @@
 )]
 
 use std::cell::RefCell;
+
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use secrecy::SecretString;
+
+use crate::answer::Answer;
 use tempfile::TempDir;
 
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
@@ -117,7 +120,7 @@ impl CodeConversation for ScriptedConversation {
         self.shown.push(message.to_owned());
     }
 
-    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
+    fn prompt_visible(&mut self, prompt: &str) -> Result<Answer, PamConvError> {
         self.asked.push(prompt.to_owned());
         // Only the last line of the prompt: the code prompt carries the whole
         // drawn challenge in front of it, and a timeline of that is unreadable.
@@ -125,7 +128,10 @@ impl CodeConversation for ScriptedConversation {
             "asked {}",
             prompt.lines().next_back().unwrap_or(prompt).trim()
         ));
-        self.answers.pop_front().ok_or(PamConvError::ConvFailed)
+        self.answers
+            .pop_front()
+            .map(Answer::new)
+            .ok_or(PamConvError::ConvFailed)
     }
 
     fn prompt_secret(&mut self, prompt: &str) -> Result<SecretString, PamConvError> {

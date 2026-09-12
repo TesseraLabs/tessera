@@ -367,9 +367,16 @@ const LOGIN_PROMPT: &str = "Имя учётной записи: ";
 /// a refused role writes the name it refused. A value typed into a prompt is
 /// not an account until something says so, and two things have to say it: the
 /// role-id contract (`^[a-z][a-z0-9-]{0,15}$`), which is the only shape a role
-/// account name can have at all, and NSS, which says this device has one. The
-/// contract goes first because it is the cheaper question and because it is the
-/// one that admits nothing else: a password does not look like a role id.
+/// account name can have at all, and the device's own account view, which says
+/// it has one. The contract goes first because it is the cheaper question and
+/// because it is the one that admits nothing else: a password does not look
+/// like a role id.
+///
+/// The account view is the one the role stage is loaded with — the local passwd
+/// database plus name resolution under the bound `[roles]` configures. Asking
+/// the resolver directly from here would be a second path into NSS, unbounded,
+/// on the login path of a device the product promises to keep working with no
+/// network at all.
 ///
 /// Neither refusal names the value, and the answer is overwritten in place
 /// before it is dropped. What an unverified string turns out to be is exactly
@@ -389,6 +396,7 @@ const LOGIN_PROMPT: &str = "Имя учётной записи: ";
 #[cfg(target_os = "linux")]
 unsafe fn resolve_login_account(
     pamh: *mut pam_sys::pam_handle_t,
+    accounts: tessera_core::role::SystemAccounts,
 ) -> Result<String, crate::pam_helpers::PamHelperError> {
     // SAFETY: `pamh` is the live PAM handle (caller contract).
     let named = unsafe { crate::pam_helpers::pam_get_user_prompted(pamh, Some(LOGIN_PROMPT)) }?;
@@ -423,6 +431,10 @@ unsafe fn resolve_login_account(
             return Err(crate::pam_helpers::PamHelperError::NoUser);
         }
     };
+    // The answer itself is wiped when it goes out of scope, whatever this
+    // function decides — see `crate::answer`. What is kept is this trimmed
+    // copy, and keeping it is a decision made here: it is either refused and
+    // overwritten below, or it becomes the account of the login.
     let mut typed = typed.trim().to_owned();
     if typed.is_empty() {
         tracing::warn!(
@@ -443,7 +455,7 @@ unsafe fn resolve_login_account(
         typed.zeroize();
         return Err(crate::pam_helpers::PamHelperError::NoUser);
     }
-    if !account_exists(&typed) {
+    if !accounts.knows(&typed) {
         tracing::warn!(
             target: "tessera.auth",
             answer_len = typed.len(),
@@ -461,12 +473,12 @@ unsafe fn resolve_login_account(
     Ok(typed)
 }
 
-/// Overwrite a string that turned out not to be an account name.
+/// Overwrite a copy of an answer that turned out not to be an account name.
 ///
-/// A `String` is not wiped when it is dropped: the allocation goes back to the
-/// allocator with the bytes still in it. The answers to the other prompts of
-/// this conversation are wiped where PAM allocated them (`pam_conv`), and an
-/// answer that reached this module has to be wiped here.
+/// The answer as the conversation returned it wipes itself ([`crate::answer`]).
+/// This is for the copy made from it: a `String` hands its allocation back with
+/// the bytes still in it, and a copy the caller decided to keep is the caller's
+/// to overwrite.
 #[cfg(target_os = "linux")]
 trait WipeInPlace {
     /// Overwrite the bytes in place, then empty the string.
@@ -485,18 +497,6 @@ impl WipeInPlace for String {
         unsafe { self.as_mut_vec() }.zeroize();
         self.clear();
     }
-}
-
-/// Whether this device has an account of that name.
-///
-/// NSS, and nothing cleverer: the question is only whether the string can be an
-/// account at all before it is allowed into PAM_USER, the journal and the audit
-/// chain. A lookup that FAILS (a broken name service, not an absent account) is
-/// treated as "no": a login that cannot be attributed is refused, and this path
-/// only ever runs for a name nobody but the person at the keyboard supplied.
-#[cfg(target_os = "linux")]
-fn account_exists(name: &str) -> bool {
-    matches!(nix::unistd::User::from_name(name), Ok(Some(_)))
 }
 
 /// Generate a cryptographically random session id by hex-encoding 16 bytes
@@ -601,7 +601,11 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
         // 2. PAM_USER / PAM_SERVICE.
         // SAFETY: `pamh` is the live PAM handle for this callback.
-        let pam_user = match unsafe { resolve_login_account(pamh) } {
+        // The same bounded view the role stage is loaded with, built here
+        // because the name has to be judged before anything else happens.
+        let accounts = tessera_core::role::SystemAccounts::device(cfg.roles.account_lookup_timeout);
+        // SAFETY: `pamh` is the live PAM handle for this callback.
+        let pam_user = match unsafe { resolve_login_account(pamh, accounts) } {
             Ok(s) => s,
             Err(err) => {
                 tracing::warn!(
