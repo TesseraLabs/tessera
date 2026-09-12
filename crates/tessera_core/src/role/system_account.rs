@@ -516,6 +516,26 @@ impl SystemAccounts {
     pub fn check(&self, account: &str) -> Result<(), SystemAccountError> {
         self.snapshot(&[account]).check(account)
     }
+
+    /// Whether either source has an entry for `account` at all.
+    ///
+    /// The question [`Self::check`] does NOT answer: that one classifies a name
+    /// somebody configured and treats silence as permission, because a role
+    /// slice may legitimately name an account the device has not created yet.
+    /// This one is for a caller holding a string a PERSON just typed, which has
+    /// to be shown to be an account before it is allowed into the identity of a
+    /// transaction, a journal or an audit record.
+    ///
+    /// Silence is therefore NOT existence here: a local database that could not
+    /// be read and a name service that outran its bound both leave the answer
+    /// `false`. Both sources are asked through the same bounded view every
+    /// other account question on the login path uses — a caller that reached
+    /// into the resolver on its own would be a second, unbounded path into NSS
+    /// on a device the product promises to keep working without a network.
+    #[must_use]
+    pub fn knows(&self, account: &str) -> bool {
+        self.snapshot(&[account]).knows(account)
+    }
 }
 
 /// What both sources said about a set of names at one moment.
@@ -544,6 +564,29 @@ impl AccountSnapshot {
     pub fn covers(&self, account: &str) -> bool {
         self.asked.iter().any(|name| name == account)
     }
+    /// Whether either source had an entry for `account` when this was taken.
+    ///
+    /// See [`SystemAccounts::knows`] for what the answer is for and why silence
+    /// counts as "no". A snapshot this name was not taken for answers `false`:
+    /// the additive source was never asked about it, and a verdict without it
+    /// is not one.
+    #[must_use]
+    pub fn knows(&self, account: &str) -> bool {
+        if !self.covers(account) {
+            return false;
+        }
+        let has_entry = |lookup: PasswdLookup| match lookup {
+            // An entry exists, whatever class it puts the account in — a
+            // system principal exists too, and it is `check` that refuses it.
+            PasswdLookup::Uid(_) | PasswdLookup::SystemPrincipal | PasswdLookup::RegularAccount => {
+                true
+            }
+            // Nothing said, or nothing that could be said.
+            PasswdLookup::NoEntry | PasswdLookup::Unavailable => false,
+        };
+        has_entry(self.local.lookup(account)) || has_entry(self.resolved.answer_for(account))
+    }
+
     /// Decide whether `account` may be used as a role name on this device.
     ///
     /// An account neither source knows is *not* a system account: it is simply
@@ -1094,6 +1137,30 @@ mod tests {
             "broken" => PasswdLookup::Unavailable,
             _ => PasswdLookup::NoEntry,
         })
+    }
+
+    #[test]
+    fn existence_is_asked_of_both_sources_and_silence_is_not_existence() {
+        // The question a login asks about a string somebody typed, and it is
+        // not the question `check` asks: `check` clears a name nobody knows,
+        // because a role slice may name an account not created yet. Here an
+        // account nobody knows must read as absent, or a value typed into a
+        // prompt would travel on as an identity.
+        let view = fixture();
+        assert!(view.knows("serv"), "a provisioned account is known");
+        // A system principal exists; that it may not act as a role is a
+        // different verdict, reached by `check`.
+        assert!(view.knows("root"), "root exists, whatever class it is");
+        assert!(
+            !view.knows("hunter2"),
+            "a value nobody has an entry for was taken for an account"
+        );
+        // The source could not answer. Treating that as existence would let a
+        // typed value through exactly when the device can prove the least.
+        assert!(
+            !view.knows("broken"),
+            "an unreadable entry was taken for an account"
+        );
     }
 
     #[test]
