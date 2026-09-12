@@ -601,14 +601,27 @@ fn wait_for_drawn(stream: &UnixStream, budget: Duration) -> Result<(), std::io::
 
     let deadline = Instant::now() + budget;
     let mut byte = [0u8; 1];
+    let expired = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the overlay did not say the symbol was drawn",
+        )
+    };
     let outcome = loop {
-        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-            break Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the overlay did not say the symbol was drawn",
-            ));
+        // A remainder of exactly zero is an expired deadline and not a wait of
+        // no length: `set_read_timeout(Some(ZERO))` is an error in the standard
+        // library ("cannot set a 0 duration timeout"), and reporting that as
+        // the reason an overlay was dropped would name the wrong thing.
+        let left = deadline.checked_duration_since(Instant::now());
+        let Some(left) = left.filter(|left| !left.is_zero()) else {
+            break Err(expired());
         };
-        stream.set_read_timeout(Some(left))?;
+        // NOT `?`: every path out of this loop has to reach the line that
+        // clears the timeout below, and a failure to SET one is no exception —
+        // the same socket carries the cancel frame on the way out.
+        if let Err(error) = stream.set_read_timeout(Some(left)) {
+            break Err(error);
+        }
         match (&*stream).read(&mut byte) {
             Ok(1) if byte.first() == Some(&DRAWN) => break Ok(()),
             Ok(1) => {
@@ -629,9 +642,13 @@ fn wait_for_drawn(stream: &UnixStream, budget: Duration) -> Result<(), std::io::
             // overlay this very function is waiting on. Taking EINTR for an
             // answer would report "no symbol on the screen" for a symbol that
             // is on the screen, and the challenge would be drawn twice: once
-            // by the overlay, once as glyphs in the prompt. The deadline is
-            // kept across the retry, so an interrupted wait is not a longer
-            // one. `send_frame` treats the same errno the same way.
+            // by the overlay, once as glyphs in the prompt. `send_frame` treats
+            // the same errno the same way.
+            //
+            // The deadline is kept across the retry, so an interrupted wait is
+            // not a longer one — and a storm of signals spins this loop rather
+            // than sleeping in it, which costs the login nothing beyond that
+            // same deadline.
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
@@ -645,9 +662,9 @@ fn wait_for_drawn(stream: &UnixStream, budget: Duration) -> Result<(), std::io::
             Err(error) => break Err(error),
         }
     };
-    // The timeout is cleared whatever happened: the same socket carries the
-    // cancel frame on the way out, and a read timeout left on it belongs to
-    // nothing.
+    // Reached on every path out of the loop above, which is why none of them
+    // uses `?`: the same socket carries the cancel frame on the way out, and a
+    // read timeout left on it belongs to nothing.
     let _ignored = stream.set_read_timeout(None);
     outcome
 }
@@ -987,7 +1004,15 @@ fn accept_one(
                 stream.set_nonblocking(false)?;
                 return Ok(stream);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            // Nothing to accept yet, and a signal that interrupted the asking
+            // are the same thing from here: neither says the overlay will not
+            // come. The module is a guest in `sshd`, `login` or a display
+            // manager, where signals are ordinary — including the `SIGCHLD` of
+            // the child this loop is waiting for — so an interrupted call is
+            // retried, bounded by the same deadline as the rest of the wait.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
 

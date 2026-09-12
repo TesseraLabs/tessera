@@ -887,19 +887,23 @@ fn an_overlay_that_never_says_it_drew_is_no_overlay() {
     // long one would keep a thread of the suite for twenty seconds while every
     // other test competes for the machine. What is asserted is the bound, and a
     // bound is a bound at any size.
-    let overlay = SpawningOverlay::new(binary, dir.path().to_path_buf(), owner())
-        .with_handshake(Duration::from_secs(2));
+    const BUDGET: Duration = Duration::from_secs(2);
+    let overlay =
+        SpawningOverlay::new(binary, dir.path().to_path_buf(), owner()).with_handshake(BUDGET);
 
     let started = Instant::now();
     assert!(
         overlay.present(PAYLOAD).is_none(),
         "a silent overlay was taken for one that had drawn"
     );
-    // And the wait is bounded by the same budget as the handshake: a login must
-    // not hang on an overlay that will never answer.
+    // The bound is RELATIVE to the budget, not a number of seconds: a regression
+    // that restarted the deadline on every interrupted read would take fifteen
+    // budgets to cross a flat thirty seconds, and would pass here forever.
+    // Three budgets leaves room for a loaded machine and none for a deadline
+    // that does not hold.
     let waited = started.elapsed();
     assert!(
-        waited < Duration::from_secs(30),
+        waited < BUDGET * 3,
         "the login waited {waited:?} on an overlay that said nothing"
     );
 }
