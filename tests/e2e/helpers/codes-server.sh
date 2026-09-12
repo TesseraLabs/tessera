@@ -200,9 +200,10 @@ usage: codes-server.sh <command> [args]
                         поле пароля вторым. --start задаёт, чем открыта
                         транзакция: пустым именем (по умолчанию, так делает
                         живой греетер) или отсутствующим вовсе
-  expect-empty-answers-refused <user> [level]
-                        на промпт сервера выдачи дважды приходит пустая строка;
-                        0 только на явный отказ входа, не на зависание
+  answer-nothing <user> [level]
+                        разговор каналом греетера, где на промпт сервера выдачи
+                        дважды приходит пустая строка и больше ничего;
+                        печатает вердикт драйвера и отдаёт его код
   authenticate-mistyping-once <user> --level N
                         вход, где первый код набран неверно, а второй верно:
                         журнал устройства получает отказ и успех на ОДИН nonce
@@ -915,10 +916,11 @@ run_conversation() {
     case "$source" in
         issue)
             local printed
-            printed="$(await_challenge "$err" "$driver")"
-            code="$(issue_code "$(wire_with_overrides "$printed")")"
-            [ -n "$code" ] || die "выдача не вернула код (см. $err)"
-            printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            if printed="$(await_challenge "$err" "$driver")"; then
+                code="$(issue_code "$(wire_with_overrides "$printed")")"
+                [ -n "$code" ] || die "выдача не вернула код (см. $err)"
+                printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            fi
             ;;
         device-key)
             # Код по ПРЕЖНЕЙ схеме: из статического ключа устройства, без
@@ -941,11 +943,12 @@ run_conversation() {
             # Подписывает инструмент стенда — теми же байтами, что и продукт,
             # через тот же крейт контракта (см. sign_challenge).
             local printed
-            printed="$(await_challenge "$err" "$driver")"
-            code="$(issue_code "$(sign_challenge \
-                "$(wire_with_overrides "$printed" "" "$(device_static_point)")")")"
-            [ -n "$code" ] || die "выдача не вернула код (см. $err)"
-            printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            if printed="$(await_challenge "$err" "$driver")"; then
+                code="$(issue_code "$(sign_challenge \
+                    "$(wire_with_overrides "$printed" "" "$(device_static_point)")")")"
+                [ -n "$code" ] || die "выдача не вернула код (см. $err)"
+                printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            fi
             ;;
         other-name)
             die "режим other-name недоступен: подмена личного номера ломает подпись устройства, и проверяется теперь отказом выдачи — см. expect-issue-refused-under-another-name"
@@ -957,22 +960,28 @@ run_conversation() {
             # Устройство пишет в свою цепочку ДВЕ строки на один nonce: отказ и
             # успех. Кейс сверки живёт именно на этом журнале.
             local printed
-            printed="$(await_challenge "$err" "$driver")"
-            code="$(issue_code "$(wire_with_overrides "$printed")")"
-            [ -n "$code" ] || die "выдача не вернула код (см. $err)"
-            printf '%s\n' "$code" > "$RUN_DIR/last-code"
-            printf '%s\n' "$WRONG_CODE" >&3
-            # Первый ответ уже подан; остальные — верный код.
-            code_answers=$((code_answers - 1))
+            if printed="$(await_challenge "$err" "$driver")"; then
+                code="$(issue_code "$(wire_with_overrides "$printed")")"
+                [ -n "$code" ] || die "выдача не вернула код (см. $err)"
+                printf '%s\n' "$code" > "$RUN_DIR/last-code"
+                printf '%s\n' "$WRONG_CODE" >&3
+                # Первый ответ уже подан; остальные — верный код.
+                code_answers=$((code_answers - 1))
+            fi
             ;;
         fixed:*) code="${source#fixed:}" ;;
         *) die "неизвестный источник кода: $source" ;;
     esac
 
+    # Кода может не быть вовсе: разговор кончился раньше, чем его спросили.
+    # Писать в FIFO, которого никто не читает, — верный способ получить сбой
+    # хелпера поверх уже состоявшегося вердикта.
     local i
-    for ((i = 0; i < code_answers; i++)); do
-        printf '%s\n' "$code" >&3
-    done
+    if [ -n "$code" ]; then
+        for ((i = 0; i < code_answers; i++)); do
+            printf '%s\n' "$code" >&3
+        done
+    fi
     exec 3>&-
 
     local rc=0
@@ -1013,8 +1022,9 @@ capture_challenge() {
     printf '%s\n' "$ENGINEER_ID" >&3
     printf '%s\n' "$DEVICE_KEY_PIN" >&3
 
-    local printed
-    printed="$(await_challenge "$err" "$DRIVER_PID")"
+    local printed=""
+    printed="$(await_challenge "$err" "$DRIVER_PID")" \
+        || die "разговор кончился раньше challenge, а команде нужен именно он (см. $err)"
     exec 3>&-
     wait "$DRIVER_PID" 2>/dev/null || true
     DRIVER_PID=""
@@ -1038,9 +1048,19 @@ await_challenge() {
             printf '%s' "$line"
             return 0
         fi
-        kill -0 "$driver" 2>/dev/null || die "драйвер завершился, не показав challenge (см. $err)"
+        # Разговор кончился раньше challenge — это ВЕРДИКТ, а не сбой стенда:
+        # устройство отказывает до показа challenge по доброму десятку причин
+        # (имя не ролевой учётной записи, пустой ответ, исчерпанный бюджет
+        # выдачи). Код возврата драйвера отдаётся кейсу как есть; хелпер,
+        # умиравший здесь служебным кодом, превращал отказ продукта в ERROR, и
+        # настоящий дефект читался как испорченный стенд.
+        if ! kill -0 "$driver" 2>/dev/null; then
+            return 1
+        fi
         sleep 0.2
         waited=$((waited + 1))
+        # А вот это сбой стенда: разговор жив и молчит. Ждать до таймаута кейса
+        # значит потерять и разбор, и следующие кейсы.
         [ "$waited" -lt $((limit * 5)) ] || die "challenge не появился за ${limit} с (см. $err)"
     done
 }
@@ -1128,15 +1148,20 @@ cmd_authenticate_as_greeter() {
     run_conversation "$user" "$level" issue 1
 }
 
-# Разговор, в котором на промпт сервера выдачи дважды приходит пустая строка.
+# Разговор каналом греетера, в котором на промпт сервера выдачи дважды приходит
+# пустая строка, и больше ничего.
 #
-# Проверяется не отказ сам по себе, а то, что переспрос ОГРАНИЧЕН: канал, где
-# пустое поле формы приходит на каждый промпт, не должен ни пускать, ни
-# спрашивать бесконечно. Поэтому 0 отдаётся только на вердикт отказа, а
-# зависание кейс ловит своим таймаутом.
-cmd_expect_empty_answers_refused() {
+# Вердикт не судится здесь и не переписывается: печатается строка драйвера и
+# отдаётся его код возврата. Ожидание — дело кейса, и это не формальность:
+# хелпер, решавший сам, какой отказ «правильный», превращал вердикт продукта в
+# служебный код и прятал настоящую причину под «сбой стенда».
+#
+# Что проверяет кейс поверх этого: разговор ВООБЩЕ кончается. Канал, где пустая
+# строка приходит на каждый промпт, не должен оставлять попытку висеть, а
+# зависание ловится таймаутом шага.
+cmd_answer_nothing() {
     local user="${1:-}" level="${2:-0}"
-    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-empty-answers-refused <user> [level]"
+    [ -n "$user" ] || usage_error "usage: codes-server.sh answer-nothing <user> [level]"
 
     load_prepared
     greeter_modern_channel "$user"
@@ -1175,10 +1200,7 @@ cmd_expect_empty_answers_refused() {
     rm -f "$fifo"
     cat "$out"
     cat "$err" >&2
-
-    grep -qE 'auth: PAM_AUTH_ERR \(7\)' "$out" \
-        || die "ожидался отказ входа на пустых ответах, а пришло другое (см. $out)"
-    echo "empty-answers: refused"
+    return "$rc"
 }
 
 # Тот же вход, но код приходит аргументом и подаётся как есть: выдача не
@@ -2386,7 +2408,7 @@ main() {
         prepare)              cmd_prepare "$@" ;;
         authenticate)         cmd_authenticate "$@" ;;
         authenticate-as-greeter) cmd_authenticate_as_greeter "$@" ;;
-        expect-empty-answers-refused) cmd_expect_empty_answers_refused "$@" ;;
+        answer-nothing)       cmd_answer_nothing "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
         authenticate-mistyping-once) cmd_authenticate_mistyping_once "$@" ;;
         authenticate-with-device-key) cmd_authenticate_with_device_key "$@" ;;

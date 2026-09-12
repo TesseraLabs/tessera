@@ -57,8 +57,15 @@ cases:
     requires: [service-manager]
     steps:
       - run: helpers/codes-server.sh prepare {{fixtures}}/codes
-      - run: helpers/codes-server.sh expect-empty-answers-refused {{user}} 0
-        expect: { exit_code: 0, stdout_matches: 'empty-answers: refused' }
+      # Код 7 и есть весь кейс: PAM_AUTH_ERR — то, чем модуль отвечает на
+      # негодный ввод. Отказ по роли (PAM_PERM_DENIED, 6) на этом месте означал
+      # бы, что имя учётной записи вообще не добыто, а исчерпанный бюджет
+      # (PAM_MAXTRIES, 11) — что попытка всё-таки началась.
+      #
+      # Таймаут шага здесь — вторая половина обещания: разговор, который вместо
+      # вердикта переспрашивает бесконечно, упрётся в него и даст красный.
+      - run: helpers/codes-server.sh answer-nothing {{user}} 0
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
         timeout: 60
     teardown:
       - run: helpers/codes-server.sh cleanup
