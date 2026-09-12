@@ -112,3 +112,73 @@ cases:
         timeout: 90
     teardown:
       - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-005
+    title: Дисплей графического входа модуль берёт из items PAM
+    requirement: spec9:auth.UI-008
+    # Items — единственный канал, которым дисплей-менеджер называет дисплей, и
+    # у этого кейса есть отдельная причина существовать рядом с GRM-003: тот
+    # требует графики и в контейнере получает SKIP, а ошибка в НОМЕРЕ item не
+    # зависит от наличия X-сервера вовсе. Номер, взятый неверно, читает чужой
+    # item (по заголовку PAM 13 — это `PAM_AUTHTOK_TYPE`, строка), и канал
+    # дисплея молча не работает нигде.
+    #
+    # Дисплей назван необычный (`:77`), чтобы строка журнала принадлежала
+    # именно этому кейсу: окно `expect_journal` — десять минут, и `:0` соседа
+    # зеленил бы проверку.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-as-greeter {{user}} --level 0 --xdisplay :77
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 90
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'display=:77'
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-006
+    title: Оверлей, который ничего не нарисовал, не отнимает challenge у промпта
+    requirement: spec9:auth.UI-004
+    # Показ обязан быть НА ЧЁМ-ТО. Модуль убирает текстовую форму из промпта,
+    # когда символ уже на экране, — и вопрос в том, чем он это устанавливает.
+    # Подключившийся к сокету процесс ещё ничего не нарисовал: настоящий оверлей
+    # открывает дисплей ПОСЛЕ подключения и на неоткрывшемся умирает. Инженер в
+    # этом случае видит «Код:» и challenge нигде, то есть вход, который нельзя
+    # завершить.
+    #
+    # Заглушка вместо настоящего оверлея здесь не упрощение, а единственный
+    # способ проверить именно это: живой бинарь на негодном дисплее умирает за
+    # миллисекунды, и кейс ловил бы гонку, а не поведение модуля.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+               --overlay-binary={{helpers}}/overlay-stub.pl
+      - run: helpers/codes-server.sh expect-qr-in-code-prompt {{user}}
+        expect: { exit_code: 0, stdout_matches: 'qr-in-prompt: yes' }
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-007
+    title: Незаполненное поле имени не превращает пароль в имя учётной записи
+    requirement: spec9:auth.UI-006
+    # Порядок ответов греетера modern делает переспрос имени опасным: первый
+    # видимый промпт получает поле «Имя», второй — поле «Пароль». Модуль,
+    # спросивший имя дважды, получает во второй раз пароль и принимает его за
+    # имя учётной записи — после чего пароль уходит в PAM_USER, в журнал и в
+    # журнал аудита со сцеплением хешей, откуда его уже не вычеркнуть.
+    #
+    # Отсюда и ожидание: пустое имя — отказ сразу, без второго вопроса.
+    # Строка, стоящая в поле пароля, фиктивна и лежит в кейсе открыто: секрета
+    # в реестре нет, проверяется отсутствие следа.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-second-answer-not-logged {{user}}
+               not-a-password-just-a-marker-7f3a
+        expect: { exit_code: 0, stdout_matches: 'second-answer: refused and unlogged' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup

@@ -42,9 +42,11 @@ RUN apt-get update \
 COPY helpers/usb-loop.sh helpers/ocsp-responder.sh helpers/udevd-start.sh \
      helpers/config-mutate.sh helpers/codes-server.sh helpers/codes-overlay.sh \
      helpers/codes-enroll.sh helpers/codes-reconcile.sh helpers/audit-fill.sh \
+     helpers/overlay-stub.pl \
      /opt/tessera-e2e/helpers/
 COPY helpers/setup/ /opt/tessera-e2e/helpers/setup/
-RUN chmod 0755 /opt/tessera-e2e/helpers/*.sh /opt/tessera-e2e/helpers/setup/*.sh \
+RUN chmod 0755 /opt/tessera-e2e/helpers/*.sh /opt/tessera-e2e/helpers/*.pl \
+    /opt/tessera-e2e/helpers/setup/*.sh \
     && mkdir -p /opt/tessera-e2e/fixtures /opt/tessera-e2e/pkg
 
 # Раннер выполняет подготовку suite как `helpers/setup/<name>.sh` — путь

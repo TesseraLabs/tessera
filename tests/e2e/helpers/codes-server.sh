@@ -117,6 +117,18 @@ CHALLENGE_FILE="$RUN_DIR/challenge.txt"
 # умолчание контракта с обеих сторон, а задать число в одном месте.
 ATTEMPTS_PER_NONCE="${TESSERA_E2E_CODE_ATTEMPTS:-5}"
 
+# Фиктивная куки дисплея: шестнадцать нулевых байтов. Секретом не является и
+# доступа ни к какому дисплею не даёт — она нужна там, где проверяется КАНАЛ
+# передачи, а не сам доступ.
+DUMMY_COOKIE_HEX="00000000000000000000000000000000"
+
+# Промпт имени учётной записи, как его печатает модуль. Держится здесь ровно
+# затем, чтобы проверять ЧИСЛО таких промптов: второй означает переспрос.
+NAME_PROMPT_LINE="${TESSERA_E2E_NAME_PROMPT:-Имя учётной записи: }"
+
+# Журнал аудита устройства со сцеплением хешей — вторая половина проверки следа.
+AUDIT_JOURNAL="${TESSERA_E2E_AUDIT_JOURNAL:-/var/lib/tessera/audit.ndjson}"
+
 # Заведомо неверный код: восемь нулей — длина по умолчанию, десятичный алфавит,
 # не сходится ни с каким общим ключом. Секретом не является.
 WRONG_CODE="00000000"
@@ -178,8 +190,15 @@ HOST_P12="${TESSERA_E2E_HOST_P12:-/var/lib/tessera/host.p12}"
 # Учётная запись — та же, под которой работает греетер; на Astra это `fly-dm`.
 # Секция конфигурации пишется только по `prepare --with-overlay`.
 WITH_OVERLAY=0
-OVERLAY_USER="${TESSERA_E2E_OVERLAY_USER:-fly-dm}"
+OVERLAY_USER="${TESSERA_E2E_OVERLAY_USER:-}"
 OVERLAY_BINARY="${TESSERA_E2E_OVERLAY_BINARY:-/usr/bin/tessera-qr-overlay}"
+
+# Учётные записи, под которыми может бежать оверлей, в порядке предпочтения.
+# Первая — та, под которой работает греетер Astra; вторая — непривилегированная
+# учётная запись, которая есть в любом окружении. Выбор по НАЛИЧИЮ, а не по
+# имени: модуль отказывается от оверлея, если названной учётной записи на
+# устройстве нет, и кейс тогда «проходит» на устройстве без оверлея вовсе.
+OVERLAY_USER_CANDIDATES="fly-dm nobody"
 
 die() {
     echo "codes-server: $*" >&2
@@ -220,6 +239,11 @@ usage: codes-server.sh <command> [args]
                         поле пароля вторым. --start задаёт, чем открыта
                         транзакция: пустым именем (по умолчанию, так делает
                         живой греетер) или отсутствующим вовсе
+  expect-second-answer-not-logged <user> <строка>
+                        канал греетера, где поле имени пусто, а в поле пароля
+                        стоит <строка>: вход обязан отказать, имя не должно
+                        спрашиваться дважды, а <строка> — попасть в журнал
+                        модуля или в журнал аудита
   answer-nothing <user> [level]
                         разговор каналом греетера, где на промпт сервера выдачи
                         дважды приходит пустая строка и больше ничего;
@@ -543,15 +567,19 @@ tags = [$tags_toml]
 # умолчание контракта не должно расходиться с тем, что считает хелпер.
 attempts_per_nonce = $ATTEMPTS_PER_NONCE
 EOF
-        # Оверлей описывается только там, где кейс его проверяет. Без секции
-        # модуль показывает challenge текстом — это и есть поведение устройства
-        # без графического входа, на котором стоит большинство кейсов сюиты.
+        # Оверлей описывается только там, где кейс его проверяет. Без этих двух
+        # ключей модуль показывает challenge текстом — это и есть поведение
+        # устройства без графического входа, на котором стоит большинство кейсов
+        # сюиты.
+        #
+        # Ключи ПЛОСКИЕ и лежат в самой секции `[codes]`: под-таблицы
+        # `[codes.overlay]` схема не знает, и конфигурация с ней не грузится
+        # вовсе — устройство тогда отказывает по разбору файла, а кейс читает
+        # это как отказ метода.
         if [ "$WITH_OVERLAY" = "1" ]; then
             cat <<EOF
-
-[codes.overlay]
-user = "$OVERLAY_USER"
-binary = "$OVERLAY_BINARY"
+overlay_user = "$(overlay_account)"
+overlay_binary = "$OVERLAY_BINARY"
 EOF
         fi
     } > "$staging"
@@ -665,6 +693,45 @@ restore_device_state() {
     rm -rf "$DEVICE_BACKUP"
 }
 
+# Бинарь оверлея обязан быть исполнимым ЗДЕСЬ И СЕЙЧАС, а не просто лежать на
+# месте. Проверка нужна из-за того, как отказ выглядит иначе: модуль, у которого
+# процесс оверлея не запустился, честно уходит на текстовый путь — и кейс,
+# который как раз текстовый путь и ожидает, позеленел бы, ничего не проверив.
+# Заглушка на perl — первый кандидат на такую тишину: в образе без perl она не
+# стартует вовсе.
+#
+# Запуск с заведомо отсутствующим сокетом: годный бинарь отвечает своей ошибкой
+# (код 1), отсутствующий интерпретатор — 126 или 127 от самой оболочки.
+assert_overlay_binary_runs() {
+    local binary="$1"
+    [ -x "$binary" ] || die "бинарь оверлея $binary не исполним"
+    local status=0
+    "$binary" --socket /nonexistent/overlay-probe >/dev/null 2>&1 || status=$?
+    case "$status" in
+        126|127) die "бинарь оверлея $binary не запускается в этом окружении (код $status): нет интерпретатора?" ;;
+        0) die "бинарь оверлея $binary завершился успехом на несуществующем сокете — это не он" ;;
+        *) ;;
+    esac
+}
+
+# Учётная запись оверлея: названная снаружи либо первая существующая из списка.
+overlay_account() {
+    if [ -n "$OVERLAY_USER" ]; then
+        id "$OVERLAY_USER" >/dev/null 2>&1 \
+            || die "учётной записи оверлея $OVERLAY_USER на устройстве нет"
+        printf '%s' "$OVERLAY_USER"
+        return 0
+    fi
+    local candidate
+    for candidate in $OVERLAY_USER_CANDIDATES; do
+        if id "$candidate" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    die "не нашлось учётной записи для оверлея (пробовали: $OVERLAY_USER_CANDIDATES)"
+}
+
 assert_no_codes_url() {
     if sed -n '/^\[codes\]/,/^\[/p' "$CONFIG" | grep -qiE '^[^#]*url'; then
         die "в секции [codes] есть Codes-URL, а кейс проверяет работу без него"
@@ -692,6 +759,7 @@ cmd_prepare() {
         case "$flag" in
             --without-codes-url) WITHOUT_CODES_URL=1 ;;
             --with-overlay) WITH_OVERLAY=1 ;;
+            --overlay-binary=*) WITH_OVERLAY=1; OVERLAY_BINARY="${flag#--overlay-binary=}" ;;
             -*) usage_error "неизвестный флаг prepare: $flag" ;;
             *)
                 [ -z "$dir" ] || usage_error "prepare принимает один каталог фикстур"
@@ -707,6 +775,7 @@ cmd_prepare() {
 
     deploy_artefacts
     deploy_config
+    [ "$WITH_OVERLAY" -eq 0 ] || assert_overlay_binary_runs "$OVERLAY_BINARY"
     # После конфигурации: импорт кладёт ключ в ТО хранилище, которое названо в
     # `[codes].dir`, и до её появления положил бы его в умолчание.
     import_device_key
@@ -1130,11 +1199,20 @@ capture_challenge() {
     rm -f "$fifo" "$out" "$err"
     mkfifo -m 0600 "$fifo"
 
-    pam-drive --answers-per-prompt "$PAM_SERVICE_NAME" "$user" authenticate \
+    local -a scrub=()
+    if [ "$GREETER_CHANNEL" = "1" ]; then
+        scrub=(env -u DISPLAY -u XAUTHORITY)
+    fi
+    "${scrub[@]}" pam-drive "${DRIVER_FLAGS[@]}" --answers-per-prompt \
+        "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
         < "$fifo" > "$out" 2> "$err" &
     DRIVER_PID=$!
 
     exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
     printf '%s\n' "$SERVER_ID" >&3
     printf '%s\n' "$ENGINEER_ID" >&3
     printf '%s\n' "$DEVICE_KEY_PIN" >&3
@@ -1148,6 +1226,67 @@ capture_challenge() {
     rm -f "$fifo"
 
     printf '%s\n' "$printed" > "$CHALLENGE_FILE"
+}
+
+# Ведёт разговор до ПРОМПТА КОДА и обрывает его.
+#
+# Отличие от capture_challenge — в том, чего именно ждать. Там ждут строку
+# challenge, и её отсутствие законно считается сбоем стенда: команде, которой
+# challenge нужен для выдачи, без него делать нечего. Здесь проверяется САМ
+# ПОКАЗ, и «промпт кода пришёл без challenge» — это ответ продукта, а не
+# поломка: ждать надо вопрос, а не показ.
+capture_code_prompt() {
+    local user="$1"
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    local -a scrub=()
+    if [ "$GREETER_CHANNEL" = "1" ]; then
+        scrub=(env -u DISPLAY -u XAUTHORITY)
+    fi
+    "${scrub[@]}" pam-drive "${DRIVER_FLAGS[@]}" --answers-per-prompt \
+        "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
+    printf '%s\n' "$SERVER_ID" >&3
+    printf '%s\n' "$ENGINEER_ID" >&3
+
+    await_code_prompt "$err" "$DRIVER_PID"
+    exec 3>&-
+    wait "$DRIVER_PID" 2>/dev/null || true
+    DRIVER_PID=""
+    rm -f "$fifo"
+}
+
+# Ждёт, пока драйвер напечатает промпт кода — с символом или без него.
+#
+# Опознаётся по подписи над QR либо по самому вопросу: первый промпт кода несёт
+# показ и вопрос одним обменом, и что из этого пришло — предмет проверки, а не
+# условие ожидания.
+await_code_prompt() {
+    local err="$1" driver="$2" waited=0
+    local limit="${TESSERA_E2E_CHALLENGE_TIMEOUT:-30}"
+    while :; do
+        if grep -qE "^prompt: ($QR_CAPTION_LINE|${CODE_PROMPT_LINE% }|$CODE_PROMPT_LINE)" "$err" 2>/dev/null; then
+            return 0
+        fi
+        # Разговор кончился раньше вопроса — вердикт уже вынесен, и ждать
+        # больше нечего. Проверку делает вызывающий по тому, что в журнале.
+        kill -0 "$driver" 2>/dev/null || return 0
+        sleep 0.2
+        waited=$((waited + 1))
+        [ "$waited" -lt $((limit * 5)) ] || die "промпт кода не появился за ${limit} с (см. $err)"
+    done
 }
 
 # Ждёт показанный challenge на stderr драйвера. Строка приходит в тексте промпта
@@ -1242,7 +1381,7 @@ greeter_modern_channel() {
 
 # Полный вход по коду через канал греетера modern.
 cmd_authenticate_as_greeter() {
-    local user="${1:-}" level="" start="empty"
+    local user="${1:-}" level="" start="empty" xdisplay=""
     shift || true
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1254,9 +1393,22 @@ cmd_authenticate_as_greeter() {
                 start="${2:-}"
                 shift 2 || usage_error "--start без значения"
                 ;;
+            --xdisplay)
+                xdisplay="${2:-}"
+                shift 2 || usage_error "--xdisplay без значения"
+                ;;
             *) usage_error "неизвестный аргумент authenticate-as-greeter: $1" ;;
         esac
     done
+    # Дисплей называется items PAM — так, как это делает дисплей-менеджер.
+    # Куки при этом фиктивна и одинакова: кейсы, которым важен ДОСТУП к
+    # дисплею, работают на живом греетере (codes-overlay.sh), а здесь
+    # проверяется, что модуль вообще прочитал канал из items.
+    if [ -n "$xdisplay" ]; then
+        TESSERA_E2E_PAM_XDISPLAY="$xdisplay"
+        TESSERA_E2E_PAM_XAUTHDATA="${TESSERA_E2E_PAM_XAUTHDATA:-MIT-MAGIC-COOKIE-1:$DUMMY_COOKIE_HEX}"
+        export TESSERA_E2E_PAM_XDISPLAY TESSERA_E2E_PAM_XAUTHDATA
+    fi
     [ -n "$user" ] && [ -n "$level" ] \
         || usage_error "usage: codes-server.sh authenticate-as-greeter <user> --level N [--start empty|none]"
 
@@ -1318,6 +1470,86 @@ cmd_answer_nothing() {
     cat "$out"
     cat "$err" >&2
     return "$rc"
+}
+
+# Разговор, где на промпт имени учётной записи приходит пустая строка, а
+# следом — то, что греетер отдаёт вторым ответом: содержимое поля «Пароль».
+#
+# Проверяется не только отказ. Второй ответ обязан НИКУДА не попасть: модуль,
+# переспрашивающий имя, принял бы пароль за имя учётной записи — и оно ушло бы
+# в журнал, в аудит со сцеплением хешей и в PAM_USER, откуда его читают
+# соседние модули стека. Журнал и аудит проверяются на подстроку; сравнивать с
+# ожидаемым текстом нечего, потому что верное поведение — отсутствие следа.
+#
+# $1 — имя учётной записи, $2 — что стоит в поле «Пароль».
+cmd_expect_second_answer_not_logged() {
+    local user="${1:-}" secret="${2:-}"
+    [ -n "$user" ] && [ -n "$secret" ] \
+        || usage_error "usage: codes-server.sh expect-second-answer-not-logged <user> <строка>"
+
+    load_prepared
+    greeter_modern_channel "$user"
+    # Ответы канала: пустое поле имени, затем поле пароля. Больше ничего —
+    # разговор обязан кончиться раньше, чем понадобится третий ответ.
+    LEADING_ANSWERS=("" "$secret")
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    # Момент старта — граница срезов журнала: строки прошлых кейсов не должны
+    # ни попадать в проверку, ни зеленить её.
+    local since
+    since="$(date +%s)"
+
+    env -u DISPLAY -u XAUTHORITY pam-drive "${DRIVER_FLAGS[@]}" \
+        --answers-per-prompt "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
+    exec 3>&-
+
+    local rc=0
+    wait "$DRIVER_PID" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+    cat "$out"
+    cat "$err" >&2
+
+    if [ "$rc" = "0" ]; then
+        echo "codes-server: вход прошёл на пустом имени учётной записи" >&2
+        return 1
+    fi
+
+    # Сколько промптов было видно. Второй промпт имени — это и есть переспрос,
+    # из-за которого пароль превращается в имя учётной записи.
+    local name_prompts
+    name_prompts="$(grep -c "^prompt: $NAME_PROMPT_LINE" "$err" || true)"
+    if [ "${name_prompts:-0}" -gt 1 ]; then
+        echo "codes-server: имя учётной записи спрошено $name_prompts раза — переспрос отдаёт модулю поле пароля" >&2
+        return 1
+    fi
+
+    if journalctl -t pam_tessera --since "@$since" --no-pager 2>/dev/null \
+        | grep -qF -- "$secret"; then
+        echo "codes-server: набранное во втором поле попало в журнал модуля" >&2
+        return 1
+    fi
+
+    if [ -f "$AUDIT_JOURNAL" ] && grep -qF -- "$secret" "$AUDIT_JOURNAL"; then
+        echo "codes-server: набранное во втором поле попало в журнал аудита" >&2
+        return 1
+    fi
+
+    echo "second-answer: refused and unlogged"
 }
 
 # Тот же вход, но код приходит аргументом и подаётся как есть: выдача не
@@ -2183,11 +2415,20 @@ cmd_expect_qr_decodes_to_challenge() {
 # обязано ответить, `module: ` — PAM_TEXT_INFO, который fly-modern до экрана не
 # доносит. Показ, уехавший в PAM_TEXT_INFO, на консоли выглядит исправным.
 cmd_expect_qr_in_code_prompt() {
-    local user="${1:-}"
-    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-qr-in-code-prompt <user>"
+    local user="${1:-}" as_greeter=0
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --as-greeter) as_greeter=1 ;;
+            *) usage_error "неизвестный аргумент expect-qr-in-code-prompt: $1" ;;
+        esac
+        shift
+    done
+    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-qr-in-code-prompt <user> [--as-greeter]"
 
     load_prepared
-    capture_challenge "$user"
+    [ "$as_greeter" = "0" ] || greeter_modern_channel "$user"
+    capture_code_prompt "$user"
 
     local err="$RUN_DIR/conv.err"
     if grep -qF "module: $QR_CAPTION_LINE" "$err"; then
@@ -2526,6 +2767,7 @@ main() {
         authenticate)         cmd_authenticate "$@" ;;
         authenticate-as-greeter) cmd_authenticate_as_greeter "$@" ;;
         answer-nothing)       cmd_answer_nothing "$@" ;;
+        expect-second-answer-not-logged) cmd_expect_second_answer_not_logged "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
         authenticate-mistyping-once) cmd_authenticate_mistyping_once "$@" ;;
         authenticate-with-device-key) cmd_authenticate_with_device_key "$@" ;;
