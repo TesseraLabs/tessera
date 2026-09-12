@@ -342,11 +342,31 @@ const LOGIN_PROMPT: &str = "Имя учётной записи: ";
 /// The third case is the one the target fleet produces and the reason this
 /// function exists: a greeter that starts the transaction with an EMPTY name
 /// rather than none. libpam has a name — the empty one — so it asks nothing,
-/// and the method would refuse a login before showing a single prompt. Here the
-/// empty answer is asked for once, and only then is PAM_USER supplied with what
-/// came back. Supplying it is what keeps the module honest about identity: the
+/// and the method would refuse a login before showing a single prompt. The
+/// answer is ONE prompt, and only then is PAM_USER supplied with what came
+/// back. Supplying it is what keeps the module honest about identity: the
 /// post-authentication phases refuse to act under a name that differs from
 /// PAM_USER, and a name known only inside this module would fail that check.
+///
+/// # Why the name is asked for exactly once
+///
+/// Because of what the SECOND visible prompt of this conversation receives. The
+/// greeter of the target fleet answers the first one with its name field and the
+/// second with its password field, whatever the second one asks for. A module
+/// that asked again would be handed a password and would take it for an account
+/// name — from where it travels into PAM_USER, which the rest of the stack
+/// reads, into the journal, and into a hash-chained audit journal from which
+/// nothing can be struck out afterwards. An empty answer is therefore a
+/// refusal, not an occasion to ask again.
+///
+/// # Why the answer is checked against the passwd database here
+///
+/// Everything downstream names the account in its logs and its audit records —
+/// a refused role writes the name it refused. A value typed into a prompt is
+/// not an account until something says so, and the cheapest thing that can say
+/// so is NSS. A name that resolves to no account is refused here, and the value
+/// itself is not written anywhere: what an unverified string turns out to be is
+/// exactly what must not be recorded.
 ///
 /// # Safety
 ///
@@ -355,8 +375,9 @@ const LOGIN_PROMPT: &str = "Имя учётной записи: ";
 /// # Errors
 ///
 /// [`PamHelperError`] when PAM cannot be asked at all, and
-/// [`PamHelperError::NoUser`] when every answer was empty — a login whose
-/// account nobody will name is refused rather than guessed at.
+/// [`PamHelperError::NoUser`] when the answer was empty or named no account on
+/// this device — a login whose account nobody will name is refused rather than
+/// guessed at.
 #[cfg(target_os = "linux")]
 unsafe fn resolve_login_account(
     pamh: *mut pam_sys::pam_handle_t,
@@ -367,37 +388,56 @@ unsafe fn resolve_login_account(
         return Ok(named);
     }
 
-    for _ in 0..=crate::codes_flow::EMPTY_ANSWER_RETRIES {
-        // SAFETY: as above; the prompt does not outlive this call.
-        let typed = match unsafe { crate::pam_conv::prompt_visible(pamh, LOGIN_PROMPT) } {
-            Ok(answer) => answer,
-            Err(err) => {
-                tracing::warn!(
-                    target: "tessera.auth",
-                    error = %err,
-                    "the login account could not be asked for",
-                );
-                return Err(crate::pam_helpers::PamHelperError::NoUser);
-            }
-        };
-        let typed = typed.trim().to_owned();
-        if typed.is_empty() {
-            continue;
+    // SAFETY: as above; the prompt does not outlive this call.
+    let typed = match unsafe { crate::pam_conv::prompt_visible(pamh, LOGIN_PROMPT) } {
+        Ok(answer) => answer,
+        Err(err) => {
+            tracing::warn!(
+                target: "tessera.auth",
+                error = %err,
+                "the login account could not be asked for",
+            );
+            return Err(crate::pam_helpers::PamHelperError::NoUser);
         }
-        // The name enters the transaction, not just this module: everything
-        // after authentication compares against PAM_USER, and the stack
-        // above us has to see the same account. Filling an empty item is not
-        // rewriting one — see `pam_helpers::pam_set_user_string`.
-        // SAFETY: as above.
-        unsafe { crate::pam_helpers::pam_set_user_string(pamh, &typed) }?;
-        return Ok(typed);
+    };
+    let typed = typed.trim().to_owned();
+    if typed.is_empty() {
+        tracing::warn!(
+            target: "tessera.auth",
+            "no login account was given; refusing the login without asking again",
+        );
+        return Err(crate::pam_helpers::PamHelperError::NoUser);
     }
+    if !account_exists(&typed) {
+        // The value is NOT in this line, and that is the whole point of the
+        // check: what was typed may be a password the greeter put into the
+        // second field, and a journal that recorded it would keep it.
+        tracing::warn!(
+            target: "tessera.auth",
+            answer_len = typed.len(),
+            "what was typed at the account prompt names no account on this device; refusing",
+        );
+        return Err(crate::pam_helpers::PamHelperError::NoUser);
+    }
+    // The name enters the transaction, not just this module: everything
+    // after authentication compares against PAM_USER, and the stack
+    // above us has to see the same account. Filling an empty item is not
+    // rewriting one — see `pam_helpers::pam_set_user_string`.
+    // SAFETY: as above.
+    unsafe { crate::pam_helpers::pam_set_user_string(pamh, &typed) }?;
+    Ok(typed)
+}
 
-    tracing::warn!(
-        target: "tessera.auth",
-        "no login account was given after asking; refusing the login",
-    );
-    Err(crate::pam_helpers::PamHelperError::NoUser)
+/// Whether this device has an account of that name.
+///
+/// NSS, and nothing cleverer: the question is only whether the string can be an
+/// account at all before it is allowed into PAM_USER, the journal and the audit
+/// chain. A lookup that FAILS (a broken name service, not an absent account) is
+/// treated as "no": a login that cannot be attributed is refused, and this path
+/// only ever runs for a name nobody but the person at the keyboard supplied.
+#[cfg(target_os = "linux")]
+fn account_exists(name: &str) -> bool {
+    matches!(nix::unistd::User::from_name(name), Ok(Some(_)))
 }
 
 /// Generate a cryptographically random session id by hex-encoding 16 bytes
