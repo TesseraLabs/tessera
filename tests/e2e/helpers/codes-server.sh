@@ -710,6 +710,12 @@ snapshot_device_state() {
     if [ -f "$HOST_P12" ]; then
         cp -a "$HOST_P12" "$DEVICE_BACKUP/host.p12"
     fi
+    # Пометка ставится ПОСЛЕДНЕЙ и одним переименованием: только по ней видно,
+    # что снимок полон. Без неё оборванная на середине копия выглядела бы как
+    # снимок устройства, у которого просто не было ни ролей, ни тегов, и
+    # возврат снёс бы то, что не успел скопировать.
+    : >"$DEVICE_BACKUP/.partial"
+    mv -f "$DEVICE_BACKUP/.partial" "$DEVICE_BACKUP/.complete"
 }
 
 # Возврат по выходу: делает работу только там, где снимок ещё лежит на месте.
@@ -718,6 +724,14 @@ snapshot_device_state() {
 # его наличие на диске переживает даже смерть процесса по сигналу.
 restore_device_state_if_taken() {
     [ -d "$DEVICE_BACKUP" ] || return 0
+    if [ ! -f "$DEVICE_BACKUP/.complete" ]; then
+        # Незавершённый снимок ничего не доказывает о том, что было на
+        # устройстве. Возврат по нему опаснее его отсутствия, поэтому не
+        # трогается ничего, а состояние называется вслух: следующий прогон
+        # начнётся с того, что кто-то это прочитает.
+        echo "codes-server: снимок состояния устройства не завершён ($DEVICE_BACKUP) — ничего не возвращаю, роли и теги могли остаться от пакета импорта" >&2
+        return 0
+    fi
     restore_device_state
 }
 
@@ -725,13 +739,7 @@ restore_device_state_if_taken() {
 # срез пакета — это чужая роль на устройстве, которую следующий кейс примет за
 # своё окружение.
 restore_device_state() {
-    # Путь под `rm -rf` проверяется, а не предполагается: переменная приходит из
-    # окружения, и пустое или относительное значение здесь стоило бы каталога,
-    # который никто не собирался трогать.
-    case "$ROLES_DIR" in
-        /*/*) ;;
-        *) die "ROLES_DIR=$ROLES_DIR не годится для удаления: нужен абсолютный путь глубже корня" ;;
-    esac
+    assert_removable_path "$ROLES_DIR" "ROLES_DIR"
     if [ -d "$DEVICE_BACKUP/roles" ]; then
         rm -rf "$ROLES_DIR"
         cp -a "$DEVICE_BACKUP/roles" "$ROLES_DIR"
@@ -772,6 +780,23 @@ assert_overlay_binary_runs() {
     esac
 }
 
+# Путь, который стенд собирается удалять, проверяется, а не предполагается:
+# переменные приходят из окружения, и пустое, относительное или корневое
+# значение стоило бы каталога, который никто не собирался трогать.
+#
+# $1 — путь, $2 — имя переменной для сообщения.
+assert_removable_path() {
+    local path="$1" name="$2"
+    case "$path" in
+        /*/*) ;;
+        *) die "$name=$path не годится для удаления: нужен абсолютный путь глубже корня" ;;
+    esac
+    case "$path" in
+        */..*) die "$name=$path не годится для удаления: путь с переходом вверх" ;;
+        *) ;;
+    esac
+}
+
 # Обёртка, которая зовёт заглушку с ключом `--ack`.
 #
 # Конфигурация называет ОДИН исполняемый файл и аргументов не несёт — так и
@@ -779,6 +804,7 @@ assert_overlay_binary_runs() {
 # строку, которую кто-то однажды соберёт из чужих данных. Обёртка живёт в
 # рабочем каталоге прогона и снимается вместе с ним.
 write_overlay_wrapper() {
+    assert_removable_path "$WRAPPER_DIR" "WRAPPER_DIR"
     local target="$1" wrapper="$WRAPPER_DIR/overlay-acks"
     # НЕ в рабочем каталоге прогона: он лежит под /run, а /run в контейнерных
     # окружениях смонтирован noexec — запустить оттуда нельзя даже root'у, и
@@ -1604,6 +1630,52 @@ cmd_expect_user_item_untouched() {
     echo "user-item: untouched"
 }
 
+# Проверяет, что строки нет НИ В ОДНОМ журнале — и что журналы вообще читаются.
+#
+# Отсутствие следа и отсутствие журнала выглядят одинаково, и это разница между
+# проверкой и её видимостью: `grep` по несуществующему файлу и `journalctl`,
+# чей сбой ушёл в /dev/null, зеленеют оба. Поэтому сначала требуется СЛЕД ЭТОЙ
+# ЖЕ попытки — строка, которую модуль обязан был написать, — и только потом
+# проверяется отсутствие искомого.
+#
+# $1 — строка, которой быть не должно; $2 — момент старта попытки (epoch).
+assert_absent_from_journals() {
+    local secret="$1" since="$2"
+
+    local module_slice
+    if ! module_slice="$(journalctl -t pam_tessera --since "@$since" --no-pager 2>&1)"; then
+        echo "codes-server: журнал модуля не читается — проверка следа невозможна: $module_slice" >&2
+        return 1
+    fi
+    # Контрольная строка: модуль пишет её на каждом отказе входа по коду. Её
+    # отсутствие означает, что срез журнала пуст не потому, что следа нет.
+    if ! printf '%s' "$module_slice" | grep -q "tessera.codes\|tessera.auth"; then
+        echo "codes-server: в срезе журнала модуля нет ни одной его строки за время попытки — проверять нечего" >&2
+        return 1
+    fi
+    if printf '%s' "$module_slice" | grep -qF -- "$secret"; then
+        echo "codes-server: набранное попало в журнал модуля" >&2
+        return 1
+    fi
+
+    # Цепочка аудита. Отсутствие файла само по себе ничего не доказывает, и
+    # молчаливый `grep` по несуществующему пути — это и есть зелёная проверка
+    # ни о чём. Но отказ бывает и РАНЬШЕ первой записи цепочки: имя учётной
+    # записи, негодный идентификатор сервера — до них попытки ещё нет. Поэтому
+    # файла может не быть законно, и законность проверяется по журналу модуля:
+    # раз событие входа по коду в нём не появилось, писать в цепочку было
+    # нечего.
+    if [ -f "$AUDIT_JOURNAL" ]; then
+        if grep -qF -- "$secret" "$AUDIT_JOURNAL"; then
+            echo "codes-server: набранное попало в журнал аудита" >&2
+            return 1
+        fi
+    elif printf '%s' "$module_slice" | grep -q "qr_code_login"; then
+        echo "codes-server: модуль записал событие входа по коду, а журнала аудита $AUDIT_JOURNAL нет — проверить отсутствие следа в нём нечем" >&2
+        return 1
+    fi
+}
+
 # Разговор канала греетера, где поле пароля заполнено и попадает на промпт
 # идентификатора сервера выдачи.
 #
@@ -1675,15 +1747,7 @@ cmd_expect_server_id_not_logged() {
         echo "codes-server: набранное вернулось в тексте промптов" >&2
         return 1
     fi
-    if journalctl -t pam_tessera --since "@$since" --no-pager 2>/dev/null \
-        | grep -qF -- "$secret"; then
-        echo "codes-server: набранное попало в журнал модуля" >&2
-        return 1
-    fi
-    if [ -f "$AUDIT_JOURNAL" ] && grep -qF -- "$secret" "$AUDIT_JOURNAL"; then
-        echo "codes-server: набранное попало в журнал аудита" >&2
-        return 1
-    fi
+    assert_absent_from_journals "$secret" "$since" || return 1
     echo "server-id: refused and unlogged"
 }
 
@@ -1831,16 +1895,7 @@ cmd_expect_second_answer_not_logged() {
         return 1
     fi
 
-    if journalctl -t pam_tessera --since "@$since" --no-pager 2>/dev/null \
-        | grep -qF -- "$secret"; then
-        echo "codes-server: набранное во втором поле попало в журнал модуля" >&2
-        return 1
-    fi
-
-    if [ -f "$AUDIT_JOURNAL" ] && grep -qF -- "$secret" "$AUDIT_JOURNAL"; then
-        echo "codes-server: набранное во втором поле попало в журнал аудита" >&2
-        return 1
-    fi
+    assert_absent_from_journals "$secret" "$since" || return 1
 
     echo "second-answer: refused and unlogged"
 }
@@ -3048,7 +3103,15 @@ cmd_cleanup() {
     rmdir "$CODES_DIR" 2>/dev/null || true
 
     rm -rf "$RUN_DIR"
-    rm -rf "$WRAPPER_DIR"
+    # Удаляется ТОЛЬКО то, что стенд сам сюда положил, и только если после
+    # этого каталог пуст: путь приходит из окружения, а `rm -rf` по чужому
+    # каталогу — не уборка, а потеря. Проверка та же, что у ролевого
+    # хранилища.
+    if [ -n "${WRAPPER_DIR:-}" ]; then
+        assert_removable_path "$WRAPPER_DIR" "WRAPPER_DIR"
+        rm -f "$WRAPPER_DIR/overlay-acks"
+        rmdir "$WRAPPER_DIR" 2>/dev/null || true
+    fi
 
     echo "cleaned"
 }
