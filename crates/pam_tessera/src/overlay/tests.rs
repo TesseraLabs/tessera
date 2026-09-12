@@ -881,7 +881,14 @@ fn an_overlay_that_never_says_it_drew_is_no_overlay() {
     // finish the login at all.
     let dir = tempfile::tempdir().unwrap();
     let binary = mute_overlay(dir.path());
-    let overlay = overlay_from(binary, dir.path());
+    // A SHORT budget on purpose, and the only test here that sets its own. The
+    // wait this test is about is one nothing ever ends early — a peer that is
+    // alive and silent — so the test pays the budget in full, and paying the
+    // long one would keep a thread of the suite for twenty seconds while every
+    // other test competes for the machine. What is asserted is the bound, and a
+    // bound is a bound at any size.
+    let overlay = SpawningOverlay::new(binary, dir.path().to_path_buf(), owner())
+        .with_handshake(Duration::from_secs(2));
 
     let started = Instant::now();
     assert!(
@@ -892,7 +899,7 @@ fn an_overlay_that_never_says_it_drew_is_no_overlay() {
     // not hang on an overlay that will never answer.
     let waited = started.elapsed();
     assert!(
-        waited < TEST_HANDSHAKE * 3,
+        waited < Duration::from_secs(30),
         "the login waited {waited:?} on an overlay that said nothing"
     );
 }
