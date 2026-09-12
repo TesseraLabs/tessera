@@ -1,0 +1,269 @@
+suite: greeter-modern
+description: >
+  Вход по коду через ШТАТНЫЙ греетер fly-dm с плагином modern — тот, что стоит по
+  умолчанию на Astra 1.8. Канал этого плагина отличается от текстового входа тремя
+  вещами, и каждая из них ломает вход по-своему: транзакция открывается пустым
+  именем учётной записи, второй промпт получает содержимое поля пароля (пустую
+  строку, если оно не заполнено), а дисплей называется модулю items PAM, потому
+  что переменных DISPLAY и XAUTHORITY у процесса греетера нет.
+setup: [build-pam-drive, install-package, deploy-fixtures, deploy-issuer]
+
+# Канал снят зондом (одноразовый PAM-модуль, ответы в syslog) на живой Astra
+# 1.8.4 12.09.2026, а не выведен из документации: fly-dm документирует из этого
+# ровно ничего.
+#
+# Кейсы воспроизводят канал драйвером, а не греетером: набрать в чужой форме
+# стенд не умеет. Поэтому проверяется то, что от греетера ЗАВИСИТ — имя, которого
+# в транзакции нет, пустой ответ, items с дисплеем, — а не разметка его окна.
+#
+# Прежний путь (имя задано приложением, дисплей в окружении) остаётся под
+# кейсами сюиты codes-server: CODE-001 — вход целиком, QR-005 — порядок промптов.
+# Второго такого кейса здесь нет намеренно; он проверял бы то же самое.
+
+cases:
+  - id: GRM-001
+    title: Вход по коду проходит через греетер, не задавший имя учётной записи
+    requirement: spec9:auth.UI-006
+    # Имя ролевой учётной записи — вход в весь метод: по нему выбирается роль и
+    # решается, ролевая ли это учётная запись вообще. Греетер modern оставляет
+    # его пустым и отдаёт содержимое поля первым ответом с эхом, поэтому модуль
+    # обязан спросить имя сам — иначе на целевом парке метод отказывает до
+    # первого промпта, и отказывает молча.
+    #
+    # Уровень 0: кейс про канал, а не про мандатный механизм. Требование `mac`
+    # закрыло бы его на контейнерных профилях, где канал проверяется ровно так же.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-as-greeter {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 90
+      # Вердикт PAM сам по себе не говорит, что вход записан как вход по коду:
+      # запись в цепочке — то, по чему этот вход потом сверяется с выдачей.
+      - expect_journal: { identifier: pam_tessera, matches: 'qr_code_login' }
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-002
+    title: Пустое поле формы не пускает и не оставляет попытку висеть
+    requirement: spec9:auth.UI-007
+    # Переспрос ограничен — в этом весь кейс. Канал, где пустая строка приходит
+    # на каждый промпт, обязан кончиться вердиктом: инженер, у которого вход
+    # висит без объяснения, звонит по телефону, а устройство тем временем держит
+    # замок попытки.
+    #
+    # Отказ именно PAM_AUTH_ERR: пустой ответ — негодный ввод, а не отсутствие
+    # метода (PAM_AUTHINFO_UNAVAIL) и не исчерпанный бюджет (PAM_MAXTRIES).
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      # Код 7 и есть весь кейс: PAM_AUTH_ERR — то, чем модуль отвечает на
+      # негодный ввод. Отказ по роли (PAM_PERM_DENIED, 6) на этом месте означал
+      # бы, что имя учётной записи вообще не добыто, а исчерпанный бюджет
+      # (PAM_MAXTRIES, 11) — что попытка всё-таки началась.
+      #
+      # Таймаут шага здесь — вторая половина обещания: разговор, который вместо
+      # вердикта переспрашивает бесконечно, упрётся в него и даст красный.
+      - run: helpers/codes-server.sh answer-nothing {{user}} 0
+        expect: { exit_code: 7, stdout_matches: 'auth: PAM_AUTH_ERR \(7\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-003
+    title: Оверлей находит дисплей греетера без переменных окружения
+    requirement: spec9:auth.UI-008
+    # Единственный способ показать QR на графическом входе — оверлей поверх
+    # греетера, а поднять его можно, только зная дисплей и права на него. У
+    # процесса fly-dm нет ни DISPLAY, ни XAUTHORITY: он называет дисплей items
+    # PAM_XDISPLAY и PAM_XAUTHDATA. Модуль, читающий только окружение, на
+    # целевом парке не поднимает оверлей никогда.
+    #
+    # Наблюдение — экран, а не журнал: символ, прочитанный сторонним декодером,
+    # и есть то, ради чего оверлей существует. Проверка «в журнале нет строки
+    # про неподнявшийся оверлей» зеленела бы и на устройстве без дисплея.
+    requires: [service-manager, graphics]
+    steps:
+      # С оверлеем: остальные кейсы сюиты идут текстовым показом, и секция
+      # конфигурации, написанная им всем, проверялась бы там, где графики нет.
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes --with-overlay
+      - run: helpers/codes-overlay.sh expect-overlay-from-pam-items {{user}}
+        expect:
+          exit_code: 0
+          stdout_matches: "overlay: shown, code accepted, overlay closed"
+        timeout: 300
+    teardown:
+      - run: helpers/codes-overlay.sh cleanup
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-004
+    title: Транзакция, открытая вовсе без имени, пускает так же
+    requirement: spec9:auth.UI-006
+    # Пустое имя и отсутствующее имя — разные состояния PAM, и путь у них
+    # разный: отсутствующее добывает сама libpam, пустое она отдаёт модулю как
+    # готовый ответ. Зонд увидел на живой машине первое, но обещание дано не
+    # про версию греетера, а про вход: обновлённый греетер, перешедший на
+    # второе поведение, обязан работать так же.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-as-greeter {{user}} --level 0 --start none
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-005
+    title: Дисплей графического входа модуль берёт из items PAM
+    requirement: spec9:auth.UI-008
+    # Items — единственный канал, которым дисплей-менеджер называет дисплей, и
+    # у этого кейса есть отдельная причина существовать рядом с GRM-003: тот
+    # требует графики и в контейнере получает SKIP, а ошибка в НОМЕРЕ item не
+    # зависит от наличия X-сервера вовсе. Номер, взятый неверно, читает чужой
+    # item (по заголовку PAM 13 — это `PAM_AUTHTOK_TYPE`, строка), и канал
+    # дисплея молча не работает нигде.
+    #
+    # Дисплей назван необычный (`:77`), чтобы строка журнала принадлежала
+    # именно этому кейсу: окно `expect_journal` — десять минут, и `:0` соседа
+    # зеленил бы проверку.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate-as-greeter {{user}} --level 0 --xdisplay :77
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 90
+      - expect_journal:
+          identifier: pam_tessera
+          matches: 'display=:77'
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-006
+    title: Оверлей, который ничего не нарисовал, не отнимает challenge у промпта
+    requirement: spec9:auth.UI-004
+    # Показ обязан быть НА ЧЁМ-ТО. Модуль убирает текстовую форму из промпта,
+    # когда символ уже на экране, — и вопрос в том, чем он это устанавливает.
+    # Подключившийся к сокету процесс ещё ничего не нарисовал: настоящий оверлей
+    # открывает дисплей ПОСЛЕ подключения и на неоткрывшемся умирает. Инженер в
+    # этом случае видит «Код:» и challenge нигде, то есть вход, который нельзя
+    # завершить.
+    #
+    # Заглушка вместо настоящего оверлея здесь не упрощение, а единственный
+    # способ проверить именно это: живой бинарь на негодном дисплее умирает за
+    # миллисекунды, и кейс ловил бы гонку, а не поведение модуля.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+               --overlay-binary={{helpers}}/overlay-stub.pl
+      - run: helpers/codes-server.sh expect-qr-in-code-prompt {{user}}
+        expect: { exit_code: 0, stdout_matches: 'qr-in-prompt: yes' }
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-007
+    title: Незаполненное поле имени не превращает пароль в имя учётной записи
+    requirement: spec9:auth.UI-006
+    # Порядок ответов греетера modern делает переспрос имени опасным: первый
+    # видимый промпт получает поле «Имя», второй — поле «Пароль». Модуль,
+    # спросивший имя дважды, получает во второй раз пароль и принимает его за
+    # имя учётной записи — после чего пароль уходит в PAM_USER, в журнал и в
+    # журнал аудита со сцеплением хешей, откуда его уже не вычеркнуть.
+    #
+    # Отсюда и ожидание: пустое имя — отказ сразу, без второго вопроса.
+    # Строка, стоящая в поле пароля, фиктивна и лежит в кейсе открыто: секрета
+    # в реестре нет, проверяется отсутствие следа.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-second-answer-not-logged {{user}}
+               not-a-password-just-a-marker-7f3a
+        expect: { exit_code: 0, stdout_matches: 'second-answer: refused and unlogged' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-008
+    title: Пустое поле имени закрывает вход первым же ответом
+    requirement: spec9:auth.UI-006
+    # Рядом с GRM-007 это отдельная гарантия: там проверяется, куда не попал
+    # второй ответ, здесь — что второго вопроса не было. Разница видна на канале
+    # греетера: любой второй видимый промпт получает поле «Пароль», поэтому
+    # незаполненное поле имени обязано кончиться вердиктом сразу, а не
+    # повторённым вопросом.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-empty-name-refused {{user}}
+        expect: { exit_code: 0, stdout_matches: 'empty-name: refused after one question' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-009
+    title: При поднятом оверлее промпт несёт адрес попытки строкой
+    requirement: spec9:auth.UI-004
+    # Оверлей рисует ТОЛЬКО символ. Инженер, у которого камера не берёт экран —
+    # блики, запрет на телефон с камерой в помещении, — вводит адрес руками, и
+    # взять его больше негде: полублочную решётку из промпта убрали именно
+    # потому, что символ уже на экране.
+    #
+    # Заглушка отвечает байтом подтверждения: без него модуль считает, что
+    # оверлея нет, и кейс проверял бы текстовый путь вместо графического.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+               --overlay-binary={{helpers}}/overlay-stub.pl --overlay-acks
+      - run: helpers/codes-server.sh expect-payload-line-in-code-prompt {{user}}
+        expect: { exit_code: 0, stdout_matches: 'payload-line: yes' }
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-010
+    title: Пароль в поле формы не становится идентификатором сервера выдачи
+    requirement: spec9:codes.CODE-102
+    # Тот же класс, что GRM-007, и другой выход. Второй ответ канала греетера —
+    # поле «Пароль»; на этом промпте оно становится идентификатором сервера
+    # выдачи, а тот входит в challenge. Challenge печатается QR'ом на экране
+    # входа, уезжает в браузер инженера и в запрос к выдаче, где попадает в
+    # журнал и в запись выдачи — то есть за пределы устройства, откуда его уже
+    # не убрать.
+    #
+    # Поэтому отказ обязан наступить ДО построения challenge: устройство знает
+    # билеты, которые ему выдали, и идентификатор, которого среди них нет,
+    # проверять нечем и незачем.
+    #
+    # Личный номер при этом спрашивается в любом случае, и ожидания кейса на
+    # него не опираются: разговор, обрывающийся раньше на негодном
+    # идентификаторе, отвечал бы самой своей формой на вопрос, есть ли у
+    # устройства билет названной стороны.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-server-id-not-logged {{user}}
+               not-a-password-just-a-marker-91c4
+        expect: { exit_code: 0, stdout_matches: 'server-id: refused and unlogged' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-011
+    title: Имя, заданное приложением, модуль не подменяет своим
+    requirement: spec9:auth.UI-006
+    # Имя из одних пробелов — не отдельный случай, а способ это увидеть:
+    # приложение имя ЗАДАЛО, и модуль обязан отказать, а не решить, что имени
+    # нет, и дописать своё. Подменённый item — то самое расхождение, из-за
+    # которого существует класс CVE-2021-3560: модули стека до и после видят
+    # разные идентичности, и ни один об этом не знает.
+    #
+    # Поэтому вердикт здесь — не единственное ожидание: кейс читает item PAM_USER
+    # со стороны приложения после попытки и требует, чтобы он не изменился.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-user-item-untouched "   "
+        expect: { exit_code: 0, stdout_matches: 'user-item: untouched' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup

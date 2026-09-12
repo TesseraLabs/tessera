@@ -9,6 +9,7 @@
 // caller reaches the daemon over a named pipe and still gets the trust wiring
 // — the per-host `[[trust_override]]` selection above all — from here rather
 // than from a second implementation of its own.
+pub mod answer;
 pub mod di;
 
 pub mod codes_flow;

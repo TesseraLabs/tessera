@@ -3,10 +3,14 @@
 //! Started by the PAM module of the attempt, with the path of the socket that
 //! attempt is served on. Exits when the attempt ends, whichever way it ended.
 //!
-//! Nothing travels back up the socket. When the overlay cannot draw, it says so
-//! on its standard error — which lands wherever the greeter's own does — and
-//! stops; the module runs as root and does not read what an unprivileged
-//! process wrote.
+//! One byte travels back up the socket, and only one: `DRAWN`, written after
+//! the FIRST symbol is on the screen. The module chooses between showing the
+//! challenge as text in the prompt and leaving it to this process, and that
+//! choice needs to know the symbol is actually visible — connecting to the
+//! socket happens before the display is open and proves nothing. Everything
+//! else the overlay has to say goes to its standard error, which lands wherever
+//! the greeter's own does; the module runs as root and reads nothing else from
+//! here. See `overlay_ipc` for what bounds that byte.
 //!
 //! # Usage
 //!
@@ -33,8 +37,10 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tessera_core::codes::overlay_ipc;
+use tessera_core::codes::qr::Symbol;
 use tessera_qr_overlay::x11::X11Surface;
-use tessera_qr_overlay::{pump, Waiting};
+use tessera_qr_overlay::{pump, Surface, SurfaceError, Waiting};
 
 /// How long the overlay waits for a frame before deciding the module is gone.
 ///
@@ -72,11 +78,14 @@ fn show(socket: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // The wait is set here rather than inside the conversation: a clock in the
     // part that is tested would be a clock every test has to wait on.
     stream.set_read_timeout(Some(SILENCE))?;
-    // Nothing is ever written back — the wire runs one way — so the write half
-    // goes down at once. It costs nothing and it makes the direction a fact of
-    // the socket rather than a promise of the code above it.
-    let _ignored = stream.shutdown(std::net::Shutdown::Write);
-    let mut surface = X11Surface::open()?;
+    // The write half stays open for exactly one byte, sent after the first
+    // symbol is drawn (see `AckOnFirstDraw`). It used to go down here, when
+    // nothing travelled upwards at all.
+    let ack = stream.try_clone()?;
+    let mut surface = AckOnFirstDraw {
+        inner: X11Surface::open()?,
+        ack: Some(ack),
+    };
 
     // The ending is not turned into an exit code. What the overlay reports is
     // whether it did its job; what the attempt came to is the module's to
@@ -90,6 +99,46 @@ fn show(socket: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let waiting = Waiting::new(watched.as_fd(), SILENCE);
     pump(&mut stream, Some(waiting), &mut surface)?;
     Ok(())
+}
+
+/// A surface that tells the module, once, that a symbol reached the screen.
+///
+/// A decorator rather than a line inside [`pump`]: the acknowledgement belongs
+/// to the moment a draw SUCCEEDED, and that moment is already a return value
+/// here. Putting it in the conversation would mean every test of the
+/// conversation carrying a socket it has no use for.
+///
+/// The byte goes out at most once — `ack` is taken on the first success — and a
+/// write that fails is ignored: the module is the one waiting for it, and a
+/// module that has gone away needs nothing from this process.
+struct AckOnFirstDraw<S: Surface> {
+    inner: S,
+    ack: Option<UnixStream>,
+}
+
+impl<S: Surface> Surface for AckOnFirstDraw<S> {
+    fn show(&mut self, symbol: &Symbol) -> Result<(), SurfaceError> {
+        self.inner.show(symbol)?;
+        if let Some(stream) = self.ack.take() {
+            let _ignored = (&stream).write_all(&[overlay_ipc::DRAWN]);
+            // The half goes down as soon as the byte is out: one byte is the
+            // whole of what this direction carries.
+            let _ignored = stream.shutdown(std::net::Shutdown::Write);
+        }
+        Ok(())
+    }
+
+    fn hide(&mut self) -> Result<(), SurfaceError> {
+        self.inner.hide()
+    }
+
+    fn events(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.inner.events()
+    }
+
+    fn service(&mut self) -> Result<(), SurfaceError> {
+        self.inner.service()
+    }
 }
 
 /// The socket path out of the arguments.

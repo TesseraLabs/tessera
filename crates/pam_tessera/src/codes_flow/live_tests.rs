@@ -67,6 +67,12 @@ use std::cell::RefCell;
 #[cfg(unix)]
 use std::time::Duration;
 
+// Everything this module builds an answer for is a `#[cfg(unix)]` conversation,
+// so the import carries the same condition the rest of them do — a plain one
+// is an unused import on Windows, where the tests below do not exist.
+#[cfg(unix)]
+use crate::answer::Answer;
+
 #[cfg(unix)]
 use openssl::bn::{BigNum, BigNumContext};
 #[cfg(unix)]
@@ -456,12 +462,12 @@ impl CodeConversation for Engineer<'_> {
     }
 
     #[cfg(unix)]
-    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
+    fn prompt_visible(&mut self, prompt: &str) -> Result<Answer, PamConvError> {
         if prompt == super::SERVER_PROMPT {
-            return Ok(SERVER.to_owned());
+            return Ok(Answer::new(SERVER.to_owned()));
         }
         if prompt == super::ENGINEER_PROMPT {
-            return Ok(ENGINEER.to_owned());
+            return Ok(Answer::new(ENGINEER.to_owned()));
         }
         // The challenge travels in the TEXT of the code prompt. Reading it here
         // is what an engineer does with their eyes and a telephone camera, and
@@ -474,7 +480,7 @@ impl CodeConversation for Engineer<'_> {
             // The engineer gave up rather than keep typing.
             return Err(PamConvError::ConvFailed);
         };
-        Ok(match next {
+        Ok(Answer::new(match next {
             Typed::Wrong => WRONG_CODE.to_owned(),
             Typed::Right | Typed::RightInGroups => {
                 let printed = self.printed.borrow();
@@ -491,7 +497,7 @@ impl CodeConversation for Engineer<'_> {
                     code
                 }
             }
-        })
+        }))
     }
 
     fn prompt_secret(&mut self, _prompt: &str) -> Result<SecretString, PamConvError> {
@@ -511,14 +517,14 @@ impl CodeConversation for Replay {
     fn show_info(&mut self, _message: &str) {}
 
     #[cfg(unix)]
-    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
+    fn prompt_visible(&mut self, prompt: &str) -> Result<Answer, PamConvError> {
         if prompt == super::SERVER_PROMPT {
-            return Ok(SERVER.to_owned());
+            return Ok(Answer::new(SERVER.to_owned()));
         }
         if prompt == super::ENGINEER_PROMPT {
-            return Ok(ENGINEER.to_owned());
+            return Ok(Answer::new(ENGINEER.to_owned()));
         }
-        Ok(self.0.clone())
+        Ok(Answer::new(self.0.clone()))
     }
 
     fn prompt_secret(&mut self, _prompt: &str) -> Result<SecretString, PamConvError> {

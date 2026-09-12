@@ -61,6 +61,7 @@ use tessera_core::pam_conv::PamConvError;
 use tessera_core::pam_data::AuthContext;
 use tessera_core::role::{AccountCheck, RoleDenyReason, RoleStore, SessionRolePayload};
 
+use crate::answer::Answer;
 use crate::codes_level::{LevelError, LevelSource};
 
 /// Longest identifier of an issuing side a person may type, in BYTES.
@@ -105,6 +106,15 @@ const REASON_INPUT: &str = "input";
 /// rather than a QR nobody can scan.
 const REASON_QR: &str = "qr_payload_too_long";
 
+/// Refusal detail: no ticket of this device names that issuing side.
+///
+/// Kept apart from the general input refusal because the two are acted on
+/// differently: that one says a value was too long or carried a separator, this
+/// one says the value was a well-formed string naming a side this device has
+/// nothing from — a fleet that renamed its issuing side, or a value that was
+/// never an identifier at all.
+const REASON_ISSUER_UNKNOWN: &str = "issuer_unknown";
+
 /// Refusal detail: the personal number is not one.
 ///
 /// Kept apart from the general input refusal because the two are acted on
@@ -113,6 +123,32 @@ const REASON_QR: &str = "qr_payload_too_long";
 /// its own check character, and only the second points at a person retyping
 /// something off a note.
 const REASON_ENGINEER_NUMBER: &str = "engineer_number_malformed";
+
+/// How many times an empty answer to a visible prompt of THIS branch is asked
+/// for again.
+///
+/// The prompts this governs are the issuing side and the personal number.
+/// The account name is not among them and never asks twice: the second visible
+/// prompt of the greeter's channel receives its password field, and a name
+/// asked for again would be that password — see `entry::resolve_login_account`.
+/// These two are different: they are not identity, they are checked against the
+/// contract of the channel before anything is done with them, and a value that
+/// is merely wrong is refused rather than recorded.
+///
+/// One, and both halves of that are deliberate.
+///
+/// Asking again at all: the standard greeter of the target fleet answers the
+/// second prompt of a conversation with the contents of its password field,
+/// which on this method nobody fills — so the answer to the first visible
+/// prompt arrives empty through no fault of the person at the device. From the
+/// third prompt onwards the greeter draws the module's own text, and the
+/// repeat reaches them.
+///
+/// Not asking forever: a channel that returns an empty string for every prompt
+/// exists too, and a login that keeps asking holds the attempt lock open with
+/// nothing to show for it. A non-empty answer that is wrong is refused as
+/// before — this is about an answer nobody gave, not about a bad one.
+pub(crate) const EMPTY_ANSWER_RETRIES: usize = 1;
 
 /// Prompt naming the issuing side this attempt is addressed to.
 const SERVER_PROMPT: &str = "Сервер выдачи: ";
@@ -166,6 +202,22 @@ fn shown_challenge(
     ))
 }
 
+/// What goes above the code prompt when the symbol is already on a screen.
+///
+/// One line of text and the payload, and neither is decoration. The overlay
+/// draws the SYMBOL and nothing else: a camera that will not focus, glare on a
+/// screen, a room where telephones with cameras are not allowed — in every one
+/// of them the address typed by hand is the only way the challenge reaches the
+/// engineer's side, and there is nowhere else on a graphical login to read it
+/// from.
+///
+/// What is left out is the half-block drawing: it is forty lines, the greeter
+/// of the target fleet renders the module's text in a one-line inline panel,
+/// and the symbol it would duplicate is already on the screen behind it.
+fn typed_challenge(payload: &str) -> String {
+    format!("{QR_FALLBACK_CAPTION}\n{payload}\n")
+}
+
 /// The conversation with the person at the device.
 ///
 /// Production drives the live `pam_conv`; tests script the answers, which is
@@ -180,11 +232,18 @@ pub trait CodeConversation {
 
     /// Ask for a value that is meant to be visible while it is typed.
     ///
+    /// The answer comes back inside [`Answer`], which overwrites itself when it
+    /// is dropped. That is not tidiness: the greeter of the target fleet answers
+    /// the second prompt of a conversation with its password field whatever the
+    /// prompt asked for, so every answer here may be a password — including the
+    /// ones this branch refuses, throws away to ask again, or never looks at
+    /// after bounding it.
+    ///
     /// # Errors
     ///
     /// [`PamConvError`] when the conversation cannot be driven or the answer
     /// is not text.
-    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError>;
+    fn prompt_visible(&mut self, prompt: &str) -> Result<Answer, PamConvError>;
 
     /// Ask for a value that must not be echoed.
     ///
@@ -281,6 +340,14 @@ pub trait CodeMethodApi {
     /// An attempt this method started.
     type Attempt;
 
+    /// Whether this device holds a ticket issued by that side.
+    ///
+    /// The question is asked before a challenge is built, and the answer is the
+    /// only one available at that point: what the person typed either names an
+    /// issuing side this device was given a ticket for, or it names nothing the
+    /// device can check anything against. See [`ask_who_is_asking`].
+    fn knows_issuer(&self, server_id: &str) -> bool;
+
     /// The key epoch this method is running under.
     ///
     /// Read from the method rather than from the configuration because the two
@@ -318,6 +385,10 @@ pub trait CodeMethodApi {
 
 impl CodeMethodApi for CodeMethod {
     type Attempt = tessera_core::codes::StartedAttempt;
+
+    fn knows_issuer(&self, server_id: &str) -> bool {
+        Self::holds_ticket_of(self, server_id)
+    }
 
     fn epoch(&self) -> u32 {
         Self::epoch(self).get()
@@ -708,7 +779,13 @@ where
     let role_id = requested_role(pam_user, level, epoch)?;
     ensure_role_account(pam_user, deps.accounts, level, epoch)?;
 
-    let (server_id, engineer_id) = ask_who_is_asking(conv, pam_user, level, epoch)?;
+    let (server_id, engineer_id) = ask_who_is_asking(
+        conv,
+        |side| method.knows_issuer(side),
+        pam_user,
+        level,
+        epoch,
+    )?;
     let request = AttemptRequest {
         role_id: role_id.as_str(),
         level,
@@ -730,11 +807,22 @@ where
     // that does reach every front end is the prompt.
     let payload = method.payload(&attempt);
     let shown = shown_challenge(&payload, pam_user, level, epoch)?;
-    // Bound and not used: the handle IS the overlay being on the screen, and it
+    // Held, not acted on: the handle IS the overlay being on the screen, and it
     // comes down when this binding goes out of scope at the end of the attempt.
     // Named rather than `_`, which would drop it here and take the symbol down
     // before the engineer had seen it.
-    let _overlay = raise_overlay(deps, &payload, pam_user, epoch);
+    let overlay = raise_overlay(deps, &payload, pam_user, epoch);
+    // Whether the symbol is already on a screen. The text form goes into the
+    // prompt only when it is not: on a graphical login the person is looking at
+    // the overlay, and the greeter of the target fleet draws the module's text
+    // in a one-line inline panel, where forty lines of half-block glyphs are
+    // not a fallback but a prompt nobody can read the code request out of.
+    //
+    // Asked of the overlay rather than of the items PAM set: the items say a
+    // display was NAMED, the handle says a symbol is SHOWN. An overlay that
+    // did not come up on a named display leaves the challenge in the prompt,
+    // where it was going anyway.
+    let symbol_on_screen = overlay.is_some();
 
     // Nothing is asked for the key container, and nothing holds a password for
     // it either: the key of the device is stored without one, guarded by the
@@ -762,20 +850,23 @@ where
         // every retry would scroll the screen and leave the engineer scanning a
         // half-erased QR — and they are looking at the code they mistyped, not
         // at the challenge, which has not changed.
-        let prompt = if first_prompt {
-            format!("{shown}{CODE_PROMPT}")
-        } else {
-            CODE_PROMPT.to_owned()
+        let prompt = match (first_prompt, symbol_on_screen) {
+            (true, false) => format!("{shown}{CODE_PROMPT}"),
+            (true, true) => format!("{}{CODE_PROMPT}", typed_challenge(&payload)),
+            (false, _) => CODE_PROMPT.to_owned(),
         };
         first_prompt = false;
         let typed = bounded_answer(
-            &conv.prompt_visible(&prompt)?,
+            conv.prompt_visible(&prompt)?.as_str(),
             MAX_CODE_LEN,
             pam_user,
             level,
             epoch,
         )?;
-        let code = normalise_code(&typed);
+        // Both the answer and the code folded out of it wipe themselves at the
+        // end of this pass: the code is the one value here nobody may leave in
+        // the heap of `sshd`, `login` or a display manager.
+        let code = Answer::new(normalise_code(&typed));
         // Markers are read afresh for every verification: an attempt that did
         // not survive a reboot must be refused by the reboot, not by whatever
         // the branch remembered from before it.
@@ -841,6 +932,32 @@ where
     })
 }
 
+/// Asks a visible prompt, and asks it again when the answer comes back empty.
+///
+/// The last answer is returned whatever it is: what an empty or unusable value
+/// costs is decided by [`bounded_answer`], in one place, for every prompt. This
+/// only decides how many times the question is put — see
+/// [`EMPTY_ANSWER_RETRIES`] for why it is put more than once and why not
+/// indefinitely.
+///
+/// # Errors
+///
+/// [`CodeFlowError::Conv`] when the conversation cannot be driven at all.
+fn ask_visible<C: CodeConversation>(conv: &mut C, prompt: &str) -> Result<Answer, CodeFlowError> {
+    let mut answer = conv.prompt_visible(prompt)?;
+    for _ in 0..EMPTY_ANSWER_RETRIES {
+        if !answer.trim().is_empty() {
+            break;
+        }
+        // The discarded answer is wiped by being dropped here. An empty one on
+        // this fleet is an unfilled form field — but a channel that answers
+        // every prompt with the same field would put a password in this
+        // variable, and nothing downstream would ever look at it again.
+        answer = conv.prompt_visible(prompt)?;
+    }
+    Ok(answer)
+}
+
 /// Asks which side is expected to issue, and who is standing at the device.
 ///
 /// Two prompts and no more, in that order. The second answer is checked as a
@@ -855,26 +972,73 @@ where
 /// [`CodeFlowError::Input`] for an answer the channel cannot carry.
 fn ask_who_is_asking<C: CodeConversation>(
     conv: &mut C,
+    knows_issuer: impl Fn(&str) -> bool,
     pam_user: &str,
     level: Level,
     epoch: u32,
 ) -> Result<(String, String), CodeFlowError> {
     let server_id = bounded_answer(
-        &conv.prompt_visible(SERVER_PROMPT)?,
+        ask_visible(conv, SERVER_PROMPT)?.as_str(),
         MAX_SERVER_ID_LEN,
         pam_user,
         level,
         epoch,
     )?;
+    // Checked HERE, against the tickets this device holds, and not later
+    // against the shape of a string. The value is about to enter the challenge,
+    // and the challenge is drawn on the login screen, carried to the engineer's
+    // browser and recorded by the issuing side — so a value that names nothing
+    // this device can verify must not get that far. The greeter of the target
+    // fleet answers this prompt with its password field: a person who filled
+    // that field and left the method's own prompt untouched would otherwise
+    // have their password photographed off a screen and written into somebody
+    // else's journal.
+    //
+    // Refused without being echoed, and not asked for again: what it is cannot
+    // be told from here, and the one answer worth repeating a question for is
+    // an empty one (see `ask_visible`).
+    //
+    // The verdict is taken now and ACTED ON below, after the next prompt. The
+    // order of the questions is the same for every answer either way: a
+    // conversation that stopped here would tell whoever is typing whether this
+    // device holds a ticket of the side they named — a fact about the device,
+    // answered by the shape of the dialogue rather than by anything anybody was
+    // allowed to ask.
+    let issuer_known = knows_issuer(&server_id);
     let typed = bounded_answer(
-        &conv.prompt_visible(ENGINEER_PROMPT)?,
+        ask_visible(conv, ENGINEER_PROMPT)?.as_str(),
         MAX_ENGINEER_ID_LEN,
         pam_user,
         level,
         epoch,
     )?;
+    if !issuer_known {
+        tracing::info!(
+            target: "tessera.codes",
+            user = pam_user,
+            epoch,
+            answer_len = server_id.len(),
+            "no ticket of this device names the issuing side that was typed; refusing before a challenge exists",
+        );
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: level.get(),
+            epoch,
+            ticket_number: None,
+            claimed_engineer_no: None,
+            reason: REASON_ISSUER_UNKNOWN,
+        });
+        // The answer wipes itself as this frame unwinds — see `Answer`.
+        // Still before the challenge, and still without spending anything: no
+        // attempt was started, so no budget was touched and no nonce exists.
+        return Err(CodeFlowError::Denied);
+    }
     let engineer_id = checked_engineer_number(&typed, pam_user, level, epoch)?;
-    Ok((server_id, engineer_id))
+    // Owned copies made ON PURPOSE, at the one point both values are known to
+    // be what they claim: they go into the challenge, which outlives this
+    // frame. Everything up to here wiped itself.
+    Ok((server_id.to_kept_string(), engineer_id))
 }
 
 /// Puts the same payload on the screen of a graphical login, if there is one.
@@ -1003,7 +1167,7 @@ fn bounded_answer(
     pam_user: &str,
     level: Level,
     epoch: u32,
-) -> Result<String, CodeFlowError> {
+) -> Result<Answer, CodeFlowError> {
     let trimmed = answer.trim();
     // Bytes, not characters: the bound belongs to the payload budget, which is
     // spent in bytes. Counting characters let a value in Cyrillic pass a prompt
@@ -1024,7 +1188,11 @@ fn bounded_answer(
         });
         return Err(CodeFlowError::Input { limit });
     }
-    Ok(trimmed.to_owned())
+    // The copy this makes wipes itself, like the answer it was trimmed from:
+    // what is bounded here is what a person typed, and on this fleet that may
+    // be the contents of a password field whatever the prompt asked for. The
+    // refusal path above allocates nothing — `trim` borrows.
+    Ok(Answer::new(trimmed.to_owned()))
 }
 
 /// Refuse a personal number whose check character does not meet.
@@ -1684,7 +1852,7 @@ impl CodeConversation for PamCodeConversation {
         }
     }
 
-    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
+    fn prompt_visible(&mut self, prompt: &str) -> Result<Answer, PamConvError> {
         // SAFETY: `self.pamh` is the live PAM handle of the enclosing frame.
         unsafe { crate::pam_conv::prompt_visible(self.pamh, prompt) }
     }

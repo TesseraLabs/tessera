@@ -11,7 +11,7 @@
 # объекте. Ради исключения этого заведён контрактный крейт, и хелпер этой
 # границы не переходит.
 #
-#   codes-server.sh prepare <fixtures>/codes [--without-codes-url]
+#   codes-server.sh prepare <fixtures>/codes [--without-codes-url] [--with-overlay]
 #   codes-server.sh authenticate <user> --level N
 #   codes-server.sh authenticate-with-code <user> --level N --code <код>
 #   codes-server.sh authenticate-with-device-key <user> --level N
@@ -117,6 +117,19 @@ CHALLENGE_FILE="$RUN_DIR/challenge.txt"
 # умолчание контракта с обеих сторон, а задать число в одном месте.
 ATTEMPTS_PER_NONCE="${TESSERA_E2E_CODE_ATTEMPTS:-5}"
 
+# Фиктивная куки дисплея: шестнадцать нулевых байтов. Секретом не является и
+# доступа ни к какому дисплею не даёт — она нужна там, где проверяется КАНАЛ
+# передачи, а не сам доступ.
+DUMMY_COOKIE_HEX="00000000000000000000000000000000"
+
+# Промпт имени учётной записи, как его печатает модуль. Держится здесь ровно
+# затем, чтобы проверять ЧИСЛО таких промптов: второй означает переспрос.
+NAME_PROMPT_LINE="${TESSERA_E2E_NAME_PROMPT:-Имя учётной записи: }"
+
+
+# Журнал аудита устройства со сцеплением хешей — вторая половина проверки следа.
+AUDIT_JOURNAL="${TESSERA_E2E_AUDIT_JOURNAL:-/var/lib/tessera/audit.ndjson}"
+
 # Заведомо неверный код: восемь нулей — длина по умолчанию, десятичный алфавит,
 # не сходится ни с каким общим ключом. Секретом не является.
 WRONG_CODE="00000000"
@@ -145,6 +158,57 @@ ENGINEER_ID="${TESSERA_E2E_ENGINEER_ID:-ORG1-0000014}"
 # чужой номер, а не то, что негодный номер отвергается формой.
 OTHER_ENGINEER_ID="${TESSERA_E2E_OTHER_ENGINEER_ID:-ORG1-0000022}"
 
+# Чем запускается драйвер, каким именем открывается транзакция и что отвечается
+# до промпта сервера выдачи. Для текстового входа — пусто и имя как есть: он и
+# есть базовый путь. Команды графического входа наполняют это перед разговором
+# (см. greeter_modern_channel).
+DRIVER_FLAGS=()
+LEADING_ANSWERS=()
+GREETER_CHANNEL=0
+# DRIVER_USER намеренно НЕ задан: «имени нет» и «имя пустое» — разные состояния
+# транзакции, и пустая строка здесь открывала бы КАЖДЫЙ разговор так, как это
+# делает греетер. Текстовый вход тогда шёл бы чужим каналом, а кейсы, ничего не
+# знающие про греетер, получали бы лишний промпт имени. Значение появляется
+# только в greeter_modern_channel.
+
+# Пакет первичной настройки, которым на устройство кладётся ключевой материал,
+# и файл PIN контейнера доставки. Оба живут только на время `prepare`.
+ENROLL_DIR="$RUN_DIR/enroll-package"
+PIN_FILE="$RUN_DIR/container.pin"
+
+# Что импорт перезаписывает помимо части Codes. Снимается до импорта и
+# возвращается сразу после: этому хелперу от импорта нужен ТОЛЬКО ключевой
+# материал метода, а ролевое хранилище кладёт подготовка suite — и вход по коду
+# ищет роль именно в нём. Импорт, оставленный как есть, заменяет хранилище
+# срезом пакета, и следующий кейс получает отказ `role_unknown` там, где
+# проверяется совсем другое.
+DEVICE_BACKUP="$RUN_DIR/device-backup"
+ROLES_DIR="${TESSERA_E2E_ROLES_DIR:-/var/lib/tessera/roles}"
+TAGS_FILE="${TESSERA_E2E_TAGS_FILE:-/etc/tessera/device-tags.toml}"
+HOST_P12="${TESSERA_E2E_HOST_P12:-/var/lib/tessera/host.p12}"
+
+# Оверлей графического входа: чьей учётной записью он бежит и откуда берётся.
+# Учётная запись — та же, под которой работает греетер; на Astra это `fly-dm`.
+# Секция конфигурации пишется только по `prepare --with-overlay`.
+WITH_OVERLAY=0
+# Заглушке оверлея нужен ключ, чтобы отвечать байтом подтверждения. Бинарь в
+# конфигурации — путь без аргументов, поэтому ключ дописывается обёрткой (см.
+# write_overlay_wrapper): так кейс остаётся одной строкой, а модуль по-прежнему
+# запускает один исполняемый файл.
+OVERLAY_ACKS=0
+# Где живут исполняемые файлы, которые заводит стенд. Каталог обязан быть на
+# файловой системе БЕЗ noexec — рабочий каталог прогона под /run не годится.
+WRAPPER_DIR="${TESSERA_E2E_BIN_DIR:-/usr/local/lib/tessera-e2e}"
+OVERLAY_USER="${TESSERA_E2E_OVERLAY_USER:-}"
+OVERLAY_BINARY="${TESSERA_E2E_OVERLAY_BINARY:-/usr/bin/tessera-qr-overlay}"
+
+# Учётные записи, под которыми может бежать оверлей, в порядке предпочтения.
+# Первая — та, под которой работает греетер Astra; вторая — непривилегированная
+# учётная запись, которая есть в любом окружении. Выбор по НАЛИЧИЮ, а не по
+# имени: модуль отказывается от оверлея, если названной учётной записи на
+# устройстве нет, и кейс тогда «проходит» на устройстве без оверлея вовсе.
+OVERLAY_USER_CANDIDATES="fly-dm nobody"
+
 die() {
     echo "codes-server: $*" >&2
     exit "$EXIT_INTERNAL"
@@ -160,7 +224,20 @@ stop_driver() {
     kill "$DRIVER_PID" 2>/dev/null || true
     DRIVER_PID=""
 }
-trap stop_driver EXIT
+
+# Выход из хелпера любым путём: оборванный разговор добивается, а снятое перед
+# продуктовым импортом возвращается на место.
+#
+# Второе — не гигиена. Импорт заменяет ролевое хранилище, теги и удостоверение
+# узла срезом пакета; хелпер, упавший между снимком и возвратом, оставил бы
+# устройство с ЧУЖОЙ ролевой базой, и следующий кейс проверял бы не то
+# устройство, не зная об этом. Возврат идемпотентен: без снимка он ничего не
+# делает.
+on_exit() {
+    stop_driver
+    restore_device_state_if_taken
+}
+trap on_exit EXIT
 
 usage_error() {
     echo "codes-server: $*" >&2
@@ -171,12 +248,45 @@ usage_error() {
 usage() {
     cat >&2 <<'EOF'
 usage: codes-server.sh <command> [args]
-  prepare <fixtures>/codes [--without-codes-url]
+  prepare <fixtures>/codes [--without-codes-url] [--with-overlay]
+                          [--overlay-binary=<путь>] [--overlay-acks]
                         разложить артефакты Codes, включить [codes] и завести
-                        PAM-сервис codeauth
+                        PAM-сервис codeauth; --with-overlay дописывает учётную
+                        запись и бинарь оверлея графического входа,
+                        --overlay-acks запускает его так, что он отвечает
+                        байтом подтверждения отрисовки
   authenticate <user> --level N
                         полный вход по коду: снять challenge, получить код у
                         `issuer codes issue`, подать его
+  authenticate-as-greeter <user> --level N [--start empty|none]
+                        тот же вход, но каналом штатного греетера fly-dm с
+                        плагином modern: имя из формы первым ответом, пустое
+                        поле пароля вторым. --start задаёт, чем открыта
+                        транзакция: пустым именем (по умолчанию, так делает
+                        живой греетер) или отсутствующим вовсе
+  expect-user-item-untouched <имя>
+                        вход под именем, которое задало приложение: отказ, и
+                        item PAM_USER обязан остаться тем же значением
+  expect-server-id-not-logged <user> <строка>
+                        канал греетера, где поле пароля попадает на промпт
+                        сервера выдачи: отказ обязан прийти до challenge, а
+                        <строка> — не появиться ни в промптах, ни в тексте
+                        попытки, ни в журналах
+  expect-empty-name-refused <user>
+                        канал греетера, где поле имени пусто и больше ничего не
+                        подаётся: отказ обязан прийти после ОДНОГО вопроса
+  expect-payload-line-in-code-prompt <user>
+                        при поднятом оверлее промпт кода обязан нести адрес
+                        попытки строкой и не нести рисунок QR
+  expect-second-answer-not-logged <user> <строка>
+                        канал греетера, где поле имени пусто, а в поле пароля
+                        стоит <строка>: вход обязан отказать, имя не должно
+                        спрашиваться дважды, а <строка> — попасть в журнал
+                        модуля или в журнал аудита
+  answer-nothing <user> [level]
+                        разговор каналом греетера, где на промпт сервера выдачи
+                        дважды приходит пустая строка и больше ничего;
+                        печатает вердикт драйвера и отдаёт его код
   authenticate-mistyping-once <user> --level N
                         вход, где первый код набран неверно, а второй верно:
                         журнал устройства получает отказ и успех на ОДИН nonce
@@ -430,16 +540,12 @@ deploy_artefacts() {
     # каталог закрыт. Ослабленные права продукт обязан заметить сам, и кейс,
     # стартовавший с 0644, проверял бы поведение стенда.
     install -d -m 0700 -o root -g root "$CODES_DIR"
-    # ВНИМАНИЕ: этот шаг устарел и будет красным. Устройство больше не открывает
-    # контейнер паролем — `[codes].key_password` убран, ключ в хранилище лежит
-    # БЕЗ пароля, а PIN остался формой доставки. `device.p12` из комплекта фикстур
-    # закрыт PIN'ом (DEVICE_KEY_PIN), поэтому положенный сюда как есть он не
-    # откроется, и кейсы CODE-* упадут на материале ключа, а не на проверяемой
-    # гарантии. Чинится одним из двух способов, оба вне этой волны: раскладывать
-    # ключ продуктовым импортом (`tessera enroll --codes-pin-file`), как это
-    # делает helpers/codes-enroll.sh, либо научить `cargo xtask codes-fixtures`
-    # класть рядом хранимую форму контейнера (без пароля). Записано в BASELINE.md.
-    install -m 0600 -o root -g root "$src/device.p12" "$CODES_DIR/device.p12"
+    # Контейнера ключа здесь НЕТ намеренно: его кладёт продукт, импортом пакета
+    # первичной настройки (см. import_device_key). `device.p12` комплекта закрыт
+    # PIN'ом доставки, а устройство читает хранимую форму — без пароля, — и
+    # положенный сюда как есть он не открылся бы. Прежний контейнер снимается:
+    # прогон начинается с устройства, которому ключ ещё не выдан.
+    rm -f "$CODES_DIR/device.p12"
     install -m 0644 -o root -g root "$src/tickets.txt" "$CODES_DIR/tickets.txt"
     install -m 0644 -o root -g root "$src/ticket-authority.pem" \
         "$CODES_DIR/ticket-authority.pem"
@@ -500,6 +606,21 @@ tags = [$tags_toml]
 # умолчание контракта не должно расходиться с тем, что считает хелпер.
 attempts_per_nonce = $ATTEMPTS_PER_NONCE
 EOF
+        # Оверлей описывается только там, где кейс его проверяет. Без этих двух
+        # ключей модуль показывает challenge текстом — это и есть поведение
+        # устройства без графического входа, на котором стоит большинство кейсов
+        # сюиты.
+        #
+        # Ключи ПЛОСКИЕ и лежат в самой секции `[codes]`: под-таблицы
+        # `[codes.overlay]` схема не знает, и конфигурация с ней не грузится
+        # вовсе — устройство тогда отказывает по разбору файла, а кейс читает
+        # это как отказ метода.
+        if [ "$WITH_OVERLAY" = "1" ]; then
+            cat <<EOF
+overlay_user = "$(overlay_account)"
+overlay_binary = "$OVERLAY_RUN_BINARY"
+EOF
+        fi
     } > "$staging"
     chmod --reference="$CONFIG" "$staging"
     chown --reference="$CONFIG" "$staging"
@@ -513,6 +634,206 @@ EOF
 # вовсе, и проверка сторожит будущее: ключ, появившийся со значением по
 # умолчанию, тихо превратил бы кейс «устройство без серверной конфигурации» в
 # кейс про устройство с ней.
+# Контрольная сумма файла в форме, которой ждёт манифест пакета.
+sha256_of() {
+    sha256sum "$1" | awk '{print $1}'
+}
+
+# Кладёт ключевой материал метода на устройство ПРОДУКТОМ, а не копированием.
+#
+# Почему не копией: контейнер комплекта закрыт PIN'ом доставки, а хранимая форма
+# пароля не имеет — их различает сам продукт, и единственный поддерживаемый путь
+# от первой ко второй — импорт пакета первичной настройки. Стенд, подделавший
+# хранимую форму, проверял бы собственную реализацию формата вместо продуктовой.
+#
+# Что пакет несёт: удостоверение узла, теги и часть Codes. Ролевого среза в нём
+# НЕТ — роли на устройстве уже разложила подготовка suite, и вход по коду ищет
+# роль именно там. Импорт всё равно трогает роли, теги и удостоверение узла,
+# поэтому все три снимаются до него и возвращаются сразу после: этому хелперу от
+# импорта нужен только ключ.
+import_device_key() {
+    require_tool tessera
+    require_tool sha256sum
+    local src="$FIXTURES_CODES_DIR"
+
+    install -d -m 0700 "$RUN_DIR"
+    rm -rf "$ENROLL_DIR"
+    install -d -m 0700 "$ENROLL_DIR"
+
+    install -m 0600 "$src/device.p12" "$ENROLL_DIR/host.p12"
+    cat >"$ENROLL_DIR/tags.toml" <<EOF
+[tags]
+region = "$REGION"
+EOF
+    install -m 0600 "$src/device.p12" "$ENROLL_DIR/codes-device.p12"
+    install -m 0644 "$src/tickets.txt" "$ENROLL_DIR/codes-tickets.txt"
+    install -m 0644 "$src/ticket-authority.pem" \
+        "$ENROLL_DIR/codes-ticket-authority.pem"
+    {
+        echo "epoch = $EPOCH"
+        echo "key_container = { file = \"codes-device.p12\", sha256 = \"$(sha256_of "$ENROLL_DIR/codes-device.p12")\" }"
+        echo "tickets = { file = \"codes-tickets.txt\", sha256 = \"$(sha256_of "$ENROLL_DIR/codes-tickets.txt")\" }"
+        echo "ticket_authority = { file = \"codes-ticket-authority.pem\", sha256 = \"$(sha256_of "$ENROLL_DIR/codes-ticket-authority.pem")\" }"
+    } >"$ENROLL_DIR/codes.toml"
+
+    # PIN уходит в файл, а не в argv: аргументы видны всей машине в списке
+    # процессов. Фикстурный он или нет — привычка одна.
+    ( umask 077; printf '%s' "$DEVICE_KEY_PIN" >"$PIN_FILE" )
+
+    snapshot_device_state
+    local output status=0
+    output="$(tessera enroll --standalone --import "$ENROLL_DIR" --skip-check \
+        --codes-pin-file "$PIN_FILE" 2>&1)" || status=$?
+    restore_device_state
+    rm -rf "$ENROLL_DIR"
+    rm -f "$PIN_FILE"
+    if [ "$status" != "0" ]; then
+        echo "$output" >&2
+        die "продуктовый импорт ключевого материала не прошёл (код $status)"
+    fi
+}
+
+# Снимок путей, которые перепишет импорт. Отсутствующий путь — не ошибка:
+# устройство может не иметь ни ролей, ни тегов, ни удостоверения узла.
+snapshot_device_state() {
+    rm -rf "$DEVICE_BACKUP"
+    install -d -m 0700 "$DEVICE_BACKUP"
+    if [ -d "$ROLES_DIR" ]; then
+        cp -a "$ROLES_DIR" "$DEVICE_BACKUP/roles"
+    fi
+    if [ -f "$TAGS_FILE" ]; then
+        cp -a "$TAGS_FILE" "$DEVICE_BACKUP/device-tags.toml"
+    fi
+    if [ -f "$HOST_P12" ]; then
+        cp -a "$HOST_P12" "$DEVICE_BACKUP/host.p12"
+    fi
+    # Пометка ставится ПОСЛЕДНЕЙ и одним переименованием: только по ней видно,
+    # что снимок полон. Без неё оборванная на середине копия выглядела бы как
+    # снимок устройства, у которого просто не было ни ролей, ни тегов, и
+    # возврат снёс бы то, что не успел скопировать.
+    : >"$DEVICE_BACKUP/.partial"
+    mv -f "$DEVICE_BACKUP/.partial" "$DEVICE_BACKUP/.complete"
+}
+
+# Возврат по выходу: делает работу только там, где снимок ещё лежит на месте.
+#
+# Отдельная функция, а не флаг: снимок и есть признак незавершённого импорта, и
+# его наличие на диске переживает даже смерть процесса по сигналу.
+restore_device_state_if_taken() {
+    [ -d "$DEVICE_BACKUP" ] || return 0
+    if [ ! -f "$DEVICE_BACKUP/.complete" ]; then
+        # Незавершённый снимок ничего не доказывает о том, что было на
+        # устройстве. Возврат по нему опаснее его отсутствия, поэтому не
+        # трогается ничего, а состояние называется вслух: следующий прогон
+        # начнётся с того, что кто-то это прочитает.
+        echo "codes-server: снимок состояния устройства не завершён ($DEVICE_BACKUP) — ничего не возвращаю, роли и теги могли остаться от пакета импорта" >&2
+        return 0
+    fi
+    restore_device_state
+}
+
+# Возвращает снятое. Путь, которого до импорта не было, УДАЛЯЕТСЯ: оставленный
+# срез пакета — это чужая роль на устройстве, которую следующий кейс примет за
+# своё окружение.
+restore_device_state() {
+    assert_removable_path "$ROLES_DIR" "ROLES_DIR"
+    if [ -d "$DEVICE_BACKUP/roles" ]; then
+        rm -rf "$ROLES_DIR"
+        cp -a "$DEVICE_BACKUP/roles" "$ROLES_DIR"
+    else
+        rm -rf "$ROLES_DIR"
+    fi
+    if [ -f "$DEVICE_BACKUP/device-tags.toml" ]; then
+        cp -a "$DEVICE_BACKUP/device-tags.toml" "$TAGS_FILE"
+    else
+        rm -f "$TAGS_FILE"
+    fi
+    if [ -f "$DEVICE_BACKUP/host.p12" ]; then
+        cp -a "$DEVICE_BACKUP/host.p12" "$HOST_P12"
+    else
+        rm -f "$HOST_P12"
+    fi
+    rm -rf "$DEVICE_BACKUP"
+}
+
+# Бинарь оверлея обязан быть исполнимым ЗДЕСЬ И СЕЙЧАС, а не просто лежать на
+# месте. Проверка нужна из-за того, как отказ выглядит иначе: модуль, у которого
+# процесс оверлея не запустился, честно уходит на текстовый путь — и кейс,
+# который как раз текстовый путь и ожидает, позеленел бы, ничего не проверив.
+# Заглушка на perl — первый кандидат на такую тишину: в образе без perl она не
+# стартует вовсе.
+#
+# Запуск с заведомо отсутствующим сокетом: годный бинарь отвечает своей ошибкой
+# (код 1), отсутствующий интерпретатор — 126 или 127 от самой оболочки.
+assert_overlay_binary_runs() {
+    local binary="$1"
+    [ -x "$binary" ] || die "бинарь оверлея $binary не исполним"
+    local status=0
+    "$binary" --socket /nonexistent/overlay-probe >/dev/null 2>&1 || status=$?
+    case "$status" in
+        126|127) die "бинарь оверлея $binary не запускается в этом окружении (код $status): нет интерпретатора?" ;;
+        0) die "бинарь оверлея $binary завершился успехом на несуществующем сокете — это не он" ;;
+        *) ;;
+    esac
+}
+
+# Путь, который стенд собирается удалять, проверяется, а не предполагается:
+# переменные приходят из окружения, и пустое, относительное или корневое
+# значение стоило бы каталога, который никто не собирался трогать.
+#
+# $1 — путь, $2 — имя переменной для сообщения.
+assert_removable_path() {
+    local path="$1" name="$2"
+    case "$path" in
+        /*/*) ;;
+        *) die "$name=$path не годится для удаления: нужен абсолютный путь глубже корня" ;;
+    esac
+    case "$path" in
+        */..*) die "$name=$path не годится для удаления: путь с переходом вверх" ;;
+        *) ;;
+    esac
+}
+
+# Обёртка, которая зовёт заглушку с ключом `--ack`.
+#
+# Конфигурация называет ОДИН исполняемый файл и аргументов не несёт — так и
+# должно быть: аргументы к пути превратили бы поле конфигурации в командную
+# строку, которую кто-то однажды соберёт из чужих данных. Обёртка живёт в
+# рабочем каталоге прогона и снимается вместе с ним.
+write_overlay_wrapper() {
+    assert_removable_path "$WRAPPER_DIR" "WRAPPER_DIR"
+    local target="$1" wrapper="$WRAPPER_DIR/overlay-acks"
+    # НЕ в рабочем каталоге прогона: он лежит под /run, а /run в контейнерных
+    # окружениях смонтирован noexec — запустить оттуда нельзя даже root'у, и
+    # модуль получил бы оверлей, который не стартует. Каталог снимается в
+    # cleanup.
+    install -d -m 0755 "$WRAPPER_DIR"
+    cat >"$wrapper" <<EOF
+#!/bin/sh
+exec "$target" --ack "\$@"
+EOF
+    chmod 0755 "$wrapper"
+    printf '%s' "$wrapper"
+}
+
+# Учётная запись оверлея: названная снаружи либо первая существующая из списка.
+overlay_account() {
+    if [ -n "$OVERLAY_USER" ]; then
+        id "$OVERLAY_USER" >/dev/null 2>&1 \
+            || die "учётной записи оверлея $OVERLAY_USER на устройстве нет"
+        printf '%s' "$OVERLAY_USER"
+        return 0
+    fi
+    local candidate
+    for candidate in $OVERLAY_USER_CANDIDATES; do
+        if id "$candidate" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    die "не нашлось учётной записи для оверлея (пробовали: $OVERLAY_USER_CANDIDATES)"
+}
+
 assert_no_codes_url() {
     if sed -n '/^\[codes\]/,/^\[/p' "$CONFIG" | grep -qiE '^[^#]*url'; then
         die "в секции [codes] есть Codes-URL, а кейс проверяет работу без него"
@@ -539,6 +860,9 @@ cmd_prepare() {
     for flag in "$@"; do
         case "$flag" in
             --without-codes-url) WITHOUT_CODES_URL=1 ;;
+            --with-overlay) WITH_OVERLAY=1 ;;
+            --overlay-binary=*) WITH_OVERLAY=1; OVERLAY_BINARY="${flag#--overlay-binary=}" ;;
+            --overlay-acks) WITH_OVERLAY=1; OVERLAY_ACKS=1 ;;
             -*) usage_error "неизвестный флаг prepare: $flag" ;;
             *)
                 [ -z "$dir" ] || usage_error "prepare принимает один каталог фикстур"
@@ -546,14 +870,24 @@ cmd_prepare() {
                 ;;
         esac
     done
-    [ -n "$dir" ] || usage_error "usage: codes-server.sh prepare <fixtures>/codes [--without-codes-url]"
+    [ -n "$dir" ] || usage_error "usage: codes-server.sh prepare <fixtures>/codes [--without-codes-url] [--with-overlay]"
 
     require_root
     require_tool install
     load_manifest "$dir"
 
     deploy_artefacts
+    # Чем именно запускается оверлей, решается ДО записи конфигурации: её пишет
+    # deploy_config, и путь, вычисленный после, попал бы в файл пустым.
+    OVERLAY_RUN_BINARY="$OVERLAY_BINARY"
+    if [ "$WITH_OVERLAY" -eq 1 ] && [ "$OVERLAY_ACKS" = "1" ]; then
+        OVERLAY_RUN_BINARY="$(write_overlay_wrapper "$OVERLAY_BINARY")"
+    fi
+    [ "$WITH_OVERLAY" -eq 0 ] || assert_overlay_binary_runs "$OVERLAY_RUN_BINARY"
     deploy_config
+    # После конфигурации: импорт кладёт ключ в ТО хранилище, которое названо в
+    # `[codes].dir`, и до её появления положил бы его в умолчание.
+    import_device_key
     [ "$WITHOUT_CODES_URL" -eq 0 ] || assert_no_codes_url
     deploy_pam_service
 
@@ -823,6 +1157,12 @@ level_prefix() {
 # устройства), `other-name` (посчитать на чужой личный номер), `wrong`
 # (заведомо неверный), либо `fixed:<код>`; $4 — сколько раз отвечать на промпт
 # кода.
+#
+# Разговор графического входа отличается от текстового не кодом, а КАНАЛОМ, и
+# отличия задаются двумя массивами, которые команда выставляет перед вызовом:
+# DRIVER_FLAGS — чем запускается драйвер (нет имени учётной записи, items с
+# дисплеем), LEADING_ANSWERS — ответы, которые греетер отдаёт ДО ответа про
+# сервер выдачи (имя из формы, пустое поле пароля).
 run_conversation() {
     local user="$1" level="$2" source="$3" code_answers="$4"
     local prefix
@@ -835,8 +1175,22 @@ run_conversation() {
     rm -f "$fifo" "$out" "$err"
     mkfifo -m 0600 "$fifo"
 
+    # Окружение дисплея снимается ровно тогда, когда разговор идёт каналом
+    # греетера: у процесса fly-dm этих переменных нет, и разговор, который
+    # унаследовал бы их от прогона кейса, проверял бы запасной путь вместо
+    # проверяемого.
+    local -a scrub=()
+    if [ "$GREETER_CHANNEL" = "1" ]; then
+        scrub=(env -u DISPLAY -u XAUTHORITY)
+    fi
+    # Имя, которым открывается транзакция. У греетера оно не то, под которым
+    # идёт вход: он открывает транзакцию пустым именем и называет учётную
+    # запись ответом на промпт.
+    local driver_user="${DRIVER_USER-$user}"
+
     # shellcheck disable=SC2086  # prefix — команда с аргументами, разбиение намеренно
-    $prefix pam-drive --answers-per-prompt "$PAM_SERVICE_NAME" "$user" authenticate \
+    "${scrub[@]}" $prefix pam-drive "${DRIVER_FLAGS[@]}" --answers-per-prompt \
+        "$PAM_SERVICE_NAME" "$driver_user" authenticate \
         < "$fifo" > "$out" 2> "$err" &
     local driver=$!
     DRIVER_PID="$driver"
@@ -845,6 +1199,10 @@ run_conversation() {
     # конца разговора: закрытый дескриптор — это EOF, а EOF на промпте драйвер
     # считает ошибкой разговора.
     exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
     printf '%s\n' "$SERVER_ID" >&3
     printf '%s\n' "$ENGINEER_ID" >&3
     printf '%s\n' "$DEVICE_KEY_PIN" >&3
@@ -853,10 +1211,11 @@ run_conversation() {
     case "$source" in
         issue)
             local printed
-            printed="$(await_challenge "$err" "$driver")"
-            code="$(issue_code "$(wire_with_overrides "$printed")")"
-            [ -n "$code" ] || die "выдача не вернула код (см. $err)"
-            printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            if printed="$(await_challenge "$err" "$driver")"; then
+                code="$(issue_code "$(wire_with_overrides "$printed")")"
+                [ -n "$code" ] || die "выдача не вернула код (см. $err)"
+                printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            fi
             ;;
         device-key)
             # Код по ПРЕЖНЕЙ схеме: из статического ключа устройства, без
@@ -879,11 +1238,12 @@ run_conversation() {
             # Подписывает инструмент стенда — теми же байтами, что и продукт,
             # через тот же крейт контракта (см. sign_challenge).
             local printed
-            printed="$(await_challenge "$err" "$driver")"
-            code="$(issue_code "$(sign_challenge \
-                "$(wire_with_overrides "$printed" "" "$(device_static_point)")")")"
-            [ -n "$code" ] || die "выдача не вернула код (см. $err)"
-            printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            if printed="$(await_challenge "$err" "$driver")"; then
+                code="$(issue_code "$(sign_challenge \
+                    "$(wire_with_overrides "$printed" "" "$(device_static_point)")")")"
+                [ -n "$code" ] || die "выдача не вернула код (см. $err)"
+                printf '%s\n' "$code" > "$RUN_DIR/last-code"
+            fi
             ;;
         other-name)
             die "режим other-name недоступен: подмена личного номера ломает подпись устройства, и проверяется теперь отказом выдачи — см. expect-issue-refused-under-another-name"
@@ -895,22 +1255,28 @@ run_conversation() {
             # Устройство пишет в свою цепочку ДВЕ строки на один nonce: отказ и
             # успех. Кейс сверки живёт именно на этом журнале.
             local printed
-            printed="$(await_challenge "$err" "$driver")"
-            code="$(issue_code "$(wire_with_overrides "$printed")")"
-            [ -n "$code" ] || die "выдача не вернула код (см. $err)"
-            printf '%s\n' "$code" > "$RUN_DIR/last-code"
-            printf '%s\n' "$WRONG_CODE" >&3
-            # Первый ответ уже подан; остальные — верный код.
-            code_answers=$((code_answers - 1))
+            if printed="$(await_challenge "$err" "$driver")"; then
+                code="$(issue_code "$(wire_with_overrides "$printed")")"
+                [ -n "$code" ] || die "выдача не вернула код (см. $err)"
+                printf '%s\n' "$code" > "$RUN_DIR/last-code"
+                printf '%s\n' "$WRONG_CODE" >&3
+                # Первый ответ уже подан; остальные — верный код.
+                code_answers=$((code_answers - 1))
+            fi
             ;;
         fixed:*) code="${source#fixed:}" ;;
         *) die "неизвестный источник кода: $source" ;;
     esac
 
+    # Кода может не быть вовсе: разговор кончился раньше, чем его спросили.
+    # Писать в FIFO, которого никто не читает, — верный способ получить сбой
+    # хелпера поверх уже состоявшегося вердикта.
     local i
-    for ((i = 0; i < code_answers; i++)); do
-        printf '%s\n' "$code" >&3
-    done
+    if [ -n "$code" ]; then
+        for ((i = 0; i < code_answers; i++)); do
+            printf '%s\n' "$code" >&3
+        done
+    fi
     exec 3>&-
 
     local rc=0
@@ -942,23 +1308,95 @@ capture_challenge() {
     rm -f "$fifo" "$out" "$err"
     mkfifo -m 0600 "$fifo"
 
-    pam-drive --answers-per-prompt "$PAM_SERVICE_NAME" "$user" authenticate \
+    local -a scrub=()
+    if [ "$GREETER_CHANNEL" = "1" ]; then
+        scrub=(env -u DISPLAY -u XAUTHORITY)
+    fi
+    "${scrub[@]}" pam-drive "${DRIVER_FLAGS[@]}" --answers-per-prompt \
+        "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
         < "$fifo" > "$out" 2> "$err" &
     DRIVER_PID=$!
 
     exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
     printf '%s\n' "$SERVER_ID" >&3
     printf '%s\n' "$ENGINEER_ID" >&3
     printf '%s\n' "$DEVICE_KEY_PIN" >&3
 
-    local printed
-    printed="$(await_challenge "$err" "$DRIVER_PID")"
+    local printed=""
+    printed="$(await_challenge "$err" "$DRIVER_PID")" \
+        || die "разговор кончился раньше challenge, а команде нужен именно он (см. $err)"
     exec 3>&-
     wait "$DRIVER_PID" 2>/dev/null || true
     DRIVER_PID=""
     rm -f "$fifo"
 
     printf '%s\n' "$printed" > "$CHALLENGE_FILE"
+}
+
+# Ведёт разговор до ПРОМПТА КОДА и обрывает его.
+#
+# Отличие от capture_challenge — в том, чего именно ждать. Там ждут строку
+# challenge, и её отсутствие законно считается сбоем стенда: команде, которой
+# challenge нужен для выдачи, без него делать нечего. Здесь проверяется САМ
+# ПОКАЗ, и «промпт кода пришёл без challenge» — это ответ продукта, а не
+# поломка: ждать надо вопрос, а не показ.
+capture_code_prompt() {
+    local user="$1"
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    local -a scrub=()
+    if [ "$GREETER_CHANNEL" = "1" ]; then
+        scrub=(env -u DISPLAY -u XAUTHORITY)
+    fi
+    "${scrub[@]}" pam-drive "${DRIVER_FLAGS[@]}" --answers-per-prompt \
+        "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
+    printf '%s\n' "$SERVER_ID" >&3
+    printf '%s\n' "$ENGINEER_ID" >&3
+
+    await_code_prompt "$err" "$DRIVER_PID"
+    exec 3>&-
+    wait "$DRIVER_PID" 2>/dev/null || true
+    DRIVER_PID=""
+    rm -f "$fifo"
+}
+
+# Ждёт, пока драйвер напечатает промпт кода — с символом или без него.
+#
+# Опознаётся по любой из трёх шапок: подпись над рисунком QR, подпись над
+# текстовой формой адреса, сам вопрос. Первый промпт кода несёт показ и вопрос
+# одним обменом, и что из трёх пришло — предмет проверки, а не условие ожидания;
+# ждать одну конкретную форму значило бы считать сбоем стенда любую другую.
+await_code_prompt() {
+    local err="$1" driver="$2" waited=0
+    local limit="${TESSERA_E2E_CHALLENGE_TIMEOUT:-30}"
+    while :; do
+        if grep -qE "^prompt: ($QR_CAPTION_LINE|$QR_FALLBACK_LINE|${CODE_PROMPT_LINE% })" "$err" 2>/dev/null; then
+            return 0
+        fi
+        # Разговор кончился раньше вопроса — вердикт уже вынесен, и ждать
+        # больше нечего. Проверку делает вызывающий по тому, что в журнале.
+        kill -0 "$driver" 2>/dev/null || return 0
+        sleep 0.2
+        waited=$((waited + 1))
+        [ "$waited" -lt $((limit * 5)) ] || die "промпт кода не появился за ${limit} с (см. $err)"
+    done
 }
 
 # Ждёт показанный challenge на stderr драйвера. Строка приходит в тексте промпта
@@ -976,9 +1414,19 @@ await_challenge() {
             printf '%s' "$line"
             return 0
         fi
-        kill -0 "$driver" 2>/dev/null || die "драйвер завершился, не показав challenge (см. $err)"
+        # Разговор кончился раньше challenge — это ВЕРДИКТ, а не сбой стенда:
+        # устройство отказывает до показа challenge по доброму десятку причин
+        # (имя не ролевой учётной записи, пустой ответ, исчерпанный бюджет
+        # выдачи). Код возврата драйвера отдаётся кейсу как есть; хелпер,
+        # умиравший здесь служебным кодом, превращал отказ продукта в ERROR, и
+        # настоящий дефект читался как испорченный стенд.
+        if ! kill -0 "$driver" 2>/dev/null; then
+            return 1
+        fi
         sleep 0.2
         waited=$((waited + 1))
+        # А вот это сбой стенда: разговор жив и молчит. Ждать до таймаута кейса
+        # значит потерять и разбор, и следующие кейсы.
         [ "$waited" -lt $((limit * 5)) ] || die "challenge не появился за ${limit} с (см. $err)"
     done
 }
@@ -1004,6 +1452,444 @@ cmd_authenticate() {
 
     load_prepared
     run_conversation "$user" "$level" issue 1
+}
+
+# Наполняет DRIVER_FLAGS и LEADING_ANSWERS так, как разговор выглядит из-под
+# штатного греетера fly-dm с плагином modern.
+#
+# Что именно воспроизводится (снято зондом на живой 1.8.4): транзакция стартует
+# без имени учётной записи вовсе; первый промпт с эхом получает содержимое поля
+# «Имя пользователя»; второй промпт любого стиля получает поле «Пароль» —
+# пустую строку, когда оно не заполнено; третий и дальнейшие промпты рисуются
+# инлайн-панелью и доходят до человека как есть.
+#
+# Пустое имя и отсутствующее имя — РАЗНЫЕ состояния транзакции, и путь модуля у
+# них разный: отсутствующее имя добывает сама libpam, пустое она отдаёт как
+# готовый ответ. Зонд на живой машине увидел пустое, поэтому оно и по умолчанию;
+# второй вариант проверяется тем же кейсом с `--start none`, потому что греетер,
+# обновлённый до другого поведения, обязан работать так же.
+#
+# $1 — имя учётной записи, которым отвечает форма; $2 — `empty` (по умолчанию)
+# или `none`.
+greeter_modern_channel() {
+    local user="$1" start="${2:-empty}"
+    GREETER_CHANNEL=1
+    DRIVER_FLAGS=()
+    case "$start" in
+        empty) DRIVER_USER="" ;;
+        none)  DRIVER_FLAGS=(--no-user); DRIVER_USER="$user" ;;
+        *)     usage_error "неизвестный режим старта транзакции: $start" ;;
+    esac
+    LEADING_ANSWERS=("$user" "")
+    if [ -n "${TESSERA_E2E_PAM_XDISPLAY:-}" ]; then
+        DRIVER_FLAGS+=(--xdisplay "$TESSERA_E2E_PAM_XDISPLAY")
+    fi
+    if [ -n "${TESSERA_E2E_PAM_XAUTHDATA:-}" ]; then
+        DRIVER_FLAGS+=(--xauthdata "$TESSERA_E2E_PAM_XAUTHDATA")
+    fi
+}
+
+# Полный вход по коду через канал греетера modern.
+cmd_authenticate_as_greeter() {
+    local user="${1:-}" level="" start="empty" xdisplay=""
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --level)
+                level="${2:-}"
+                shift 2 || usage_error "--level без значения"
+                ;;
+            --start)
+                start="${2:-}"
+                shift 2 || usage_error "--start без значения"
+                ;;
+            --xdisplay)
+                xdisplay="${2:-}"
+                shift 2 || usage_error "--xdisplay без значения"
+                ;;
+            *) usage_error "неизвестный аргумент authenticate-as-greeter: $1" ;;
+        esac
+    done
+    # Дисплей называется items PAM — так, как это делает дисплей-менеджер.
+    # Куки при этом фиктивна и одинакова: кейсы, которым важен ДОСТУП к
+    # дисплею, работают на живом греетере (codes-overlay.sh), а здесь
+    # проверяется, что модуль вообще прочитал канал из items.
+    if [ -n "$xdisplay" ]; then
+        TESSERA_E2E_PAM_XDISPLAY="$xdisplay"
+        TESSERA_E2E_PAM_XAUTHDATA="${TESSERA_E2E_PAM_XAUTHDATA:-MIT-MAGIC-COOKIE-1:$DUMMY_COOKIE_HEX}"
+        export TESSERA_E2E_PAM_XDISPLAY TESSERA_E2E_PAM_XAUTHDATA
+    fi
+    [ -n "$user" ] && [ -n "$level" ] \
+        || usage_error "usage: codes-server.sh authenticate-as-greeter <user> --level N [--start empty|none]"
+
+    load_prepared
+    greeter_modern_channel "$user" "$start"
+    run_conversation "$user" "$level" issue 1
+}
+
+# Разговор каналом греетера, в котором на промпт сервера выдачи дважды приходит
+# пустая строка, и больше ничего.
+#
+# Вердикт не судится здесь и не переписывается: печатается строка драйвера и
+# отдаётся его код возврата. Ожидание — дело кейса, и это не формальность:
+# хелпер, решавший сам, какой отказ «правильный», превращал вердикт продукта в
+# служебный код и прятал настоящую причину под «сбой стенда».
+#
+# Что проверяет кейс поверх этого: разговор ВООБЩЕ кончается. Канал, где пустая
+# строка приходит на каждый промпт, не должен оставлять попытку висеть, а
+# зависание ловится таймаутом шага.
+cmd_answer_nothing() {
+    local user="${1:-}" level="${2:-0}"
+    [ -n "$user" ] || usage_error "usage: codes-server.sh answer-nothing <user> [level]"
+
+    load_prepared
+    greeter_modern_channel "$user"
+    # Ещё одна пустая строка сверх двух ведущих: первый промпт сервера выдачи
+    # съедает пустое поле пароля, переспрос получает эту.
+    LEADING_ANSWERS+=("")
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    local prefix
+    prefix="$(level_prefix "$level")"
+    # shellcheck disable=SC2086  # prefix — команда с аргументами, разбиение намеренно
+    env -u DISPLAY -u XAUTHORITY $prefix pam-drive "${DRIVER_FLAGS[@]}" \
+        --answers-per-prompt "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
+    # Дальше разговор не ведётся: продолжать его означало бы проверять уже
+    # другой сценарий. Закрытый stdin даёт драйверу явную ошибку разговора, если
+    # модуль спросит что-то ещё, и она отличима от вердикта отказа.
+    exec 3>&-
+
+    local rc=0
+    wait "$DRIVER_PID" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+    cat "$out"
+    cat "$err" >&2
+    return "$rc"
+}
+
+# Вход под именем, которое задало приложение и которое состоит из пробелов.
+#
+# Проверяется не отказ — он очевиден, — а то, что item PAM_USER остался ТЕМ,
+# который задало приложение. Модуль, дописывающий имя поверх заданного, создаёт
+# ровно то расхождение, из-за которого существует класс CVE-2021-3560: модули
+# стека до и после видят разные идентичности, и ни один из них об этом не знает.
+#
+# $1 — имя учётной записи, как его задаёт приложение (для кейса — пробелы).
+cmd_expect_user_item_untouched() {
+    local user="${1-}"
+    [ -n "${1+set}" ] \
+        || usage_error "usage: codes-server.sh expect-user-item-untouched <имя>"
+
+    load_prepared
+
+    install -d -m 0700 "$RUN_DIR"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$out" "$err"
+
+    # Ответов не подаётся вовсе: если модуль спросит имя, значит он уже решил,
+    # что заданного имени нет, и следующим шагом перепишет item.
+    local rc=0
+    pam-drive --show-user --answers-per-prompt "$PAM_SERVICE_NAME" "$user" authenticate \
+        < /dev/null > "$out" 2> "$err" || rc=$?
+    cat "$out"
+    cat "$err" >&2
+
+    if [ "$rc" = "0" ]; then
+        echo "codes-server: вход прошёл под именем из пробелов" >&2
+        return 1
+    fi
+    if grep -q "^prompt: $NAME_PROMPT_LINE" "$err"; then
+        echo "codes-server: у человека спросили имя, хотя приложение его задало" >&2
+        return 1
+    fi
+    local seen
+    seen="$(sed -n 's/^pam_user: //p' "$out" | head -n 1)"
+    if [ "$seen" != "$user" ]; then
+        echo "codes-server: PAM_USER после попытки «$seen», а приложение задавало «$user»" >&2
+        return 1
+    fi
+    echo "user-item: untouched"
+}
+
+# Проверяет, что строки нет НИ В ОДНОМ журнале — и что журналы вообще читаются.
+#
+# Отсутствие следа и отсутствие журнала выглядят одинаково, и это разница между
+# проверкой и её видимостью: `grep` по несуществующему файлу и `journalctl`,
+# чей сбой ушёл в /dev/null, зеленеют оба. Поэтому сначала требуется СЛЕД ЭТОЙ
+# ЖЕ попытки — строка, которую модуль обязан был написать, — и только потом
+# проверяется отсутствие искомого.
+#
+# $1 — строка, которой быть не должно; $2 — момент старта попытки (epoch).
+assert_absent_from_journals() {
+    local secret="$1" since="$2"
+
+    local module_slice
+    if ! module_slice="$(journalctl -t pam_tessera --since "@$since" --no-pager 2>&1)"; then
+        echo "codes-server: журнал модуля не читается — проверка следа невозможна: $module_slice" >&2
+        return 1
+    fi
+    # Контрольная строка: модуль пишет её на каждом отказе входа по коду. Её
+    # отсутствие означает, что срез журнала пуст не потому, что следа нет.
+    if ! printf '%s' "$module_slice" | grep -q "tessera.codes\|tessera.auth"; then
+        echo "codes-server: в срезе журнала модуля нет ни одной его строки за время попытки — проверять нечего" >&2
+        return 1
+    fi
+    if printf '%s' "$module_slice" | grep -qF -- "$secret"; then
+        echo "codes-server: набранное попало в журнал модуля" >&2
+        return 1
+    fi
+
+    # Цепочка аудита. Отсутствие файла само по себе ничего не доказывает, и
+    # молчаливый `grep` по несуществующему пути — это и есть зелёная проверка
+    # ни о чём. Но отказ бывает и РАНЬШЕ первой записи цепочки: имя учётной
+    # записи, негодный идентификатор сервера — до них попытки ещё нет. Поэтому
+    # файла может не быть законно, и законность проверяется по журналу модуля:
+    # раз событие входа по коду в нём не появилось, писать в цепочку было
+    # нечего.
+    if [ -f "$AUDIT_JOURNAL" ]; then
+        if grep -qF -- "$secret" "$AUDIT_JOURNAL"; then
+            echo "codes-server: набранное попало в журнал аудита" >&2
+            return 1
+        fi
+    elif printf '%s' "$module_slice" | grep -q "qr_code_login"; then
+        echo "codes-server: модуль записал событие входа по коду, а журнала аудита $AUDIT_JOURNAL нет — проверить отсутствие следа в нём нечем" >&2
+        return 1
+    fi
+}
+
+# Разговор канала греетера, где поле пароля заполнено и попадает на промпт
+# идентификатора сервера выдачи.
+#
+# Тот же класс, что и с именем учётной записи, но выход другой: идентификатор
+# сервера входит в challenge, challenge — в QR на экране входа и в запрос к
+# выдаче, а оттуда в её журнал и запись. Отказ обязан наступить ДО построения
+# challenge, и набранное не должно остаться ни в промптах, ни в тексте попытки,
+# ни в журналах.
+#
+# $1 — имя учётной записи, $2 — что стоит в поле «Пароль».
+cmd_expect_server_id_not_logged() {
+    local user="${1:-}" secret="${2:-}"
+    [ -n "$user" ] && [ -n "$secret" ] \
+        || usage_error "usage: codes-server.sh expect-server-id-not-logged <user> <строка>"
+
+    load_prepared
+    greeter_modern_channel "$user"
+    # Канал: поле имени несёт имя учётной записи, поле пароля — заполнено.
+    # Личный номер подаётся третьим, и он же спрашивается при любом ответе:
+    # последовательность промптов одинакова, есть у устройства билет названной
+    # стороны или нет, — иначе разговор сам отвечал бы на этот вопрос. Ответ на
+    # промпт кода не подаётся: до него дело дойти не должно, потому что
+    # challenge строиться не должен.
+    LEADING_ANSWERS=("$user" "$secret" "$ENGINEER_ID")
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    local since
+    since="$(date +%s)"
+
+    env -u DISPLAY -u XAUTHORITY pam-drive "${DRIVER_FLAGS[@]}" \
+        --answers-per-prompt "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
+    exec 3>&-
+
+    local rc=0
+    wait "$DRIVER_PID" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+    cat "$out"
+    cat "$err" >&2
+
+    if [ "$rc" = "0" ]; then
+        echo "codes-server: вход прошёл на пароле в поле сервера выдачи" >&2
+        return 1
+    fi
+    if grep -q "tessera-codes/v1/signed-challenge;" "$err"; then
+        echo "codes-server: challenge построен на набранном в поле пароля — он уже на экране и в запросе к выдаче" >&2
+        return 1
+    fi
+    if grep -qF -- "$secret" "$err"; then
+        echo "codes-server: набранное вернулось в тексте промптов" >&2
+        return 1
+    fi
+    assert_absent_from_journals "$secret" "$since" || return 1
+    echo "server-id: refused and unlogged"
+}
+
+# Разговор канала греетера, где поле имени пусто и БОЛЬШЕ НИЧЕГО не подаётся.
+#
+# Отличие от expect-second-answer-not-logged: там проверяется, куда не попал
+# второй ответ, здесь — что второго вопроса не было вовсе. Незаполненное поле
+# имени обязано кончиться вердиктом на первом же ответе: любой второй вопрос под
+# этим греетером получит поле «Пароль».
+cmd_expect_empty_name_refused() {
+    local user="${1:-}"
+    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-empty-name-refused <user>"
+
+    load_prepared
+    greeter_modern_channel "$user"
+    LEADING_ANSWERS=("")
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    env -u DISPLAY -u XAUTHORITY pam-drive "${DRIVER_FLAGS[@]}" \
+        --answers-per-prompt "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    printf '%s\n' "" >&3
+    exec 3>&-
+
+    local rc=0
+    wait "$DRIVER_PID" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+    cat "$out"
+    cat "$err" >&2
+
+    if [ "$rc" = "0" ]; then
+        echo "codes-server: вход прошёл на пустом поле имени" >&2
+        return 1
+    fi
+    local name_prompts
+    name_prompts="$(grep -c "^prompt: $NAME_PROMPT_LINE" "$err" || true)"
+    if [ "${name_prompts:-0}" -ne 1 ]; then
+        echo "codes-server: имя учётной записи спрошено ${name_prompts:-0} раз(а), а обязано ровно один" >&2
+        return 1
+    fi
+    echo "empty-name: refused after one question"
+}
+
+# Показ при ПОДНЯТОМ оверлее: промпт обязан нести адрес попытки одной строкой.
+#
+# Оверлей рисует только символ. Инженер, у которого камера не берёт экран —
+# блики, разбитый объектив, запрет на телефон с камерой в помещении, — вводит
+# адрес руками, и взять его больше негде: полублочная решётка из промпта убрана
+# именно потому, что символ уже на экране, а вот текст попытки нужен в любом
+# случае.
+cmd_expect_payload_line_in_code_prompt() {
+    local user="${1:-}"
+    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-payload-line-in-code-prompt <user>"
+
+    load_prepared
+    capture_code_prompt "$user"
+
+    local err="$RUN_DIR/conv.err"
+    if ! grep -q "tessera-codes/v1/signed-challenge;" "$err"; then
+        echo "codes-server: в промпте кода нет текста попытки (см. $err)" >&2
+        return 1
+    fi
+    # Решётка полублоков при поднятом оверлее — это сорок строк в однострочную
+    # инлайн-панель греетера: символ уже на экране, и промпт обязан нести текст.
+    if grep -qF "$QR_CAPTION_LINE" "$err"; then
+        echo "codes-server: при поднятом оверлее промпт всё ещё несёт рисунок QR" >&2
+        return 1
+    fi
+    echo "payload-line: yes"
+}
+
+# Разговор, где на промпт имени учётной записи приходит пустая строка, а
+# следом — то, что греетер отдаёт вторым ответом: содержимое поля «Пароль».
+#
+# Проверяется не только отказ. Второй ответ обязан НИКУДА не попасть: модуль,
+# переспрашивающий имя, принял бы пароль за имя учётной записи — и оно ушло бы
+# в журнал, в аудит со сцеплением хешей и в PAM_USER, откуда его читают
+# соседние модули стека. Журнал и аудит проверяются на подстроку; сравнивать с
+# ожидаемым текстом нечего, потому что верное поведение — отсутствие следа.
+#
+# $1 — имя учётной записи, $2 — что стоит в поле «Пароль».
+cmd_expect_second_answer_not_logged() {
+    local user="${1:-}" secret="${2:-}"
+    [ -n "$user" ] && [ -n "$secret" ] \
+        || usage_error "usage: codes-server.sh expect-second-answer-not-logged <user> <строка>"
+
+    load_prepared
+    greeter_modern_channel "$user"
+    # Ответы канала: пустое поле имени, затем поле пароля. Больше ничего —
+    # разговор обязан кончиться раньше, чем понадобится третий ответ.
+    LEADING_ANSWERS=("" "$secret")
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    # Момент старта — граница срезов журнала: строки прошлых кейсов не должны
+    # ни попадать в проверку, ни зеленить её.
+    local since
+    since="$(date +%s)"
+
+    env -u DISPLAY -u XAUTHORITY pam-drive "${DRIVER_FLAGS[@]}" \
+        --answers-per-prompt "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
+    exec 3>&-
+
+    local rc=0
+    wait "$DRIVER_PID" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+    cat "$out"
+    cat "$err" >&2
+
+    if [ "$rc" = "0" ]; then
+        echo "codes-server: вход прошёл на пустом имени учётной записи" >&2
+        return 1
+    fi
+
+    # Сколько промптов было видно. Второй промпт имени — это и есть переспрос,
+    # из-за которого пароль превращается в имя учётной записи.
+    local name_prompts
+    name_prompts="$(grep -c "^prompt: $NAME_PROMPT_LINE" "$err" || true)"
+    if [ "${name_prompts:-0}" -gt 1 ]; then
+        echo "codes-server: имя учётной записи спрошено $name_prompts раза — переспрос отдаёт модулю поле пароля" >&2
+        return 1
+    fi
+
+    assert_absent_from_journals "$secret" "$since" || return 1
+
+    echo "second-answer: refused and unlogged"
 }
 
 # Тот же вход, но код приходит аргументом и подаётся как есть: выдача не
@@ -1869,11 +2755,20 @@ cmd_expect_qr_decodes_to_challenge() {
 # обязано ответить, `module: ` — PAM_TEXT_INFO, который fly-modern до экрана не
 # доносит. Показ, уехавший в PAM_TEXT_INFO, на консоли выглядит исправным.
 cmd_expect_qr_in_code_prompt() {
-    local user="${1:-}"
-    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-qr-in-code-prompt <user>"
+    local user="${1:-}" as_greeter=0
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --as-greeter) as_greeter=1 ;;
+            *) usage_error "неизвестный аргумент expect-qr-in-code-prompt: $1" ;;
+        esac
+        shift
+    done
+    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-qr-in-code-prompt <user> [--as-greeter]"
 
     load_prepared
-    capture_challenge "$user"
+    [ "$as_greeter" = "0" ] || greeter_modern_channel "$user"
+    capture_code_prompt "$user"
 
     local err="$RUN_DIR/conv.err"
     if grep -qF "module: $QR_CAPTION_LINE" "$err"; then
@@ -2200,6 +3095,15 @@ cmd_cleanup() {
     rmdir "$CODES_DIR" 2>/dev/null || true
 
     rm -rf "$RUN_DIR"
+    # Удаляется ТОЛЬКО то, что стенд сам сюда положил, и только если после
+    # этого каталог пуст: путь приходит из окружения, а `rm -rf` по чужому
+    # каталогу — не уборка, а потеря. Проверка та же, что у ролевого
+    # хранилища.
+    if [ -n "${WRAPPER_DIR:-}" ]; then
+        assert_removable_path "$WRAPPER_DIR" "WRAPPER_DIR"
+        rm -f "$WRAPPER_DIR/overlay-acks"
+        rmdir "$WRAPPER_DIR" 2>/dev/null || true
+    fi
 
     echo "cleaned"
 }
@@ -2210,6 +3114,13 @@ main() {
     case "$cmd" in
         prepare)              cmd_prepare "$@" ;;
         authenticate)         cmd_authenticate "$@" ;;
+        authenticate-as-greeter) cmd_authenticate_as_greeter "$@" ;;
+        answer-nothing)       cmd_answer_nothing "$@" ;;
+        expect-second-answer-not-logged) cmd_expect_second_answer_not_logged "$@" ;;
+        expect-empty-name-refused) cmd_expect_empty_name_refused "$@" ;;
+        expect-server-id-not-logged) cmd_expect_server_id_not_logged "$@" ;;
+        expect-user-item-untouched) cmd_expect_user_item_untouched "$@" ;;
+        expect-payload-line-in-code-prompt) cmd_expect_payload_line_in_code_prompt "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
         authenticate-mistyping-once) cmd_authenticate_mistyping_once "$@" ;;
         authenticate-with-device-key) cmd_authenticate_with_device_key "$@" ;;

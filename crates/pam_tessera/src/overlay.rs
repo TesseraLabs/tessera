@@ -14,17 +14,29 @@
 //! where it was going anyway. There is no error return, because there is no
 //! action a caller is allowed to take — see [`OverlayPresenter`].
 //!
-//! # The wire runs one way, and root never reads it
+//! # The wire runs one way, except for one byte
 //!
-//! The module writes; the overlay draws. Nothing comes back, and the read half
-//! of the socket is shut down before the first byte goes out.
+//! The module writes; the overlay draws. What comes back is a single byte,
+//! [`DRAWN`], sent once the first symbol is on the screen; the read
+//! half of the socket is shut down the moment it arrives, or the moment the
+//! deadline for it passes.
 //!
-//! This is the property worth the most in this file. The module is a cdylib
-//! inside `sshd`, `login` or a display manager and runs as root; the overlay
-//! is unprivileged code on a machine anybody can walk up to. A reverse
-//! direction would be the one place where root parses a stream that side
-//! produced — and it would exist so that a journal could say *why* a symbol
-//! was not drawn. The overlay says that on its own standard error instead.
+//! The direction is worth the most in this file, so the exception is stated
+//! precisely. The module is a cdylib inside `sshd`, `login` or a display
+//! manager and runs as root; the overlay is unprivileged code on a machine
+//! anybody can walk up to. A reverse direction carrying MESSAGES would be the
+//! one place where root parses a stream that side produced, and it would exist
+//! so that a journal could say *why* a symbol was not drawn — the overlay says
+//! that on its own standard error instead.
+//!
+//! This byte is not that. It is read once, with a fixed length, compared with a
+//! constant, and never used as data: anything other than exactly that value —
+//! silence, a different byte, a closed socket — means "no overlay", which is
+//! the same answer as a device that has none. What it buys is the difference
+//! between "a process connected" and "a symbol is on a screen": the overlay
+//! opens the display AFTER connecting, and without the byte the module would
+//! take the challenge out of the prompt for an overlay that never drew it,
+//! leaving the engineer a bare code prompt with the challenge nowhere.
 //!
 //! # The socket
 //!
@@ -103,7 +115,9 @@
 #![cfg(unix)]
 
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -111,7 +125,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tessera_core::codes::overlay_ipc::{
-    module, AttemptId, ATTEMPT_ID_LEN, SOCKET_DIRECTORY, SOCKET_DIRECTORY_MODE,
+    module, AttemptId, ATTEMPT_ID_LEN, DRAWN, SOCKET_DIRECTORY, SOCKET_DIRECTORY_MODE,
 };
 use tessera_core::codes::OverlaySettings;
 
@@ -233,13 +247,80 @@ fn context(step: &'static str, error: &std::io::Error) -> std::io::Error {
 /// An X client cannot find a display without the first two, and cannot find a
 /// program without the third. Everything else the host process carries stays
 /// with the host process.
+///
+/// The first two are the FALLBACK, taken from the environment only when the
+/// application named no display of its own — `sshd` with a forwarded display,
+/// a test driver, `login` under an X session. A display manager names the
+/// display through PAM instead, and then [`XChannel`] supplies both values and
+/// the host's environment is not consulted for them at all.
 const PASSED_ENV: [&str; 3] = ["DISPLAY", "XAUTHORITY", "PATH"];
 
-/// How long the module waits for the overlay to connect.
+/// The display of a graphical login and the credential that opens it.
 ///
-/// Short on purpose: it is time added to every graphical login before the
-/// engineer sees a prompt, and the thing being waited for is a process that
-/// either starts immediately or is not going to start at all.
+/// Comes from the items `PAM_XDISPLAY` and `PAM_XAUTHDATA`, which is the only
+/// channel a display manager has for saying it: the process the module is
+/// loaded into — `fly-dm` on the target fleet — carries neither `DISPLAY` nor
+/// `XAUTHORITY` in its own environment. Those two variables belong to the
+/// greeter's child process, which is not where PAM runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XChannel {
+    /// Value of `PAM_XDISPLAY`, e.g. `:0`.
+    pub display: String,
+    /// Scheme name of `PAM_XAUTHDATA`, e.g. `MIT-MAGIC-COOKIE-1`.
+    pub scheme: String,
+    /// The credential bytes. Not a string: a cookie is binary.
+    pub cookie: Vec<u8>,
+}
+
+/// Family of an `Xauthority` entry that matches any display address.
+///
+/// `FamilyWild` of the X protocol. The entry the module writes carries no
+/// address and no display number, and libXau's matching treats both as
+/// wildcards — so the cookie is found whichever way the client spells the
+/// display it was given (`:0`, `unix/:0`, the host's own name). Spelling the
+/// address out instead would mean guessing the hostname the X client is about
+/// to compute, and a guess that misses reads to everyone as "the overlay did
+/// not come up".
+///
+/// The file this goes into is readable by one account, holds one cookie and
+/// is removed with the attempt, so the wildcard widens nothing that the file
+/// itself does not already bound.
+const XAUTH_FAMILY_WILD: u16 = 0xFFFF;
+
+/// Lay out one `Xauthority` entry the way the format wants it.
+///
+/// Five fields, each a big-endian length followed by its bytes, with the
+/// family first: family, address, display number, scheme name, credential.
+/// Address and number are left empty on purpose — see [`XAUTH_FAMILY_WILD`].
+fn xauth_entry(scheme: &str, cookie: &[u8]) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+        // Truncation is impossible for the values this is called with — a
+        // scheme name and a cookie, both well under 64 KiB — and saturating
+        // keeps the function total rather than adding a panic to a path that
+        // runs inside a login.
+        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(bytes.get(..len as usize).unwrap_or_default());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&XAUTH_FAMILY_WILD.to_be_bytes());
+    put(&mut out, b"");
+    put(&mut out, b"");
+    put(&mut out, scheme.as_bytes());
+    put(&mut out, cookie);
+    out
+}
+
+/// How long the module waits for EACH of the two things it waits for.
+///
+/// The two are the overlay connecting to the socket and the overlay saying the
+/// first symbol is on the screen. One budget for both, so a fleet or a test has
+/// one number to change — and the worst case is therefore TWICE this: a process
+/// that connects at the last moment and then never draws. That is the bound on
+/// what a graphical login pays before the engineer sees a prompt.
+///
+/// Short on purpose: what is being waited for is a process that either does its
+/// job at once or is not going to do it at all.
 const HANDSHAKE: Duration = Duration::from_secs(2);
 
 /// How often the wait for a connection looks again.
@@ -260,6 +341,7 @@ pub struct SpawningOverlay {
     socket_dir: PathBuf,
     owner: Owner,
     handshake: Duration,
+    x: Option<XChannel>,
 }
 
 /// The account the overlay runs as, and the socket belongs to.
@@ -281,24 +363,42 @@ impl SpawningOverlay {
             socket_dir,
             owner,
             handshake: HANDSHAKE,
+            x: None,
         }
     }
 
-    /// The same overlay, waiting a different length of time to be connected to.
+    /// The same overlay, told which display to draw on.
     ///
-    /// The default is short because the wait is added to every graphical login
-    /// (see `HANDSHAKE`). It is adjustable for two reasons that are really
-    /// one: a machine under load starts processes slowly, and a test harness
-    /// running eight of them at once is such a machine.
+    /// Without this the overlay looks for a display in the host's environment,
+    /// which is right for `sshd` and a test driver and wrong for every display
+    /// manager — see [`XChannel`].
+    #[must_use]
+    pub fn with_x_channel(mut self, x: Option<XChannel>) -> Self {
+        self.x = x;
+        self
+    }
+
+    /// The same overlay, waiting a different length of time for each step.
+    ///
+    /// Sets both budgets — connecting and the drawn byte — because they are the
+    /// same number by construction (see `HANDSHAKE`). The default is short
+    /// because the wait is added to every graphical login. It is adjustable for
+    /// two reasons that are really one: a machine under load starts processes
+    /// slowly, and a test harness running eight of them at once is such a
+    /// machine.
     #[must_use]
     pub fn with_handshake(mut self, handshake: Duration) -> Self {
         self.handshake = handshake;
         self
     }
 
-    /// The process identifier of the overlay, once it is running.
+    /// How long each of the two waits of one attempt may take.
+    ///
+    /// Named rather than read from the field directly at both call sites: the
+    /// two waits are the same budget on purpose, and a reader who sees one name
+    /// twice can tell that from a reader who sees a field twice.
     #[must_use]
-    fn wait_for_connection(&self) -> Duration {
+    fn step_budget(&self) -> Duration {
         self.handshake
     }
 
@@ -324,6 +424,20 @@ impl SpawningOverlay {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .map_err(|error| context("mode", &error))?;
         chown(&path, self.owner).map_err(|error| context("chown", &error))?;
+
+        // The credential of the display, when the application named one. It
+        // goes to disk because that is the only way an X client takes it: the
+        // client reads `XAUTHORITY`. It lands beside the socket — a directory
+        // this module has already vouched for — with the mode and the owner of
+        // the socket, and it is removed when the attempt ends, whichever way it
+        // ends (`PathGuard`).
+        let xauth = match self.x.as_ref() {
+            Some(channel) => Some(
+                self.write_xauth(&attempt, channel)
+                    .map_err(|error| context("xauth", &error))?,
+            ),
+            None => None,
+        };
 
         let mut command = Command::new(&self.binary);
         command
@@ -354,29 +468,33 @@ impl SpawningOverlay {
             // Its input is closed: nothing is ever typed at it.
             .stdin(Stdio::null())
             .stdout(Stdio::null());
-        for name in PASSED_ENV {
-            if let Ok(value) = std::env::var(name) {
-                command.env(name, value);
-            }
+        let display = xauth
+            .as_ref()
+            .and_then(|file| self.x.as_ref().map(|channel| (channel, file)));
+        for (name, value) in child_environment(display, |name| std::env::var(name).ok()) {
+            command.env(name, value);
         }
         let child = command.spawn().map_err(|error| context("spawn", &error))?;
         let mut child = ChildGuard { child: Some(child) };
 
-        let stream = accept_one(&listener, child.child.as_mut(), self.wait_for_connection())
+        let stream = accept_one(&listener, child.child.as_mut(), self.step_budget())
             .map_err(|error| context("accept", &error))?;
         check_peer(&stream, self.owner).map_err(|error| context("peer", &error))?;
-        // The read half is shut down before a single byte is written, and this
-        // is the security property of the whole join, not a tidiness: the
-        // module runs as root inside `sshd` or a display manager, the overlay
-        // is unprivileged, and this is the one place where the two touch. With
-        // nothing to read there is nothing to parse and nothing to get wrong.
-        stream
-            .shutdown(std::net::Shutdown::Read)
-            .map_err(|error| context("shutdown-read", &error))?;
-
         let frame = module::challenge(attempt, payload)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         send_frame(&stream, &frame).map_err(|error| context("write", &error))?;
+
+        // The symbol has to be ON A SCREEN before the caller may leave it out
+        // of the prompt, and only the overlay can say that: it opens the
+        // display after connecting, so everything up to this line is true of an
+        // overlay that never drew anything. An overlay that does not answer is
+        // treated exactly as an absent one.
+        wait_for_drawn(&stream, self.step_budget()).map_err(|error| context("ack", &error))?;
+        // Down for good now, and this is where the one-way rule resumes: the
+        // byte above is the whole of what this direction ever carries.
+        stream
+            .shutdown(std::net::Shutdown::Read)
+            .map_err(|error| context("shutdown-read", &error))?;
 
         // Taken out of the guard now that the handle owns it. The guard is what
         // kills a child that was started and then could not be handed on — a
@@ -392,8 +510,163 @@ impl SpawningOverlay {
             stream,
             child,
             _path: guard,
+            _xauth: xauth,
         })
     }
+
+    /// Writes the credential of the display where the overlay can read it.
+    ///
+    /// One entry, one file, one attempt. Created with the mode BEFORE anything
+    /// is written to it — a file that is briefly world-readable and holds a
+    /// cookie is a cookie anybody on the machine has — and handed to the
+    /// account the overlay runs as, which is the only account that reads it.
+    ///
+    /// # Errors
+    ///
+    /// The underlying failure to create, write or hand over the file. Every one
+    /// of them ends as every other overlay failure does: the challenge stays in
+    /// the prompt and the login proceeds.
+    fn write_xauth(
+        &self,
+        attempt: &AttemptId,
+        channel: &XChannel,
+    ) -> Result<PathGuard, std::io::Error> {
+        use std::io::Write as _;
+
+        let path = self
+            .socket_dir
+            .join(format!("{}.xauth", attempt.socket_name()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let guard = PathGuard { path: path.clone() };
+        file.write_all(&xauth_entry(&channel.scheme, &channel.cookie))?;
+        file.sync_all()?;
+        drop(file);
+        chown(&path, self.owner)?;
+        Ok(guard)
+    }
+}
+
+/// What the overlay is started with, given a display and a host environment.
+///
+/// A function of its two inputs and nothing else, because the rule it holds is
+/// worth a test and the process environment is not something a test may set:
+/// `DISPLAY` and `XAUTHORITY` come from the display the APPLICATION named, when
+/// it named one, and from the host's environment only when it did not. An
+/// inherited `DISPLAY` — `sshd` with a forwarded display, a developer's shell —
+/// beside a greeter's own would send the symbol to the wrong screen, and that
+/// screen belongs to somebody else.
+///
+/// `PATH` always comes from the host: it is how a process finds a program, and
+/// no display names it.
+fn child_environment(
+    display: Option<(&XChannel, &PathGuard)>,
+    host: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::with_capacity(PASSED_ENV.len());
+    for name in PASSED_ENV {
+        let named_by_application = display.is_some() && (name == "DISPLAY" || name == "XAUTHORITY");
+        if named_by_application {
+            continue;
+        }
+        if let Some(value) = host(name) {
+            out.push((name, value));
+        }
+    }
+    if let Some((channel, file)) = display {
+        out.push(("DISPLAY", channel.display.clone()));
+        out.push(("XAUTHORITY", file.path.to_string_lossy().into_owned()));
+    }
+    out
+}
+
+/// Waits for the overlay to say the symbol is on the screen.
+///
+/// One byte, fixed length, compared with a constant. Nothing about the value is
+/// interpreted: it either is [`DRAWN`] or the overlay is treated as
+/// absent — see the module docs for what bounds this direction.
+///
+/// # Errors
+///
+/// [`std::io::ErrorKind::TimedOut`] when the deadline passed with nothing on
+/// the socket (which is also what a `WouldBlock` from the read timeout means),
+/// [`std::io::ErrorKind::InvalidData`] for any other byte, and
+/// [`std::io::ErrorKind::UnexpectedEof`] for an overlay that closed instead of
+/// answering. Every one of them ends the same way for the caller.
+fn wait_for_drawn(stream: &UnixStream, budget: Duration) -> Result<(), std::io::Error> {
+    use std::io::Read as _;
+
+    let deadline = Instant::now() + budget;
+    let mut byte = [0u8; 1];
+    let expired = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the overlay did not say the symbol was drawn",
+        )
+    };
+    let outcome = loop {
+        // A remainder of exactly zero is an expired deadline and not a wait of
+        // no length: `set_read_timeout(Some(ZERO))` is an error in the standard
+        // library ("cannot set a 0 duration timeout"), and reporting that as
+        // the reason an overlay was dropped would name the wrong thing.
+        let left = deadline.checked_duration_since(Instant::now());
+        let Some(left) = left.filter(|left| !left.is_zero()) else {
+            break Err(expired());
+        };
+        // NOT `?`: every path out of this loop has to reach the line that
+        // clears the timeout below, and a failure to SET one is no exception —
+        // the same socket carries the cancel frame on the way out.
+        if let Err(error) = stream.set_read_timeout(Some(left)) {
+            break Err(error);
+        }
+        match (&*stream).read(&mut byte) {
+            Ok(1) if byte.first() == Some(&DRAWN) => break Ok(()),
+            Ok(1) => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the overlay answered with something other than the drawn byte",
+                ))
+            }
+            Ok(_) => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the overlay closed the socket instead of drawing",
+                ))
+            }
+            // A signal arrived while the call was in flight, and the module
+            // lives inside `sshd`, `login` or a display manager — processes
+            // where signals are ordinary, starting with the `SIGCHLD` of the
+            // overlay this very function is waiting on. Taking EINTR for an
+            // answer would report "no symbol on the screen" for a symbol that
+            // is on the screen, and the challenge would be drawn twice: once
+            // by the overlay, once as glyphs in the prompt. `send_frame` treats
+            // the same errno the same way.
+            //
+            // The deadline is kept across the retry, so an interrupted wait is
+            // not a longer one — and a storm of signals spins this loop rather
+            // than sleeping in it, which costs the login nothing beyond that
+            // same deadline.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the overlay did not say the symbol was drawn",
+                ))
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    // Reached on every path out of the loop above, which is why none of them
+    // uses `?`: the same socket carries the cancel frame on the way out, and a
+    // read timeout left on it belongs to nothing.
+    let _ignored = stream.set_read_timeout(None);
+    outcome
 }
 
 /// Writes one frame to the overlay without the process being signalled.
@@ -495,14 +768,43 @@ impl Chosen {
     }
 }
 
+/// What the application said about the display of this login.
+///
+/// Three states and not two, because "nothing was named" and "what was named is
+/// not a display this module will act on" lead to opposite places. The first is
+/// every text login: there is no display item, and the environment of the host
+/// process is the only source there is (`sshd` with a forwarded display, a
+/// developer's shell). The second is a refusal, and a refusal that fell back to
+/// the environment would start an overlay anyway — on the display of whoever
+/// exported `DISPLAY` into that process — which is exactly what refusing a
+/// display was for.
+#[derive(Debug)]
+pub enum Display {
+    /// The application named a display this module will act on.
+    Named(XChannel),
+    /// The application named no display at all.
+    Unnamed,
+    /// The application named something this module will not act on.
+    Refused,
+}
+
 /// Chooses what this device shows its challenges on.
 ///
-/// Never fails: a fleet that named no account, and a device that does not have
-/// the account a fleet named, both get [`Chosen::Absent`] — and so does every
-/// device without a display manager, which is most of them.
+/// Never fails: a fleet that named no account, a device that does not have the
+/// account a fleet named, and a display this module refuses all get
+/// [`Chosen::Absent`] — and so does every device without a display manager,
+/// which is most of them.
 #[must_use]
-pub fn choose(settings: Option<&OverlaySettings>) -> Chosen {
-    from_settings(settings).map_or(Chosen::Absent(NoOverlay), Chosen::Spawning)
+pub fn choose(settings: Option<&OverlaySettings>, display: Display) -> Chosen {
+    let x = match display {
+        Display::Named(channel) => Some(channel),
+        Display::Unnamed => None,
+        // No overlay at all, and NOT a fall back to the environment: the
+        // display that was named is refused, and starting the overlay on
+        // another one would be this module choosing a screen nobody named.
+        Display::Refused => return Chosen::Absent(NoOverlay),
+    };
+    from_settings(settings, x).map_or(Chosen::Absent(NoOverlay), Chosen::Spawning)
 }
 
 /// Builds the overlay a fleet configured, if it configured one.
@@ -512,7 +814,10 @@ pub fn choose(settings: Option<&OverlaySettings>) -> Chosen {
 /// but it is reported to a journal, not to a login: a device whose overlay
 /// account was deleted still lets its engineers in through the prompt.
 #[must_use]
-pub fn from_settings(settings: Option<&OverlaySettings>) -> Option<SpawningOverlay> {
+pub fn from_settings(
+    settings: Option<&OverlaySettings>,
+    x: Option<XChannel>,
+) -> Option<SpawningOverlay> {
     let settings = settings?;
     let account = match nix::unistd::User::from_name(&settings.user) {
         Ok(Some(account)) => account,
@@ -537,14 +842,17 @@ pub fn from_settings(settings: Option<&OverlaySettings>) -> Option<SpawningOverl
         }
     };
 
-    Some(SpawningOverlay::new(
-        settings.binary.clone(),
-        PathBuf::from(SOCKET_DIRECTORY),
-        Owner {
-            uid: account.uid.as_raw(),
-            gid: account.gid.as_raw(),
-        },
-    ))
+    Some(
+        SpawningOverlay::new(
+            settings.binary.clone(),
+            PathBuf::from(SOCKET_DIRECTORY),
+            Owner {
+                uid: account.uid.as_raw(),
+                gid: account.gid.as_raw(),
+            },
+        )
+        .with_x_channel(x),
+    )
 }
 
 impl OverlayPresenter for SpawningOverlay {
@@ -577,6 +885,9 @@ struct SpawnedOverlay {
     stream: UnixStream,
     child: Child,
     _path: PathGuard,
+    /// The credential file of the display, for as long as the attempt lasts.
+    /// Held rather than used: dropping it removes the cookie from disk.
+    _xauth: Option<PathGuard>,
 }
 
 impl SpawnedOverlay {
@@ -640,7 +951,10 @@ impl Drop for SpawnedOverlay {
     }
 }
 
-/// Removes the socket when the attempt is over, whichever way it ended.
+/// Removes the file it names when the attempt is over, whichever way it ended.
+///
+/// Two of them exist per graphical attempt: the socket and the credential of
+/// the display. Neither outlives the login it belongs to.
 struct PathGuard {
     path: PathBuf,
 }
@@ -690,7 +1004,15 @@ fn accept_one(
                 stream.set_nonblocking(false)?;
                 return Ok(stream);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            // Nothing to accept yet, and a signal that interrupted the asking
+            // are the same thing from here: neither says the overlay will not
+            // come. The module is a guest in `sshd`, `login` or a display
+            // manager, where signals are ordinary — including the `SIGCHLD` of
+            // the child this loop is waiting for — so an interrupted call is
+            // retried, bounded by the same deadline as the rest of the wait.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
 

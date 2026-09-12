@@ -19,6 +19,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
+use crate::overlay::{Display, XChannel};
+
 /// Errors raised by [`pam_get_user_string`] / [`pam_get_item_string`].
 #[derive(Debug, thiserror::Error)]
 pub enum PamHelperError {
@@ -31,11 +33,44 @@ pub enum PamHelperError {
     /// The PAM-supplied bytes were not valid UTF-8.
     #[error("non-utf8 PAM string")]
     NonUtf8,
+    /// Nobody named the account: neither the application nor the person.
+    ///
+    /// Distinct from [`PamHelperError::Null`], which says PAM failed to answer.
+    /// This one says PAM answered, and the answer was nothing — a login that
+    /// cannot be attributed to an account, which is refused rather than guessed.
+    #[error("no login account was given")]
+    NoUser,
 }
 
 const PAM_SUCCESS: c_int = pam_sys::PAM_SUCCESS as c_int;
 const PAM_SERVICE: c_int = pam_sys::PAM_SERVICE as c_int;
 const PAM_TTY: c_int = pam_sys::PAM_TTY as c_int;
+/// `PAM_USER`, for the one call that supplies a name where there was none.
+const PAM_USER: c_int = pam_sys::PAM_USER as c_int;
+/// The display a graphical login runs on, as the application named it.
+///
+/// Taken from the bindings, which `bindgen` generates from the very header
+/// libpam was built with — never written out as a number here. A number typed
+/// by hand was wrong once already: `PAM_XAUTHDATA` was given as 13, which is
+/// `PAM_AUTHTOK_TYPE`, so the X channel was never read at all and a stack that
+/// had set the authtok type handed this module a `char *` to dereference as a
+/// struct.
+const PAM_XDISPLAY: c_int = pam_sys::PAM_XDISPLAY as c_int;
+/// The credential for that display: a scheme name and its bytes.
+const PAM_XAUTHDATA: c_int = pam_sys::PAM_XAUTHDATA as c_int;
+
+/// The X authorisation data of a graphical login, as libpam lays it out.
+///
+/// Mirrors `struct pam_xauth_data` of `_pam_types.h` field for field. Unlike
+/// the item numbers, the struct is NOT in the bindings — `bindgen` leaves it
+/// out — so its shape is written here, and the shape is part of the ABI.
+#[repr(C)]
+struct PamXauthData {
+    namelen: c_int,
+    name: *mut c_char,
+    datalen: c_int,
+    data: *mut c_char,
+}
 
 extern "C" {
     /// Re-declared with a stable signature; bindgen generates this with
@@ -50,6 +85,16 @@ extern "C" {
     ///
     /// Re-declared for the same reason as the calls above.
     fn pam_fail_delay(pamh: *mut pam_sys::pam_handle_t, usec: std::os::raw::c_uint) -> c_int;
+
+    /// Sets one item of the transaction.
+    ///
+    /// Re-declared for the same reason as the calls above. Used for exactly
+    /// one item — see [`pam_set_user_string`].
+    fn pam_set_item(
+        pamh: *mut pam_sys::pam_handle_t,
+        item_type: c_int,
+        item: *const c_void,
+    ) -> c_int;
 
     /// Same rationale as [`pam_get_user`] above.
     fn pam_get_item(
@@ -79,9 +124,40 @@ extern "C" {
 pub unsafe fn pam_get_user_string(
     pamh: *mut pam_sys::pam_handle_t,
 ) -> Result<String, PamHelperError> {
+    // SAFETY: same contract as this function's own (caller supplies the live
+    // handle); a NULL prompt leaves the choice of wording to libpam.
+    unsafe { pam_get_user_prompted(pamh, None) }
+}
+
+/// The same read, carrying the prompt to show if PAM has to ask.
+///
+/// libpam asks the application for the name when the transaction was started
+/// without one, which is how a display manager greeter behaves: it holds the
+/// name in a form field and hands it over on the first visible prompt. The
+/// prompt travels through libpam so that the name libpam stores and the name
+/// this module acts on are the same string with no window between them.
+///
+/// # Safety
+///
+/// See [`pam_get_user_string`].
+///
+/// # Errors
+///
+/// See [`pam_get_user_string`]; additionally [`PamHelperError::PamRc`] with
+/// `rc=-1` for a prompt carrying an interior NUL byte.
+pub unsafe fn pam_get_user_prompted(
+    pamh: *mut pam_sys::pam_handle_t,
+    prompt: Option<&str>,
+) -> Result<String, PamHelperError> {
+    let prompt = match prompt {
+        Some(text) => Some(CString::new(text).map_err(|_| PamHelperError::PamRc(-1))?),
+        None => None,
+    };
+    let prompt_ptr = prompt.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let mut user_ptr: *const c_char = std::ptr::null();
-    // SAFETY: `pamh` is owned by PAM; `user_ptr` is a valid out-pointer.
-    let rc = unsafe { pam_get_user(pamh, &raw mut user_ptr, std::ptr::null()) };
+    // SAFETY: `pamh` is owned by PAM; `user_ptr` is a valid out-pointer; the
+    // prompt, when there is one, outlives the call.
+    let rc = unsafe { pam_get_user(pamh, &raw mut user_ptr, prompt_ptr) };
     if rc != PAM_SUCCESS {
         return Err(PamHelperError::PamRc(rc));
     }
@@ -211,6 +287,170 @@ pub unsafe fn pam_get_env_string(
     }
 }
 
+/// Supply PAM_USER for a transaction that was started without a name.
+///
+/// This is the one identity-writing call in the module, and the narrowness of
+/// it is the point. The module never rewrites a name the stack already read —
+/// the difference between the name before and after such a rewrite is exactly
+/// what other modules can observe (the polkit CVE-2021-3560 class). What this
+/// does is fill an EMPTY item, which is what libpam itself does when it has to
+/// ask the application for a name. Callers MUST establish that PAM_USER is
+/// empty first.
+///
+/// Without it the name would exist only inside this module: every
+/// post-authentication phase checks PAM_USER against the account the
+/// certificate or the code admitted, and an empty item fails that check —
+/// so a login through a greeter that supplies no name would authenticate and
+/// then be refused a session.
+///
+/// # Safety
+///
+/// See [`pam_get_user_string`].
+///
+/// # Errors
+///
+/// * [`PamHelperError::PamRc`] when libpam refuses the call, or the name
+///   carries an interior NUL byte (`rc=-1`).
+pub unsafe fn pam_set_user_string(
+    pamh: *mut pam_sys::pam_handle_t,
+    user: &str,
+) -> Result<(), PamHelperError> {
+    let value = CString::new(user).map_err(|_| PamHelperError::PamRc(-1))?;
+    // SAFETY: `pamh` is owned by PAM; `value` is a NUL-terminated C string
+    // that outlives the call, and libpam copies what it is given.
+    let rc = unsafe { pam_set_item(pamh, PAM_USER, value.as_ptr().cast::<c_void>()) };
+    if rc == PAM_SUCCESS {
+        Ok(())
+    } else {
+        Err(PamHelperError::PamRc(rc))
+    }
+}
+
+/// Read the display of a graphical login and the credential for it.
+///
+/// Returns [`Display::Unnamed`] when the application named no display, which is
+/// every text login and is not a failure of anything — there the environment of
+/// the host process is the only source there is.
+///
+/// Returns [`Display::Refused`] when a display WAS named and this module will
+/// not act on it: a form that is not local (`host:0` sends the cookie of a
+/// login screen across a network), or a credential that is missing or unusable.
+/// A refusal must not become a fall back to the environment: that would start
+/// the overlay on a display nobody named, which is the opposite of refusing.
+///
+/// The items are the only channel a display manager has for this. The process
+/// the module runs inside — `fly-dm` on the target fleet — carries neither
+/// `DISPLAY` nor `XAUTHORITY` in its environment, so a module reading the
+/// environment finds nothing there and shows no symbol at all.
+///
+/// # Safety
+///
+/// See [`pam_get_user_string`].
+///
+/// # Errors
+///
+/// * [`PamHelperError::PamRc`] when a `pam_get_item` call fails outright.
+/// * [`PamHelperError::NonUtf8`] for a display or scheme name that is not
+///   UTF-8. The cookie itself is bytes and is never decoded.
+pub unsafe fn pam_get_x_channel(
+    pamh: *mut pam_sys::pam_handle_t,
+) -> Result<Display, PamHelperError> {
+    let mut item_ptr: *const c_void = std::ptr::null();
+    // SAFETY: `pamh` is owned by PAM; `item_ptr` is a valid out-pointer.
+    let rc = unsafe { pam_get_item(pamh, PAM_XDISPLAY, &raw mut item_ptr) };
+    if rc != PAM_SUCCESS {
+        return Err(PamHelperError::PamRc(rc));
+    }
+    if item_ptr.is_null() {
+        return Ok(Display::Unnamed);
+    }
+    // SAFETY: for PAM_XDISPLAY the item is a `const char *` valid for the
+    // lifetime of `pamh`.
+    let display = unsafe { CStr::from_ptr(item_ptr.cast::<c_char>()) }
+        .to_str()
+        .map_err(|_| PamHelperError::NonUtf8)?
+        .to_owned();
+    if !is_local_display(&display) {
+        // A display this module will not act on. The value travels into the
+        // environment of a process started as the greeter's account, and the
+        // form `host:0` sends the cookie of that display over TCP to whatever
+        // `host` resolves to. A login on this device draws on this device.
+        tracing::warn!(
+            target: "tessera.codes",
+            "the display named by the application is not a local one; the overlay will not be started",
+        );
+        return Ok(Display::Refused);
+    }
+
+    let mut xauth_ptr: *const c_void = std::ptr::null();
+    // SAFETY: as above.
+    let rc = unsafe { pam_get_item(pamh, PAM_XAUTHDATA, &raw mut xauth_ptr) };
+    if rc != PAM_SUCCESS {
+        return Err(PamHelperError::PamRc(rc));
+    }
+    if xauth_ptr.is_null() {
+        // A display was named and no credential came with it. The environment
+        // is not an answer to that: its cookie belongs to another display, and
+        // this one cannot be opened without the one the application withheld.
+        return Ok(Display::Refused);
+    }
+    // SAFETY: `xauth_ptr` is the non-NULL `struct pam_xauth_data *` PAM stores
+    // for PAM_XAUTHDATA, valid for the lifetime of `pamh`. The value is COPIED
+    // OUT rather than borrowed: a `&PamXauthData` would assert, for as long as
+    // it lived, that nobody else writes to a structure this module neither owns
+    // nor laid out, and `read_unaligned` additionally asserts nothing about the
+    // alignment of an allocation made by another library. What is left is the
+    // one claim the item contract makes — that this address holds an
+    // initialised value of that shape — and four integers and pointers that are
+    // read from a local copy below, in safe code.
+    let xauth: PamXauthData = unsafe { std::ptr::read_unaligned(xauth_ptr.cast::<PamXauthData>()) };
+    let namelen = usize::try_from(xauth.namelen).unwrap_or(0);
+    let datalen = usize::try_from(xauth.datalen).unwrap_or(0);
+    let (name, data) = (xauth.name, xauth.data);
+    if namelen == 0 || datalen == 0 || name.is_null() || data.is_null() {
+        // As above: named display, unusable credential.
+        return Ok(Display::Refused);
+    }
+    // SAFETY: the two buffers are `namelen`/`datalen` bytes long by the
+    // contract of the item, and are read without being kept.
+    let scheme_bytes = unsafe { std::slice::from_raw_parts(name.cast::<u8>(), namelen) };
+    // SAFETY: as above.
+    let cookie = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), datalen) }.to_vec();
+    let scheme = std::str::from_utf8(scheme_bytes)
+        .map_err(|_| PamHelperError::NonUtf8)?
+        .to_owned();
+
+    Ok(Display::Named(XChannel {
+        display,
+        scheme,
+        cookie,
+    }))
+}
+
+/// Whether a display name is the local form this module will act on.
+///
+/// `:N` or `:N.M`, and nothing else. Everything else is refused rather than
+/// sanitised, and the two worth naming are the reason: `host:0` is a display on
+/// another machine, and an X client handed it opens a TCP connection and sends
+/// the cookie of the login screen across it; a name with a path or a space in it
+/// is not a display at all and would be passed to a process this module starts.
+///
+/// Not a parser of the X display syntax — a predicate. The value is only ever
+/// handed back to X clients, which do their own parsing; what is decided here is
+/// whether this module touches it at all.
+#[must_use]
+fn is_local_display(display: &str) -> bool {
+    let Some(rest) = display.strip_prefix(':') else {
+        return false;
+    };
+    let (number, screen) = match rest.split_once('.') {
+        Some((number, screen)) => (number, Some(screen)),
+        None => (rest, None),
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    digits(number) && screen.is_none_or(digits)
+}
+
 /// Build a NUL-terminated `CString` for a PAM data key, panicking only on
 /// programmer error (interior NUL, which never happens for our static keys).
 ///
@@ -231,6 +471,42 @@ pub fn data_key_cstring(key: &str) -> Result<CString, PamHelperError> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_x_items_are_the_numbers_the_header_gives_them() {
+        // The values are asserted against the ABI, not against the bindings
+        // they come from: a test that compared them with themselves would pass
+        // for any pair of numbers, which is exactly how 13 got in here. The
+        // literals below are `_pam_types.h` — X display 11, X auth data 12, and
+        // 13 is the type for `pam_get_authtok`, which is a `char *` and would
+        // be dereferenced as a struct by a module that confused the two.
+        assert_eq!(PAM_XDISPLAY, 11);
+        assert_eq!(PAM_XAUTHDATA, 12);
+        assert_eq!(pam_sys::PAM_AUTHTOK_TYPE as c_int, 13);
+        assert_ne!(PAM_XAUTHDATA, pam_sys::PAM_AUTHTOK_TYPE as c_int);
+    }
+
+    #[test]
+    fn only_a_local_display_is_acted_on() {
+        // The form that matters is the one that is refused: `host:0` would have
+        // the overlay open a TCP connection to another machine and hand it the
+        // cookie of this login screen.
+        assert!(is_local_display(":0"));
+        assert!(is_local_display(":1"));
+        assert!(is_local_display(":0.0"));
+        assert!(is_local_display(":10.2"));
+
+        assert!(!is_local_display("host:0"));
+        assert!(!is_local_display("192.0.2.1:0"));
+        assert!(!is_local_display("localhost:0.0"));
+        assert!(!is_local_display(""));
+        assert!(!is_local_display(":"));
+        assert!(!is_local_display(":x"));
+        assert!(!is_local_display(":0."));
+        assert!(!is_local_display(":0.x"));
+        assert!(!is_local_display(" :0"));
+        assert!(!is_local_display("unix/:0"));
+    }
 
     #[test]
     fn data_key_round_trip() {

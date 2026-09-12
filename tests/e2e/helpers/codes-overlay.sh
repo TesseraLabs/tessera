@@ -36,6 +36,29 @@ RUN_DIR="${TESSERA_E2E_STATE_DIR:-/run/tessera-e2e}/codes-overlay"
 OVERLAY_DISPLAY="${TESSERA_E2E_DISPLAY:-:0}"
 OVERLAY_XAUTHORITY="${TESSERA_E2E_XAUTHORITY:-}"
 
+# Файл прав на дисплей, если его не назвали снаружи, БЕРЁТСЯ У ЖИВОГО X-СЕРВЕРА:
+# путь стоит в его собственной командной строке (`-auth`), меняется от загрузки
+# к загрузке и на разных дистрибутивах лежит в разных каталогах. Список
+# вероятных путей вместо этого — тот самый «угаданный путь», который даёт
+# «оверлея нет» вместо ответа.
+#
+# Ничего не печатает и ничем не кончается при неудаче: вызывающая команда сама
+# решает, что делать с пустым значением.
+discover_xauthority() {
+    # Имя процесса берётся отдельной колонкой, а не ищется в строке аргументов:
+    # `-auth` может стоять в командной строке чего угодно, и жадный греп по всей
+    # строке однажды принесёт путь чужого процесса. Сопоставляется `comm`, а
+    # аргументы читаются только у совпавшего.
+    ps -eo comm=,args= 2>/dev/null | while read -r comm args; do
+        case "$comm" in
+            X|Xorg|Xwayland) ;;
+            *) continue ;;
+        esac
+        printf '%s' "$args" | sed -n 's/.*-auth \([^ ]*\).*/\1/p'
+        break
+    done
+}
+
 # Имя процесса оверлея. Совпадает с бинарём пакета; расхождение выглядит как
 # «оверлей не поднялся» и разбирается по журналу модуля.
 OVERLAY_PROCESS="${TESSERA_E2E_OVERLAY_PROCESS:-tessera-qr-overlay}"
@@ -52,6 +75,11 @@ usage: codes-overlay.sh <command> [args]
                         вход по коду в графическом сеансе: символ обязан
                         появиться на экране, прочитаться декодером и исчезнуть
                         после принятого кода
+  expect-overlay-from-pam-items <user> [--level N]
+                        то же, но дисплей и права на него модуль получает
+                        только items PAM_XDISPLAY/PAM_XAUTHDATA, а переменных
+                        DISPLAY и XAUTHORITY в окружении разговора нет — так
+                        устроен штатный греетер fly-dm
   cleanup               убрать состояние прогона (идемпотентно)
 USAGE
 }
@@ -99,9 +127,9 @@ cmd_expect_overlay_login() {
     require_tool pgrep
     [ -x "$CODES_SERVER" ] || die "нет $CODES_SERVER — разговор вести нечем"
 
-    XAUTH="$OVERLAY_XAUTHORITY"
+    XAUTH="${OVERLAY_XAUTHORITY:-$(discover_xauthority)}"
     if [ -z "$XAUTH" ]; then
-        die "не задан TESSERA_E2E_XAUTHORITY: без прав на дисплей греетера снимок экрана невозможен, а угаданный путь дал бы «оверлея нет» вместо ответа"
+        die "прав на дисплей греетера не нашлось: TESSERA_E2E_XAUTHORITY не задан, а у живого X-сервера нет аргумента -auth"
     fi
     [ -r "$XAUTH" ] || die "нет доступа к $XAUTH"
 
@@ -110,9 +138,76 @@ cmd_expect_overlay_login() {
 
     # Разговор идёт в фоне: символ живёт только между показом challenge и
     # принятым кодом, и наблюдать его после завершения входа уже не по чему.
+    #
+    # Дисплей передаётся ОКРУЖЕНИЕМ — это запасной путь модуля, тот самый, что
+    # работает под sshd и pam-drive. Путь дисплей-менеджера проверяет соседняя
+    # команда.
     DISPLAY="$OVERLAY_DISPLAY" XAUTHORITY="$XAUTH" \
         "$CODES_SERVER" authenticate "$user" --level "$level" > "$log" 2>&1 &
-    local conversation=$!
+    watch_conversation $! "$log"
+}
+
+# Тот же вход, но дисплей модуль узнаёт ТОЛЬКО из items PAM.
+#
+# Разница с командой выше — единственная и она же вся суть: у процесса fly-dm
+# нет ни DISPLAY, ни XAUTHORITY, дисплей он называет модулю items PAM_XDISPLAY и
+# PAM_XAUTHDATA. Кейс, ведущий разговор с этими переменными в окружении, зеленел
+# бы на запасном пути и ничего не говорил бы о графическом входе.
+#
+# Куки берётся из того же файла xauth греетера, каким снимается экран: своей
+# куки стенд не заводит, иначе проверялся бы доступ к дисплею, выданный стендом.
+cmd_expect_overlay_from_pam_items() {
+    local user="${1:-}" level=0
+    shift || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --level)
+                level="${2:-}"
+                shift 2 || usage_error "--level без значения"
+                ;;
+            *) usage_error "неизвестный аргумент expect-overlay-from-pam-items: $1" ;;
+        esac
+    done
+    [ -n "$user" ] || usage_error "usage: codes-overlay.sh expect-overlay-from-pam-items <user> [--level N]"
+
+    [ "$(id -u)" = "0" ] || die "требуются права root"
+    require_tool import
+    require_tool zbarimg
+    require_tool pgrep
+    require_tool xauth
+    [ -x "$CODES_SERVER" ] || die "нет $CODES_SERVER — разговор вести нечем"
+
+    XAUTH="${OVERLAY_XAUTHORITY:-$(discover_xauthority)}"
+    if [ -z "$XAUTH" ]; then
+        die "прав на дисплей греетера не нашлось: TESSERA_E2E_XAUTHORITY не задан, а у живого X-сервера нет аргумента -auth"
+    fi
+    [ -r "$XAUTH" ] || die "нет доступа к $XAUTH"
+
+    # Последние два поля строки xauth — имя схемы и шестнадцатеричная куки.
+    # Строка выбирается по дисплею: в файле греетера их бывает несколько.
+    local entry scheme cookie
+    entry="$(xauth -f "$XAUTH" list "$OVERLAY_DISPLAY" 2>/dev/null | head -n 1)"
+    [ -n "$entry" ] || die "в $XAUTH нет записи для дисплея $OVERLAY_DISPLAY"
+    scheme="$(printf '%s' "$entry" | awk '{print $(NF-1)}')"
+    cookie="$(printf '%s' "$entry" | awk '{print $NF}')"
+    [ -n "$scheme" ] && [ -n "$cookie" ] || die "запись xauth разобрана не полностью: $entry"
+
+    install -d -m 0700 "$RUN_DIR"
+    local log="$RUN_DIR/conversation.log"
+
+    TESSERA_E2E_PAM_XDISPLAY="$OVERLAY_DISPLAY" \
+    TESSERA_E2E_PAM_XAUTHDATA="$scheme:$cookie" \
+        "$CODES_SERVER" authenticate-as-greeter "$user" --level "$level" > "$log" 2>&1 &
+    watch_conversation $! "$log"
+}
+
+# Наблюдает экран, пока идёт разговор, и выносит вердикт по увиденному.
+#
+# $1 — pid разговора, $2 — его журнал. Вынесено в общую функцию не ради краткости:
+# две команды обязаны судить об одном и том же по одним и тем же признакам, иначе
+# сравнивать их исходы нельзя.
+watch_conversation() {
+    local conversation="$1" log="$2"
 
     local decoded="" saw_process=0 waited=0
     local limit="${TESSERA_E2E_OVERLAY_TIMEOUT:-120}"
@@ -180,6 +275,7 @@ main() {
     shift || true
     case "$cmd" in
         expect-overlay-login) cmd_expect_overlay_login "$@" ;;
+        expect-overlay-from-pam-items) cmd_expect_overlay_from_pam_items "$@" ;;
         cleanup)              cmd_cleanup "$@" ;;
         -h|--help)            usage; exit 0 ;;
         "")                   usage; exit "$EXIT_USAGE" ;;

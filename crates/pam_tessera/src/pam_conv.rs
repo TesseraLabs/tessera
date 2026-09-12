@@ -130,9 +130,13 @@ pub unsafe fn prompt_pin(
 pub unsafe fn prompt_visible(
     pamh: *mut pam_sys::pam_handle_t,
     prompt: &str,
-) -> Result<String, PamConvError> {
+) -> Result<crate::answer::Answer, PamConvError> {
     // SAFETY: `pamh` is the live PAM handle (caller contract).
-    unsafe { converse(pamh, PAM_PROMPT_ECHO_ON, prompt) }
+    let text = unsafe { converse(pamh, PAM_PROMPT_ECHO_ON, prompt) }?;
+    // Handed on inside the type that wipes it. The buffer PAM allocated was
+    // already wiped by `converse`; this is the copy that used to be left to
+    // every caller to overwrite — see `crate::answer`.
+    Ok(crate::answer::Answer::new(text))
 }
 
 /// Drive one prompt of the live PAM conversation and return the answer.

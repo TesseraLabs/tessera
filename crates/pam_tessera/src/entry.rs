@@ -323,6 +323,182 @@ unsafe fn verified_session_account(
     }
 }
 
+/// What the person at the keyboard is asked when nobody has named the account.
+///
+/// Wording follows the terminology of the product: the thing being named is a
+/// role account, and the greeter's own field says the same in its own words.
+#[cfg(target_os = "linux")]
+const LOGIN_PROMPT: &str = "Имя учётной записи: ";
+
+/// Establish the account this login is for.
+///
+/// Three applications, one answer. `login`, `sudo` and `sshd` name the account
+/// when they start the transaction, and then libpam hands it back unchanged and
+/// nothing is asked. A display manager greeter may start the transaction with
+/// no name at all, holding it in a form field: libpam then asks the application
+/// for it through the conversation, stores what came back, and this reads the
+/// same string every later phase will read.
+///
+/// The third case is the one the target fleet produces and the reason this
+/// function exists: a greeter that starts the transaction with an EMPTY name
+/// rather than none. Empty is the word: a name of blank space was named by the
+/// application, and this module refuses it rather than asking for another one —
+/// asking would end with the item the application set being written over. libpam has a name — the empty one — so it asks nothing,
+/// and the method would refuse a login before showing a single prompt. The
+/// answer is ONE prompt, and only then is PAM_USER supplied with what came
+/// back. Supplying it is what keeps the module honest about identity: the
+/// post-authentication phases refuse to act under a name that differs from
+/// PAM_USER, and a name known only inside this module would fail that check.
+///
+/// # Why the name is asked for exactly once
+///
+/// Because of what the SECOND visible prompt of this conversation receives. The
+/// greeter of the target fleet answers the first one with its name field and the
+/// second with its password field, whatever the second one asks for. A module
+/// that asked again would be handed a password and would take it for an account
+/// name — from where it travels into PAM_USER, which the rest of the stack
+/// reads, into the journal, and into a hash-chained audit journal from which
+/// nothing can be struck out afterwards. An empty answer is therefore a
+/// refusal, not an occasion to ask again.
+///
+/// # Why the answer is checked twice before it becomes PAM_USER
+///
+/// Everything downstream names the account in its logs and its audit records —
+/// a refused role writes the name it refused. A value typed into a prompt is
+/// not an account until something says so, and two things have to say it: the
+/// role-id contract (`^[a-z][a-z0-9-]{0,15}$`), which is the only shape a role
+/// account name can have at all, and the device's own account view, which says
+/// it has one. The contract goes first because it is the cheaper question and
+/// because it is the one that admits nothing else: a password does not look
+/// like a role id.
+///
+/// The account view is the one the role stage is loaded with — the local passwd
+/// database plus name resolution under the bound `[roles]` configures. Asking
+/// the resolver directly from here would be a second path into NSS, unbounded,
+/// on the login path of a device the product promises to keep working with no
+/// network at all.
+///
+/// Neither refusal names the value, and the answer is overwritten in place
+/// before it is dropped. What an unverified string turns out to be is exactly
+/// what must not be recorded — and what must not be left in the module's memory
+/// for a core dump to carry out.
+///
+/// # Safety
+///
+/// `pamh` must be the live PAM handle for the current callback.
+///
+/// # Errors
+///
+/// [`PamHelperError`] when PAM cannot be asked at all, and
+/// [`PamHelperError::NoUser`] when the answer was empty or named no account on
+/// this device — a login whose account nobody will name is refused rather than
+/// guessed at.
+#[cfg(target_os = "linux")]
+unsafe fn resolve_login_account(
+    pamh: *mut pam_sys::pam_handle_t,
+    accounts: tessera_core::role::SystemAccounts,
+) -> Result<String, crate::pam_helpers::PamHelperError> {
+    // SAFETY: `pamh` is the live PAM handle (caller contract).
+    let named = unsafe { crate::pam_helpers::pam_get_user_prompted(pamh, Some(LOGIN_PROMPT)) }?;
+    // EMPTY, not "blank". The two are different facts about a transaction and
+    // only the first one means nobody has named an account: a name of spaces
+    // was named — badly — by the application, and asking a person for another
+    // one would end with this module writing over an item the application set.
+    // That is the substitution the whole class of CVE-2021-3560 is about:
+    // modules before and after this one would see different identities, and
+    // neither would know it.
+    if !named.is_empty() {
+        if named.trim().is_empty() {
+            tracing::warn!(
+                target: "tessera.auth",
+                name_len = named.len(),
+                "the application named an account of blank space; refusing without replacing it",
+            );
+            return Err(crate::pam_helpers::PamHelperError::NoUser);
+        }
+        return Ok(named);
+    }
+
+    // SAFETY: as above; the prompt does not outlive this call.
+    let typed = match unsafe { crate::pam_conv::prompt_visible(pamh, LOGIN_PROMPT) } {
+        Ok(answer) => answer,
+        Err(err) => {
+            tracing::warn!(
+                target: "tessera.auth",
+                error = %err,
+                "the login account could not be asked for",
+            );
+            return Err(crate::pam_helpers::PamHelperError::NoUser);
+        }
+    };
+    // The answer itself is wiped when it goes out of scope, whatever this
+    // function decides — see `crate::answer`. What is kept is this trimmed
+    // copy, and keeping it is a decision made here: it is either refused and
+    // overwritten below, or it becomes the account of the login.
+    let mut typed = typed.trim().to_owned();
+    if typed.is_empty() {
+        tracing::warn!(
+            target: "tessera.auth",
+            "no login account was given; refusing the login without asking again",
+        );
+        return Err(crate::pam_helpers::PamHelperError::NoUser);
+    }
+    // Neither branch below names the value, and that is the whole point: what
+    // was typed may be a password the greeter put into a field this module
+    // asked something else for, and a journal that recorded it would keep it.
+    if tessera_core::role::RoleId::new(&typed).is_err() {
+        tracing::warn!(
+            target: "tessera.auth",
+            answer_len = typed.len(),
+            "what was typed at the account prompt cannot be a role account name; refusing",
+        );
+        typed.zeroize();
+        return Err(crate::pam_helpers::PamHelperError::NoUser);
+    }
+    if !accounts.knows(&typed) {
+        tracing::warn!(
+            target: "tessera.auth",
+            answer_len = typed.len(),
+            "what was typed at the account prompt names no account on this device; refusing",
+        );
+        typed.zeroize();
+        return Err(crate::pam_helpers::PamHelperError::NoUser);
+    }
+    // The name enters the transaction, not just this module: everything
+    // after authentication compares against PAM_USER, and the stack
+    // above us has to see the same account. Filling an empty item is not
+    // rewriting one — see `pam_helpers::pam_set_user_string`.
+    // SAFETY: as above.
+    unsafe { crate::pam_helpers::pam_set_user_string(pamh, &typed) }?;
+    Ok(typed)
+}
+
+/// Overwrite a copy of an answer that turned out not to be an account name.
+///
+/// The answer as the conversation returned it wipes itself ([`crate::answer`]).
+/// This is for the copy made from it: a `String` hands its allocation back with
+/// the bytes still in it, and a copy the caller decided to keep is the caller's
+/// to overwrite.
+#[cfg(target_os = "linux")]
+trait WipeInPlace {
+    /// Overwrite the bytes in place, then empty the string.
+    fn zeroize(&mut self);
+}
+
+#[cfg(target_os = "linux")]
+impl WipeInPlace for String {
+    fn zeroize(&mut self) {
+        use zeroize::Zeroize as _;
+        // The bytes of the buffer, not the buffer itself: the capacity stays,
+        // which is what keeps this an overwrite rather than a new allocation
+        // with the old one left behind.
+        // SAFETY: the string is filled with zeros, which is valid UTF-8, and
+        // it is truncated to nothing immediately afterwards.
+        unsafe { self.as_mut_vec() }.zeroize();
+        self.clear();
+    }
+}
+
 /// Generate a cryptographically random session id by hex-encoding 16 bytes
 /// from the OS RNG (`getrandom`/`OsRng`).
 ///
@@ -425,20 +601,31 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
         // 2. PAM_USER / PAM_SERVICE.
         // SAFETY: `pamh` is the live PAM handle for this callback.
-        let pam_user = match unsafe { crate::pam_helpers::pam_get_user_string(pamh) } {
+        // The same bounded view the role stage is loaded with, built here
+        // because the name has to be judged before anything else happens.
+        let accounts = tessera_core::role::SystemAccounts::device(cfg.roles.account_lookup_timeout);
+        // SAFETY: `pamh` is the live PAM handle for this callback.
+        let pam_user = match unsafe { resolve_login_account(pamh, accounts) } {
             Ok(s) => s,
             Err(err) => {
-                tracing::warn!(target: "tessera.auth", error = %err, "pam_get_user failed");
+                tracing::warn!(
+                    target: "tessera.auth",
+                    error = %err,
+                    "the login account could not be established",
+                );
                 return PAM_AUTH_ERR;
             }
         };
 
         // Role selection happens inside the flow: the account being logged
-        // into IS the requested role, so `pam_user` below is its only source
-        // and the module never rewrites `PAM_USER`. The name the rest of the
-        // stack sees is the name we act on, with no window between the two
-        // (polkit CVE-2021-3560 class). A name that cannot be a role id at all
-        // is refused by the flow before any credential material is touched.
+        // into IS the requested role, so `pam_user` below is its only source.
+        // The name the rest of the stack sees is the name we act on, with no
+        // window between the two (polkit CVE-2021-3560 class) — the one write
+        // this module makes fills an EMPTY item and only after the answer has
+        // been checked against the role-id contract and the passwd database,
+        // which is what `resolve_login_account` above is. A name that cannot be
+        // a role id at all is refused before any credential material is
+        // touched.
         // SAFETY: `pamh` is the live PAM handle for this callback.
         let pam_service = unsafe { crate::pam_helpers::pam_get_service_string(pamh) }
             .unwrap_or_else(|err| {
@@ -770,7 +957,33 @@ unsafe fn authenticate_by_code_entry(
     // what is written here has to be plumbing and nothing else. Built before the
     // dependencies so that it outlives them; nothing about it can fail the login
     // — see `codes_flow::OverlayPresenter`.
-    let chosen = crate::overlay::choose(codes_config.overlay.as_ref());
+    //
+    // The display comes from the items the application set, not from the
+    // environment of this process: under a display manager there is nothing in
+    // the environment to find — see `pam_helpers::pam_get_x_channel`.
+    // SAFETY: `pamh` is the live PAM handle of the enclosing callback.
+    let display = unsafe { crate::pam_helpers::pam_get_x_channel(pamh) }.unwrap_or_else(|err| {
+        tracing::debug!(
+            target: "tessera.codes",
+            error = %err,
+            "the display of this login could not be read from PAM; falling back to the environment",
+        );
+        crate::overlay::Display::Unnamed
+    });
+    // Said out loud, and for a reason a journal can act on: when this line is
+    // absent on a graphical login, the overlay is about to look for a display
+    // in an environment that has none, and the engineer will see no symbol at
+    // all. The scheme is named, the cookie is not — it opens the screen of the
+    // machine somebody is standing at.
+    if let crate::overlay::Display::Named(channel) = &display {
+        tracing::info!(
+            target: "tessera.codes",
+            display = %channel.display,
+            scheme = %channel.scheme,
+            "the display of this login came from PAM; the overlay will not read the environment",
+        );
+    }
+    let chosen = crate::overlay::choose(codes_config.overlay.as_ref(), display);
 
     let deps = CodeDeps {
         overlay: chosen.presenter(),

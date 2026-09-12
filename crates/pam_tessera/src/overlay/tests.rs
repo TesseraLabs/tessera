@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use tessera_core::codes::overlay_ipc::{decode, Message, HEADER_LEN};
 
-use super::{Owner, SpawningOverlay};
+use super::{Owner, SpawningOverlay, XChannel};
 use crate::codes_flow::OverlayPresenter as _;
 
 const PAYLOAD: &str = "https://codes.example/#tessera-codes/v1/signed-challenge;device=77-000123X";
@@ -75,6 +75,11 @@ fn fake_overlay(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
 /// into a Rust string literal loses its indentation to the line continuations,
 /// and a Python program without indentation is a Python program that does not
 /// run. That cost an hour once; it costs a file now.
+///
+/// It also sends the drawn byte after the first frame, because that is what a
+/// real overlay does once a symbol is on the screen — and without it the module
+/// treats this stand-in as an overlay that never drew anything. The stand-in
+/// that deliberately stays quiet is [`mute_overlay`].
 fn recording_overlay(
     dir: &std::path::Path,
     record: &std::path::Path,
@@ -93,12 +98,16 @@ import socket, sys
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 out = open(sys.argv[2], \"wb\")
+acked = False
 while True:
     data = s.recv(4096)
     if not data:
         break
     out.write(data)
     out.flush()
+    if not acked:
+        s.sendall(b\"\\x2a\")
+        acked = True
 "
     } else {
         // Reads the challenge and then waits, which is what a real overlay does
@@ -109,6 +118,7 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 data = s.recv(4096)
 open(sys.argv[2], \"wb\").write(data)
+s.sendall(b\"\\x2a\")
 time.sleep(30)
 "
     };
@@ -305,7 +315,7 @@ fn a_fleet_that_named_no_account_shows_the_challenge_in_the_prompt_only() {
     // does. It also has to be reachable from the line the PAM entry point
     // writes, which is compiled only for Linux — so the choosing lives here,
     // where a machine that is not Linux can still hold it to something.
-    let chosen = super::choose(None);
+    let chosen = super::choose(None, super::Display::Unnamed);
     assert!(matches!(chosen, super::Chosen::Absent(_)));
     assert!(
         chosen.presenter().present(PAYLOAD).is_none(),
@@ -323,8 +333,34 @@ fn an_account_this_device_does_not_have_is_not_an_overlay_either() {
         user: "no-such-account-on-this-device".to_owned(),
         binary: PathBuf::from(tessera_core::codes::DEFAULT_OVERLAY_BINARY),
     };
-    let chosen = super::choose(Some(&settings));
+    let chosen = super::choose(Some(&settings), super::Display::Unnamed);
     assert!(matches!(chosen, super::Chosen::Absent(_)));
+}
+
+#[test]
+fn a_refused_display_leaves_no_overlay_even_with_one_in_the_environment() {
+    // The environment is the fall-back for a login that named NO display: ssh
+    // with a forwarded one, a developer's shell. A login that named one this
+    // module refuses — `host:0`, whose cookie would go across a network — must
+    // not fall back to it: the overlay would then start on whatever screen the
+    // host process happens to point at, which is the opposite of refusing.
+    //
+    // Held at the choosing rather than at the reading: whether the environment
+    // has a display is a property of the machine the test runs on, and this is
+    // the line where the two answers part.
+    let settings = tessera_core::codes::OverlaySettings {
+        user: current_account_name(),
+        binary: PathBuf::from("/usr/bin/tessera-qr-overlay"),
+    };
+    let chosen = super::choose(Some(&settings), super::Display::Refused);
+    assert!(
+        matches!(chosen, super::Chosen::Absent(_)),
+        "a refused display still produced an overlay"
+    );
+    assert!(
+        chosen.presenter().present(PAYLOAD).is_none(),
+        "a refused display drew something"
+    );
 }
 
 #[test]
@@ -333,7 +369,7 @@ fn an_account_this_device_does_have_gets_an_overlay() {
         user: current_account_name(),
         binary: PathBuf::from("/usr/bin/tessera-qr-overlay"),
     };
-    let chosen = super::choose(Some(&settings));
+    let chosen = super::choose(Some(&settings), super::Display::Unnamed);
     assert!(
         matches!(chosen, super::Chosen::Spawning(_)),
         "an account this device has was not resolved"
@@ -369,6 +405,7 @@ out.flush()
 s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 s.recv(4096)
+s.sendall(b\"\\x2a\")
 out.write(\"connected\\n\")
 out.close()
 ",
@@ -477,16 +514,18 @@ fn await_text(path: &std::path::Path, marker: &str, wait: Duration) -> String {
 }
 
 #[test]
-fn nothing_the_overlay_writes_reaches_the_module() {
-    // The security property of this whole join. The module runs as root inside
-    // `sshd` or a display manager; the overlay does not. Root reading a stream
-    // that side produced would be the one place where a privileged process
-    // parses an unprivileged one's output — so the read half is shut down
-    // before the first byte goes out, and there is nothing to parse.
+fn nothing_the_overlay_writes_after_the_drawn_byte_reaches_the_module() {
+    // The security property of this whole join, as it stands now. The module
+    // runs as root inside `sshd` or a display manager; the overlay does not.
+    // Root parsing a stream that side produced would be the one place where a
+    // privileged process reads an unprivileged one's output — so exactly one
+    // byte is read, the one that says a symbol is on the screen, and the read
+    // half goes down the moment it is in. Everything after it is refused or
+    // discarded.
     //
     // Asserted from the OVERLAY's side, which is where it is observable: a
-    // stand-in that writes into the socket after connecting gets its bytes
-    // refused, and the module never sees them.
+    // stand-in that floods the socket after acknowledging gets its bytes
+    // refused or dropped, and the module never sees them.
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join("wrote.txt");
     let program = dir.path().join("talk-back.py");
@@ -498,6 +537,7 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 s.recv(4096)
 out = open(sys.argv[2], \"w\")
+s.sendall(b\"\\x2a\")
 try:
     s.sendall(b\"XXXX\" * 64)
     out.write(\"sent\\n\")
@@ -754,4 +794,182 @@ fn the_overlay_is_told_the_attempt_is_over() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A stand-in that connects, takes the frame and never says it drew anything.
+///
+/// The failure the real overlay produces when the display will not open: it is
+/// already connected by then, and it either dies or sits there. Held as a
+/// separate stand-in rather than a flag on [`recording_overlay`] because it
+/// stands for the opposite outcome.
+fn mute_overlay(dir: &std::path::Path) -> PathBuf {
+    let program = dir.join("mute.py");
+    std::fs::write(
+        &program,
+        "import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.recv(4096)
+time.sleep(30)
+",
+    )
+    .unwrap();
+    fake_overlay(
+        dir,
+        "overlay-mute",
+        &format!("exec python3 {} \"$2\"", program.display()),
+    )
+}
+
+#[test]
+fn the_display_named_through_pam_wins_over_the_one_in_the_environment() {
+    // Both can be present at once, and the wrong choice sends the symbol to
+    // somebody else's screen: a login over ssh with X forwarding carries
+    // `DISPLAY` in the environment of the host process, while the display a
+    // greeter names through PAM is the one the person is standing in front of.
+    //
+    // Asserted over the function that decides it rather than over a child
+    // process: what a child inherits depends on the environment of the test
+    // binary, which a test must not set.
+    let dir = tempfile::tempdir().unwrap();
+    let cookie = super::PathGuard {
+        path: dir.path().join("attempt.xauth"),
+    };
+    let channel = x_channel();
+    let host = |name: &str| match name {
+        "DISPLAY" => Some(":99".to_owned()),
+        "XAUTHORITY" => Some("/nonexistent/inherited-cookie".to_owned()),
+        "PATH" => Some("/usr/bin".to_owned()),
+        _ => None,
+    };
+
+    let named = super::child_environment(Some((&channel, &cookie)), host);
+    assert_eq!(value_of(&named, "DISPLAY").as_deref(), Some(":0"));
+    assert_eq!(
+        value_of(&named, "XAUTHORITY").as_deref(),
+        cookie.path.to_str(),
+    );
+    // And the one name a display never supplies still comes from the host.
+    assert_eq!(value_of(&named, "PATH").as_deref(), Some("/usr/bin"));
+
+    // Without a display named by the application the environment is the only
+    // source there is — that is the ssh path and the developer's shell.
+    let inherited = super::child_environment(None, host);
+    assert_eq!(value_of(&inherited, "DISPLAY").as_deref(), Some(":99"));
+    assert_eq!(
+        value_of(&inherited, "XAUTHORITY").as_deref(),
+        Some("/nonexistent/inherited-cookie"),
+    );
+}
+
+/// The value of one name in what the child would be started with.
+fn value_of(environment: &[(&'static str, String)], name: &str) -> Option<String> {
+    environment
+        .iter()
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.clone())
+}
+
+#[test]
+fn an_overlay_that_never_says_it_drew_is_no_overlay() {
+    // The difference between "a process connected" and "a symbol is on the
+    // screen". The real overlay opens the display after connecting, so a wrong
+    // cookie or a dead X server leaves exactly this: a peer on the socket with
+    // nothing on the screen. Reported as no overlay, because the caller's next
+    // decision is whether to leave the challenge out of the prompt — and an
+    // engineer facing a bare code prompt with the challenge nowhere cannot
+    // finish the login at all.
+    const BUDGET: Duration = Duration::from_secs(2);
+
+    let dir = tempfile::tempdir().unwrap();
+    let binary = mute_overlay(dir.path());
+    // A SHORT budget on purpose, and the only test here that sets its own. The
+    // wait this test is about is one nothing ever ends early — a peer that is
+    // alive and silent — so the test pays the budget in full, and paying the
+    // long one would keep a thread of the suite for twenty seconds while every
+    // other test competes for the machine. What is asserted is the bound, and a
+    // bound is a bound at any size.
+    let overlay =
+        SpawningOverlay::new(binary, dir.path().to_path_buf(), owner()).with_handshake(BUDGET);
+
+    let started = Instant::now();
+    assert!(
+        overlay.present(PAYLOAD).is_none(),
+        "a silent overlay was taken for one that had drawn"
+    );
+    // The bound is RELATIVE to the budget, not a number of seconds: a regression
+    // that restarted the deadline on every interrupted read would take fifteen
+    // budgets to cross a flat thirty seconds, and would pass here forever.
+    // Three budgets leaves room for a loaded machine and none for a deadline
+    // that does not hold.
+    let waited = started.elapsed();
+    assert!(
+        waited < BUDGET * 3,
+        "the login waited {waited:?} on an overlay that said nothing"
+    );
+}
+
+/// A display named the way a display manager names one.
+fn x_channel() -> XChannel {
+    XChannel {
+        display: ":0".to_owned(),
+        scheme: "MIT-MAGIC-COOKIE-1".to_owned(),
+        cookie: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+    }
+}
+
+#[test]
+fn the_credential_file_is_laid_out_the_way_an_x_client_reads_it() {
+    // The format is not ours and cannot be checked against our own reading of
+    // it: what an X client does is match family, address and display number,
+    // then take the scheme and the bytes. The entry claims the wildcard family
+    // with neither address nor number, which is what makes it match whichever
+    // way the client spells the display it was handed.
+    let channel = x_channel();
+    let bytes = super::xauth_entry(&channel.scheme, &channel.cookie);
+
+    let mut expected = vec![0xFF, 0xFF];
+    expected.extend_from_slice(&[0x00, 0x00]); // address: empty
+    expected.extend_from_slice(&[0x00, 0x00]); // display number: empty
+    expected.extend_from_slice(&[0x00, 0x12]); // scheme: 18 bytes
+    expected.extend_from_slice(channel.scheme.as_bytes());
+    expected.extend_from_slice(&[0x00, 0x06]); // cookie: 6 bytes
+    expected.extend_from_slice(&channel.cookie);
+
+    assert_eq!(bytes, expected);
+}
+
+#[test]
+fn the_credential_of_the_display_is_written_for_one_account_and_removed_after() {
+    // Two properties, and the second is the one a person can walk up to: while
+    // the attempt lasts the cookie is on disk readable by the overlay's account
+    // alone, and when the attempt ends it is gone. A cookie left behind is a
+    // key to the screen of an unattended machine.
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("recorded.bin");
+    let binary = recording_overlay(dir.path(), &record, false);
+    let overlay = overlay_from(binary, dir.path()).with_x_channel(Some(x_channel()));
+
+    let handle = overlay.present(PAYLOAD);
+    assert!(handle.is_some(), "the overlay did not come up");
+
+    let files: Vec<PathBuf> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "xauth"))
+        .collect();
+    assert_eq!(files.len(), 1, "expected exactly one credential file");
+    let credential = files.first().expect("one credential file").clone();
+    let mode = std::fs::metadata(&credential).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the credential of the display was readable by others"
+    );
+
+    drop(handle);
+    assert!(
+        !credential.exists(),
+        "the credential of the display outlived the attempt"
+    );
 }

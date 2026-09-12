@@ -17,12 +17,15 @@
 )]
 
 use std::cell::RefCell;
+
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use secrecy::SecretString;
+
+use crate::answer::Answer;
 use tempfile::TempDir;
 
 use tessera_codes_contract::device_number::CheckedDeviceNumber;
@@ -117,7 +120,7 @@ impl CodeConversation for ScriptedConversation {
         self.shown.push(message.to_owned());
     }
 
-    fn prompt_visible(&mut self, prompt: &str) -> Result<String, PamConvError> {
+    fn prompt_visible(&mut self, prompt: &str) -> Result<Answer, PamConvError> {
         self.asked.push(prompt.to_owned());
         // Only the last line of the prompt: the code prompt carries the whole
         // drawn challenge in front of it, and a timeline of that is unreadable.
@@ -125,7 +128,10 @@ impl CodeConversation for ScriptedConversation {
             "asked {}",
             prompt.lines().next_back().unwrap_or(prompt).trim()
         ));
-        self.answers.pop_front().ok_or(PamConvError::ConvFailed)
+        self.answers
+            .pop_front()
+            .map(Answer::new)
+            .ok_or(PamConvError::ConvFailed)
     }
 
     fn prompt_secret(&mut self, prompt: &str) -> Result<SecretString, PamConvError> {
@@ -194,6 +200,14 @@ struct ScriptedMethod {
     presented: RefCell<Vec<String>>,
     /// How often the branch asked which epoch the method runs under.
     epoch_reads: RefCell<usize>,
+    /// Whether this device holds a ticket of the side an answer names.
+    ///
+    /// True by default: almost every test here is about something other than
+    /// which sides the device was given tickets for, and a list of names would
+    /// have to be kept in step with every scripted answer. The test about a
+    /// value that names no side at all sets it with
+    /// [`ScriptedMethod::holding_no_ticket`].
+    knows_issuer: bool,
 }
 
 impl ScriptedMethod {
@@ -205,6 +219,15 @@ impl ScriptedMethod {
             verdicts: RefCell::new(verdicts.into_iter().collect()),
             presented: RefCell::new(Vec::new()),
             epoch_reads: RefCell::new(0),
+            knows_issuer: true,
+        }
+    }
+
+    /// The same method on a device holding no ticket of the side that is named.
+    fn holding_no_ticket(self) -> Self {
+        Self {
+            knows_issuer: false,
+            ..self
         }
     }
 
@@ -214,6 +237,7 @@ impl ScriptedMethod {
             verdicts: RefCell::new(VecDeque::new()),
             presented: RefCell::new(Vec::new()),
             epoch_reads: RefCell::new(0),
+            knows_issuer: true,
         }
     }
 }
@@ -238,6 +262,10 @@ fn accepted_under_ceiling(level: u32, ceiling: u32) -> Accepted {
 
 impl CodeMethodApi for ScriptedMethod {
     type Attempt = String;
+
+    fn knows_issuer(&self, _server_id: &str) -> bool {
+        self.knows_issuer
+    }
 
     fn epoch(&self) -> u32 {
         // Deliberately not the epoch of the fixture configuration: the branch
@@ -1027,7 +1055,13 @@ fn the_session_opens_when_the_cert_integrity_policy_is_required() {
 
 #[test]
 fn the_challenge_is_shown_in_the_text_of_the_code_prompt() {
-    let harness = Harness::new();
+    // A device with no overlay, which is the text login: a console, `login`,
+    // ssh. The symbol has nowhere else to go, so it goes into the prompt. The
+    // graphical case is the test below.
+    let harness = Harness {
+        overlay: ScriptedOverlay::absent(),
+        ..Harness::new()
+    };
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
     let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
     let probe = ScriptedProbe::at_level(1);
@@ -1254,15 +1288,121 @@ fn the_bound_on_an_answer_is_counted_in_bytes_and_not_in_characters() {
 }
 
 #[test]
-fn an_empty_answer_is_refused() {
+fn a_symbol_already_on_the_screen_keeps_the_glyph_wall_out_of_the_prompt_but_not_the_address() {
+    // The graphical login. The overlay is showing the symbol, so the prompt
+    // asks for the code and nothing else: the greeter of the target fleet draws
+    // the module's text in a single inline panel, and forty lines of half-block
+    // glyphs pushed through it leave the person with no readable question.
+    //
+    // Keyed on the overlay being UP rather than on a display being named: a
+    // display named where the overlay failed to start still needs the text
+    // form, and that is the case this distinction exists for.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["   "]);
+    let mut conv = ScriptedConversation::new(["op-42", ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+
+    harness.run(&method, &mut conv, &probe, ROLE).unwrap();
+
+    let code_prompt = conv.asked.get(2).cloned().expect("the code is asked for");
+    assert!(
+        !code_prompt.contains(super::QR_CAPTION),
+        "the drawing went into the prompt while the overlay was up: {code_prompt:?}",
+    );
+    // The address stays. The overlay draws the symbol and nothing else, and a
+    // camera that will not focus — or a room where telephones with cameras are
+    // not allowed — leaves typing it by hand as the only way across.
+    assert!(
+        code_prompt.contains("77-000123M"),
+        "the prompt carried no address to type: {code_prompt:?}",
+    );
+    assert!(
+        code_prompt.ends_with(super::CODE_PROMPT),
+        "the prompt does not end with its own question: {code_prompt:?}",
+    );
+}
+
+#[test]
+fn a_side_no_ticket_names_is_refused_before_a_challenge_exists() {
+    // The greeter's password field arrives on this prompt, and what happens to
+    // it afterwards is why the check is here: the identifier goes into the
+    // challenge, and the challenge is drawn on the login screen, carried to the
+    // engineer's browser and recorded by the issuing side. So the refusal
+    // happens before an attempt is started at all.
+    //
+    // It does NOT happen before the next prompt, and that is deliberate: the
+    // personal number is asked whatever the identifier turned out to be, or the
+    // shape of the dialogue would say whether this device holds a ticket of the
+    // side that was named. The assertion below is what holds that.
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]).holding_no_ticket();
+    let mut conv =
+        ScriptedConversation::new(["a-password-nobody-should-keep", ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+
+    let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
+
+    assert!(matches!(error, CodeFlowError::Denied), "{error:?}");
+    // Both prompts are asked whatever the answer: stopping after the first
+    // would answer, by the shape of the dialogue, whether this device holds a
+    // ticket of the side that was named.
+    assert_eq!(
+        conv.asked,
+        vec![
+            super::SERVER_PROMPT.to_owned(),
+            super::ENGINEER_PROMPT.to_owned()
+        ],
+        "the sequence of prompts gave away whether a ticket exists",
+    );
+    assert!(
+        method.presented.borrow().is_empty(),
+        "an attempt was started for a side no ticket names"
+    );
+    assert!(
+        harness.overlay.events().is_empty(),
+        "a challenge reached a screen for a side no ticket names"
+    );
+}
+
+#[test]
+fn an_empty_answer_is_refused_once_asking_again_has_not_helped() {
+    // Asked twice, refused after that. The repeat exists because the standard
+    // greeter answers this prompt with an unfilled password field; a channel
+    // that answers every prompt with nothing gets a verdict instead of another
+    // question, or the attempt would be held open by a conversation that cannot
+    // produce an answer.
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new(["   ", ""]);
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
 
     assert!(matches!(error, CodeFlowError::Input { .. }));
+    assert_eq!(
+        conv.asked,
+        vec![
+            super::SERVER_PROMPT.to_owned(),
+            super::SERVER_PROMPT.to_owned()
+        ],
+        "the empty answer was not asked for again, or was asked for more than once",
+    );
+}
+
+#[test]
+fn an_empty_first_answer_does_not_end_the_login() {
+    // The whole reason the repeat exists: on the target fleet the first visible
+    // prompt of the conversation is answered with the contents of the greeter's
+    // password field, which on this method nobody fills. The repeat is drawn by
+    // the greeter itself and reaches the person at the device.
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
+    let mut conv = ScriptedConversation::new(["", "op-42", ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+
+    harness
+        .run(&method, &mut conv, &probe, ROLE)
+        .expect("an unfilled form field ended the login");
 }
 
 #[test]
@@ -1353,7 +1493,7 @@ fn an_empty_personal_number_is_refused() {
     // of who came in. It is bounded exactly like the operator's.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]);
-    let mut conv = ScriptedConversation::new(["op-42", "   "]);
+    let mut conv = ScriptedConversation::new(["op-42", "   ", ""]);
     let probe = ScriptedProbe::at_level(1);
 
     let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
@@ -1363,6 +1503,7 @@ fn an_empty_personal_number_is_refused() {
         conv.asked,
         vec![
             super::SERVER_PROMPT.to_owned(),
+            super::ENGINEER_PROMPT.to_owned(),
             super::ENGINEER_PROMPT.to_owned()
         ],
         "the refusal comes at the personal number, before any challenge exists",
