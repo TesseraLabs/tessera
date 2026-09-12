@@ -872,6 +872,19 @@ impl CodeMethod {
         Ok(ticket)
     }
 
+    /// Whether this device holds a ticket issued by that side.
+    ///
+    /// The membership question on its own, without the scope checks `admit`
+    /// makes: a caller that has only a typed identifier and no request yet —
+    /// the PAM branch, before it builds a challenge — can find out whether the
+    /// value names anything this device was given. A revoked ticket still
+    /// counts as named here; whether it admits an attempt is `admit`'s answer
+    /// and comes later, on the verdict.
+    #[must_use]
+    pub fn holds_ticket_of(&self, server_id: &str) -> bool {
+        self.tickets.ticket_number_of(server_id).is_some()
+    }
+
     /// Refuses unless the key container of this device still opens.
     ///
     /// Nothing a person typed opens this container, and nothing the

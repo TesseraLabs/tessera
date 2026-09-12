@@ -194,6 +194,14 @@ struct ScriptedMethod {
     presented: RefCell<Vec<String>>,
     /// How often the branch asked which epoch the method runs under.
     epoch_reads: RefCell<usize>,
+    /// Whether this device holds a ticket of the side an answer names.
+    ///
+    /// True by default: almost every test here is about something other than
+    /// which sides the device was given tickets for, and a list of names would
+    /// have to be kept in step with every scripted answer. The test about a
+    /// value that names no side at all sets it with
+    /// [`ScriptedMethod::holding_no_ticket`].
+    knows_issuer: bool,
 }
 
 impl ScriptedMethod {
@@ -205,6 +213,15 @@ impl ScriptedMethod {
             verdicts: RefCell::new(verdicts.into_iter().collect()),
             presented: RefCell::new(Vec::new()),
             epoch_reads: RefCell::new(0),
+            knows_issuer: true,
+        }
+    }
+
+    /// The same method on a device holding no ticket of the side that is named.
+    fn holding_no_ticket(self) -> Self {
+        Self {
+            knows_issuer: false,
+            ..self
         }
     }
 
@@ -214,6 +231,7 @@ impl ScriptedMethod {
             verdicts: RefCell::new(VecDeque::new()),
             presented: RefCell::new(Vec::new()),
             epoch_reads: RefCell::new(0),
+            knows_issuer: true,
         }
     }
 }
@@ -238,6 +256,10 @@ fn accepted_under_ceiling(level: u32, ceiling: u32) -> Accepted {
 
 impl CodeMethodApi for ScriptedMethod {
     type Attempt = String;
+
+    fn knows_issuer(&self, _server_id: &str) -> bool {
+        self.knows_issuer
+    }
 
     fn epoch(&self) -> u32 {
         // Deliberately not the epoch of the fixture configuration: the branch
@@ -1291,6 +1313,38 @@ fn a_symbol_already_on_the_screen_keeps_the_glyph_wall_out_of_the_prompt_but_not
     assert!(
         code_prompt.ends_with(super::CODE_PROMPT),
         "the prompt does not end with its own question: {code_prompt:?}",
+    );
+}
+
+#[test]
+fn a_side_no_ticket_names_is_refused_before_a_challenge_exists() {
+    // The greeter's password field arrives on this prompt, and what happens to
+    // it afterwards is why the check is here: the identifier goes into the
+    // challenge, and the challenge is drawn on the login screen, carried to the
+    // engineer's browser and recorded by the issuing side. So the refusal
+    // happens before an attempt is started at all — and the personal number is
+    // not asked for either, because asking would mean the value was taken.
+    let harness = Harness::new();
+    let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]).holding_no_ticket();
+    let mut conv =
+        ScriptedConversation::new(["a-password-nobody-should-keep", ENGINEER, RIGHT_CODE]);
+    let probe = ScriptedProbe::at_level(1);
+
+    let error = harness.run(&method, &mut conv, &probe, ROLE).unwrap_err();
+
+    assert!(matches!(error, CodeFlowError::Denied), "{error:?}");
+    assert_eq!(
+        conv.asked,
+        vec![super::SERVER_PROMPT.to_owned()],
+        "the conversation went on after a side the device holds no ticket of",
+    );
+    assert!(
+        method.presented.borrow().is_empty(),
+        "an attempt was started for a side no ticket names"
+    );
+    assert!(
+        harness.overlay.events().is_empty(),
+        "a challenge reached a screen for a side no ticket names"
     );
 }
 

@@ -105,6 +105,15 @@ const REASON_INPUT: &str = "input";
 /// rather than a QR nobody can scan.
 const REASON_QR: &str = "qr_payload_too_long";
 
+/// Refusal detail: no ticket of this device names that issuing side.
+///
+/// Kept apart from the general input refusal because the two are acted on
+/// differently: that one says a value was too long or carried a separator, this
+/// one says the value was a well-formed string naming a side this device has
+/// nothing from — a fleet that renamed its issuing side, or a value that was
+/// never an identifier at all.
+const REASON_ISSUER_UNKNOWN: &str = "issuer_unknown";
+
 /// Refusal detail: the personal number is not one.
 ///
 /// Kept apart from the general input refusal because the two are acted on
@@ -323,6 +332,14 @@ pub trait CodeMethodApi {
     /// An attempt this method started.
     type Attempt;
 
+    /// Whether this device holds a ticket issued by that side.
+    ///
+    /// The question is asked before a challenge is built, and the answer is the
+    /// only one available at that point: what the person typed either names an
+    /// issuing side this device was given a ticket for, or it names nothing the
+    /// device can check anything against. See [`ask_who_is_asking`].
+    fn knows_issuer(&self, server_id: &str) -> bool;
+
     /// The key epoch this method is running under.
     ///
     /// Read from the method rather than from the configuration because the two
@@ -360,6 +377,10 @@ pub trait CodeMethodApi {
 
 impl CodeMethodApi for CodeMethod {
     type Attempt = tessera_core::codes::StartedAttempt;
+
+    fn knows_issuer(&self, server_id: &str) -> bool {
+        Self::holds_ticket_of(self, server_id)
+    }
 
     fn epoch(&self) -> u32 {
         Self::epoch(self).get()
@@ -750,7 +771,13 @@ where
     let role_id = requested_role(pam_user, level, epoch)?;
     ensure_role_account(pam_user, deps.accounts, level, epoch)?;
 
-    let (server_id, engineer_id) = ask_who_is_asking(conv, pam_user, level, epoch)?;
+    let (server_id, engineer_id) = ask_who_is_asking(
+        conv,
+        |side| method.knows_issuer(side),
+        pam_user,
+        level,
+        epoch,
+    )?;
     let request = AttemptRequest {
         role_id: role_id.as_str(),
         level,
@@ -894,6 +921,21 @@ where
     })
 }
 
+/// Overwrite an answer this branch is about to drop.
+///
+/// A `String` hands its allocation back with the bytes still in it. The answers
+/// to these prompts are wiped where PAM allocated them (`pam_conv`), and a copy
+/// this branch made has to be wiped where it made it — a value refused here may
+/// be a password the greeter put into a field this method asked something else
+/// for.
+fn wipe(value: &mut String) {
+    use zeroize::Zeroize as _;
+    // SAFETY: the bytes are overwritten with zeros, which is valid UTF-8, and
+    // the string is emptied immediately afterwards.
+    unsafe { value.as_mut_vec() }.zeroize();
+    value.clear();
+}
+
 /// Asks a visible prompt, and asks it again when the answer comes back empty.
 ///
 /// The last answer is returned whatever it is: what an empty or unusable value
@@ -930,17 +972,51 @@ fn ask_visible<C: CodeConversation>(conv: &mut C, prompt: &str) -> Result<String
 /// [`CodeFlowError::Input`] for an answer the channel cannot carry.
 fn ask_who_is_asking<C: CodeConversation>(
     conv: &mut C,
+    knows_issuer: impl Fn(&str) -> bool,
     pam_user: &str,
     level: Level,
     epoch: u32,
 ) -> Result<(String, String), CodeFlowError> {
-    let server_id = bounded_answer(
+    let mut server_id = bounded_answer(
         &ask_visible(conv, SERVER_PROMPT)?,
         MAX_SERVER_ID_LEN,
         pam_user,
         level,
         epoch,
     )?;
+    // Checked HERE, against the tickets this device holds, and not later
+    // against the shape of a string. The value is about to enter the challenge,
+    // and the challenge is drawn on the login screen, carried to the engineer's
+    // browser and recorded by the issuing side — so a value that names nothing
+    // this device can verify must not get that far. The greeter of the target
+    // fleet answers this prompt with its password field: a person who filled
+    // that field and left the method's own prompt untouched would otherwise
+    // have their password photographed off a screen and written into somebody
+    // else's journal.
+    //
+    // Refused without being echoed, and not asked for again: what it is cannot
+    // be told from here, and the one answer worth repeating a question for is
+    // an empty one (see `ask_visible`).
+    if !knows_issuer(&server_id) {
+        tracing::info!(
+            target: "tessera.codes",
+            user = pam_user,
+            epoch,
+            answer_len = server_id.len(),
+            "no ticket of this device names the issuing side that was typed; refusing before a challenge exists",
+        );
+        audit::emit_denied(&audit::Denial {
+            nonce: None,
+            role_id: pam_user,
+            level: level.get(),
+            epoch,
+            ticket_number: None,
+            claimed_engineer_no: None,
+            reason: REASON_ISSUER_UNKNOWN,
+        });
+        wipe(&mut server_id);
+        return Err(CodeFlowError::Denied);
+    }
     let typed = bounded_answer(
         &ask_visible(conv, ENGINEER_PROMPT)?,
         MAX_ENGINEER_ID_LEN,
