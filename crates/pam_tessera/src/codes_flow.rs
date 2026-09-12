@@ -747,11 +747,11 @@ where
     // that does reach every front end is the prompt.
     let payload = method.payload(&attempt);
     let shown = shown_challenge(&payload, pam_user, level, epoch)?;
-    // Bound and not used: the handle IS the overlay being on the screen, and it
+    // Held, not acted on: the handle IS the overlay being on the screen, and it
     // comes down when this binding goes out of scope at the end of the attempt.
     // Named rather than `_`, which would drop it here and take the symbol down
     // before the engineer had seen it.
-    let _overlay = raise_overlay(deps, &payload, pam_user, epoch);
+    let overlay = raise_overlay(deps, &payload, pam_user, epoch);
     // Whether the symbol is already on a screen. The text form goes into the
     // prompt only when it is not: on a graphical login the person is looking at
     // the overlay, and the greeter of the target fleet draws the module's text
@@ -762,7 +762,7 @@ where
     // display was NAMED, the handle says a symbol is SHOWN. An overlay that
     // did not come up on a named display leaves the challenge in the prompt,
     // where it was going anyway.
-    let symbol_on_screen = _overlay.is_some();
+    let symbol_on_screen = overlay.is_some();
 
     // Nothing is asked for the key container, and nothing holds a password for
     // it either: the key of the device is stored without one, guarded by the
@@ -880,10 +880,7 @@ where
 /// # Errors
 ///
 /// [`CodeFlowError::Conv`] when the conversation cannot be driven at all.
-fn ask_visible<C: CodeConversation>(
-    conv: &mut C,
-    prompt: &str,
-) -> Result<String, CodeFlowError> {
+fn ask_visible<C: CodeConversation>(conv: &mut C, prompt: &str) -> Result<String, CodeFlowError> {
     let mut answer = conv.prompt_visible(prompt)?;
     for _ in 0..EMPTY_ANSWER_RETRIES {
         if !answer.trim().is_empty() {

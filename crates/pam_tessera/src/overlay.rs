@@ -103,7 +103,9 @@
 #![cfg(unix)]
 
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};

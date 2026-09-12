@@ -355,8 +355,8 @@ const LOGIN_PROMPT: &str = "Имя учётной записи: ";
 /// # Errors
 ///
 /// [`PamHelperError`] when PAM cannot be asked at all, and
-/// [`PamHelperError::Null`] when every answer was empty — a login whose account
-/// nobody will name is refused rather than guessed at.
+/// [`PamHelperError::NoUser`] when every answer was empty — a login whose
+/// account nobody will name is refused rather than guessed at.
 #[cfg(target_os = "linux")]
 unsafe fn resolve_login_account(
     pamh: *mut pam_sys::pam_handle_t,
@@ -377,7 +377,7 @@ unsafe fn resolve_login_account(
                     error = %err,
                     "the login account could not be asked for",
                 );
-                return Err(crate::pam_helpers::PamHelperError::Null);
+                return Err(crate::pam_helpers::PamHelperError::NoUser);
             }
         };
         let typed = typed.trim().to_owned();
@@ -397,7 +397,7 @@ unsafe fn resolve_login_account(
         target: "tessera.auth",
         "no login account was given after asking; refusing the login",
     );
-    Err(crate::pam_helpers::PamHelperError::Null)
+    Err(crate::pam_helpers::PamHelperError::NoUser)
 }
 
 /// Generate a cryptographically random session id by hex-encoding 16 bytes

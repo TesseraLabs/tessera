@@ -807,12 +807,16 @@ fn the_credential_of_the_display_is_written_for_one_account_and_removed_after() 
         .filter(|path| path.extension().is_some_and(|ext| ext == "xauth"))
         .collect();
     assert_eq!(files.len(), 1, "expected exactly one credential file");
-    let mode = std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "the credential of the display was readable by others");
+    let credential = files.first().expect("one credential file").clone();
+    let mode = std::fs::metadata(&credential).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the credential of the display was readable by others"
+    );
 
     drop(handle);
     assert!(
-        !files[0].exists(),
+        !credential.exists(),
         "the credential of the display outlived the attempt"
     );
 }

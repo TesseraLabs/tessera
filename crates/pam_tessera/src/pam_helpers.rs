@@ -33,6 +33,13 @@ pub enum PamHelperError {
     /// The PAM-supplied bytes were not valid UTF-8.
     #[error("non-utf8 PAM string")]
     NonUtf8,
+    /// Nobody named the account: neither the application nor the person.
+    ///
+    /// Distinct from [`PamHelperError::Null`], which says PAM failed to answer.
+    /// This one says PAM answered, and the answer was nothing — a login that
+    /// cannot be attributed to an account, which is refused rather than guessed.
+    #[error("no login account was given")]
+    NoUser,
 }
 
 const PAM_SUCCESS: c_int = pam_sys::PAM_SUCCESS as c_int;
@@ -61,7 +68,6 @@ struct PamXauthData {
     datalen: c_int,
     data: *mut c_char,
 }
-
 
 extern "C" {
     /// Re-declared with a stable signature; bindgen generates this with
