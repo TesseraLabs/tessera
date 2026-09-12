@@ -1126,6 +1126,40 @@ cases:
     /// `deny_unknown_fields` не прощает опечатку, а битый шаблон или
     /// повторённый идентификатор всплыли бы иначе только на стенде, посреди
     /// прогона и уже после того, как окружение что-то поменяло.
+    /// Заглушка оверлея живёт на perl и константу продукта импортировать не
+    /// может. Единственное, что держит две записи одного байта вместе, — эта
+    /// проверка: разъехавшись, они дадут кейс, который зеленеет на негодном
+    /// поведении (модуль ждёт подтверждения, заглушка присылает другое, модуль
+    /// решает, что оверлея нет — и текстовый путь проверяется там, где
+    /// проверялся графический).
+    #[test]
+    fn the_stand_in_overlay_acknowledges_with_the_protocol_byte() {
+        let stub =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/helpers/overlay-stub.pl");
+        if !stub.is_file() {
+            // Хелперы появляются вместе с контуром; до этого сверять нечего.
+            return;
+        }
+        let text = std::fs::read_to_string(&stub)
+            .unwrap_or_else(|err| panic!("{}: {err}", stub.display()));
+        let declared = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("my $DRAWN = 0x"))
+            .and_then(|rest| rest.split(';').next())
+            .and_then(|hex| u8::from_str_radix(hex.trim(), 16).ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "в {} не нашлось объявления `my $DRAWN = 0x..;`",
+                    stub.display()
+                )
+            });
+        assert_eq!(
+            declared,
+            tessera_core::codes::overlay_ipc::DRAWN,
+            "байт подтверждения в заглушке разошёлся с протоколом"
+        );
+    }
+
     #[test]
     fn the_registry_in_the_repository_loads_and_validates() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/cases");
