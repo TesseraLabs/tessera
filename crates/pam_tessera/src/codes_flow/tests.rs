@@ -1328,8 +1328,12 @@ fn a_side_no_ticket_names_is_refused_before_a_challenge_exists() {
     // it afterwards is why the check is here: the identifier goes into the
     // challenge, and the challenge is drawn on the login screen, carried to the
     // engineer's browser and recorded by the issuing side. So the refusal
-    // happens before an attempt is started at all — and the personal number is
-    // not asked for either, because asking would mean the value was taken.
+    // happens before an attempt is started at all.
+    //
+    // It does NOT happen before the next prompt, and that is deliberate: the
+    // personal number is asked whatever the identifier turned out to be, or the
+    // shape of the dialogue would say whether this device holds a ticket of the
+    // side that was named. The assertion below is what holds that.
     let harness = Harness::new();
     let method = ScriptedMethod::with_verdicts([Ok(accepted(1))]).holding_no_ticket();
     let mut conv =

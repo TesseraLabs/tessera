@@ -863,17 +863,15 @@ where
             level,
             epoch,
         )?;
-        // The typed answer wipes itself at the end of this pass; the
-        // normalised copy made from it does not, and it is the code — so it is
-        // overwritten as soon as the verdict is in, below.
-        let mut code = normalise_code(&typed);
+        // Both the answer and the code folded out of it wipe themselves at the
+        // end of this pass: the code is the one value here nobody may leave in
+        // the heap of `sshd`, `login` or a display manager.
+        let code = Answer::new(normalise_code(&typed));
         // Markers are read afresh for every verification: an attempt that did
         // not survive a reboot must be refused by the reboot, not by whatever
         // the branch remembered from before it.
         let markers = read_markers(probe, pam_user, level, epoch)?;
-        let verdict = method.verify(&mut attempt, &code, &markers);
-        wipe(&mut code);
-        match verdict {
+        match method.verify(&mut attempt, &code, &markers) {
             Ok(value) => {
                 accepted = Some(value);
                 break;
@@ -934,21 +932,6 @@ where
     })
 }
 
-/// Overwrite a copy this branch made of an answer.
-///
-/// Three layers, and this is the third. PAM's own buffer is wiped where PAM
-/// allocated it (`pam_conv`); the answer handed back wipes itself when it is
-/// dropped ([`Answer`]); and a copy this branch chose to keep — a bounded
-/// value, a normalised code — is this function's to overwrite, because nothing
-/// else knows it was made.
-fn wipe(value: &mut String) {
-    use zeroize::Zeroize as _;
-    // SAFETY: the bytes are overwritten with zeros, which is valid UTF-8, and
-    // the string is emptied immediately afterwards.
-    unsafe { value.as_mut_vec() }.zeroize();
-    value.clear();
-}
-
 /// Asks a visible prompt, and asks it again when the answer comes back empty.
 ///
 /// The last answer is returned whatever it is: what an empty or unusable value
@@ -994,7 +977,7 @@ fn ask_who_is_asking<C: CodeConversation>(
     level: Level,
     epoch: u32,
 ) -> Result<(String, String), CodeFlowError> {
-    let mut server_id = bounded_answer(
+    let server_id = bounded_answer(
         ask_visible(conv, SERVER_PROMPT)?.as_str(),
         MAX_SERVER_ID_LEN,
         pam_user,
@@ -1046,13 +1029,16 @@ fn ask_who_is_asking<C: CodeConversation>(
             claimed_engineer_no: None,
             reason: REASON_ISSUER_UNKNOWN,
         });
-        wipe(&mut server_id);
+        // The answer wipes itself as this frame unwinds — see `Answer`.
         // Still before the challenge, and still without spending anything: no
         // attempt was started, so no budget was touched and no nonce exists.
         return Err(CodeFlowError::Denied);
     }
     let engineer_id = checked_engineer_number(&typed, pam_user, level, epoch)?;
-    Ok((server_id, engineer_id))
+    // Owned copies made ON PURPOSE, at the one point both values are known to
+    // be what they claim: they go into the challenge, which outlives this
+    // frame. Everything up to here wiped itself.
+    Ok((server_id.to_kept_string(), engineer_id))
 }
 
 /// Puts the same payload on the screen of a graphical login, if there is one.
@@ -1181,7 +1167,7 @@ fn bounded_answer(
     pam_user: &str,
     level: Level,
     epoch: u32,
-) -> Result<String, CodeFlowError> {
+) -> Result<Answer, CodeFlowError> {
     let trimmed = answer.trim();
     // Bytes, not characters: the bound belongs to the payload budget, which is
     // spent in bytes. Counting characters let a value in Cyrillic pass a prompt
@@ -1202,7 +1188,11 @@ fn bounded_answer(
         });
         return Err(CodeFlowError::Input { limit });
     }
-    Ok(trimmed.to_owned())
+    // The copy this makes wipes itself, like the answer it was trimmed from:
+    // what is bounded here is what a person typed, and on this fleet that may
+    // be the contents of a password field whatever the prompt asked for. The
+    // refusal path above allocates nothing — `trim` borrows.
+    Ok(Answer::new(trimmed.to_owned()))
 }
 
 /// Refuse a personal number whose check character does not meet.
