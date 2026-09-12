@@ -394,20 +394,28 @@ pub unsafe fn pam_get_x_channel(
         // this one cannot be opened without the one the application withheld.
         return Ok(Display::Refused);
     }
-    // SAFETY: for PAM_XAUTHDATA the item points at a `struct pam_xauth_data`
-    // owned by PAM and valid for the lifetime of `pamh`.
-    let xauth = unsafe { &*xauth_ptr.cast::<PamXauthData>() };
+    // SAFETY: `xauth_ptr` is the non-NULL `struct pam_xauth_data *` PAM stores
+    // for PAM_XAUTHDATA, valid for the lifetime of `pamh`. The value is COPIED
+    // OUT rather than borrowed: a `&PamXauthData` would assert, for as long as
+    // it lived, that nobody else writes to a structure this module neither owns
+    // nor laid out, and `read_unaligned` additionally asserts nothing about the
+    // alignment of an allocation made by another library. What is left is the
+    // one claim the item contract makes — that this address holds an
+    // initialised value of that shape — and four integers and pointers that are
+    // read from a local copy below, in safe code.
+    let xauth: PamXauthData = unsafe { std::ptr::read_unaligned(xauth_ptr.cast::<PamXauthData>()) };
     let namelen = usize::try_from(xauth.namelen).unwrap_or(0);
     let datalen = usize::try_from(xauth.datalen).unwrap_or(0);
-    if namelen == 0 || datalen == 0 || xauth.name.is_null() || xauth.data.is_null() {
+    let (name, data) = (xauth.name, xauth.data);
+    if namelen == 0 || datalen == 0 || name.is_null() || data.is_null() {
         // As above: named display, unusable credential.
         return Ok(Display::Refused);
     }
     // SAFETY: the two buffers are `namelen`/`datalen` bytes long by the
     // contract of the item, and are read without being kept.
-    let scheme_bytes = unsafe { std::slice::from_raw_parts(xauth.name.cast::<u8>(), namelen) };
+    let scheme_bytes = unsafe { std::slice::from_raw_parts(name.cast::<u8>(), namelen) };
     // SAFETY: as above.
-    let cookie = unsafe { std::slice::from_raw_parts(xauth.data.cast::<u8>(), datalen) }.to_vec();
+    let cookie = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), datalen) }.to_vec();
     let scheme = std::str::from_utf8(scheme_bytes)
         .map_err(|_| PamHelperError::NonUtf8)?
         .to_owned();
