@@ -599,34 +599,57 @@ fn child_environment(
 fn wait_for_drawn(stream: &UnixStream, budget: Duration) -> Result<(), std::io::Error> {
     use std::io::Read as _;
 
-    stream.set_read_timeout(Some(budget))?;
+    let deadline = Instant::now() + budget;
     let mut byte = [0u8; 1];
-    let read = (&*stream).read(&mut byte);
+    let outcome = loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the overlay did not say the symbol was drawn",
+            ));
+        };
+        stream.set_read_timeout(Some(left))?;
+        match (&*stream).read(&mut byte) {
+            Ok(1) if byte.first() == Some(&DRAWN) => break Ok(()),
+            Ok(1) => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the overlay answered with something other than the drawn byte",
+                ))
+            }
+            Ok(_) => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the overlay closed the socket instead of drawing",
+                ))
+            }
+            // A signal arrived while the call was in flight, and the module
+            // lives inside `sshd`, `login` or a display manager — processes
+            // where signals are ordinary, starting with the `SIGCHLD` of the
+            // overlay this very function is waiting on. Taking EINTR for an
+            // answer would report "no symbol on the screen" for a symbol that
+            // is on the screen, and the challenge would be drawn twice: once
+            // by the overlay, once as glyphs in the prompt. The deadline is
+            // kept across the retry, so an interrupted wait is not a longer
+            // one. `send_frame` treats the same errno the same way.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the overlay did not say the symbol was drawn",
+                ))
+            }
+            Err(error) => break Err(error),
+        }
+    };
     // The timeout is cleared whatever happened: the same socket carries the
     // cancel frame on the way out, and a read timeout left on it belongs to
     // nothing.
     let _ignored = stream.set_read_timeout(None);
-    match read {
-        Ok(1) if byte.first() == Some(&DRAWN) => Ok(()),
-        Ok(1) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the overlay answered with something other than the drawn byte",
-        )),
-        Ok(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "the overlay closed the socket instead of drawing",
-        )),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::WouldBlock
-                || error.kind() == std::io::ErrorKind::TimedOut =>
-        {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the overlay did not say the symbol was drawn",
-            ))
-        }
-        Err(error) => Err(error),
-    }
+    outcome
 }
 
 /// Writes one frame to the overlay without the process being signalled.
