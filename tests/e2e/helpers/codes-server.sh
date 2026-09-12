@@ -190,6 +190,14 @@ HOST_P12="${TESSERA_E2E_HOST_P12:-/var/lib/tessera/host.p12}"
 # Учётная запись — та же, под которой работает греетер; на Astra это `fly-dm`.
 # Секция конфигурации пишется только по `prepare --with-overlay`.
 WITH_OVERLAY=0
+# Заглушке оверлея нужен ключ, чтобы отвечать байтом подтверждения. Бинарь в
+# конфигурации — путь без аргументов, поэтому ключ дописывается обёрткой (см.
+# write_overlay_wrapper): так кейс остаётся одной строкой, а модуль по-прежнему
+# запускает один исполняемый файл.
+OVERLAY_ACKS=0
+# Где живут исполняемые файлы, которые заводит стенд. Каталог обязан быть на
+# файловой системе БЕЗ noexec — рабочий каталог прогона под /run не годится.
+WRAPPER_DIR="${TESSERA_E2E_BIN_DIR:-/usr/local/lib/tessera-e2e}"
 OVERLAY_USER="${TESSERA_E2E_OVERLAY_USER:-}"
 OVERLAY_BINARY="${TESSERA_E2E_OVERLAY_BINARY:-/usr/bin/tessera-qr-overlay}"
 
@@ -215,7 +223,20 @@ stop_driver() {
     kill "$DRIVER_PID" 2>/dev/null || true
     DRIVER_PID=""
 }
-trap stop_driver EXIT
+
+# Выход из хелпера любым путём: оборванный разговор добивается, а снятое перед
+# продуктовым импортом возвращается на место.
+#
+# Второе — не гигиена. Импорт заменяет ролевое хранилище, теги и удостоверение
+# узла срезом пакета; хелпер, упавший между снимком и возвратом, оставил бы
+# устройство с ЧУЖОЙ ролевой базой, и следующий кейс проверял бы не то
+# устройство, не зная об этом. Возврат идемпотентен: без снимка он ничего не
+# делает.
+on_exit() {
+    stop_driver
+    restore_device_state_if_taken
+}
+trap on_exit EXIT
 
 usage_error() {
     echo "codes-server: $*" >&2
@@ -227,9 +248,12 @@ usage() {
     cat >&2 <<'EOF'
 usage: codes-server.sh <command> [args]
   prepare <fixtures>/codes [--without-codes-url] [--with-overlay]
+                          [--overlay-binary=<путь>] [--overlay-acks]
                         разложить артефакты Codes, включить [codes] и завести
                         PAM-сервис codeauth; --with-overlay дописывает учётную
-                        запись и бинарь оверлея графического входа
+                        запись и бинарь оверлея графического входа,
+                        --overlay-acks запускает его так, что он отвечает
+                        байтом подтверждения отрисовки
   authenticate <user> --level N
                         полный вход по коду: снять challenge, получить код у
                         `issuer codes issue`, подать его
@@ -239,6 +263,12 @@ usage: codes-server.sh <command> [args]
                         поле пароля вторым. --start задаёт, чем открыта
                         транзакция: пустым именем (по умолчанию, так делает
                         живой греетер) или отсутствующим вовсе
+  expect-empty-name-refused <user>
+                        канал греетера, где поле имени пусто и больше ничего не
+                        подаётся: отказ обязан прийти после ОДНОГО вопроса
+  expect-payload-line-in-code-prompt <user>
+                        при поднятом оверлее промпт кода обязан нести адрес
+                        попытки строкой и не нести рисунок QR
   expect-second-answer-not-logged <user> <строка>
                         канал греетера, где поле имени пусто, а в поле пароля
                         стоит <строка>: вход обязан отказать, имя не должно
@@ -579,7 +609,7 @@ EOF
         if [ "$WITH_OVERLAY" = "1" ]; then
             cat <<EOF
 overlay_user = "$(overlay_account)"
-overlay_binary = "$OVERLAY_BINARY"
+overlay_binary = "$OVERLAY_RUN_BINARY"
 EOF
         fi
     } > "$staging"
@@ -670,10 +700,26 @@ snapshot_device_state() {
     fi
 }
 
+# Возврат по выходу: делает работу только там, где снимок ещё лежит на месте.
+#
+# Отдельная функция, а не флаг: снимок и есть признак незавершённого импорта, и
+# его наличие на диске переживает даже смерть процесса по сигналу.
+restore_device_state_if_taken() {
+    [ -d "$DEVICE_BACKUP" ] || return 0
+    restore_device_state
+}
+
 # Возвращает снятое. Путь, которого до импорта не было, УДАЛЯЕТСЯ: оставленный
 # срез пакета — это чужая роль на устройстве, которую следующий кейс примет за
 # своё окружение.
 restore_device_state() {
+    # Путь под `rm -rf` проверяется, а не предполагается: переменная приходит из
+    # окружения, и пустое или относительное значение здесь стоило бы каталога,
+    # который никто не собирался трогать.
+    case "$ROLES_DIR" in
+        /*/*) ;;
+        *) die "ROLES_DIR=$ROLES_DIR не годится для удаления: нужен абсолютный путь глубже корня" ;;
+    esac
     if [ -d "$DEVICE_BACKUP/roles" ]; then
         rm -rf "$ROLES_DIR"
         cp -a "$DEVICE_BACKUP/roles" "$ROLES_DIR"
@@ -712,6 +758,27 @@ assert_overlay_binary_runs() {
         0) die "бинарь оверлея $binary завершился успехом на несуществующем сокете — это не он" ;;
         *) ;;
     esac
+}
+
+# Обёртка, которая зовёт заглушку с ключом `--ack`.
+#
+# Конфигурация называет ОДИН исполняемый файл и аргументов не несёт — так и
+# должно быть: аргументы к пути превратили бы поле конфигурации в командную
+# строку, которую кто-то однажды соберёт из чужих данных. Обёртка живёт в
+# рабочем каталоге прогона и снимается вместе с ним.
+write_overlay_wrapper() {
+    local target="$1" wrapper="$WRAPPER_DIR/overlay-acks"
+    # НЕ в рабочем каталоге прогона: он лежит под /run, а /run в контейнерных
+    # окружениях смонтирован noexec — запустить оттуда нельзя даже root'у, и
+    # модуль получил бы оверлей, который не стартует. Каталог снимается в
+    # cleanup.
+    install -d -m 0755 "$WRAPPER_DIR"
+    cat >"$wrapper" <<EOF
+#!/bin/sh
+exec "$target" --ack "\$@"
+EOF
+    chmod 0755 "$wrapper"
+    printf '%s' "$wrapper"
 }
 
 # Учётная запись оверлея: названная снаружи либо первая существующая из списка.
@@ -760,6 +827,7 @@ cmd_prepare() {
             --without-codes-url) WITHOUT_CODES_URL=1 ;;
             --with-overlay) WITH_OVERLAY=1 ;;
             --overlay-binary=*) WITH_OVERLAY=1; OVERLAY_BINARY="${flag#--overlay-binary=}" ;;
+            --overlay-acks) WITH_OVERLAY=1; OVERLAY_ACKS=1 ;;
             -*) usage_error "неизвестный флаг prepare: $flag" ;;
             *)
                 [ -z "$dir" ] || usage_error "prepare принимает один каталог фикстур"
@@ -774,8 +842,14 @@ cmd_prepare() {
     load_manifest "$dir"
 
     deploy_artefacts
+    # Чем именно запускается оверлей, решается ДО записи конфигурации: её пишет
+    # deploy_config, и путь, вычисленный после, попал бы в файл пустым.
+    OVERLAY_RUN_BINARY="$OVERLAY_BINARY"
+    if [ "$WITH_OVERLAY" -eq 1 ] && [ "$OVERLAY_ACKS" = "1" ]; then
+        OVERLAY_RUN_BINARY="$(write_overlay_wrapper "$OVERLAY_BINARY")"
+    fi
+    [ "$WITH_OVERLAY" -eq 0 ] || assert_overlay_binary_runs "$OVERLAY_RUN_BINARY"
     deploy_config
-    [ "$WITH_OVERLAY" -eq 0 ] || assert_overlay_binary_runs "$OVERLAY_BINARY"
     # После конфигурации: импорт кладёт ключ в ТО хранилище, которое названо в
     # `[codes].dir`, и до её появления положил бы его в умолчание.
     import_device_key
@@ -1270,14 +1344,15 @@ capture_code_prompt() {
 
 # Ждёт, пока драйвер напечатает промпт кода — с символом или без него.
 #
-# Опознаётся по подписи над QR либо по самому вопросу: первый промпт кода несёт
-# показ и вопрос одним обменом, и что из этого пришло — предмет проверки, а не
-# условие ожидания.
+# Опознаётся по любой из трёх шапок: подпись над рисунком QR, подпись над
+# текстовой формой адреса, сам вопрос. Первый промпт кода несёт показ и вопрос
+# одним обменом, и что из трёх пришло — предмет проверки, а не условие ожидания;
+# ждать одну конкретную форму значило бы считать сбоем стенда любую другую.
 await_code_prompt() {
     local err="$1" driver="$2" waited=0
     local limit="${TESSERA_E2E_CHALLENGE_TIMEOUT:-30}"
     while :; do
-        if grep -qE "^prompt: ($QR_CAPTION_LINE|${CODE_PROMPT_LINE% }|$CODE_PROMPT_LINE)" "$err" 2>/dev/null; then
+        if grep -qE "^prompt: ($QR_CAPTION_LINE|$QR_FALLBACK_LINE|${CODE_PROMPT_LINE% })" "$err" 2>/dev/null; then
             return 0
         fi
         # Разговор кончился раньше вопроса — вердикт уже вынесен, и ждать
@@ -1470,6 +1545,84 @@ cmd_answer_nothing() {
     cat "$out"
     cat "$err" >&2
     return "$rc"
+}
+
+# Разговор канала греетера, где поле имени пусто и БОЛЬШЕ НИЧЕГО не подаётся.
+#
+# Отличие от expect-second-answer-not-logged: там проверяется, куда не попал
+# второй ответ, здесь — что второго вопроса не было вовсе. Незаполненное поле
+# имени обязано кончиться вердиктом на первом же ответе: любой второй вопрос под
+# этим греетером получит поле «Пароль».
+cmd_expect_empty_name_refused() {
+    local user="${1:-}"
+    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-empty-name-refused <user>"
+
+    load_prepared
+    greeter_modern_channel "$user"
+    LEADING_ANSWERS=("")
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    env -u DISPLAY -u XAUTHORITY pam-drive "${DRIVER_FLAGS[@]}" \
+        --answers-per-prompt "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    printf '%s\n' "" >&3
+    exec 3>&-
+
+    local rc=0
+    wait "$DRIVER_PID" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+    cat "$out"
+    cat "$err" >&2
+
+    if [ "$rc" = "0" ]; then
+        echo "codes-server: вход прошёл на пустом поле имени" >&2
+        return 1
+    fi
+    local name_prompts
+    name_prompts="$(grep -c "^prompt: $NAME_PROMPT_LINE" "$err" || true)"
+    if [ "${name_prompts:-0}" -ne 1 ]; then
+        echo "codes-server: имя учётной записи спрошено ${name_prompts:-0} раз(а), а обязано ровно один" >&2
+        return 1
+    fi
+    echo "empty-name: refused after one question"
+}
+
+# Показ при ПОДНЯТОМ оверлее: промпт обязан нести адрес попытки одной строкой.
+#
+# Оверлей рисует только символ. Инженер, у которого камера не берёт экран —
+# блики, разбитый объектив, запрет на телефон с камерой в помещении, — вводит
+# адрес руками, и взять его больше негде: полублочная решётка из промпта убрана
+# именно потому, что символ уже на экране, а вот текст попытки нужен в любом
+# случае.
+cmd_expect_payload_line_in_code_prompt() {
+    local user="${1:-}"
+    [ -n "$user" ] || usage_error "usage: codes-server.sh expect-payload-line-in-code-prompt <user>"
+
+    load_prepared
+    capture_code_prompt "$user"
+
+    local err="$RUN_DIR/conv.err"
+    if ! grep -q "tessera-codes/v1/signed-challenge;" "$err"; then
+        echo "codes-server: в промпте кода нет текста попытки (см. $err)" >&2
+        return 1
+    fi
+    # Решётка полублоков при поднятом оверлее — это сорок строк в однострочную
+    # инлайн-панель греетера: символ уже на экране, и промпт обязан нести текст.
+    if grep -qF "$QR_CAPTION_LINE" "$err"; then
+        echo "codes-server: при поднятом оверлее промпт всё ещё несёт рисунок QR" >&2
+        return 1
+    fi
+    echo "payload-line: yes"
 }
 
 # Разговор, где на промпт имени учётной записи приходит пустая строка, а
@@ -2755,6 +2908,7 @@ cmd_cleanup() {
     rmdir "$CODES_DIR" 2>/dev/null || true
 
     rm -rf "$RUN_DIR"
+    rm -rf "$WRAPPER_DIR"
 
     echo "cleaned"
 }
@@ -2768,6 +2922,8 @@ main() {
         authenticate-as-greeter) cmd_authenticate_as_greeter "$@" ;;
         answer-nothing)       cmd_answer_nothing "$@" ;;
         expect-second-answer-not-logged) cmd_expect_second_answer_not_logged "$@" ;;
+        expect-empty-name-refused) cmd_expect_empty_name_refused "$@" ;;
+        expect-payload-line-in-code-prompt) cmd_expect_payload_line_in_code_prompt "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
         authenticate-mistyping-once) cmd_authenticate_mistyping_once "$@" ;;
         authenticate-with-device-key) cmd_authenticate_with_device_key "$@" ;;

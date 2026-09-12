@@ -182,3 +182,40 @@ cases:
         timeout: 60
     teardown:
       - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-008
+    title: Пустое поле имени закрывает вход первым же ответом
+    requirement: spec9:auth.UI-006
+    # Рядом с GRM-007 это отдельная гарантия: там проверяется, куда не попал
+    # второй ответ, здесь — что второго вопроса не было. Разница видна на канале
+    # греетера: любой второй видимый промпт получает поле «Пароль», поэтому
+    # незаполненное поле имени обязано кончиться вердиктом сразу, а не
+    # повторённым вопросом.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-empty-name-refused {{user}}
+        expect: { exit_code: 0, stdout_matches: 'empty-name: refused after one question' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-009
+    title: При поднятом оверлее промпт несёт адрес попытки строкой
+    requirement: spec9:auth.UI-004
+    # Оверлей рисует ТОЛЬКО символ. Инженер, у которого камера не берёт экран —
+    # блики, запрет на телефон с камерой в помещении, — вводит адрес руками, и
+    # взять его больше негде: полублочную решётку из промпта убрали именно
+    # потому, что символ уже на экране.
+    #
+    # Заглушка отвечает байтом подтверждения: без него модуль считает, что
+    # оверлея нет, и кейс проверял бы текстовый путь вместо графического.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+               --overlay-binary={{helpers}}/overlay-stub.pl --overlay-acks
+      - run: helpers/codes-server.sh expect-payload-line-in-code-prompt {{user}}
+        expect: { exit_code: 0, stdout_matches: 'payload-line: yes' }
+        timeout: 90
+    teardown:
+      - run: helpers/codes-server.sh cleanup
