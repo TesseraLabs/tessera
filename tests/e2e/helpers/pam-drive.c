@@ -7,9 +7,15 @@
  * от «auth отказала» — эти два исхода означают разные дефекты продукта.
  *
  * Использование:
- *     pam-drive [--show-creds] [--answers-per-prompt] [--no-user]
+ *     pam-drive [--show-creds] [--show-user] [--answers-per-prompt] [--no-user]
  *               [--xdisplay <display>] [--xauthdata <name>:<hex>]
  *               <service> <user> <phase> [<phase> ...]
+ *
+ * `--show-user` печатает item PAM_USER после исполнения всех фаз, строкой
+ * `pam_user: <значение>` (или `pam_user: <unset>`). Это единственный способ
+ * увидеть со стороны приложения, ПОДМЕНИЛ ли стек имя, которое приложение
+ * задало: модули стека до и после видели бы разные идентичности, а вердикт
+ * фазы об этом не говорит ничего.
  *     phase ∈ { authenticate, acct_mgmt, open_session, close_session }
  *
  * `--no-user` ведёт разговор без имени учётной записи: pam_start получает NULL,
@@ -311,6 +317,9 @@ static void usage(FILE *out)
           "                answering the i-th prompt with the i-th line; a prompt met with\n"
           "                end of input ends the conversation with an error rather than an\n"
           "                empty answer\n"
+          "  --show-user: after the last phase, print the PAM_USER item as\n"
+          "                `pam_user: <value>`; `<unset>` when the item is NULL. Shows\n"
+          "                whether the stack replaced the name the application gave it\n"
           "  --no-user: start the transaction with no user name at all (NULL), the way a\n"
           "                display manager greeter does; the positional <user> is then only\n"
           "                the name the case is written about\n"
@@ -499,6 +508,7 @@ int main(int argc, char **argv)
      * собираются в свой список. Так `--show-creds` можно поставить где угодно,
      * и уже написанные вызовы без флага разбираются ровно как раньше. */
     int show_creds = 0;
+    int show_user = 0;
     int no_user = 0;
     const char *xdisplay = NULL;
     const char *xauthdata = NULL;
@@ -511,6 +521,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--show-creds") == 0) {
             show_creds = 1;
+        } else if (strcmp(argv[i], "--show-user") == 0) {
+            show_user = 1;
         } else if (strcmp(argv[i], "--answers-per-prompt") == 0) {
             g_per_prompt = 1;
         } else if (strcmp(argv[i], "--no-user") == 0) {
@@ -652,6 +664,21 @@ int main(int argc, char **argv)
             /* Остальные фазы всё равно исполняем: кейсу бывает нужно увидеть,
              * что открытие сессии не произошло после отказавшей auth-фазы. */
         }
+    }
+
+    /* Item печатается ДО pam_end: после него handle недействителен, а сравнивать
+     * кейсу нужно именно то, что стек оставил приложению. */
+    if (show_user) {
+        const void *item = NULL;
+        int urc = pam_get_item(pamh, PAM_USER, &item);
+        if (urc != PAM_SUCCESS) {
+            printf("pam_user: <error %s (%d)>\n", pam_code_name(urc), urc);
+        } else if (item == NULL) {
+            printf("pam_user: <unset>\n");
+        } else {
+            printf("pam_user: %s\n", (const char *)item);
+        }
+        fflush(stdout);
     }
 
     /* pam_end вызывается в любом случае — включая путь ранней ошибки выше. */

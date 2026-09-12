@@ -267,6 +267,9 @@ usage: codes-server.sh <command> [args]
                         поле пароля вторым. --start задаёт, чем открыта
                         транзакция: пустым именем (по умолчанию, так делает
                         живой греетер) или отсутствующим вовсе
+  expect-user-item-untouched <имя>
+                        вход под именем, которое задало приложение: отказ, и
+                        item PAM_USER обязан остаться тем же значением
   expect-server-id-not-logged <user> <строка>
                         канал греетера, где поле пароля попадает на промпт
                         сервера выдачи: отказ обязан прийти до challenge, а
@@ -1554,6 +1557,51 @@ cmd_answer_nothing() {
     cat "$out"
     cat "$err" >&2
     return "$rc"
+}
+
+# Вход под именем, которое задало приложение и которое состоит из пробелов.
+#
+# Проверяется не отказ — он очевиден, — а то, что item PAM_USER остался ТЕМ,
+# который задало приложение. Модуль, дописывающий имя поверх заданного, создаёт
+# ровно то расхождение, из-за которого существует класс CVE-2021-3560: модули
+# стека до и после видят разные идентичности, и ни один из них об этом не знает.
+#
+# $1 — имя учётной записи, как его задаёт приложение (для кейса — пробелы).
+cmd_expect_user_item_untouched() {
+    local user="${1-}"
+    [ -n "${1+set}" ] \
+        || usage_error "usage: codes-server.sh expect-user-item-untouched <имя>"
+
+    load_prepared
+
+    install -d -m 0700 "$RUN_DIR"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$out" "$err"
+
+    # Ответов не подаётся вовсе: если модуль спросит имя, значит он уже решил,
+    # что заданного имени нет, и следующим шагом перепишет item.
+    local rc=0
+    pam-drive --show-user --answers-per-prompt "$PAM_SERVICE_NAME" "$user" authenticate \
+        < /dev/null > "$out" 2> "$err" || rc=$?
+    cat "$out"
+    cat "$err" >&2
+
+    if [ "$rc" = "0" ]; then
+        echo "codes-server: вход прошёл под именем из пробелов" >&2
+        return 1
+    fi
+    if grep -q "^prompt: $NAME_PROMPT_LINE" "$err"; then
+        echo "codes-server: у человека спросили имя, хотя приложение его задало" >&2
+        return 1
+    fi
+    local seen
+    seen="$(sed -n 's/^pam_user: //p' "$out" | head -n 1)"
+    if [ "$seen" != "$user" ]; then
+        echo "codes-server: PAM_USER после попытки «$seen», а приложение задавало «$user»" >&2
+        return 1
+    fi
+    echo "user-item: untouched"
 }
 
 # Разговор канала греетера, где поле пароля заполнено и попадает на промпт
@@ -3016,6 +3064,7 @@ main() {
         expect-second-answer-not-logged) cmd_expect_second_answer_not_logged "$@" ;;
         expect-empty-name-refused) cmd_expect_empty_name_refused "$@" ;;
         expect-server-id-not-logged) cmd_expect_server_id_not_logged "$@" ;;
+        expect-user-item-untouched) cmd_expect_user_item_untouched "$@" ;;
         expect-payload-line-in-code-prompt) cmd_expect_payload_line_in_code_prompt "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
         authenticate-mistyping-once) cmd_authenticate_mistyping_once "$@" ;;

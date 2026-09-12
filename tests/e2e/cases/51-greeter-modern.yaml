@@ -243,3 +243,23 @@ cases:
         timeout: 60
     teardown:
       - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-011
+    title: Имя, заданное приложением, модуль не подменяет своим
+    requirement: spec9:auth.UI-006
+    # Имя из одних пробелов — не отдельный случай, а способ это увидеть:
+    # приложение имя ЗАДАЛО, и модуль обязан отказать, а не решить, что имени
+    # нет, и дописать своё. Подменённый item — то самое расхождение, из-за
+    # которого существует класс CVE-2021-3560: модули стека до и после видят
+    # разные идентичности, и ни один об этом не знает.
+    #
+    # Поэтому вердикт здесь — не единственное ожидание: кейс читает item PAM_USER
+    # со стороны приложения после попытки и требует, чтобы он не изменился.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-user-item-untouched "   "
+        expect: { exit_code: 0, stdout_matches: 'user-item: untouched' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
