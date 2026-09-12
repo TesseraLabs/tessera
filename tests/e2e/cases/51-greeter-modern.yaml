@@ -219,3 +219,27 @@ cases:
         timeout: 90
     teardown:
       - run: helpers/codes-server.sh cleanup
+
+  - id: GRM-010
+    title: Пароль в поле формы не становится идентификатором сервера выдачи
+    requirement: spec9:codes.CODE-102
+    # Тот же класс, что GRM-007, и другой выход. Второй ответ канала греетера —
+    # поле «Пароль»; на этом промпте оно становится идентификатором сервера
+    # выдачи, а тот входит в challenge. Challenge печатается QR'ом на экране
+    # входа, уезжает в браузер инженера и в запрос к выдаче, где попадает в
+    # журнал и в запись выдачи — то есть за пределы устройства, откуда его уже
+    # не убрать.
+    #
+    # Поэтому отказ обязан наступить ДО построения challenge: устройство знает
+    # билеты, которые ему выдали, и идентификатор, которого среди них нет,
+    # проверять нечем и незачем. Третий ответ в кейсе не подаётся намеренно —
+    # промпт личного номера означал бы, что набранное уже принято.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh expect-server-id-not-logged {{user}}
+               not-a-password-just-a-marker-91c4
+        expect: { exit_code: 0, stdout_matches: 'server-id: refused and unlogged' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup

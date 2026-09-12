@@ -126,6 +126,10 @@ DUMMY_COOKIE_HEX="00000000000000000000000000000000"
 # затем, чтобы проверять ЧИСЛО таких промптов: второй означает переспрос.
 NAME_PROMPT_LINE="${TESSERA_E2E_NAME_PROMPT:-Имя учётной записи: }"
 
+# Промпт личного номера инженера: по его наличию видно, что идентификатор
+# сервера выдачи модуль уже принял.
+ENGINEER_PROMPT_LINE="${TESSERA_E2E_ENGINEER_PROMPT:-Личный номер: }"
+
 # Журнал аудита устройства со сцеплением хешей — вторая половина проверки следа.
 AUDIT_JOURNAL="${TESSERA_E2E_AUDIT_JOURNAL:-/var/lib/tessera/audit.ndjson}"
 
@@ -263,6 +267,11 @@ usage: codes-server.sh <command> [args]
                         поле пароля вторым. --start задаёт, чем открыта
                         транзакция: пустым именем (по умолчанию, так делает
                         живой греетер) или отсутствующим вовсе
+  expect-server-id-not-logged <user> <строка>
+                        канал греетера, где поле пароля попадает на промпт
+                        сервера выдачи: отказ обязан прийти до challenge, а
+                        <строка> — не появиться ни в промптах, ни в тексте
+                        попытки, ни в журналах
   expect-empty-name-refused <user>
                         канал греетера, где поле имени пусто и больше ничего не
                         подаётся: отказ обязан прийти после ОДНОГО вопроса
@@ -1545,6 +1554,89 @@ cmd_answer_nothing() {
     cat "$out"
     cat "$err" >&2
     return "$rc"
+}
+
+# Разговор канала греетера, где поле пароля заполнено и попадает на промпт
+# идентификатора сервера выдачи.
+#
+# Тот же класс, что и с именем учётной записи, но выход другой: идентификатор
+# сервера входит в challenge, challenge — в QR на экране входа и в запрос к
+# выдаче, а оттуда в её журнал и запись. Отказ обязан наступить ДО построения
+# challenge, и набранное не должно остаться ни в промптах, ни в тексте попытки,
+# ни в журналах.
+#
+# $1 — имя учётной записи, $2 — что стоит в поле «Пароль».
+cmd_expect_server_id_not_logged() {
+    local user="${1:-}" secret="${2:-}"
+    [ -n "$user" ] && [ -n "$secret" ] \
+        || usage_error "usage: codes-server.sh expect-server-id-not-logged <user> <строка>"
+
+    load_prepared
+    greeter_modern_channel "$user"
+    # Канал: поле имени несёт имя учётной записи, поле пароля — заполнено.
+    # Личный номер подаётся третьим: без него разговор кончился бы на промпте
+    # личного номера сам собой, и кейс зеленел бы, ничего не проверив — модуль
+    # так и не дошёл бы до построения challenge. Ответ на промпт кода не
+    # подаётся: до него дело дойти не должно.
+    LEADING_ANSWERS=("$user" "$secret" "$ENGINEER_ID")
+
+    install -d -m 0700 "$RUN_DIR"
+    local fifo="$RUN_DIR/conv.in"
+    local out="$RUN_DIR/conv.out"
+    local err="$RUN_DIR/conv.err"
+    rm -f "$fifo" "$out" "$err"
+    mkfifo -m 0600 "$fifo"
+
+    local since
+    since="$(date +%s)"
+
+    env -u DISPLAY -u XAUTHORITY pam-drive "${DRIVER_FLAGS[@]}" \
+        --answers-per-prompt "$PAM_SERVICE_NAME" "${DRIVER_USER-$user}" authenticate \
+        < "$fifo" > "$out" 2> "$err" &
+    DRIVER_PID=$!
+
+    exec 3> "$fifo"
+    local leading
+    for leading in "${LEADING_ANSWERS[@]}"; do
+        printf '%s\n' "$leading" >&3
+    done
+    exec 3>&-
+
+    local rc=0
+    wait "$DRIVER_PID" || rc=$?
+    DRIVER_PID=""
+    rm -f "$fifo"
+    cat "$out"
+    cat "$err" >&2
+
+    if [ "$rc" = "0" ]; then
+        echo "codes-server: вход прошёл на пароле в поле сервера выдачи" >&2
+        return 1
+    fi
+    if grep -q "tessera-codes/v1/signed-challenge;" "$err"; then
+        echo "codes-server: challenge построен на набранном в поле пароля — он уже на экране и в запросе к выдаче" >&2
+        return 1
+    fi
+    # Промпт личного номера означает, что набранное принято как идентификатор
+    # сервера: отказ обязан прийти раньше, на самом идентификаторе.
+    if grep -q "^prompt: $ENGINEER_PROMPT_LINE" "$err"; then
+        echo "codes-server: у инженера спросили личный номер, хотя сервер выдачи уже негоден" >&2
+        return 1
+    fi
+    if grep -qF -- "$secret" "$err"; then
+        echo "codes-server: набранное вернулось в тексте промптов" >&2
+        return 1
+    fi
+    if journalctl -t pam_tessera --since "@$since" --no-pager 2>/dev/null \
+        | grep -qF -- "$secret"; then
+        echo "codes-server: набранное попало в журнал модуля" >&2
+        return 1
+    fi
+    if [ -f "$AUDIT_JOURNAL" ] && grep -qF -- "$secret" "$AUDIT_JOURNAL"; then
+        echo "codes-server: набранное попало в журнал аудита" >&2
+        return 1
+    fi
+    echo "server-id: refused and unlogged"
 }
 
 # Разговор канала греетера, где поле имени пусто и БОЛЬШЕ НИЧЕГО не подаётся.
@@ -2923,6 +3015,7 @@ main() {
         answer-nothing)       cmd_answer_nothing "$@" ;;
         expect-second-answer-not-logged) cmd_expect_second_answer_not_logged "$@" ;;
         expect-empty-name-refused) cmd_expect_empty_name_refused "$@" ;;
+        expect-server-id-not-logged) cmd_expect_server_id_not_logged "$@" ;;
         expect-payload-line-in-code-prompt) cmd_expect_payload_line_in_code_prompt "$@" ;;
         authenticate-with-code) cmd_authenticate_with_code "$@" ;;
         authenticate-mistyping-once) cmd_authenticate_mistyping_once "$@" ;;
