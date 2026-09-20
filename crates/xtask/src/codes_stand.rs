@@ -32,8 +32,9 @@ use p256::pkcs8::{EncodePrivateKey as _, EncodePublicKey as _, LineEnding};
 use sha2::{Digest as _, Sha256};
 
 use tessera_codes_contract::canon::Level;
+use tessera_codes_contract::device_number::CheckedDeviceNumber;
 use tessera_codes_contract::engineer::{
-    AuthenticatorKey, AuthorisationFields, EngineerAuthorisation, EngineerRecord,
+    AuthenticatorKey, AuthorisationFields, Devices, EngineerAuthorisation, EngineerRecord,
 };
 use tessera_codes_contract::registry::{DeviceRecord, RecordFields};
 use tessera_codes_contract::revocation::{
@@ -333,7 +334,8 @@ fn build(source_record: &DeviceRecord) -> Result<Bundle> {
     } = certificates(&root, &organisation)?;
     let engineer_id = engineer_number()?;
     let record = engineer_record(&organisation, &engineer_id)?;
-    let authorisation_doc = engineer_authorisation(&authorisation, &engineer_id)?;
+    let authorisation_doc =
+        engineer_authorisation(&authorisation, &engineer_id, device_record.device_number())?;
     let rights = rights_revocations(&authorisation)?;
 
     let ticket_authority = StandKey::from_seed(&TICKET_AUTHORITY_SEED)?;
@@ -409,7 +411,12 @@ fn build(source_record: &DeviceRecord) -> Result<Bundle> {
             (names::RIGHTS_REVOCATIONS, line(&rights.to_wire())),
             (
                 names::README,
-                readme(&engineer_id, device_record.owner_id()).into_bytes(),
+                readme(
+                    &engineer_id,
+                    device_record.owner_id(),
+                    device_record.device_number(),
+                )
+                .into_bytes(),
             ),
         ],
     })
@@ -822,11 +829,19 @@ fn engineer_record(organisation: &StandKey, engineer_id: &str) -> Result<Enginee
 ///
 /// Рамки вложены в потолок организации: одна её роль из двух, тот же уровень,
 /// та же метка. Авторизация шире потолка была бы документом, который парк не
-/// выпустил бы, и стенд, принимающий её, ничего не проверял бы.
+/// выпустил бы, и стенд, принимающий её, ничего не проверял бы. Список
+/// устройств — одно устройство комплекта; период совпадает с окном
+/// сертификатов.
 fn engineer_authorisation(
     authorisation: &StandKey,
     engineer_id: &str,
+    device: &CheckedDeviceNumber,
 ) -> Result<EngineerAuthorisation> {
+    // Устройство названо поимённо, а не маркером «любое»: комплект показывает
+    // разрешение на работу НА ЭТОМ устройстве, и документ, годный для соседней
+    // машины с той же меткой, проверял бы не ту гарантию.
+    let devices = Devices::only(std::slice::from_ref(device))
+        .map_err(|error| anyhow::anyhow!("устройства авторизации: {error}"))?;
     let fields = |signature: Signature| AuthorisationFields {
         engineer_id,
         organisation_id: ORGANISATION_ID,
@@ -834,9 +849,11 @@ fn engineer_authorisation(
         // и не притворяются им; сама авторизация в MVP привязана к личному
         // номеру, и это записано в ADR-CODES-003 как невыполненное требование.
         key_fingerprint: [0x00; 32],
+        devices: devices.clone(),
         tags: vec![CEILING_TAG.1.to_owned()],
         roles: vec![CEILING_ROLES[0].to_owned()],
         max_level: Level::new(u32::try_from(CEILING_LEVEL).unwrap_or(0)),
+        not_before: ClaimedTime::new(NOT_BEFORE),
         not_after: ClaimedTime::new(NOT_AFTER),
         authorisation_signature: signature,
     };
@@ -964,7 +981,7 @@ fn readme_device_record(owner_id: &str) -> String {
 }
 
 /// Опись комплекта.
-fn readme(engineer_id: &str, owner_id: &str) -> String {
+fn readme(engineer_id: &str, owner_id: &str, device_number: &CheckedDeviceNumber) -> String {
     format!(
         "# Комплект фикстур серверного стенда\n\
          \n\
@@ -985,7 +1002,10 @@ fn readme(engineer_id: &str, owner_id: &str) -> String {
            причиной `stub-provider`: настоящего провайдера в MVP нет.\n\
          - `{authorisation}` — авторизация того же инженера, подписанная КЛЮЧОМ\n\
            АВТОРИЗАЦИЙ парка (не организацией). Рамки вложены в потолок\n\
-           организации: одна роль из двух, тот же уровень, та же метка.\n\
+           организации: одна роль из двух, тот же уровень, та же метка. Список\n\
+           устройств — один номер, `{device_number}`: разрешение на работу на\n\
+           ЭТОМ устройстве, а не на любом с той же меткой. Период подписан\n\
+           обоими концами и совпадает с окном сертификатов.\n\
          - `{rights}` — подписанный список отзыва прав, пустой, серийный номер 1.\n\
          \n\
          {device_record_section}\
@@ -1046,6 +1066,7 @@ fn readme(engineer_id: &str, owner_id: &str) -> String {
         tag_key = CEILING_TAG.0,
         tag_value = CEILING_TAG.1,
         engineer = engineer_id,
+        device_number = device_number.significant(),
     )
 }
 
@@ -1292,6 +1313,47 @@ mod tests {
         let rights = SignedRevocationList::parse(file(names::RIGHTS_REVOCATIONS).trim()).unwrap();
         assert_eq!(rights.verify(&verifier), Ok(()));
         assert!(rights.list().entries().is_empty());
+    }
+
+    /// Авторизация комплекта названа на устройство комплекта, а не на любое.
+    ///
+    /// Комплект с авторизацией «на любое устройство» проверял бы не ту
+    /// гарантию: разрешение, годное на соседней машине с той же меткой, — это
+    /// ровно то состояние, ради которого список устройств и появился.
+    #[test]
+    fn the_authorisation_names_the_device_of_the_bundle() {
+        use tessera_codes_contract::engineer::{Devices, EngineerAuthorisation};
+
+        let source = source_record();
+        let bundle = build(&source).unwrap();
+        let text = String::from_utf8(
+            bundle
+                .files
+                .iter()
+                .find(|(name, _)| *name == names::ENGINEER_AUTHORISATION)
+                .expect("авторизация инженера")
+                .1
+                .clone(),
+        )
+        .unwrap();
+        let authorisation = EngineerAuthorisation::parse(text.trim()).unwrap();
+
+        assert!(authorisation.covers_device(source.device_number()));
+        let named = match authorisation.devices() {
+            Devices::Any => panic!("комплект выдан на любое устройство"),
+            Devices::Only(list) => list.as_slice().len(),
+        };
+        assert_eq!(named, 1);
+        assert!(
+            authorisation.applies_at(tessera_codes_contract::time::ClaimedTime::new(
+                super::NOT_BEFORE
+            ))
+        );
+        assert!(
+            !authorisation.applies_at(tessera_codes_contract::time::ClaimedTime::new(
+                super::NOT_BEFORE - 1
+            ))
+        );
     }
 
     /// Личный номер собран по правилу, а не написан руками.

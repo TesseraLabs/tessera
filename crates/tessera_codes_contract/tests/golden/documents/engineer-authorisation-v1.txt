@@ -1,19 +1,23 @@
-# The authorisation of an engineer, vector 1.
+# Авторизация инженера. Одно названное устройство.
 #
-# What an engineer may ask for, and until when. Signed by the AUTHORISATION KEY
-# of the fleet and not by the organisation: the ceiling of an organisation comes
-# from its certificate rather than from its signature, and an organisation
-# signing this document would be writing its own people any ceiling it liked.
+# Что инженер может просить, НА КАКИХ УСТРОЙСТВАХ и в какой период. Подписана
+# КЛЮЧОМ АВТОРИЗАЦИЙ парка, а не организацией: потолок организации приходит из
+# её сертификата, а не из её подписи.
 #
-# The organisation is still named in the document — it is the party the engineer
-# belongs to. Its signature is not here, and must not be.
+# Байты ниже — поверхность совместимости канала. Они не перегенерируются при
+# падении теста: расхождение разбирается.
+# Разрешение на устройство: список из одного номера. Тот же документ на
+# соседнем устройстве той же площадки не применяется — это и есть разница,
+# ради которой поле появилось.
 engineer = eng-7
 organisation = acme
 key_fingerprint_hex = 24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4
+devices = 77000123S
 tags = dc-1,hq
 roles = ops.dc.senior
 max_level = 2
+not_before = 1700000000
 not_after = 1800000000
 signature_hex = 03
-canon_hex = 00000030746573736572612d636f6465732d636f6e74726163742f76312f656e67696e6565722d617574686f7269736174696f6e00000005656e672d370000000461636d650000002024a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d400000004000000020000000464632d3100000002687100000004000000010000000d6f70732e64632e73656e696f72000000040000000200000008000000006b49d200
-wire = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_after=1800000000;authorisation_signature=03
+canon_hex = 00000030746573736572612d636f6465732d636f6e74726163742f76312f656e67696e6565722d617574686f7269736174696f6e00000005656e672d370000000461636d650000002024a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d400000004000000010000000937373030303132335300000004000000020000000464632d3100000002687100000004000000010000000d6f70732e64632e73656e696f72000000040000000200000008000000006553f10000000008000000006b49d200
+wire = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77000123S;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03

@@ -33,7 +33,8 @@
 //!   signatures over it in the order they are made, and what the record says
 //!   about where the device key is kept.
 //! - [`engineer`] — the registry record of a person and the authorisation that
-//!   says what they may ask for, kept apart on purpose.
+//!   says what they may ask for, on which devices and during which period,
+//!   kept apart on purpose.
 //! - [`request`] — the signed request of an engineer: one canonical object with
 //!   the challenge inside it and the authorisation fields in a single copy.
 //! - [`grant`] — what the issuing side answers a request with: the signed

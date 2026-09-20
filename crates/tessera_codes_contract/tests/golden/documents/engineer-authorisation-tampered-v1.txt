@@ -1,0 +1,10 @@
+# Авторизация инженера: правка подписанного документа.
+#
+# Оба новых поля сужают права, а сужение вне подписанных байтов — пожелание:
+# подписанный документ ниже правится ровно так, как его правил бы тот, кому
+# нужно больше прав, и подпись обязана перестать сходиться.
+wire = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77000123S;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# Одно устройство превращается в любое.
+widened_devices_wire = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=*;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# Период начинается сутками раньше одобренного.
+earlier_start_wire = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77000123S;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1699913600;not_after=1800000000;authorisation_signature=03

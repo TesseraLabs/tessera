@@ -6,8 +6,8 @@
 //!   when a person joins or their key is replaced — rarely, and by the
 //!   organisation;
 //! - the **authorisation** says what that person may ask for, within which
-//!   bounds and until when. It changes often, and it is the thing a fleet
-//!   narrows in a hurry.
+//!   bounds, on which devices and during which period. It changes often, and
+//!   it is the thing a fleet narrows in a hurry.
 //!
 //! Keeping them in one document would tie the two together: narrowing what
 //! somebody may do would mean re-issuing the statement that they exist, and the
@@ -26,6 +26,7 @@
 //! it states it here and in the documentation of [`EngineerAuthorisation`].
 
 use crate::canon::{CanonError, Encoder, Level};
+use crate::device_number::{CheckedDeviceNumber, DeviceNumberError};
 use crate::mac::{sha256, DIGEST_LEN};
 use crate::signature::{PublicKey, Signature, SignatureError, SignatureVerifier, SignerRef};
 use crate::time::ClaimedTime;
@@ -41,7 +42,7 @@ pub const AUTHORISATION_PREFIX: &str = "tessera-codes/v1/engineer-authorisation"
 pub const ENGINEER_RECORD_FIELD_COUNT: usize = 5;
 
 /// Number of fields an authorisation carries.
-pub const AUTHORISATION_FIELD_COUNT: usize = 8;
+pub const AUTHORISATION_FIELD_COUNT: usize = 10;
 
 /// Field keys of the record, in the only order the parser accepts.
 const RECORD_KEYS: [&str; ENGINEER_RECORD_FIELD_COUNT] = [
@@ -57,9 +58,11 @@ const AUTHORISATION_KEYS: [&str; AUTHORISATION_FIELD_COUNT] = [
     "engineer",
     "organisation",
     "key_fingerprint",
+    "devices",
     "tags",
     "roles",
     "max_level",
+    "not_before",
     "not_after",
     "authorisation_signature",
 ];
@@ -80,6 +83,214 @@ const AUTHORISATION_LABEL: &str = "tessera-codes-contract/v1/engineer-authorisat
 /// collide with a real role, and "may ask for anything" stays visible in the
 /// document instead of being expressed by an empty list.
 pub const ALL_ROLES: &str = "*";
+
+/// Marker standing for "every device of the fleet" in the list of devices.
+///
+/// The same marker as [`ALL_ROLES`], and it cannot collide with a device: a
+/// number is read by [`CheckedDeviceNumber`], which counts only letters and
+/// digits, so `*` carries no significant character and parses as no number at
+/// all.
+pub const ALL_DEVICES: &str = "*";
+
+/// Largest number of devices one authorisation may name.
+///
+/// There is a bound at all because an unbounded list is a way to write a
+/// document nobody can read: the person approving a work permission has to see
+/// which devices it opens, and a list that does not fit on a screen is approved
+/// by scrolling past it. The figure is a working one — a shift of a brigade
+/// over a site, not a fleet — and raising it is a decision about what an
+/// approver is still able to check, not a constant to be nudged when a list
+/// does not fit.
+pub const MAX_DEVICES: usize = 64;
+
+/// The devices an authorisation is granted for.
+///
+/// # Why a type and not a list with a convention
+///
+/// Because the two cases must not be told apart by the shape of a list. An
+/// empty list, a missing field and a list nobody filled in all read as "no
+/// restriction" to somebody writing a consumer in a hurry, and the widest
+/// possible permission is exactly the reading a mistake must never produce.
+/// Here "every device" is a thing somebody wrote down, and everything else is a
+/// named set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Devices {
+    /// Every device the rest of the authorisation admits.
+    ///
+    /// Only the list of devices is lifted: the tags, the roles, the level and
+    /// the period still hold.
+    Any,
+    /// The devices named in the document, and no others.
+    Only(DeviceList),
+}
+
+impl Devices {
+    /// Names the devices an authorisation is granted for.
+    ///
+    /// The set is canonicalised: the numbers are sorted by their significant
+    /// form and kept in it, so that one permission written by two people is one
+    /// document and not two.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineerError::NoDevices`] for an empty set — a document that names no
+    /// device is not a narrower permission, it is one nobody can act on — and
+    /// [`EngineerError::TooManyDevices`] above [`MAX_DEVICES`].
+    /// [`EngineerError::DuplicateDevice`] when one number is named twice: the
+    /// second mention is either a mistake or a different number somebody
+    /// mistyped, and dropping it silently would change what was approved.
+    pub fn only(numbers: &[CheckedDeviceNumber]) -> Result<Self, EngineerError> {
+        DeviceList::new(numbers).map(Self::Only)
+    }
+
+    /// Reports whether the authorisation is granted for `number`.
+    ///
+    /// Compared on the significant form, so two spellings of one number are one
+    /// device — the same rule the check character and the canonical bytes are
+    /// built on.
+    #[must_use]
+    pub fn covers(&self, number: &CheckedDeviceNumber) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Only(list) => list
+                .as_slice()
+                .iter()
+                .any(|named| named.significant() == number.significant()),
+        }
+    }
+
+    /// Returns the items the field is written from, marker included.
+    fn items(&self) -> Vec<&str> {
+        match self {
+            Self::Any => vec![ALL_DEVICES],
+            Self::Only(list) => list
+                .as_slice()
+                .iter()
+                .map(CheckedDeviceNumber::significant)
+                .collect(),
+        }
+    }
+
+    /// Reads the field of the wire form.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineerError::DeviceMarkerBesideNumbers`] when the marker travels
+    /// beside a number — two statements in one field — and, for a field that is
+    /// not canonical, [`EngineerError::DeviceNotSignificantForm`] and
+    /// [`EngineerError::DevicesOutOfOrder`]: a document read in a spelling or
+    /// an order other than the one it was written in is not the document that
+    /// was signed. [`EngineerError::TooManyDevices`],
+    /// [`EngineerError::DuplicateDevice`] and the errors of the number itself
+    /// follow. An empty field never reaches here — the wire refuses an empty
+    /// value before the field is read — so [`EngineerError::NoDevices`] belongs
+    /// to the assembly of a document and not to its reading.
+    fn parse_field(value: &str) -> Result<Self, EngineerError> {
+        // Counted before anything is collected: the count walks the field
+        // without allocating, and a field of a million items would otherwise
+        // materialise a million slices on its way to being refused.
+        let count = value.split(wire::LIST_SEPARATOR).count();
+        if value
+            .split(wire::LIST_SEPARATOR)
+            .any(|item| item == ALL_DEVICES)
+        {
+            return if count == 1 {
+                Ok(Self::Any)
+            } else {
+                Err(EngineerError::DeviceMarkerBesideNumbers)
+            };
+        }
+        if count > MAX_DEVICES {
+            return Err(EngineerError::TooManyDevices { got: count });
+        }
+
+        let mut numbers = Vec::with_capacity(count);
+        for item in value.split(wire::LIST_SEPARATOR) {
+            let number = CheckedDeviceNumber::parse(item)?;
+            // The significant form and nothing else. Separators and lowercase
+            // fold away for the check character, so `77-000123s` and
+            // `77000123S` are one device — and a reader that accepted both
+            // would take two different fields as one document, while the
+            // signature covers only the bytes that were actually written.
+            if item != number.significant() {
+                return Err(EngineerError::DeviceNotSignificantForm {
+                    written: item.to_owned(),
+                    significant: number.significant().to_owned(),
+                });
+            }
+            numbers.push(number);
+        }
+        for pair in numbers.windows(2) {
+            let (Some(left), Some(right)) = (pair.first(), pair.last()) else {
+                continue;
+            };
+            // A number repeated is reported as a duplicate by the constructor
+            // below, which sees the whole set; what is caught here is the order
+            // the document was written in.
+            if right.significant() < left.significant() {
+                return Err(EngineerError::DevicesOutOfOrder {
+                    number: right.significant().to_owned(),
+                    after: left.significant().to_owned(),
+                });
+            }
+        }
+        Self::only(&numbers)
+    }
+}
+
+/// A canonically ordered set of device numbers, non-empty and within
+/// [`MAX_DEVICES`].
+///
+/// A type of its own so that the invariants travel with the value: were
+/// [`Devices::Only`] to carry a bare vector, any consumer could assemble a
+/// document with an empty, unsorted or duplicated list, and the parser would be
+/// the only place the rules held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceList {
+    numbers: Vec<CheckedDeviceNumber>,
+}
+
+impl DeviceList {
+    /// Canonicalises a set of numbers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Devices::only`].
+    fn new(numbers: &[CheckedDeviceNumber]) -> Result<Self, EngineerError> {
+        if numbers.is_empty() {
+            return Err(EngineerError::NoDevices);
+        }
+        if numbers.len() > MAX_DEVICES {
+            return Err(EngineerError::TooManyDevices { got: numbers.len() });
+        }
+
+        // Kept in the significant form, not in the one the caller wrote: the
+        // wire form, the signed bytes and the comparison then agree by
+        // construction, and a document assembled from a label with separators
+        // reads back as the document that was signed.
+        let mut canonical: Vec<CheckedDeviceNumber> = Vec::with_capacity(numbers.len());
+        for number in numbers {
+            canonical.push(CheckedDeviceNumber::parse(number.significant())?);
+        }
+        canonical.sort_by(|left, right| left.significant().cmp(right.significant()));
+        for pair in canonical.windows(2) {
+            if let (Some(left), Some(right)) = (pair.first(), pair.last()) {
+                if left.significant() == right.significant() {
+                    return Err(EngineerError::DuplicateDevice {
+                        number: left.significant().to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(Self { numbers: canonical })
+    }
+
+    /// Returns the numbers, in canonical order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[CheckedDeviceNumber] {
+        &self.numbers
+    }
+}
 
 /// Separator between the marker of an absent authenticator and its reason.
 const ABSENT_SEPARATOR: char = ':';
@@ -411,12 +622,16 @@ pub struct AuthorisationFields<'a> {
     pub organisation_id: &'a str,
     /// Fingerprint of the authenticator key it is granted to.
     pub key_fingerprint: [u8; DIGEST_LEN],
+    /// Devices the engineer may work on: the named ones, or every device.
+    pub devices: Devices,
     /// Site tags the engineer may work at. At least one.
     pub tags: Vec<String>,
     /// Roles the engineer may ask for, or the marker [`ALL_ROLES`].
     pub roles: Vec<String>,
     /// Highest level the engineer may ask for.
     pub max_level: Level,
+    /// When the authorisation starts.
+    pub not_before: ClaimedTime,
     /// When the authorisation stops.
     pub not_after: ClaimedTime,
     /// Signature of the fleet's authorisation key over the authorisation.
@@ -425,10 +640,18 @@ pub struct AuthorisationFields<'a> {
 
 /// What an engineer may ask for, and until when.
 ///
+/// # Both ends of the period are signed
+///
+/// A permission to work is "this person, on these devices, from this moment
+/// until that one". Both ends travel inside the signed bytes, so a document
+/// issued for next week cannot be used today by a consumer that only looked at
+/// the far end, and moving the near end means signing a new document.
+/// [`EngineerAuthorisation::applies_at`] is the one rule for it.
+///
 /// # This document is not freshness
 ///
-/// The term says when the authorisation stops being valid at the latest. It
-/// says nothing about whether it was withdrawn this morning. A consumer must
+/// The period says when the authorisation holds at the latest. It says nothing
+/// about whether it was withdrawn this morning. A consumer must
 /// check the status-token ([`crate::status`]) **before** using an authorisation
 /// for anything — the specification puts it plainly, and the ordering is the
 /// consumer's to enforce because the token comes from a service this crate
@@ -438,9 +661,11 @@ pub struct EngineerAuthorisation {
     engineer_id: String,
     organisation_id: String,
     key_fingerprint: [u8; DIGEST_LEN],
+    devices: Devices,
     tags: Vec<String>,
     roles: Vec<String>,
     max_level: Level,
+    not_before: ClaimedTime,
     not_after: ClaimedTime,
     authorisation_signature: Signature,
 }
@@ -455,7 +680,8 @@ impl EngineerAuthorisation {
     /// narrower authorisation, it is one nobody can read — and
     /// [`EngineerError::MarkerBesideNames`] when the marker for "every role"
     /// travels beside a named role, which is two different statements in one
-    /// list. The wire errors follow for an item the format cannot hold.
+    /// list, and [`EngineerError::PeriodNotOrdered`] when the period does not
+    /// run forwards. The wire errors follow for an item the format cannot hold.
     pub fn new(fields: AuthorisationFields<'_>) -> Result<Self, EngineerError> {
         wire::check_free_text("engineer", fields.engineer_id)?;
         wire::check_free_text("organisation", fields.organisation_id)?;
@@ -474,13 +700,24 @@ impl EngineerAuthorisation {
         if fields.roles.iter().any(|role| role == ALL_ROLES) && fields.roles.len() > 1 {
             return Err(EngineerError::MarkerBesideNames);
         }
+        // An empty period would be a document that never applies, and a
+        // reversed one reads as a wide permission to anybody comparing against
+        // one end only.
+        if fields.not_before.get() >= fields.not_after.get() {
+            return Err(EngineerError::PeriodNotOrdered {
+                not_before: fields.not_before.get(),
+                not_after: fields.not_after.get(),
+            });
+        }
         Ok(Self {
             engineer_id: fields.engineer_id.to_owned(),
             organisation_id: fields.organisation_id.to_owned(),
             key_fingerprint: fields.key_fingerprint,
+            devices: fields.devices,
             tags: fields.tags,
             roles: fields.roles,
             max_level: fields.max_level,
+            not_before: fields.not_before,
             not_after: fields.not_after,
             authorisation_signature: fields.authorisation_signature,
         })
@@ -504,6 +741,12 @@ impl EngineerAuthorisation {
         &self.key_fingerprint
     }
 
+    /// Returns the devices the authorisation is granted for.
+    #[must_use]
+    pub const fn devices(&self) -> &Devices {
+        &self.devices
+    }
+
     /// Returns the site tags.
     #[must_use]
     pub fn tags(&self) -> &[String] {
@@ -520,6 +763,12 @@ impl EngineerAuthorisation {
     #[must_use]
     pub const fn max_level(&self) -> Level {
         self.max_level
+    }
+
+    /// Returns the moment the authorisation starts.
+    #[must_use]
+    pub const fn not_before(&self) -> ClaimedTime {
+        self.not_before
     }
 
     /// Returns the moment the authorisation stops.
@@ -548,12 +797,29 @@ impl EngineerAuthorisation {
         self.tags.iter().any(|named| named == tag)
     }
 
-    /// Reports whether the term still holds at `now`.
+    /// Reports whether the authorisation covers `device`.
+    ///
+    /// The number must be the one of a device whose registry record and key the
+    /// consumer has already checked. A number taken from a request, a screen or
+    /// a field somebody filled in names a device; it does not establish which
+    /// device is in front of the engineer.
+    #[must_use]
+    pub fn covers_device(&self, device: &CheckedDeviceNumber) -> bool {
+        self.devices.covers(device)
+    }
+
+    /// Reports whether the period holds at `now`: it has started and has not
+    /// ended.
+    ///
+    /// One predicate on the type so that every consumer applies one rule. The
+    /// near end is inclusive and the far end is not: a permission that runs
+    /// until noon is not a permission at noon, and a permission from noon is
+    /// one at noon.
     ///
     /// Not freshness — see the type documentation.
     #[must_use]
-    pub const fn within_term(&self, now: ClaimedTime) -> bool {
-        now.get() <= self.not_after.get()
+    pub const fn applies_at(&self, now: ClaimedTime) -> bool {
+        self.not_before.get() <= now.get() && now.get() < self.not_after.get()
     }
 
     /// Returns the digest of the authorisation.
@@ -580,9 +846,15 @@ impl EngineerAuthorisation {
         encoder.push_text("engineer_id", &self.engineer_id)?;
         encoder.push_text("organisation_id", &self.organisation_id)?;
         encoder.push_bytes("key_fingerprint", &self.key_fingerprint)?;
+        // The marker travels inside the list, exactly as it does for the roles:
+        // "every device" is an item somebody wrote, and a list of one marker
+        // cannot be confused with a list of one device — no device number
+        // carries a significant character `*` to be written that way.
+        push_items(&mut encoder, "devices", &self.devices.items())?;
         push_list(&mut encoder, "tags", &self.tags)?;
         push_list(&mut encoder, "roles", &self.roles)?;
         encoder.push_u32("max_level", self.max_level.get())?;
+        encoder.push_u64("not_before", self.not_before.get())?;
         encoder.push_u64("not_after", self.not_after.get())?;
         Ok(encoder.finish())
     }
@@ -619,9 +891,11 @@ impl EngineerAuthorisation {
             ("engineer", self.engineer_id.clone()),
             ("organisation", self.organisation_id.clone()),
             ("key_fingerprint", hex::encode(self.key_fingerprint)),
+            ("devices", self.devices.items().join(",")),
             ("tags", self.tags.join(",")),
             ("roles", self.roles.join(",")),
             ("max_level", self.max_level.get().to_string()),
+            ("not_before", self.not_before.get().to_string()),
             ("not_after", self.not_after.get().to_string()),
             (
                 "authorisation_signature",
@@ -654,13 +928,15 @@ impl EngineerAuthorisation {
             engineer_id: wire::value(&values, 0),
             organisation_id: wire::value(&values, 1),
             key_fingerprint,
-            tags: split_list(wire::value(&values, 3)),
-            roles: split_list(wire::value(&values, 4)),
-            max_level: Level::new(wire::parse_u32("max_level", wire::value(&values, 5))?),
-            not_after: ClaimedTime::new(wire::parse_u64("not_after", wire::value(&values, 6))?),
+            devices: Devices::parse_field(wire::value(&values, 3))?,
+            tags: split_list(wire::value(&values, 4)),
+            roles: split_list(wire::value(&values, 5)),
+            max_level: Level::new(wire::parse_u32("max_level", wire::value(&values, 6))?),
+            not_before: ClaimedTime::new(wire::parse_u64("not_before", wire::value(&values, 7))?),
+            not_after: ClaimedTime::new(wire::parse_u64("not_after", wire::value(&values, 8))?),
             authorisation_signature: Signature::new(wire::parse_hex(
                 "authorisation_signature",
-                wire::value(&values, 7),
+                wire::value(&values, 9),
             )?)?,
         })
     }
@@ -693,6 +969,16 @@ fn push_list(
     field: &'static str,
     items: &[String],
 ) -> Result<(), CanonError> {
+    let borrowed: Vec<&str> = items.iter().map(String::as_str).collect();
+    push_items(encoder, field, &borrowed)
+}
+
+/// Encodes a list held as borrowed items, on the same terms as [`push_list`].
+fn push_items(
+    encoder: &mut Encoder,
+    field: &'static str,
+    items: &[&str],
+) -> Result<(), CanonError> {
     let count = u32::try_from(items.len()).map_err(|_| CanonError::FieldTooLong { field })?;
     encoder.push_u32(field, count)?;
     for item in items {
@@ -713,6 +999,54 @@ pub enum EngineerError {
     /// The marker for every role travels beside a named role.
     #[error("the marker for every role cannot travel beside a named role")]
     MarkerBesideNames,
+    /// The authorisation names no device.
+    #[error("the authorisation names no device")]
+    NoDevices,
+    /// The marker for every device travels beside a device number.
+    #[error("the marker for every device cannot travel beside a device number")]
+    DeviceMarkerBesideNumbers,
+    /// The authorisation names more devices than the format admits.
+    #[error(
+        "the authorisation names {got} devices where the format admits {}",
+        MAX_DEVICES
+    )]
+    TooManyDevices {
+        /// Number of devices the document named.
+        got: usize,
+    },
+    /// One device is named twice.
+    #[error("the authorisation names the device `{number}` twice")]
+    DuplicateDevice {
+        /// The number that is named twice, in its significant form.
+        number: String,
+    },
+    /// The devices are not in canonical order.
+    #[error("the device `{number}` is written after `{after}`, which is not canonical order")]
+    DevicesOutOfOrder {
+        /// The number that arrived out of order, in its significant form.
+        number: String,
+        /// The number it was written after, in its significant form.
+        after: String,
+    },
+    /// A device number is written in something other than its significant form.
+    #[error("the device `{written}` is not written in its significant form `{significant}`")]
+    DeviceNotSignificantForm {
+        /// The spelling the document carried.
+        written: String,
+        /// The only spelling the document may carry.
+        significant: String,
+    },
+    /// A device number does not check out.
+    #[error("the authorisation names a device number that is not well formed: {0}")]
+    DeviceNumber(#[from] DeviceNumberError),
+    /// The period of the authorisation does not run forwards.
+    #[error("the authorisation starts at {not_before} and stops at {not_after}")]
+    PeriodNotOrdered {
+        /// Moment the document says the authorisation starts.
+        not_before: u64,
+        /// Moment the document says it stops.
+        not_after: u64,
+    },
     /// A digest field is not the width of a digest.
     #[error(
         "the field `{field}` is {got} bytes where the format has {}",
@@ -765,10 +1099,12 @@ pub enum EngineerError {
 )]
 mod tests {
     use super::{
-        AuthenticatorKey, AuthorisationFields, EngineerAuthorisation, EngineerError,
-        EngineerRecord, ALL_ROLES, AUTHORISATION_PREFIX, ENGINEER_RECORD_PREFIX,
+        AuthenticatorKey, AuthorisationFields, DeviceNumberError, Devices, EngineerAuthorisation,
+        EngineerError, EngineerRecord, ALL_DEVICES, ALL_ROLES, AUTHORISATION_PREFIX,
+        ENGINEER_RECORD_PREFIX, MAX_DEVICES,
     };
     use crate::canon::Level;
+    use crate::device_number::CheckedDeviceNumber;
     use crate::signature::{PublicKey, Signature, SignatureError, SignatureVerifier, SignerRef};
     use crate::time::ClaimedTime;
     use crate::wire::WireError;
@@ -820,9 +1156,11 @@ mod tests {
             engineer_id: "eng-7",
             organisation_id: "acme",
             key_fingerprint: record().key_fingerprint().unwrap(),
+            devices: Devices::Any,
             tags: vec!["dc-1".to_owned(), "hq".to_owned()],
             roles: vec!["ops.dc.senior".to_owned()],
             max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_700_000_000),
             not_after: ClaimedTime::new(1_800_000_000),
             authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
@@ -935,9 +1273,11 @@ mod tests {
             engineer_id: "eng-7",
             organisation_id: "acme",
             key_fingerprint: record().key_fingerprint().unwrap(),
+            devices: Devices::Any,
             tags: vec!["dc-1".to_owned(), "hq".to_owned()],
             roles: vec!["ops.dc.senior".to_owned()],
             max_level: Level::new(3),
+            not_before: ClaimedTime::new(1_700_000_000),
             not_after: ClaimedTime::new(1_800_000_000),
             authorisation_signature: signed.authorisation_signature().clone(),
         })
@@ -979,8 +1319,12 @@ mod tests {
         assert!(!authorisation.covers_role("ops.dc.root"));
         assert!(authorisation.covers_tag("dc-1"));
         assert!(!authorisation.covers_tag("dc-2"));
-        assert!(authorisation.within_term(ClaimedTime::new(1_800_000_000)));
-        assert!(!authorisation.within_term(ClaimedTime::new(1_800_000_001)));
+        assert!(authorisation.applies_at(ClaimedTime::new(1_700_000_000)));
+        assert!(authorisation.applies_at(ClaimedTime::new(1_799_999_999)));
+        // The near end is inclusive and the far end is not: a permission until
+        // noon is not a permission at noon.
+        assert!(!authorisation.applies_at(ClaimedTime::new(1_699_999_999)));
+        assert!(!authorisation.applies_at(ClaimedTime::new(1_800_000_000)));
     }
 
     #[test]
@@ -991,9 +1335,11 @@ mod tests {
                 engineer_id: "eng-7",
                 organisation_id: "acme",
                 key_fingerprint: [0x11; 32],
+                devices: Devices::Any,
                 tags: vec!["dc-1".to_owned()],
                 roles: vec![ALL_ROLES.to_owned()],
                 max_level: Level::new(2),
+                not_before: ClaimedTime::new(1_700_000_000),
                 not_after: ClaimedTime::new(1_800_000_000),
                 authorisation_signature: Signature::new(vec![0x03]).unwrap(),
             }
@@ -1005,9 +1351,11 @@ mod tests {
             engineer_id: "eng-7",
             organisation_id: "acme",
             key_fingerprint: [0x11; 32],
+            devices: Devices::Any,
             tags: vec!["dc-1".to_owned()],
             roles: vec![ALL_ROLES.to_owned(), "ops.dc.senior".to_owned()],
             max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_700_000_000),
             not_after: ClaimedTime::new(1_800_000_000),
             authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         });
@@ -1020,9 +1368,11 @@ mod tests {
             engineer_id: "eng-7",
             organisation_id: "acme",
             key_fingerprint: [0x11; 32],
+            devices: Devices::Any,
             tags: vec!["dc-1".to_owned()],
             roles: Vec::new(),
             max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_700_000_000),
             not_after: ClaimedTime::new(1_800_000_000),
             authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         });
@@ -1048,9 +1398,11 @@ mod tests {
             engineer_id: "eng-7",
             organisation_id: "acme",
             key_fingerprint: record().key_fingerprint().unwrap(),
+            devices: Devices::Any,
             tags: vec!["dc-1".to_owned(), "hq".to_owned()],
             roles: vec!["ops.dc.senior".to_owned()],
             max_level: Level::new(3),
+            not_before: ClaimedTime::new(1_700_000_000),
             not_after: ClaimedTime::new(1_800_000_000),
             authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
@@ -1061,9 +1413,11 @@ mod tests {
             engineer_id: "eng-7",
             organisation_id: "acme",
             key_fingerprint: record().key_fingerprint().unwrap(),
+            devices: Devices::Any,
             tags: vec!["dc-1".to_owned(), "hq".to_owned()],
             roles: vec!["ops.dc.senior".to_owned()],
             max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_700_000_000),
             not_after: ClaimedTime::new(1_900_000_000),
             authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
@@ -1080,9 +1434,11 @@ mod tests {
             engineer_id: "eng-7",
             organisation_id: "acme",
             key_fingerprint: [0x11; 32],
+            devices: Devices::Any,
             tags: vec!["ab".to_owned(), "c".to_owned()],
             roles: vec!["r".to_owned()],
             max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_700_000_000),
             not_after: ClaimedTime::new(1_800_000_000),
             authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
@@ -1091,9 +1447,11 @@ mod tests {
             engineer_id: "eng-7",
             organisation_id: "acme",
             key_fingerprint: [0x11; 32],
+            devices: Devices::Any,
             tags: vec!["a".to_owned(), "bc".to_owned()],
             roles: vec!["r".to_owned()],
             max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_700_000_000),
             not_after: ClaimedTime::new(1_800_000_000),
             authorisation_signature: Signature::new(vec![0x03]).unwrap(),
         })
@@ -1172,6 +1530,358 @@ mod tests {
             Err(EngineerError::Wire(WireError::NotANumber {
                 field: "max_level"
             }))
+        ));
+    }
+
+    /// A device number of the stand, built so that the check character is the
+    /// one the algorithm computes.
+    fn device(body: &str) -> CheckedDeviceNumber {
+        CheckedDeviceNumber::from_body(body).unwrap()
+    }
+
+    /// The same authorisation, granted for the devices given.
+    fn authorisation_for(devices: Devices) -> EngineerAuthorisation {
+        EngineerAuthorisation::new(AuthorisationFields {
+            engineer_id: "eng-7",
+            organisation_id: "acme",
+            key_fingerprint: [0x11; 32],
+            devices,
+            tags: vec!["dc-1".to_owned()],
+            roles: vec!["ops.dc.senior".to_owned()],
+            max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_700_000_000),
+            not_after: ClaimedTime::new(1_800_000_000),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_authorisation_covers_the_devices_it_names_and_no_others() {
+        // The defect this field closes: a permission to work on one device was
+        // a permission to work on every device of the same site, because the
+        // tags were all the document narrowed.
+        let authorisation = authorisation_for(Devices::only(&[device("77-000123")]).unwrap());
+        assert!(authorisation.covers_device(&device("77-000123")));
+        assert!(!authorisation.covers_device(&device("77-000456")));
+        assert!(authorisation.covers_tag("dc-1"));
+    }
+
+    #[test]
+    fn the_marker_covers_every_device_and_cannot_stand_beside_a_number() {
+        let all = authorisation_for(Devices::Any);
+        assert!(all.covers_device(&device("77-000123")));
+        assert!(all.covers_device(&device("99-999999")));
+        assert_eq!(EngineerAuthorisation::parse(&all.to_wire()), Ok(all));
+
+        let named = authorisation_for(Devices::only(&[device("77-000123")]).unwrap());
+        let mixed = named.to_wire().replace(
+            &format!("devices={}", device("77-000123").significant()),
+            &format!(
+                "devices={ALL_DEVICES},{}",
+                device("77-000123").significant()
+            ),
+        );
+        assert_eq!(
+            EngineerAuthorisation::parse(&mixed),
+            Err(EngineerError::DeviceMarkerBesideNumbers)
+        );
+    }
+
+    #[test]
+    fn a_set_of_devices_is_canonical_however_it_was_written() {
+        // Two people writing one permission must produce one document: the
+        // numbers are sorted and folded to their significant form, so a label
+        // read with separators and a number typed in lowercase are the same
+        // device and the same signed bytes.
+        let canonical = Devices::only(&[
+            device("77-000456"),
+            device("77-000123"),
+            device("77-000789"),
+        ])
+        .unwrap();
+        let spelled = Devices::only(&[
+            CheckedDeviceNumber::parse(&device("77-000789").as_str().to_lowercase()).unwrap(),
+            CheckedDeviceNumber::parse(&device("77-000123").as_str().replace('-', " ")).unwrap(),
+            device("77-000456"),
+        ])
+        .unwrap();
+        assert_eq!(canonical, spelled);
+
+        let authorisation = authorisation_for(canonical);
+        let written: Vec<String> = match authorisation.devices() {
+            Devices::Any => Vec::new(),
+            Devices::Only(list) => list
+                .as_slice()
+                .iter()
+                .map(|number| number.significant().to_owned())
+                .collect(),
+        };
+        let mut sorted = written.clone();
+        sorted.sort();
+        assert_eq!(written, sorted);
+        assert_eq!(
+            EngineerAuthorisation::parse(&authorisation.to_wire()),
+            Ok(authorisation)
+        );
+    }
+
+    #[test]
+    fn a_set_of_devices_that_nobody_can_read_is_refused() {
+        assert_eq!(Devices::only(&[]), Err(EngineerError::NoDevices));
+
+        // One over the bound, so the test measures the bound and not a number
+        // somebody liked the look of.
+        let many: Vec<CheckedDeviceNumber> = (0..=MAX_DEVICES)
+            .map(|index| device(&format!("77-{index:06}")))
+            .collect();
+        assert_eq!(many.len(), MAX_DEVICES + 1);
+        assert_eq!(
+            Devices::only(&many),
+            Err(EngineerError::TooManyDevices {
+                got: MAX_DEVICES + 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_device_named_twice_is_refused_rather_than_quietly_dropped() {
+        // A repeated number is a mistake somebody made while writing the
+        // permission, and the two readings of it — the same device twice, or a
+        // second device mistyped — are a question for the person approving it.
+        let twice = Devices::only(&[
+            device("77-000123"),
+            device("77-000456"),
+            CheckedDeviceNumber::parse(&device("77-000123").as_str().to_lowercase()).unwrap(),
+        ]);
+        assert_eq!(
+            twice,
+            Err(EngineerError::DuplicateDevice {
+                number: device("77-000123").significant().to_owned()
+            })
+        );
+
+        let authorisation = authorisation_for(Devices::only(&[device("77-000123")]).unwrap());
+        let significant = device("77-000123").significant().to_owned();
+        let doubled = authorisation.to_wire().replace(
+            &format!("devices={significant}"),
+            &format!("devices={significant},{significant}"),
+        );
+        assert_eq!(
+            EngineerAuthorisation::parse(&doubled),
+            Err(EngineerError::DuplicateDevice {
+                number: significant
+            })
+        );
+    }
+
+    #[test]
+    fn a_set_of_devices_out_of_canonical_order_does_not_parse() {
+        // A document read in an order other than the one it was written in is
+        // not the document that was signed, so the reader refuses it instead of
+        // sorting it into shape.
+        let first = device("77-000123").significant().to_owned();
+        let second = device("77-000456").significant().to_owned();
+        let authorisation =
+            authorisation_for(Devices::only(&[device("77-000123"), device("77-000456")]).unwrap());
+        let swapped = authorisation.to_wire().replace(
+            &format!("devices={first},{second}"),
+            &format!("devices={second},{first}"),
+        );
+        assert_eq!(
+            EngineerAuthorisation::parse(&swapped),
+            Err(EngineerError::DevicesOutOfOrder {
+                number: first,
+                after: second
+            })
+        );
+    }
+
+    #[test]
+    fn a_device_written_in_another_spelling_does_not_parse() {
+        // The spelling is not cosmetic. Separators and case fold away for the
+        // check character, so `77-000123s` names the same device as
+        // `77000123S`; a reader that took both would read two different fields
+        // as one document, while the signature covers the bytes that were
+        // written and not the device they mean.
+        let authorisation = authorisation_for(Devices::only(&[device("77-000123")]).unwrap());
+        let significant = device("77-000123").significant().to_owned();
+        for spelling in ["77-000123-S", "77000123s", " 77000123S"] {
+            let text = authorisation.to_wire().replace(
+                &format!("devices={significant}"),
+                &format!("devices={spelling}"),
+            );
+            assert_eq!(
+                EngineerAuthorisation::parse(&text),
+                Err(EngineerError::DeviceNotSignificantForm {
+                    written: (*spelling).to_owned(),
+                    significant: significant.clone()
+                }),
+                "the spelling `{spelling}` was read as the canonical document"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_number_that_does_not_check_out_does_not_parse() {
+        let authorisation = authorisation_for(Devices::only(&[device("77-000123")]).unwrap());
+        let significant = device("77-000123").significant().to_owned();
+        let damaged: String = significant
+            .chars()
+            .enumerate()
+            .map(|(index, symbol)| if index == 0 { '8' } else { symbol })
+            .collect();
+        let text = authorisation.to_wire().replace(
+            &format!("devices={significant}"),
+            &format!("devices={damaged}"),
+        );
+        assert!(matches!(
+            EngineerAuthorisation::parse(&text),
+            Err(EngineerError::DeviceNumber(
+                DeviceNumberError::CheckCharacterMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn an_empty_list_of_devices_does_not_parse() {
+        let authorisation = authorisation_for(Devices::only(&[device("77-000123")]).unwrap());
+        let text = authorisation.to_wire().replace(
+            &format!("devices={}", device("77-000123").significant()),
+            "devices=",
+        );
+        assert_eq!(
+            EngineerAuthorisation::parse(&text),
+            Err(EngineerError::Wire(WireError::EmptyValue {
+                field: "devices"
+            }))
+        );
+    }
+
+    #[test]
+    fn a_period_that_does_not_run_forwards_is_refused() {
+        let reversed = EngineerAuthorisation::new(AuthorisationFields {
+            engineer_id: "eng-7",
+            organisation_id: "acme",
+            key_fingerprint: [0x11; 32],
+            devices: Devices::Any,
+            tags: vec!["dc-1".to_owned()],
+            roles: vec!["ops.dc.senior".to_owned()],
+            max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_800_000_001),
+            not_after: ClaimedTime::new(1_800_000_000),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
+        });
+        assert_eq!(
+            reversed,
+            Err(EngineerError::PeriodNotOrdered {
+                not_before: 1_800_000_001,
+                not_after: 1_800_000_000
+            })
+        );
+
+        // The empty period too: a document that never applies is not a
+        // narrower permission, it is one nobody can act on and everybody has to
+        // explain.
+        let empty = EngineerAuthorisation::new(AuthorisationFields {
+            engineer_id: "eng-7",
+            organisation_id: "acme",
+            key_fingerprint: [0x11; 32],
+            devices: Devices::Any,
+            tags: vec!["dc-1".to_owned()],
+            roles: vec!["ops.dc.senior".to_owned()],
+            max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_800_000_000),
+            not_after: ClaimedTime::new(1_800_000_000),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
+        });
+        assert!(matches!(empty, Err(EngineerError::PeriodNotOrdered { .. })));
+    }
+
+    #[test]
+    fn a_document_of_the_previous_layout_is_refused_and_never_widened() {
+        // The layout without the two fields carried a permission for every
+        // device and no start. Read as today's document it would be a wide
+        // permission nobody granted, so it is refused as a document of an
+        // unknown shape.
+        let old = format!(
+            "{AUTHORISATION_PREFIX};engineer=eng-7;organisation=acme;key_fingerprint={};\
+             tags=dc-1;roles=ops.dc.senior;max_level=2;not_after=1800000000;\
+             authorisation_signature=03",
+            hex::encode([0x11_u8; 32])
+        );
+        assert!(matches!(
+            EngineerAuthorisation::parse(&old),
+            Err(EngineerError::Wire(
+                WireError::FieldCount { .. } | WireError::UnexpectedField { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn the_devices_and_the_period_are_inside_what_the_fleet_signs() {
+        // Both fields exist to narrow a permission, and a narrowing outside the
+        // signed bytes is a suggestion: an operator could widen the set of
+        // devices or move the start of the period and the signature would still
+        // hold.
+        let one = authorisation_for(Devices::only(&[device("77-000123")]).unwrap());
+        let other = authorisation_for(Devices::only(&[device("77-000456")]).unwrap());
+        let every = authorisation_for(Devices::Any);
+        assert_ne!(one.encode().unwrap(), other.encode().unwrap());
+        assert_ne!(one.encode().unwrap(), every.encode().unwrap());
+
+        let later = EngineerAuthorisation::new(AuthorisationFields {
+            engineer_id: "eng-7",
+            organisation_id: "acme",
+            key_fingerprint: [0x11; 32],
+            devices: Devices::Any,
+            tags: vec!["dc-1".to_owned()],
+            roles: vec!["ops.dc.senior".to_owned()],
+            max_level: Level::new(2),
+            not_before: ClaimedTime::new(1_700_000_001),
+            not_after: ClaimedTime::new(1_800_000_000),
+            authorisation_signature: Signature::new(vec![0x03]).unwrap(),
+        })
+        .unwrap();
+        assert_ne!(every.encode().unwrap(), later.encode().unwrap());
+        assert_ne!(every.digest().unwrap(), later.digest().unwrap());
+    }
+
+    #[test]
+    fn editing_the_devices_or_the_start_after_signing_breaks_the_signature() {
+        let signed = authorisation_for(Devices::only(&[device("77-000123")]).unwrap());
+        let office = OfficeBound {
+            authorisation: signed.encode().unwrap(),
+        };
+        assert_eq!(signed.verify(&office), Ok(()));
+
+        // The widest edit somebody would want to make: one device becomes every
+        // device.
+        let widened = EngineerAuthorisation::parse(&signed.to_wire().replace(
+            &format!("devices={}", device("77-000123").significant()),
+            &format!("devices={ALL_DEVICES}"),
+        ))
+        .unwrap();
+        assert!(matches!(
+            widened.verify(&office),
+            Err(EngineerError::AuthorisationSignature(
+                SignatureError::Rejected
+            ))
+        ));
+
+        // And the quietest: the permission starts a day earlier than the one
+        // that was approved.
+        let earlier = EngineerAuthorisation::parse(
+            &signed
+                .to_wire()
+                .replace("not_before=1700000000", "not_before=1699913600"),
+        )
+        .unwrap();
+        assert!(matches!(
+            earlier.verify(&office),
+            Err(EngineerError::AuthorisationSignature(
+                SignatureError::Rejected
+            ))
         ));
     }
 }
