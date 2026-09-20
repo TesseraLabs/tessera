@@ -1,0 +1,36 @@
+# Авторизация инженера: документы, которые разбор ОБЯЗАН отвергнуть.
+#
+# Вектор отказов — такая же часть контракта, как вектор удачного документа:
+# он фиксирует, что расширение формата не превратилось в тихое расширение
+# прав. Каждая строка — проводная форма и ожидаемый класс отказа в имени поля.
+#
+# `old_layout` — документ прежней раскладки из восьми полей. Он НЕ
+# доразбирается и не дополняется умолчаниями: прежняя раскладка означала
+# «любое устройство» и период без начала, то есть права, которых никто не
+# выдавал.
+old_layout = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_after=1800000000;authorisation_signature=03
+# Маркер «любое устройство» рядом с номером — два разных утверждения в одном
+# поле.
+marker_beside_number = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=*,77000123S;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# Порядок не канонический: документ, прочитанный в другом порядке, — не тот
+# документ, который подписали.
+out_of_order = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77000456N,77000123S;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# Один номер назван дважды.
+duplicate = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77000123S,77000123S;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# Пустое поле. «Ничего не написано» никогда не читается как «любое».
+empty_list = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# Шестьдесят пять номеров — на один больше предела. Список, который не
+# прочитать, одобряют пролистыванием. Контрольные символы этих номеров разбор
+# не смотрит вовсе: предел считается по числу элементов до того, как хоть один
+# номер разобран, — иначе поле на десять мегабайт отвергалось бы уже после того,
+# как из него сделали миллион строк.
+over_the_limit = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77000000D,77000001B,770000029,770000037,770000045,770000053,770000061,770000070,77000008Y,77000009W,770000109,770000117,770000125,770000133,770000141,770000150,77000016Y,77000017W,77000018U,77000019S,770000205,770000213,770000221,770000230,77000024Y,77000025W,77000026U,77000027S,77000028Q,77000029O,770000301,770000310,77000032Y,77000033W,77000034U,77000035S,77000036Q,77000037O,77000038M,77000039K,77000040Y,77000041W,77000042U,77000043S,77000044Q,77000045O,77000046M,77000047K,77000048I,77000049G,77000050U,77000051S,77000052Q,77000053O,77000054M,77000055K,77000056I,77000057G,77000058E,77000059C,77000060Q,77000061O,77000062M,77000063K,77000064I;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# То же устройство, записанное иначе: разделители и регистр для контрольного
+# символа безразличны, поэтому `77-000123-s` — тот же прибор. Документ тем не
+# менее другой: подпись накрывает написанные байты, а не прибор, который они
+# называют.
+not_significant_form = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77-000123-s;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# Номер с неверным контрольным символом.
+malformed_number = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77000123X;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1700000000;not_after=1800000000;authorisation_signature=03
+# Период, который не идёт вперёд: начало позже конца.
+period_not_ordered = tessera-codes/v1/engineer-authorisation;engineer=eng-7;organisation=acme;key_fingerprint=24a3b0e9a1d7b4d9d1f0f95b0f7ea5a52c1eb37c1e9d20e6f5a5eb0b21c0c3d4;devices=77000123S;tags=dc-1,hq;roles=ops.dc.senior;max_level=2;not_before=1900000000;not_after=1800000000;authorisation_signature=03

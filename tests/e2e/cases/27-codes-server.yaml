@@ -497,6 +497,97 @@ cases:
     teardown:
       - run: helpers/codes-server.sh cleanup
 
+  # Кейсы CODE-025…CODE-028 — подписанные рамки самой авторизации: на каких
+  # устройствах работа разрешена и с какого момента. До них авторизация Codes
+  # сужалась метками площадки, и разрешение на одну машину действовало на
+  # соседней с теми же метками, а начало периода вообще не было подписано.
+  #
+  # Кейсы идут парами: отказ и разрешение по одному и тому же различию. Отказ в
+  # одиночку зеленеет на стенде, который отказывает всем, поэтому рядом стоит
+  # положительная половина, и только вместе они показывают, что различает
+  # устройство и момент именно проверяемое поле.
+
+  - id: CODE-025
+    title: Вход по коду проходит на устройстве, названном в списке авторизации
+    requirement: spec9:server.ENGREG-422
+    # Положительная половина пары с CODE-026, и на большее она не претендует:
+    # сама по себе она не показывает, что список устройств вообще читают —
+    # разрешение проходило бы и без него. Её работа — удержать CODE-026 от
+    # зелени по чужой причине: на стенде, где выдача не работает вовсе, этот
+    # кейс красный, и отказ соседнему устройству рядом ничего не стоит.
+    #
+    # Номер устройства инженер не называет: он приходит из подписанного
+    # challenge, который устройство составило само. В комплекте фикстур
+    # авторизация выдана на номер ЭТОГО устройства, не маркером «любое».
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-026
+    title: Та же авторизация не даёт кода на соседнее устройство с теми же метками
+    requirement: spec9:server.ENGREG-422
+    # Половина, ради которой пара существует. ENGREG-422 требует, чтобы
+    # авторизация не считалась применимой к попытке с устройства вне её
+    # области, даже когда метки площадки, роль, уровень и период совпадают;
+    # пока авторизация несла только метки, оба устройства были для неё одним
+    # адресом.
+    #
+    # Что готовит стенд: второе устройство той же организации, с ТЕМИ ЖЕ
+    # метками и той же ролью, и та же самая авторизация инженера. Отличается
+    # единственное — номер устройства в подписанном challenge. Отказ обязан
+    # прийти от выдачи, ДО того как код посчитан: иначе код существует, и
+    # вопрос лишь в том, кто его не проверил. Поэтому проверяется класс отказа,
+    # а не просто ненулевой код возврата.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes --with-second-device
+      - run: helpers/codes-server.sh expect-issue-refused-on-another-device {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'device_not_authorised' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-027
+    title: До начала периода авторизации код не выдаётся
+    requirement: spec9:server.ENGREG-421
+    # ENGREG-421: документ применим, только когда момент проверки не раньше
+    # начала и строго раньше конца периода. Выпуск на будущий период разрешён,
+    # выдача кода до его начала — нет.
+    #
+    # Время на устройстве не подкручивается: стенд подаёт авторизацию, начало
+    # которой ещё не наступило, и всё остальное в комплекте оставляет прежним.
+    # Проверяется класс отказа: ненулевой код возврата пришёл бы и от сломанного
+    # стенда.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes --authorisation-starts-later
+      - run: helpers/codes-server.sh expect-issue-refused-before-start {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'authorisation_not_started' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
+  - id: CODE-028
+    title: После начала периода авторизации тот же вход проходит
+    requirement: spec9:server.ENGREG-421
+    # Положительная половина пары с CODE-027: комплект фикстур несёт
+    # авторизацию, период которой уже идёт, и тот же разговор проходит целиком.
+    # Без неё отказ CODE-027 нельзя отличить от стенда, который не выдаёт кодов
+    # вовсе.
+    requires: [service-manager]
+    steps:
+      - run: helpers/codes-server.sh prepare {{fixtures}}/codes
+      - run: helpers/codes-server.sh authenticate {{user}} --level 0
+        expect: { exit_code: 0, stdout_matches: 'auth: PAM_SUCCESS \(0\)' }
+        timeout: 60
+    teardown:
+      - run: helpers/codes-server.sh cleanup
+
   # Кейсы QR-001…QR-010 — этап C: показ challenge на устройстве. До появления
   # генератора QR и оверлея они красные.
 

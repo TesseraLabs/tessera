@@ -235,6 +235,7 @@ mod documents {
     use std::fs;
     use std::path::PathBuf;
 
+    use crate::engineer::EngineerAuthorisation;
     use crate::grant::{Grant, GrantFields, UnsignedGrant};
     use crate::params::FleetParams;
     use crate::request::{
@@ -262,6 +263,59 @@ mod documents {
                 (key.trim().to_owned(), value.trim().to_owned())
             })
             .collect()
+    }
+
+    /// Rebuilds the authorisation of a vector.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a malformed vector file must fail the test on the spot"
+    )]
+    fn authorisation(lines: &[(String, String)]) -> EngineerAuthorisation {
+        use crate::canon::Level;
+        use crate::device_number::CheckedDeviceNumber;
+        use crate::engineer::{AuthorisationFields, Devices, ALL_DEVICES};
+        use crate::mac::DIGEST_LEN;
+
+        let fingerprint: [u8; DIGEST_LEN] =
+            hex::decode(field(lines, "key_fingerprint_hex").unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let written = field(lines, "devices").unwrap();
+        let devices = if written == ALL_DEVICES {
+            Devices::Any
+        } else {
+            let numbers: Vec<CheckedDeviceNumber> = written
+                .split(',')
+                .map(|number| CheckedDeviceNumber::parse(number).unwrap())
+                .collect();
+            Devices::only(&numbers).unwrap()
+        };
+
+        EngineerAuthorisation::new(AuthorisationFields {
+            engineer_id: field(lines, "engineer").unwrap(),
+            organisation_id: field(lines, "organisation").unwrap(),
+            key_fingerprint: fingerprint,
+            devices,
+            tags: field(lines, "tags")
+                .unwrap()
+                .split(',')
+                .map(str::to_owned)
+                .collect(),
+            roles: field(lines, "roles")
+                .unwrap()
+                .split(',')
+                .map(str::to_owned)
+                .collect(),
+            max_level: Level::new(field(lines, "max_level").unwrap().parse().unwrap()),
+            not_before: ClaimedTime::new(field(lines, "not_before").unwrap().parse().unwrap()),
+            not_after: ClaimedTime::new(field(lines, "not_after").unwrap().parse().unwrap()),
+            authorisation_signature: Signature::new(
+                hex::decode(field(lines, "signature_hex").unwrap()).unwrap(),
+            )
+            .unwrap(),
+        })
+        .unwrap()
     }
 
     /// Rebuilds the signed request of a vector.
@@ -416,57 +470,175 @@ mod documents {
         reason = "a vector that cannot be replayed must fail the test on the spot"
     )]
     fn the_engineer_authorisation_still_encodes_the_same_bytes() {
-        use crate::canon::Level;
-        use crate::engineer::{AuthorisationFields, EngineerAuthorisation};
-        use crate::mac::DIGEST_LEN;
+        // Four vectors of one document: one named device, the marker for every
+        // device, a set of three in canonical order, and a period that has not
+        // started yet. The bytes below are the compatibility surface of the
+        // authorisation, and a change to them is a change to every signature
+        // ever made over one.
+        for name in [
+            "engineer-authorisation-v1.txt",
+            "engineer-authorisation-any-devices-v1.txt",
+            "engineer-authorisation-three-devices-v1.txt",
+            "engineer-authorisation-future-start-v1.txt",
+        ] {
+            let lines = pairs(name);
+            let authorisation = authorisation(&lines);
 
-        let lines = pairs("engineer-authorisation-v1.txt");
-        let fingerprint: [u8; DIGEST_LEN] =
-            hex::decode(field(&lines, "key_fingerprint_hex").unwrap())
-                .unwrap()
-                .try_into()
-                .unwrap();
-        let authorisation = EngineerAuthorisation::new(AuthorisationFields {
-            engineer_id: field(&lines, "engineer").unwrap(),
-            organisation_id: field(&lines, "organisation").unwrap(),
-            key_fingerprint: fingerprint,
-            tags: field(&lines, "tags")
-                .unwrap()
-                .split(',')
-                .map(str::to_owned)
-                .collect(),
-            roles: field(&lines, "roles")
-                .unwrap()
-                .split(',')
-                .map(str::to_owned)
-                .collect(),
-            max_level: Level::new(field(&lines, "max_level").unwrap().parse().unwrap()),
-            not_after: ClaimedTime::new(field(&lines, "not_after").unwrap().parse().unwrap()),
-            authorisation_signature: Signature::new(
-                hex::decode(field(&lines, "signature_hex").unwrap()).unwrap(),
-            )
-            .unwrap(),
-        })
-        .unwrap();
+            assert_eq!(
+                hex::encode(authorisation.encode().unwrap()),
+                field(&lines, "canon_hex").unwrap(),
+                "the signed bytes of `{name}` changed"
+            );
+            assert_eq!(
+                authorisation.to_wire(),
+                field(&lines, "wire").unwrap(),
+                "the wire form of `{name}` changed"
+            );
+            assert_eq!(
+                EngineerAuthorisation::parse(&authorisation.to_wire()),
+                Ok(authorisation),
+                "the reader of `{name}` drifted from the writer"
+            );
+        }
+    }
 
-        // The bytes the fleet's authorisation key signs. The document changed
-        // signer with this vector: it used to be verified against the
-        // organisation that granted it, which let an organisation write its own
-        // ceiling.
-        assert_eq!(
-            hex::encode(authorisation.encode().unwrap()),
-            field(&lines, "canon_hex").unwrap(),
-            "the signed bytes of the engineer authorisation changed"
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a vector that cannot be replayed must fail the test on the spot"
+    )]
+    fn the_period_of_the_vector_holds_only_inside_itself() {
+        // The far end alone used to decide this, so a document issued for next
+        // week was usable today by anybody who compared against it.
+        let lines = pairs("engineer-authorisation-future-start-v1.txt");
+        let authorisation = authorisation(&lines);
+        let not_before: u64 = field(&lines, "not_before").unwrap().parse().unwrap();
+        let not_after: u64 = field(&lines, "not_after").unwrap().parse().unwrap();
+
+        assert!(!authorisation.applies_at(ClaimedTime::new(not_before - 1)));
+        assert!(authorisation.applies_at(ClaimedTime::new(not_before)));
+        assert!(authorisation.applies_at(ClaimedTime::new(not_after - 1)));
+        assert!(!authorisation.applies_at(ClaimedTime::new(not_after)));
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a vector that cannot be replayed must fail the test on the spot"
+    )]
+    fn the_authorisations_that_must_be_refused_are_still_refused() {
+        use crate::engineer::EngineerError;
+        use crate::wire::WireError;
+
+        let lines = pairs("engineer-authorisation-rejected-v1.txt");
+        let refusal = |key: &str| EngineerAuthorisation::parse(field(&lines, key).unwrap());
+
+        // The document of the previous layout is refused as a document of an
+        // unknown shape — never read as today's with the two fields filled in
+        // from nowhere, which would be a permission for every device and no
+        // start.
+        assert!(
+            matches!(
+                refusal("old_layout"),
+                Err(EngineerError::Wire(
+                    WireError::FieldCount { .. } | WireError::UnexpectedField { .. }
+                ))
+            ),
+            "the previous layout parsed: {:?}",
+            refusal("old_layout")
         );
         assert_eq!(
-            authorisation.to_wire(),
-            field(&lines, "wire").unwrap(),
-            "the wire form of the engineer authorisation changed"
+            refusal("marker_beside_number"),
+            Err(EngineerError::DeviceMarkerBesideNumbers)
         );
+        assert!(matches!(
+            refusal("out_of_order"),
+            Err(EngineerError::DevicesOutOfOrder { .. })
+        ));
+        assert!(matches!(
+            refusal("duplicate"),
+            Err(EngineerError::DuplicateDevice { .. })
+        ));
         assert_eq!(
-            EngineerAuthorisation::parse(&authorisation.to_wire()),
-            Ok(authorisation)
+            refusal("empty_list"),
+            Err(EngineerError::Wire(WireError::EmptyValue {
+                field: "devices"
+            }))
         );
+        assert!(matches!(
+            refusal("over_the_limit"),
+            Err(EngineerError::TooManyDevices { .. })
+        ));
+        assert!(matches!(
+            refusal("not_significant_form"),
+            Err(EngineerError::DeviceNotSignificantForm { .. })
+        ));
+        assert!(matches!(
+            refusal("malformed_number"),
+            Err(EngineerError::DeviceNumber(_))
+        ));
+        assert!(matches!(
+            refusal("period_not_ordered"),
+            Err(EngineerError::PeriodNotOrdered { .. })
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "a vector that cannot be replayed must fail the test on the spot"
+    )]
+    fn editing_the_devices_or_the_start_of_the_vector_breaks_the_signature() {
+        use crate::engineer::EngineerError;
+        use crate::signature::{SignatureError, SignatureVerifier, SignerRef};
+
+        /// A fleet that holds one authorisation key and knows which bytes it
+        /// signed.
+        struct SignedBytes {
+            signed: Vec<u8>,
+        }
+
+        impl SignatureVerifier for SignedBytes {
+            fn verify(
+                &self,
+                signer: SignerRef<'_>,
+                message: &[u8],
+                _signature: &Signature,
+            ) -> Result<(), SignatureError> {
+                match signer {
+                    SignerRef::AuthorisationKey if message == self.signed.as_slice() => Ok(()),
+                    SignerRef::AuthorisationKey => Err(SignatureError::Rejected),
+                    SignerRef::Named(_) | SignerRef::Key(_) | SignerRef::TicketAuthority => {
+                        Err(SignatureError::UnknownSigner)
+                    }
+                }
+            }
+        }
+
+        let lines = pairs("engineer-authorisation-tampered-v1.txt");
+        let signed = EngineerAuthorisation::parse(field(&lines, "wire").unwrap()).unwrap();
+        let fleet = SignedBytes {
+            signed: signed.encode().unwrap(),
+        };
+        assert_eq!(signed.verify(&fleet), Ok(()));
+
+        for key in ["widened_devices_wire", "earlier_start_wire"] {
+            let edited = EngineerAuthorisation::parse(field(&lines, key).unwrap()).unwrap();
+            assert_ne!(
+                edited.digest().unwrap(),
+                signed.digest().unwrap(),
+                "`{key}` left the digest of the document where it was"
+            );
+            assert!(
+                matches!(
+                    edited.verify(&fleet),
+                    Err(EngineerError::AuthorisationSignature(
+                        SignatureError::Rejected
+                    ))
+                ),
+                "`{key}` still verified against the signature of the original"
+            );
+        }
     }
 
     #[test]
