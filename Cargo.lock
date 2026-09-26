@@ -578,9 +578,9 @@ dependencies = [
 
 [[package]]
 name = "cryptoki"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff765b99fc49f3116c9a908484486a2b92fd73c48da45c3a69716471c6cc56c6"
+checksum = "625cf4599c43d69a16996ce2573fc80745a0b0300c962f0bfa11d55b6cab2b2d"
 dependencies = [
  "bitflags",
  "cryptoki-sys",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "pam_tessera"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "hex",
  "nix",
@@ -2662,7 +2662,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "tessera_cli"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "ab_glyph_rasterizer",
  "anyhow",
@@ -2702,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_codes_contract"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "hex",
  "sha2 0.11.0",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64",
  "chrono",
@@ -2761,7 +2761,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_cp"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "tempfile",
  "tessera_proto",
@@ -2775,14 +2775,14 @@ dependencies = [
 
 [[package]]
 name = "tessera_ext"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "tessera_hashchain"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64",
  "hex",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_issuer"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64",
  "clap",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_proto"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2845,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "tessera_qr_overlay"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "nix",
  "tessera_core",
@@ -2855,14 +2855,14 @@ dependencies = [
 
 [[package]]
 name = "tessera_test_plugin"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "tessera_core",
 ]
 
 [[package]]
 name = "tessera_win_service"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "hex",
  "pam_tessera",
@@ -3808,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64",
