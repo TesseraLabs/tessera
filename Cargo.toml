@@ -34,7 +34,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.95"
 # Dual-licensed: AGPL-3.0-only OR commercial (LICENSE.commercial).
@@ -75,7 +75,7 @@ clap = { version = "4", features = ["derive"] }
 nix = { version = "0.31", features = ["user", "signal", "process", "fs", "resource", "mount", "poll", "socket"] }
 libc = "0.2"
 udev = "0.9"
-cryptoki = "0.12"
+cryptoki = "0.12.1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 sd-notify = "0.5"

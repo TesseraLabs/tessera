@@ -16,7 +16,7 @@ path = "src/main.rs"
 # The frames and the states of the conversation, and the QR itself. Nothing of
 # the protocol is written a second time here: the overlay is the side that has
 # no reason to have an opinion about it.
-tessera_core = { path = "../tessera_core", version = "0.6.0" }
+tessera_core = { path = "../tessera_core", version = "0.6.1" }
 thiserror = { workspace = true }
 # The X client. Pure Rust rather than bindings to libX11: this is pre-auth code
 # on a machine anybody can walk up to, and a C library parsing a protocol on its

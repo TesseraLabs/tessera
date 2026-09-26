@@ -35,18 +35,18 @@ signal-hook = { version = "0.3", default-features = false }
 # Генератор фикстур телефонного канала собирает документы контракта и контейнер
 # ключа устройства теми же крейтами, что читают их продукт и устройство: своей
 # сериализации, своих подписей и своей сборки PKCS#12 у генератора нет.
-tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.6.0" }
+tessera_codes_contract = { path = "../tessera_codes_contract", version = "0.6.1" }
 # `file` — подписывающий ключ с диска: комплект фикстур стенда подписывается
 # настоящей ECDSA, а не заглушкой. Заглушка годилась бы ровно для стенда,
 # который подписей не проверяет.
-tessera_issuer = { path = "../tessera_issuer", version = "0.6.0", features = ["file"] }
+tessera_issuer = { path = "../tessera_issuer", version = "0.6.1", features = ["file"] }
 # Цепочка выдающей стороны для фикстуры «журнал без выдач»: строки пишет тот же
 # крейт, что и продуктив, второго писателя формата заводить нельзя.
 # `testing` даёт хранилище в памяти: фикстура собирается один раз и
 # замораживается, писать её через файловое хранилище значило бы заводить
 # временный файл ради строк, которые тут же уходят в комплект.
-tessera_hashchain = { path = "../tessera_hashchain", version = "0.6.0", features = ["testing"] }
-tessera_ext = { path = "../tessera_ext", version = "0.6.0" }
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.6.1", features = ["testing"] }
+tessera_ext = { path = "../tessera_ext", version = "0.6.1" }
 # Ключи фикстур: генерация, подписи документов и запись в PKCS#8/SPKI PEM.
 p256 = { workspace = true, features = ["pem"] }
 # Комплект фикстур стенда пишет сертификаты и список отзыва в PEM, а ключ
@@ -59,7 +59,7 @@ tempfile = { workspace = true }
 # записано в раннере строкой, и тест сверяет её с константой продукта. В сам
 # раннер `tessera_core` не тянем — он ему не нужен, а тянуть крейт целиком ради
 # строки значит удлинить сборку инструмента разработчика.
-tessera_core = { path = "../tessera_core", version = "0.6.0" }
+tessera_core = { path = "../tessera_core", version = "0.6.1" }
 
 [lints.rust]
 missing_docs = "warn"

@@ -21,14 +21,14 @@ test-support = []
 mac-tests = ["tessera_core/mac-tests"]
 
 [dependencies]
-tessera_core = { path = "../tessera_core", version = "0.6.0" }
+tessera_core = { path = "../tessera_core", version = "0.6.1" }
 # `tessera audit verify` reports the chain status the shared crate defines; the
 # CLI names those states, so it names the type they come from.
-tessera_hashchain = { path = "../tessera_hashchain", version = "0.6.0" }
+tessera_hashchain = { path = "../tessera_hashchain", version = "0.6.1" }
 # `audit attest` records when the head was signed; the device's own clock is the
 # only one it has.
 chrono = { workspace = true }
-tessera_proto = { path = "../tessera_proto", version = "0.6.0" }
+tessera_proto = { path = "../tessera_proto", version = "0.6.1" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time", "sync", "process"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
