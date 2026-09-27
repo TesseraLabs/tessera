@@ -72,6 +72,8 @@
 //! # }
 //! ```
 
+pub mod client_auth;
+
 // The issuing side of Tessera Codes: the checks, the
 // journal records and the reconciliation around a code computation that lives entirely
 // in `tessera_codes_contract`. Built for the wasm core as well, so the browser

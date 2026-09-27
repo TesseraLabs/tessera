@@ -57,7 +57,11 @@ const KEY_USAGE_DIGITAL_SIGNATURE: [u8; 4] = [0x03, 0x02, 0x07, 0x80];
 /// FALSE, extnValue OCTET STRING }`.
 ///
 /// `critical` is emitted only when `true` (DER forbids encoding the default).
-fn encode_extension(oid: &str, critical: bool, extn_value: &[u8]) -> Result<Vec<u8>, IssueError> {
+pub(crate) fn encode_extension(
+    oid: &str,
+    critical: bool,
+    extn_value: &[u8],
+) -> Result<Vec<u8>, IssueError> {
     let oid_content = encode_oid(oid)?;
     let mut inner = encode_tlv(TAG_OID, &oid_content);
     if critical {

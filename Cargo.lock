@@ -2757,6 +2757,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "windows-sys 0.61.2",
+ "x509-cert",
  "zeroize",
 ]
 

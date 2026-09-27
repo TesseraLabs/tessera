@@ -106,6 +106,7 @@ openssl = { workspace = true, features = ["vendored"] }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+x509-cert = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 mockall = { workspace = true }
