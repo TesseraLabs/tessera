@@ -1,0 +1,48 @@
+name: pr-checks
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: core-pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  pr-checks:
+    name: pr-checks
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, synology]
+    timeout-minutes: 30
+    steps:
+      - name: Set job-local diagnostic path
+        run: echo "TESSERA_SMOKE_REPORT=$RUNNER_TEMP/core-pr-smoke" >> "$GITHUB_ENV"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/ensure-rustup
+      - name: Check workflow policy and smoke failure guards
+        run: python3 scripts/run-ci-tests.py scripts/tests 'test_*ci*.py'
+      - run: rustup show
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
+        with:
+          shared-key: core-pr-smoke
+          cache-bin: false
+      - name: Public core smoke
+        run: bash scripts/check-pr-smoke.sh
+      - name: Install verified security tools
+        run: python3 scripts/install-ci-security-tools.py cargo-deny cargo-audit
+      - name: Dependency security checks
+        run: |
+          set -euo pipefail
+          cargo deny check
+          cargo audit
+      - name: Public smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: core-pr-smoke
+          path: ${{ runner.temp }}/core-pr-smoke/
+          if-no-files-found: ignore
+          retention-days: 7

@@ -11,18 +11,11 @@ name: build
 # в GitHub Release на push тега `v*`. Stub-.deb на странице релиза не
 # попадает — его нельзя ставить на терминалы.
 
+# Full packages are built manually or by an explicit release tag.
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
     tags: ['v*']
-  pull_request:
-    branches: [main]
-  # Re-run после ребилда builder-образа: новый :latest, нужно
-  # пересобрать Tessera в нём.
-  workflow_run:
-    workflows: ["build-builder-image"]
-    types: [completed]
-    branches: [main]
 
 permissions:
   contents: read

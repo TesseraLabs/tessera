@@ -13,11 +13,8 @@ name: nightly
 # .deb здесь не собирается — это делает build.yml; nightly валидирует
 # только тестовый прогон в продовом профиле.
 
+# Full release-profile validation is explicitly requested, never scheduled.
 on:
-  schedule:
-    # 02:17 UTC = 05:17 МСК. Не :00 — GitHub советует избегать
-    # начала часа (пик нагрузки schedule-очереди, прогоны дропаются).
-    - cron: '17 2 * * *'
   workflow_dispatch:
 
 permissions:
