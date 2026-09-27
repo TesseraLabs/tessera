@@ -68,6 +68,7 @@ cryptoki = { workspace = true }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+unicode-normalization = { workspace = true }
 mockall = { workspace = true, optional = true }
 libloading = { workspace = true }
 # PKCS#12 container structure, read without the password: the login screen's

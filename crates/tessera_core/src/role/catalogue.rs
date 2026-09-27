@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use openssl::pkey::{Id, PKey};
 use sha2::{Digest, Sha256};
 
 use super::issuance::RoleIssuance;
@@ -76,6 +77,7 @@ impl CatalogueRole {
 #[derive(Debug, Clone)]
 pub struct VerifiedRoleCatalogue {
     checkpoint: CatalogueCheckpoint,
+    trust_sha256: [u8; 32],
     os: RoleOs,
     issuance_schema_version: Option<u32>,
     roles: BTreeMap<RoleId, CatalogueRole>,
@@ -85,6 +87,12 @@ impl VerifiedRoleCatalogue {
     /// Bundle identity to compare and persist at the publication boundary.
     pub fn checkpoint(&self) -> CatalogueCheckpoint {
         self.checkpoint
+    }
+
+    /// Canonical SPKI SHA-256 of the exact Ed25519 key that verified this bundle.
+    /// PEM/DER spellings of the same key have the same fingerprint.
+    pub fn trust_sha256(&self) -> [u8; 32] {
+        self.trust_sha256
     }
 
     /// The single target OS declared by this bundle, independent of the host.
@@ -109,6 +117,9 @@ pub enum CatalogueError {
     /// Manifest syntax, metadata, signature, rollback or file-hash failure.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// A catalogue source uses a key outside its Ed25519 signature profile.
+    #[error("catalogue signing key is not Ed25519")]
+    SigningKeyProfile,
     /// Input includes more roles than the existing role-store cap.
     #[error("catalogue exceeds the {MAX_ROLES}-role cap")]
     TooManyRoles,
@@ -178,6 +189,7 @@ pub fn verify_catalogue(
             return Err(CatalogueError::UnlistedRole { role: role.clone() });
         }
     }
+    let trust_sha256 = signing_key_fingerprint(trusted_pubkey)?;
     verify_signature(
         &signed_payload(manifest_bytes)?,
         &manifest.signature,
@@ -238,6 +250,7 @@ pub fn verify_catalogue(
     }
     Ok(VerifiedRoleCatalogue {
         checkpoint,
+        trust_sha256,
         os: manifest.os,
         issuance_schema_version: manifest
             .issuance
@@ -245,4 +258,25 @@ pub fn verify_catalogue(
             .map(super::issuance::IssuanceMetadata::schema_version),
         roles,
     })
+}
+
+/// Preserve actual key provenance independently of a caller's source label.
+fn signing_key_fingerprint(trusted_pubkey: &[u8]) -> Result<[u8; 32], CatalogueError> {
+    let key = PKey::public_key_from_pem(trusted_pubkey)
+        .or_else(|_| PKey::public_key_from_der(trusted_pubkey))
+        .map_err(|e| ManifestError::Openssl {
+            reason: e.to_string(),
+        })?;
+    if key.id() != Id::ED25519 {
+        return Err(CatalogueError::SigningKeyProfile);
+    }
+    let trust_sha256 =
+        Sha256::digest(
+            key.public_key_to_der()
+                .map_err(|e| ManifestError::Openssl {
+                    reason: e.to_string(),
+                })?,
+        )
+        .into();
+    Ok(trust_sha256)
 }

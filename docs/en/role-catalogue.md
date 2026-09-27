@@ -51,7 +51,11 @@ It rejects unlisted files and bounds input to 256 roles, 256 KiB per manifest
 and 64 KiB per role. It never consults the reader host's OS or account database.
 
 The immutable result contains the bundle version, complete raw-manifest
-SHA-256, target OS, existing role data and explicit issuance bounds. A missing
+SHA-256, target OS, existing role data and explicit issuance bounds. It also
+retains the canonical SPKI SHA-256 of the exact Ed25519 key that verified the
+bundle. PEM and DER spellings of one key share that fingerprint; this catalogue
+projection rejects other key profiles without changing the legacy manifest
+signature API. A missing
 issuance schema version means a legacy bundle, not a usable product issuance
 catalogue. The API performs no filesystem writes or issuance.
 
