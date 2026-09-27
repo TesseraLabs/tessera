@@ -36,6 +36,7 @@ use openssl::sign::Verifier;
 use sha2::{Digest, Sha256};
 
 use super::audit;
+use super::issuance::IssuanceMetadata;
 use super::schema::RoleId;
 use super::schema::RoleOs;
 
@@ -187,6 +188,11 @@ pub struct Manifest {
     /// Access-only fleet still parses; `verify_manifest` does not act on it.
     #[serde(default)]
     pub codes: Option<ManifestCodes>,
+    /// Optional versioned issuance bounds. These are signed with the raw
+    /// manifest and reference only roles pinned by this same manifest.
+    /// Absence preserves legacy bundles; it does not grant issuance rights.
+    #[serde(default)]
+    pub issuance: Option<IssuanceMetadata>,
 }
 
 /// A manifest that has passed full verification (signature + anti-rollback +
@@ -230,6 +236,12 @@ pub enum ManifestError {
     #[error("manifest TOML is invalid: {reason}")]
     TomlParse {
         /// Underlying TOML error message.
+        reason: String,
+    },
+    /// Issuance metadata references a role absent from the signed role pins.
+    #[error("invalid issuance metadata: {reason}")]
+    InvalidIssuance {
+        /// Why the metadata cannot be used.
         reason: String,
     },
     /// No `signature = "..."` line found (cannot derive the signed payload).
@@ -361,7 +373,7 @@ fn is_signature_line(line: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Size cap, UTF-8, or TOML errors.
+/// Size cap, UTF-8, TOML or invalid issuance-role reference errors.
 pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError> {
     if bytes.len() > MAX_MANIFEST_BYTES {
         return Err(ManifestError::Oversize {
@@ -372,9 +384,19 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError> {
     let text = std::str::from_utf8(bytes).map_err(|e| ManifestError::NotUtf8 {
         reason: e.to_string(),
     })?;
-    toml::from_str(text).map_err(|e| ManifestError::TomlParse {
+    let manifest: Manifest = toml::from_str(text).map_err(|e| ManifestError::TomlParse {
         reason: e.to_string(),
-    })
+    })?;
+    if let Some(issuance) = &manifest.issuance {
+        for role in issuance.roles().keys() {
+            if !manifest.roles.contains_key(role) {
+                return Err(ManifestError::InvalidIssuance {
+                    reason: format!("role {role} is absent from manifest roles"),
+                });
+            }
+        }
+    }
+    Ok(manifest)
 }
 
 /// Verify an Ed25519 signature over `signed_payload`.
@@ -594,12 +616,9 @@ pub fn verify_manifest_without_accepting(
                 })
             }
         };
-        let actual = hex::encode(Sha256::digest(&slice_bytes));
-        if !actual.eq_ignore_ascii_case(pin.sha256.trim()) {
+        if let Err(error) = verify_role_hash(role_id, pin, &slice_bytes) {
             audit::emit_bundle_rejected(audit::REASON_HASH_MISMATCH, manifest.bundle_version);
-            return Err(ManifestError::HashMismatch {
-                role: role_id.to_string(),
-            });
+            return Err(error);
         }
     }
 
@@ -607,6 +626,22 @@ pub fn verify_manifest_without_accepting(
         manifest,
         baseline_established,
     })
+}
+
+/// Check a slice against the same raw-byte pin for device and catalogue readers.
+pub(super) fn verify_role_hash(
+    role: &RoleId,
+    pin: &ManifestRole,
+    bytes: &[u8],
+) -> Result<(), ManifestError> {
+    let actual = hex::encode(Sha256::digest(bytes));
+    if actual.eq_ignore_ascii_case(pin.sha256.trim()) {
+        Ok(())
+    } else {
+        Err(ManifestError::HashMismatch {
+            role: role.to_string(),
+        })
+    }
 }
 
 /// Record the acceptance of a verified bundle: advance the anti-rollback floor
