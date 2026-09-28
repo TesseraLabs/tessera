@@ -1,0 +1,25 @@
+{
+  "authority-empty": {
+    "bytes": 160,
+    "sha256": "87142448381efdbe4351f64d6eec921b70942a19a915694c5ecddb943be778e7"
+  },
+  "authority-register": {
+    "bytes": 528,
+    "sha256": "d4b494550e9a08088f634806bb065c4fd53f2d2ff2960abcf7c6688a9a481af4"
+  },
+  "authority-verify-only": {
+    "bytes": 531,
+    "sha256": "704c8b9d1ef4883fe5ea319db355ce1878e695a711bada535a0609fb2f8393f4"
+  },
+  "grant": {
+    "bytes": 352,
+    "sha256": "f12cceed1aa2f893a880df42e793fdc37daa6dc399513418fb078780c10ad4b1"
+  },
+  "record-proof": {
+    "bytes": 688,
+    "sha256": "e9916da194fc41301a4125b8625cf5a00933c11b6f7b51bab27bcaa5663a494a"
+  },
+  "record": {
+    "sha256": "2663902d4cbcc3d116c910dc77a5cedcfe19f8e63f0e125cb518a990b1233ee1"
+  }
+}

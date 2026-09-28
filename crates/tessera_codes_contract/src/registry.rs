@@ -528,10 +528,7 @@ impl DeviceRecord {
     ///
     /// The errors of the payload encoding.
     pub fn possession_message(&self) -> Result<Vec<u8>, CanonError> {
-        let mut encoder = Encoder::default();
-        encoder.push_text("label", POSSESSION_LABEL)?;
-        encoder.push_bytes("payload", &self.payload.encode()?)?;
-        Ok(encoder.finish())
+        possession_message(&self.payload)
     }
 
     /// Encodes the message the organisation signs: the payload *and* the proof
@@ -541,12 +538,11 @@ impl DeviceRecord {
     ///
     /// The errors of the payload encoding.
     pub fn organisation_message(&self) -> Result<Vec<u8>, CanonError> {
-        let mut encoder = Encoder::default();
-        encoder.push_text("label", ORGANISATION_LABEL)?;
-        encoder.push_text("organisation_id", &self.organisation_id)?;
-        encoder.push_bytes("payload", &self.payload.encode()?)?;
-        encoder.push_bytes("possession", self.possession_signature.as_bytes())?;
-        Ok(encoder.finish())
+        organisation_message(
+            &self.payload,
+            &self.possession_signature,
+            &self.organisation_id,
+        )
     }
 
     /// Encodes the message the owner countersigns: the digest of everything
@@ -728,6 +724,26 @@ impl core::fmt::Display for DeviceRecord {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.to_wire())
     }
+}
+
+pub(crate) fn possession_message(payload: &RecordPayload) -> Result<Vec<u8>, CanonError> {
+    let mut encoder = Encoder::default();
+    encoder.push_text("label", POSSESSION_LABEL)?;
+    encoder.push_bytes("payload", &payload.encode()?)?;
+    Ok(encoder.finish())
+}
+
+pub(crate) fn organisation_message(
+    payload: &RecordPayload,
+    possession: &Signature,
+    organisation_id: &str,
+) -> Result<Vec<u8>, CanonError> {
+    let mut encoder = Encoder::default();
+    encoder.push_text("label", ORGANISATION_LABEL)?;
+    encoder.push_text("organisation_id", organisation_id)?;
+    encoder.push_bytes("payload", &payload.encode()?)?;
+    encoder.push_bytes("possession", possession.as_bytes())?;
+    Ok(encoder.finish())
 }
 
 /// Rejection of a registry record.
