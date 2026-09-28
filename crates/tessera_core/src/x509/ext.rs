@@ -8,16 +8,14 @@
 //! façade only.
 
 use super::der::{
-    oid_to_dotted, read_tlv, read_tlv_expect, TAG_BIT_STRING, TAG_BOOLEAN, TAG_INTEGER,
-    TAG_OCTET_STRING, TAG_OID, TAG_SEQUENCE,
+    oid_to_dotted, read_tlv, read_tlv_expect, TAG_BIT_STRING, TAG_BOOLEAN, TAG_OCTET_STRING,
+    TAG_OID, TAG_SEQUENCE,
 };
 use super::TrustError;
 use openssl::x509::X509;
 
 /// OID for `keyUsage` (2.5.29.15).
 const OID_KEY_USAGE: &str = "2.5.29.15";
-/// OID for `basicConstraints` (2.5.29.19).
-const OID_BASIC_CONSTRAINTS: &str = "2.5.29.19";
 /// OID for `extendedKeyUsage` (2.5.29.37).
 const OID_EXT_KEY_USAGE: &str = "2.5.29.37";
 
@@ -54,9 +52,22 @@ pub(crate) fn key_usage_bit(cert: &X509, bit: u8) -> Result<bool, TrustError> {
         return Ok(false);
     };
     let bs = read_tlv_expect(&value, TAG_BIT_STRING)?;
+    let malformed = || TrustError::CertParse("keyUsage: malformed bit string".to_owned());
+    if !bs.rest.is_empty() {
+        return Err(malformed());
+    }
     let Some((&unused, bytes)) = bs.value.split_first() else {
-        return Ok(false);
+        return Err(malformed());
     };
+    // Validate the whole value before any bit lookup or subtraction. Malformed
+    // input must neither panic nor be hidden by a request for an absent bit.
+    if unused > 7 || (bytes.is_empty() && unused != 0) {
+        return Err(malformed());
+    }
+    let padding = (1u8 << unused) - 1;
+    if bytes.last().is_some_and(|last| last & padding != 0) {
+        return Err(malformed());
+    }
     if bytes.is_empty() {
         return Ok(false);
     }
@@ -78,38 +89,21 @@ pub(crate) fn key_usage_bit(cert: &X509, bit: u8) -> Result<bool, TrustError> {
 
 /// Parses the `basicConstraints` extension if present.
 pub(crate) fn basic_constraints(cert: &X509) -> Result<Option<BasicConstraintsView>, TrustError> {
-    let Some(value) = extension_value(cert, OID_BASIC_CONSTRAINTS)? else {
-        return Ok(None);
-    };
-    let seq = read_tlv_expect(&value, TAG_SEQUENCE)?;
-    let mut rest = seq.value;
-    let mut is_ca = false;
-    let mut path_len: Option<u32> = None;
-    if !rest.is_empty() {
-        let first = read_tlv(rest)?;
-        if first.tag == TAG_BOOLEAN {
-            is_ca = first.value.first().copied().unwrap_or(0) != 0;
-            rest = first.rest;
-        }
-    }
-    if !rest.is_empty() {
-        let next = read_tlv(rest)?;
-        if next.tag == TAG_INTEGER {
-            let mut acc: u64 = 0;
-            for &b in next.value {
-                acc = (acc << 8) | u64::from(b);
-                if acc > u64::from(u32::MAX) {
-                    return Err(TrustError::CertParse(
-                        "basicConstraints: pathLen overflow".into(),
-                    ));
-                }
-            }
-            let casted = u32::try_from(acc)
-                .map_err(|_| TrustError::CertParse("basicConstraints: pathLen overflow".into()))?;
-            path_len = Some(casted);
-        }
-    }
-    Ok(Some(BasicConstraintsView { is_ca, path_len }))
+    let der = cert.to_der().map_err(TrustError::Openssl)?;
+    // One strict decoding rule is shared with the issuer tooling. The Engine
+    // keeps its existing u32 path-length bound on top of the shared u64 view.
+    tessera_ext::ext::extract_basic_constraints(&der)?
+        .map(|value| {
+            let path_len =
+                value.path_len.map(u32::try_from).transpose().map_err(|_| {
+                    TrustError::CertParse("basicConstraints: pathLen overflow".into())
+                })?;
+            Ok(BasicConstraintsView {
+                is_ca: value.ca,
+                path_len,
+            })
+        })
+        .transpose()
 }
 
 /// Locates the OCTET STRING value of an extension by its dotted OID.
@@ -228,4 +222,141 @@ pub(crate) fn ski(cert: &X509) -> Option<Vec<u8>> {
 /// Returns the authority key identifier `keyIdentifier` field, if present.
 pub(crate) fn aki_key_id(cert: &X509) -> Option<Vec<u8>> {
     cert.authority_key_id().map(|id| id.as_slice().to_vec())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod malformed_extension_tests {
+    use super::*;
+    use openssl::asn1::{Asn1Integer, Asn1Object, Asn1OctetString, Asn1Time};
+    use openssl::bn::BigNum;
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+    use openssl::x509::{X509Extension, X509NameBuilder};
+
+    fn certificate(oid: &str, value: &[u8]) -> X509 {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "extension-test").unwrap();
+        let name = name.build();
+        let mut cert = X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_serial_number(&Asn1Integer::from_bn(&BigNum::from_u32(1).unwrap()).unwrap())
+            .unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        cert.append_extension(
+            X509Extension::new_from_der(
+                &Asn1Object::from_str(oid).unwrap(),
+                true,
+                &Asn1OctetString::new_from_bytes(value).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        cert.build()
+    }
+
+    #[test]
+    fn malformed_key_usage_is_an_error_not_a_panic_or_permission() {
+        for value in [
+            &[3, 2, 9, 6][..],
+            &[3, 2, 8, 6],
+            &[3, 2, 255, 6],
+            &[3, 2, 1, 7],
+            &[3, 2, 1, 6, 5, 0],
+            &[3, 0],
+            &[3, 1, 1],
+        ] {
+            let cert = certificate("2.5.29.15", value);
+            for bit in [0, 5, 6, 255] {
+                assert!(
+                    key_usage_bit(&cert, bit).is_err(),
+                    "accepted {value:?}, bit {bit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn valid_key_usage_retains_bits_and_empty_denial() {
+        let usage = certificate("2.5.29.15", &[3, 2, 1, 6]);
+        assert!(!key_usage_bit(&usage, 0).unwrap());
+        assert!(key_usage_bit(&usage, 5).unwrap());
+        assert!(key_usage_bit(&usage, 6).unwrap());
+        assert!(!key_usage_bit(&usage, 7).unwrap());
+        let agreement = certificate("2.5.29.15", &[3, 3, 7, 0, 128]);
+        assert!(key_usage_bit(&agreement, 8).unwrap());
+        let empty = certificate("2.5.29.15", &[3, 1, 0]);
+        assert!(!key_usage_bit(&empty, 0).unwrap());
+    }
+
+    #[test]
+    fn malformed_basic_constraints_never_become_a_ca_or_unlimited_path() {
+        for value in [
+            &[48, 6, 1, 1, 255, 2, 1, 255][..],
+            &[48, 3, 1, 1, 255, 5, 0],
+            &[48, 8, 1, 1, 255, 2, 1, 0, 5, 0],
+            &[48, 3, 1, 1, 1],
+            &[48, 2, 1, 0],
+            &[48, 7, 1, 1, 255, 2, 2, 0, 1],
+            &[48, 2, 5, 0],
+        ] {
+            let cert = certificate("2.5.29.19", value);
+            assert!(basic_constraints(&cert).is_err(), "accepted {value:?}");
+            assert!(
+                tessera_ext::ext::extract_basic_constraints(&cert.to_der().unwrap()).is_err(),
+                "shared parser accepted {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_chain_does_not_ignore_malformed_basic_constraints() {
+        let malformed = certificate("2.5.29.19", &[48, 6, 1, 1, 255, 2, 1, 255])
+            .to_der()
+            .unwrap();
+        assert!(
+            tessera_issuer::pkcs12::check_chain(&malformed, std::slice::from_ref(&malformed))
+                .is_err()
+        );
+        // Container packaging intentionally still permits older CAs with no BC.
+        let missing = certificate("2.5.29.15", &[3, 2, 1, 6]).to_der().unwrap();
+        assert!(
+            tessera_issuer::pkcs12::check_chain(&missing, std::slice::from_ref(&missing)).is_ok()
+        );
+    }
+
+    #[test]
+    fn basic_constraints_preserve_valid_false_zero_and_maximum_paths() {
+        for (value, ca, path) in [
+            (&[48, 0][..], false, None),
+            (&[48, 3, 1, 1, 0][..], false, None),
+            (&[48, 3, 1, 1, 255][..], true, None),
+            (&[48, 6, 1, 1, 255, 2, 1, 0][..], true, Some(0)),
+            (
+                &[48, 10, 1, 1, 255, 2, 5, 0, 255, 255, 255, 255][..],
+                true,
+                Some(u32::MAX),
+            ),
+        ] {
+            let cert = certificate("2.5.29.19", value);
+            assert_eq!(
+                basic_constraints(&cert).unwrap(),
+                Some(BasicConstraintsView {
+                    is_ca: ca,
+                    path_len: path
+                })
+            );
+        }
+    }
 }

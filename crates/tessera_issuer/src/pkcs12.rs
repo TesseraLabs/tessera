@@ -423,7 +423,10 @@ pub fn check_chain(leaf_der: &[u8], chain_der: &[Vec<u8>]) -> Result<(), ChainEr
     for (index, der) in chain_der.iter().enumerate() {
         let what = format!("chain element {index}");
         check_certificate(der, &what)?;
-        if let Ok(Some(constraints)) = tessera_ext::ext::extract_basic_constraints(der) {
+        let constraints = tessera_ext::ext::extract_basic_constraints(der).map_err(|error| {
+            ChainError(format!("{what} has malformed basicConstraints: {error}"))
+        })?;
+        if let Some(constraints) = constraints {
             if !constraints.ca {
                 return Err(ChainError(format!(
                     "{what} is an end-entity certificate, not a CA"
