@@ -147,6 +147,48 @@ impl LoadedKeyMaterial {
     }
 }
 
+/// Load a local Codes key-only container; certificate-bearing containers retain
+/// the full existing parser, including its chain and algorithm checks.
+pub(crate) fn local_private_key(
+    bytes: &[u8],
+    gost_engine_path: Option<&Path>,
+) -> Result<PKey<Private>, Pkcs12Error> {
+    use der::{Decode as _, Encode as _};
+    let pin = SecretString::from(String::new());
+    let p12 = Pkcs12::from_der(bytes).map_err(|e| Pkcs12Error::Corrupt(e.to_string()))?;
+    let parsed = parse_with_gost_retry(&p12, &pin, gost_engine_path)?;
+    if parsed.cert.is_some() {
+        return LoadedKeyMaterial::from_p12(bytes, &pin, gost_engine_path)?.private_key();
+    }
+    if parsed.ca.as_ref().is_some_and(|chain| !chain.is_empty()) {
+        return Err(Pkcs12Error::MissingCert);
+    }
+    let envelope =
+        ::pkcs12::pfx::Pfx::from_der(bytes).map_err(|e| Pkcs12Error::Corrupt(e.to_string()))?;
+    if envelope.mac_data.is_none()
+        || envelope
+            .to_der()
+            .map_err(|e| Pkcs12Error::Corrupt(e.to_string()))?
+            != bytes
+    {
+        return Err(Pkcs12Error::Corrupt(
+            "local key-only container requires canonical DER and a MAC".to_owned(),
+        ));
+    }
+    let key = parsed.pkey.ok_or(Pkcs12Error::MissingKey)?;
+    let ec = key
+        .ec_key()
+        .map_err(|e| Pkcs12Error::Corrupt(e.to_string()))?;
+    if ec.group().curve_name() != Some(openssl::nid::Nid::X9_62_PRIME256V1) {
+        return Err(Pkcs12Error::Corrupt(
+            "local key-only container requires P-256".to_owned(),
+        ));
+    }
+    ec.check_key()
+        .map_err(|e| Pkcs12Error::Corrupt(e.to_string()))?;
+    Ok(key)
+}
+
 /// Open a container, giving `gost-engine` a chance when the first attempt
 /// fails on an algorithm libcrypto alone does not implement.
 ///

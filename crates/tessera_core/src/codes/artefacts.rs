@@ -66,6 +66,8 @@ use std::path::Path;
 
 use openssl::pkcs12::Pkcs12;
 use secrecy::SecretString;
+#[cfg(unix)]
+use zeroize::Zeroize as _;
 use zeroize::Zeroizing;
 
 use tessera_codes_contract::key::Epoch;
@@ -294,6 +296,105 @@ pub fn apply(
     check: StoreCheck,
     configured_epoch: Option<Epoch>,
 ) -> Result<Applied, ArtefactError> {
+    apply_with_origin(
+        paths,
+        delivery,
+        gost_engine_path,
+        check,
+        configured_epoch,
+        KeyOrigin::Delivered,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum KeyOrigin {
+    Delivered,
+    #[cfg(unix)]
+    LocallyOwned,
+}
+
+/// The public enrollment adapter supplies an already locally owned key; this
+/// path cannot accept a server key container or relax courier parsing.
+#[cfg(unix)]
+pub(crate) fn apply_owned(
+    paths: &CodesPaths,
+    delivery: CodesDelivery,
+    key: &openssl::pkey::PKey<openssl::pkey::Private>,
+    epoch: Epoch,
+    configured_epoch: Option<Epoch>,
+) -> Result<Applied, ArtefactError> {
+    preflight_owned(paths, &delivery, epoch, configured_epoch)?;
+    let bytes = Pkcs12::builder()
+        .pkey(key)
+        .build2("")
+        .and_then(|p| p.to_der())
+        .map_err(|e| ArtefactError::KeyStore {
+            reason: e.to_string(),
+        })?;
+    let owned = LocalConsignment(CodesDelivery {
+        key: Some(DeliveredKey {
+            epoch,
+            container: bytes,
+            pin: SecretString::from(String::new()),
+        }),
+        ..delivery
+    });
+    apply_with_origin(
+        paths,
+        &owned.0,
+        None,
+        StoreCheck::Enforced,
+        configured_epoch,
+        KeyOrigin::LocallyOwned,
+    )
+}
+
+#[cfg(unix)]
+struct LocalConsignment(CodesDelivery);
+#[cfg(unix)]
+impl Drop for LocalConsignment {
+    fn drop(&mut self) {
+        if let Some(key) = &mut self.0.key {
+            key.container.zeroize();
+        }
+    }
+}
+
+/// Pure checks against existing state, before public enrollment mutates paths.
+#[cfg(unix)]
+pub(crate) fn preflight_owned(
+    paths: &CodesPaths,
+    delivery: &CodesDelivery,
+    epoch: Epoch,
+    configured_epoch: Option<Epoch>,
+) -> Result<(), ArtefactError> {
+    if delivery.key.is_some() {
+        return Err(ArtefactError::KeyStore {
+            reason: "public enrollment cannot carry private keys".to_owned(),
+        });
+    }
+    let key = DeliveredKey {
+        epoch,
+        container: Vec::new(),
+        pin: SecretString::from(String::new()),
+    };
+    plan_key(
+        Some(&key),
+        read_epoch(paths)?,
+        has_spoken(paths),
+        configured_epoch,
+    )?;
+    check_delivered_artefacts(paths, delivery)
+}
+
+fn apply_with_origin(
+    paths: &CodesPaths,
+    delivery: &CodesDelivery,
+    gost_engine_path: Option<&Path>,
+    check: StoreCheck,
+    configured_epoch: Option<Epoch>,
+    origin: KeyOrigin,
+) -> Result<Applied, ArtefactError> {
     if delivery.is_empty() {
         return Ok(Applied {
             epoch: read_epoch(paths)?,
@@ -333,7 +434,15 @@ pub fn apply(
     )?;
     check_delivered_artefacts(paths, delivery)?;
     let stored_key = match (&delivery.key, plan.write_key) {
-        (Some(key), true) => Some(restore_key(key, gost_engine_path)?),
+        (Some(key), true) => Some(match origin {
+            KeyOrigin::Delivered => restore_key(key, gost_engine_path)?,
+            #[cfg(unix)]
+            KeyOrigin::LocallyOwned => {
+                crate::pkcs12::local_private_key(&key.container, None)
+                    .map_err(|e| ArtefactError::Container(DeviceKeyError::Container(e)))?;
+                Zeroizing::new(key.container.clone())
+            }
+        }),
         _ => None,
     };
 
@@ -660,7 +769,8 @@ fn as_text(bytes: Option<&[u8]>, path: &Path) -> Result<Option<String>, Artefact
 /// step: the verifying process opens it with nobody in the room, and what
 /// protects it is the mode of the file and the integrity of the device, stated
 /// in the module documentation. The end-entity certificate travels with the key
-/// because a PKCS#12 without one does not open at all.
+/// because the courier delivery loader requires that complete material. The
+/// separately typed locally owned path uses a key-only storage container.
 fn restore_key(
     key: &DeliveredKey,
     gost_engine_path: Option<&Path>,

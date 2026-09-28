@@ -34,12 +34,20 @@ pub(crate) fn create_with_mode(path: &Path, mode: u32) -> io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(mode)
-            .open(path)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                NOT_A_REGULAR_FILE,
+            ));
+        }
+        Ok(file)
     }
     #[cfg(not(unix))]
     {

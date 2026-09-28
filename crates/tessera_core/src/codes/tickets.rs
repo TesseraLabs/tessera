@@ -286,6 +286,26 @@ impl TicketStore {
         })
     }
 
+    /// Check each signature without claiming the tickets are current or scoped
+    /// to a particular login. Import has no login attempt or clock to evaluate.
+    #[cfg(unix)]
+    pub(crate) fn verify_signatures(&self, anchor: &TicketAnchor) -> Result<(), TicketStoreError> {
+        for signed in &self.tickets {
+            let message = signed
+                .ticket()
+                .encode()
+                .map_err(|_| TicketStoreError::Malformed {
+                    reason: "ticket canonical encoding failed".to_owned(),
+                })?;
+            anchor
+                .verify(SignerRef::TicketAuthority, &message, signed.signature())
+                .map_err(|_| TicketStoreError::Malformed {
+                    reason: "ticket signature rejected".to_owned(),
+                })?;
+        }
+        Ok(())
+    }
+
     /// The ticket numbers this store treats as withdrawn.
     #[must_use]
     pub const fn revoked(&self) -> &BTreeSet<String> {
