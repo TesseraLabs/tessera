@@ -97,14 +97,14 @@ pub(crate) fn hash(value: &str) -> Result<[u8; 32], AuthorityError> {
         .try_into()
         .map_err(|_| AuthorityError::Malformed("digest width"))
 }
-pub(super) struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     rest: &'a [u8],
 }
 impl<'a> Reader<'a> {
-    pub(super) fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { rest: bytes }
     }
-    pub(super) fn field(&mut self, max: usize) -> Result<&'a [u8], AuthorityError> {
+    pub(crate) fn field(&mut self, max: usize) -> Result<&'a [u8], AuthorityError> {
         let raw: [u8; 4] = self
             .rest
             .get(..4)
@@ -126,31 +126,31 @@ impl<'a> Reader<'a> {
             .ok_or(AuthorityError::Malformed("field"))?;
         Ok(value)
     }
-    pub(super) fn string(&mut self, max: usize) -> Result<String, AuthorityError> {
+    pub(crate) fn string(&mut self, max: usize) -> Result<String, AuthorityError> {
         Ok(std::str::from_utf8(self.field(max)?)
             .map_err(|_| AuthorityError::Malformed("UTF8"))?
             .to_owned())
     }
-    pub(super) fn u64(&mut self) -> Result<u64, AuthorityError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, AuthorityError> {
         Ok(u64::from_be_bytes(
             self.field(8)?
                 .try_into()
                 .map_err(|_| AuthorityError::Malformed("u64 width"))?,
         ))
     }
-    pub(super) fn u32(&mut self) -> Result<u32, AuthorityError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, AuthorityError> {
         Ok(u32::from_be_bytes(
             self.field(4)?
                 .try_into()
                 .map_err(|_| AuthorityError::Malformed("u32 width"))?,
         ))
     }
-    pub(super) fn digest(&mut self) -> Result<[u8; 32], AuthorityError> {
+    pub(crate) fn digest(&mut self) -> Result<[u8; 32], AuthorityError> {
         self.field(32)?
             .try_into()
             .map_err(|_| AuthorityError::Malformed("digest width"))
     }
-    pub(super) fn finish(self) -> Result<(), AuthorityError> {
+    pub(crate) fn finish(self) -> Result<(), AuthorityError> {
         if self.rest.is_empty() {
             Ok(())
         } else {

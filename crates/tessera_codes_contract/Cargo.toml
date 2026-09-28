@@ -52,3 +52,4 @@ indexing_slicing = "deny"
 
 [dev-dependencies]
 p256 = { workspace = true }
+p384 = { workspace = true }
