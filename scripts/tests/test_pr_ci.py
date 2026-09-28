@@ -28,6 +28,30 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(workflow('build.yml')['on']['push'], {'tags': ['v*']})
         self.assertEqual(workflow('windows.yml')['on']['push'], {'tags': ['v*']})
         self.assertIn('cargo clippy --workspace --all-targets --all-features', (ROOT / '.github/workflows/lint.yml').read_text())
+        release = workflow('release-issuer.yml')
+        self.assertEqual(set(release['on']), {'workflow_dispatch', 'push'})
+        self.assertEqual(release['on']['push'], {'tags': ['v*']})
+        self.assertEqual(set(release['jobs']), {'build-issuer-linux', 'build-issuer-desktop', 'release-issuer'})
+        self.assertEqual(release['on']['workflow_dispatch']['inputs']['tag']['required'], 'true')
+        self.assertIn('refs/tags/v', release['jobs']['release-issuer']['if'])
+        self.assertIn('workflow_dispatch', release['jobs']['release-issuer']['if'])
+
+    def test_public_smoke_uses_hosted_runner_and_system_python_for_apt_yaml(self):
+        w = workflow('pr-checks.yml'); job = w['jobs']['pr-checks']
+        self.assertEqual(job['runs-on'], 'ubuntu-22.04')
+        self.assertEqual(w['permissions'], {'contents': 'read'})
+        self.assertNotIn('${{ secrets.', str(job))
+        steps = job['steps']
+        prepare = next(i for i, step in enumerate(steps) if step.get('uses') == './.github/actions/ensure-rustup')
+        fixtures = next(i for i, step in enumerate(steps) if step.get('name') == 'Check workflow policy and smoke failure guards')
+        self.assertLess(prepare, fixtures)
+        self.assertEqual(steps[fixtures]['run'], "/usr/bin/python3 scripts/run-ci-tests.py scripts/tests 'test_*ci*.py'")
+        helper = (ROOT / '.github/actions/ensure-rustup/action.yml').read_text()
+        for package in ['pkg-config', 'libssl-dev', 'libudev-dev', 'python3-yaml']:
+            self.assertIn(package, helper)
+        self.assertIn('cargo deny check', str(steps)); self.assertIn('cargo audit', str(steps))
+        self.assertIn('scripts/install-ci-security-tools.py cargo-deny cargo-audit', str(steps))
+
 
     def test_bridge_is_metadata_only_and_never_occupies_private_worker(self):
         w = workflow('enterprise-compat.yml'); job = w['jobs']['exact-sha']

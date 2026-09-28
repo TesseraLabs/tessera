@@ -12,16 +12,7 @@ name: release-issuer
 on:
   push:
     tags: ['v*']
-  # Сборка (без публикации) на PR, затрагивающих issuer: без этого workflow
-  # запускается только на теге, то есть первый его прогон за релизный цикл
-  # приходится на сам релиз. Публикация остаётся на теге — job `release-issuer`
-  # гейтится своим `if`, на PR он пропускается.
-  pull_request:
-    paths:
-      - 'crates/tessera_issuer/**'
-      - 'crates/tessera_ext/**'
-      - '.github/workflows/release-issuer.yml'
-      - 'Cargo.lock'
+  # Полная сборка платформ — вручную или на явном релизном теге.
   workflow_dispatch:
     inputs:
       tag:
@@ -32,8 +23,8 @@ permissions:
   contents: read
   # Сборка под Linux идёт в контейнере astra-builder из GHCR: без packages:read
   # GITHUB_TOKEN не имеет права его забрать, и job падает на «Initialize
-  # containers» с «Docker pull failed: denied». На PR это не всплывает —
-  # workflow идёт только на тегах.
+  # containers» с «Docker pull failed: denied». Workflow запускается только
+  # вручную или на релизном теге.
   packages: read
 
 env:
@@ -54,9 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          # github.ref, а не ref_name: на pull_request ref_name даёт «83/merge»,
-          # и checkout ищет его в refs/heads/, где такого нет. Полный ref
-          # (refs/pull/83/merge, refs/tags/v0.5.0) корректен в обоих случаях.
+          # Ручной запуск явно называет тег; push использует полный tag ref.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Build issuer (release)
@@ -95,9 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          # github.ref, а не ref_name: на pull_request ref_name даёт «83/merge»,
-          # и checkout ищет его в refs/heads/, где такого нет. Полный ref
-          # (refs/pull/83/merge, refs/tags/v0.5.0) корректен в обоих случаях.
+          # Ручной запуск явно называет тег; push использует полный tag ref.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
