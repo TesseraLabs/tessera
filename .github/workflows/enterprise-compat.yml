@@ -14,10 +14,12 @@ concurrency:
 
 jobs:
   exact-sha:
-    name: enterprise exact-SHA compatibility
-    if: github.event.pull_request.draft == false
+    # A foreign fork must not acquire the required context through a skipped job.
+    name: ${{ github.event.pull_request.head.repo.full_name == github.repository && 'enterprise exact-SHA compatibility' || 'enterprise compatibility unavailable to forks' }}
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
+    # Metadata-only hosted bridge: never occupy the sole private build worker.
     runs-on: ubuntu-22.04
-    timeout-minutes: 55
+    timeout-minutes: 45
     steps:
       - name: Validate trusted PR source
         env:
@@ -37,7 +39,7 @@ jobs:
 
       - name: Mint enterprise dispatch token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.TESSERA_CI_APP_ID }}
           private-key: ${{ secrets.TESSERA_CI_APP_PRIVATE_KEY }}
@@ -46,11 +48,22 @@ jobs:
           permission-actions: read
           permission-contents: write
 
+      - name: Resolve private consumer revision
+        id: consumer
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          sha="$(gh api repos/TesseraLabs/tessera-enterprise/commits/main --jq .sha)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Dispatch exact-SHA compatibility run
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           OPEN_CORE_SHA: ${{ github.event.pull_request.head.sha }}
           OPEN_CORE_PR: ${{ github.event.pull_request.number }}
+          ENTERPRISE_SHA: ${{ steps.consumer.outputs.sha }}
           REQUEST_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           gh api --method POST \
@@ -58,37 +71,59 @@ jobs:
             -f event_type=open-core-pr \
             -F "client_payload[open_core_sha]=$OPEN_CORE_SHA" \
             -F "client_payload[open_core_pr]=$OPEN_CORE_PR" \
+            -F "client_payload[enterprise_sha]=$ENTERPRISE_SHA" \
             -F "client_payload[request_id]=$REQUEST_ID"
 
       - name: Wait for enterprise result
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REQUEST_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          OPEN_CORE_SHA: ${{ github.event.pull_request.head.sha }}
+          ENTERPRISE_SHA: ${{ steps.consumer.outputs.sha }}
         run: |
           set -euo pipefail
-          title="open-core compatibility $REQUEST_ID"
+          [[ "$OPEN_CORE_SHA" =~ ^[0-9a-f]{40}$ && "$ENTERPRISE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$REQUEST_ID" =~ ^[0-9]+-[0-9]+$ ]] || exit 1
+          title="open-core compatibility $REQUEST_ID $OPEN_CORE_SHA $ENTERPRISE_SHA"
           endpoint="repos/TesseraLabs/tessera-enterprise/actions/workflows/open-core-compat.yml/runs?event=repository_dispatch&per_page=50"
           run_id=""
-
+          workflow_id=""
+          # Never gh run watch: private job annotations/diagnostics must remain private.
           for _ in $(seq 1 120); do
-            run_id="$(
-              gh api "$endpoint" |
-                jq -r --arg title "$title" \
-                  '[.workflow_runs[] | select(.display_title == $title) | .id] | first // empty'
-            )"
-            if [ -n "$run_id" ]; then
+            page="$(gh api "$endpoint" 2>/dev/null)" || { echo 'Enterprise metadata unavailable'; exit 1; }
+            matches="$(printf '%s' "$page" | jq -c --arg title "$title" \
+              '[.workflow_runs[] | select(.display_title == $title and .event == "repository_dispatch")]' 2>/dev/null)" || exit 1
+            count="$(printf '%s' "$matches" | jq -r length 2>/dev/null)" || exit 1
+            if [ "$count" = 1 ]; then
+              printf '%s' "$matches" | jq -e --arg sha "$ENTERPRISE_SHA" '.[0].head_sha == $sha' >/dev/null 2>&1 || exit 1
+              run_id="$(printf '%s' "$matches" | jq -r '.[0].id' 2>/dev/null)"
+              workflow_id="$(printf '%s' "$matches" | jq -r '.[0].workflow_id' 2>/dev/null)"
+              [[ "$run_id" =~ ^[0-9]+$ && "$workflow_id" =~ ^[0-9]+$ ]] || exit 1
               break
             fi
+            [ "$count" = 0 ] || { echo 'Ambiguous Enterprise result'; exit 1; }
             sleep 5
           done
-
-          if [ -z "$run_id" ]; then
-            echo "::error::Enterprise compatibility run was not visible after 10 minutes."
-            exit 1
-          fi
-
-          echo "Following enterprise run $run_id"
-          gh run watch "$run_id" \
-            --repo TesseraLabs/tessera-enterprise \
-            --interval 10 \
-            --exit-status
+          [ -n "$run_id" ] || { echo 'No matching Enterprise dispatch became visible'; exit 1; }
+          printf 'core=%s enterprise=%s\n' "$OPEN_CORE_SHA" "$ENTERPRISE_SHA"
+          echo "https://github.com/TesseraLabs/tessera-enterprise/actions/runs/$run_id"
+          for _ in $(seq 1 240); do
+            result="$(gh api "repos/TesseraLabs/tessera-enterprise/actions/runs/$run_id" 2>/dev/null)" || { echo 'Enterprise metadata unavailable'; exit 1; }
+            printf '%s' "$result" | jq -e --arg title "$title" --arg sha "$ENTERPRISE_SHA" --arg run "$run_id" --arg workflow "$workflow_id" \
+              '(.id|tostring) == $run and (.workflow_id|tostring) == $workflow and .head_sha == $sha and .display_title == $title and .event == "repository_dispatch"' >/dev/null 2>&1 || exit 1
+            status="$(printf '%s' "$result" | jq -r .status 2>/dev/null)"
+            case "$status" in
+              completed)
+                conclusion="$(printf '%s' "$result" | jq -r .conclusion 2>/dev/null)"
+                case "$conclusion" in
+                  success) echo 'Enterprise compatibility: success'; exit 0 ;;
+                  failure|cancelled|timed_out|action_required|stale|skipped|neutral|startup_failure)
+                    echo "Enterprise compatibility: $conclusion"; exit 1 ;;
+                  *) echo 'Enterprise conclusion is not recognised'; exit 1 ;;
+                esac ;;
+              queued|in_progress|waiting|pending|requested) ;;
+              *) echo 'Enterprise status is not recognised'; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo 'Enterprise compatibility timed out'; exit 1

@@ -1,11 +1,6 @@
 name: build-builder-image
 
 on:
-  push:
-    branches: [main, 'feat/**']
-    paths:
-      - 'docker/astra-builder.Dockerfile'
-      - '.github/workflows/build-builder-image.yml'
   workflow_dispatch:
 
 permissions:

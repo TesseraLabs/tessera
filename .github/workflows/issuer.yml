@@ -21,10 +21,7 @@ name: issuer
 #                   которые до сих пор не исполнялись в CI (пробел из 7.1).
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

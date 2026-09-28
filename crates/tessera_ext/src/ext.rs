@@ -337,20 +337,32 @@ pub fn extract_basic_constraints(cert_der: &[u8]) -> Result<Option<BasicConstrai
         return Ok(None);
     };
     let seq = read_tlv_expect(&value, TAG_SEQUENCE)?;
+    if !seq.rest.is_empty() {
+        return Err(DerError::TrailingBytes);
+    }
     let mut rest = seq.value;
     let mut ca = false;
     let mut path_len = None;
     if !rest.is_empty() {
         let peek = read_tlv(rest)?;
         if peek.tag == TAG_BOOLEAN {
-            ca = peek.value.first().copied().unwrap_or(0) != 0;
+            ca = match peek.value {
+                [0] => false,
+                [0xff] => true,
+                _ => return Err(DerError::MalformedBoolean),
+            };
             rest = peek.rest;
         }
     }
     if !rest.is_empty() {
         let int = read_tlv_expect(rest, TAG_INTEGER)?;
         let raw = parse_der_integer_i64(int.value)?;
-        path_len = u64::try_from(raw).ok();
+        // A negative constraint is malformed, never an absent/unlimited one.
+        path_len = Some(u64::try_from(raw).map_err(|_| DerError::IntegerOutOfRange)?);
+        rest = int.rest;
+    }
+    if !rest.is_empty() {
+        return Err(DerError::TrailingBytes);
     }
     Ok(Some(BasicConstraints { ca, path_len }))
 }

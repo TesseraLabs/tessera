@@ -2705,6 +2705,8 @@ name = "tessera_codes_contract"
 version = "0.6.1"
 dependencies = [
  "hex",
+ "p256",
+ "p384",
  "sha2 0.11.0",
  "subtle",
  "thiserror",
@@ -2754,8 +2756,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "udev",
+ "unicode-normalization",
  "uuid",
  "windows-sys 0.61.2",
+ "x509-cert",
  "zeroize",
 ]
 

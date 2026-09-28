@@ -49,3 +49,7 @@ panic_in_result_fn = "deny"
 let_underscore_must_use = "deny"
 let_underscore_lock = "deny"
 indexing_slicing = "deny"
+
+[dev-dependencies]
+p256 = { workspace = true }
+p384 = { workspace = true }

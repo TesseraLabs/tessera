@@ -47,6 +47,7 @@ mod test_support;
 pub mod token;
 pub mod trust;
 pub mod usb;
+pub mod work_authorisation;
 pub mod x509;
 
 pub use config::{RawConfig, ValidatedConfig};

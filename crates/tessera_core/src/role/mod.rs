@@ -12,11 +12,13 @@
 //! open/commercial table).
 
 pub mod audit;
+pub mod catalogue;
 #[cfg(unix)]
 mod getent;
 #[cfg(not(unix))]
 #[path = "getent_unsupported.rs"]
 mod getent;
+pub mod issuance;
 pub mod manifest;
 pub mod schema;
 pub mod selection;
@@ -27,6 +29,10 @@ pub mod update;
 // everywhere; only the source that asks Windows itself is Windows-only.
 pub mod windows_account;
 
+pub use catalogue::{
+    verify_catalogue, CatalogueCheckpoint, CatalogueError, CatalogueRole, VerifiedRoleCatalogue,
+};
+pub use issuance::{CodesIssuanceCap, IssuanceMetadata, RoleIssuance};
 pub use manifest::{
     accept_bundle_version, last_accepted_bundle_version, parse_manifest, persist_bundle_version,
     signed_payload, verify_manifest, verify_manifest_without_accepting, verify_signature, Manifest,

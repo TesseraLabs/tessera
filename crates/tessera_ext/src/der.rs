@@ -83,6 +83,9 @@ pub enum DerError {
     /// Bytes remained after a value that should have consumed its whole buffer.
     #[error("der: trailing bytes after value")]
     TrailingBytes,
+    /// A DER `BOOLEAN` was not exactly one canonical FALSE or TRUE octet.
+    #[error("der: malformed boolean")]
+    MalformedBoolean,
     /// A `BIT STRING` had a bad unused-bits count or an over-wide payload.
     #[error("der: malformed bit string")]
     MalformedBitString,

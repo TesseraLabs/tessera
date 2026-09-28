@@ -1,7 +1,7 @@
 //! Where the device keeps what the code method needs.
 //!
-//! Four artefacts, all of them delivered by enrolment and none of them written
-//! by this code: the container holding the device private key, the ticket set,
+//! The artefacts are delivered by enrollment or assembled from a locally owned
+//! key and verified public material: the private key container, the ticket set,
 //! the revocation list of those tickets, and the anchor the tickets are checked
 //! against. Beside them sits a state directory this module does write — the
 //! throttle of the device and the file its attempt lock is held on.
@@ -15,9 +15,8 @@
 use std::path::{Path, PathBuf};
 
 use openssl::pkey::{PKey, Private};
-use secrecy::SecretString;
 
-use crate::pkcs12::{LoadedKeyMaterial, Pkcs12Error};
+use crate::pkcs12::Pkcs12Error;
 
 /// Default directory the artefacts of the code method are delivered to.
 pub const DEFAULT_CODES_DIR: &str = "/var/lib/tessera/codes";
@@ -427,9 +426,7 @@ pub fn load_device_key(
             )))
         }
     };
-    let material =
-        LoadedKeyMaterial::from_p12(&bytes, &SecretString::from(String::new()), gost_engine_path)?;
-    Ok(material.private_key()?)
+    Ok(crate::pkcs12::local_private_key(&bytes, gost_engine_path)?)
 }
 
 #[cfg(test)]

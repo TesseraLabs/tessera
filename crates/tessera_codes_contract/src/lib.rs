@@ -32,6 +32,12 @@
 //! - [`registry`] — the device registry record: the payload, the three
 //!   signatures over it in the order they are made, and what the record says
 //!   about where the device key is kept.
+//! - [`registration_authority`] — bounded owner-signed registration grants,
+//!   with explicit caller-supplied protected current checkpoints.
+//! - [`delegated_registry`] — the explicit delegated device-record v2 proof;
+//!   the direct-owner v1 record and its signature slots remain unchanged.
+//! - [`registry_baseline`] — complete owner-attested historical inventories and
+//!   ordered legacy imports; protected runtime transitions remain caller duties.
 //! - [`engineer`] — the registry record of a person and the authorisation that
 //!   says what they may ask for, on which devices and during which period,
 //!   kept apart on purpose.
@@ -116,6 +122,7 @@
 pub mod canon;
 pub mod challenge;
 pub mod code;
+pub mod delegated_registry;
 pub mod device_number;
 pub mod engineer;
 pub mod engineer_number;
@@ -129,7 +136,9 @@ pub mod number;
 pub mod outcome;
 pub mod params;
 pub mod profile;
+pub mod registration_authority;
 pub mod registry;
+pub mod registry_baseline;
 pub mod request;
 pub mod revocation;
 pub mod signature;

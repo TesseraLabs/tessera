@@ -26,3 +26,10 @@ pub use import::{
     installed_managed_tags, CodesImport, EnrollmentPackage, ImportError, ImportMode, ImportOutcome,
     InstallPaths, DEFAULT_CRL_PATH, DEFAULT_P12_PATH, MAX_CRL_BYTES, MAX_P12_BYTES,
 };
+
+#[cfg(unix)]
+pub mod local_keys;
+#[cfg(unix)]
+mod owned_fs;
+#[cfg(unix)]
+pub mod public_material;
