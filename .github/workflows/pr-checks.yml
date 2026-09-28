@@ -12,7 +12,7 @@ jobs:
   pr-checks:
     name: pr-checks
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, synology]
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - name: Set job-local diagnostic path
@@ -23,7 +23,8 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/ensure-rustup
       - name: Check workflow policy and smoke failure guards
-        run: python3 scripts/run-ci-tests.py scripts/tests 'test_*ci*.py'
+        # python3-yaml is installed by apt; hosted toolcache Python is separate.
+        run: /usr/bin/python3 scripts/run-ci-tests.py scripts/tests 'test_*ci*.py'
       - run: rustup show
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
         with:
