@@ -26,7 +26,11 @@ pub const MAX_CSR_BYTES: usize = 16 * 1024;
 pub const MAX_CERTIFICATE_BYTES: usize = 64 * 1024;
 /// Maximum caller-derived URI, in ASCII bytes.
 pub const MAX_URI_BYTES: usize = 256;
+/// Maximum identifier copied from the issuing CA's Subject Key Identifier.
+pub const MAX_KEY_IDENTIFIER_BYTES: usize = 64;
 const SAN_OID: &str = "2.5.29.17";
+const SKI_OID: &str = "2.5.29.14";
+const AKI_OID: &str = "2.5.29.35";
 const CLIENT_AUTH_OID: &str = "1.3.6.1.5.5.7.3.2";
 const ECDSA_SHA256_OID: &str = "1.2.840.10045.4.3.2";
 
@@ -114,8 +118,10 @@ impl PreparedClientAuthTbs {
 
 /// Prepare a fixed clientAuth-only, CA=false certificate TBS from a verified CSR.
 ///
-/// The issuer is checked for CA/keyCertSign, matching public-key algorithm and
-/// containing validity. No issuer signature, chain, revocation or caller plan
+/// The issuer is checked for CA/keyCertSign, a bounded noncritical Subject Key
+/// Identifier, matching public-key algorithm and containing validity. Its SKI
+/// is copied into the leaf's noncritical Authority Key Identifier. No issuer
+/// signature, chain, revocation or caller plan
 /// is verified here. Access CA critical extensions remain a separate TLS
 /// verifier compatibility concern; this function does not ignore them on a path.
 ///
@@ -174,7 +180,7 @@ pub fn prepare_client_auth_tbs(
     check_issuer_algorithm(&parent.spki, request.signature_algorithm)?;
     let algorithm = tbs::algorithm_identifier_der(request.signature_algorithm)?;
     let validity = tbs::validity_der(&request.validity)?;
-    let extensions = extensions(request.subject_uri)?;
+    let extensions = extensions(request.subject_uri, &parent.key_identifier)?;
     let tbs_der = tbs::assemble_tbs(
         request.serial,
         &algorithm,
@@ -261,7 +267,7 @@ pub fn validate_client_auth_tbs(bytes: &[u8]) -> Result<(), ClientAuthError> {
     let ext = parsed
         .extensions
         .ok_or(ClientAuthError::Invalid("extensions"))?;
-    if ext.len() != 4 {
+    if ext.len() != 5 {
         return Err(ClientAuthError::Invalid("extensions"));
     }
     let san = ext.get(3).ok_or(ClientAuthError::Invalid("san"))?;
@@ -276,6 +282,16 @@ pub fn validate_client_auth_tbs(bytes: &[u8]) -> Result<(), ClientAuthError> {
     let uri =
         std::str::from_utf8(contents(uri, 0x86)?).map_err(|_| ClientAuthError::Invalid("uri"))?;
     validate_uri(uri)?;
+    let aki = ext.get(4).ok_or(ClientAuthError::Invalid("aki"))?;
+    if aki.extn_id.to_string() != AKI_OID || aki.critical {
+        return Err(ClientAuthError::Invalid("aki"));
+    }
+    let mut authority = sequence(aki.extn_value.as_bytes())?;
+    let identifier = contents(take(&mut authority, 0x80)?, 0x80)?;
+    if !authority.is_empty() {
+        return Err(ClientAuthError::Invalid("aki_fields"));
+    }
+    check_key_identifier(identifier)?;
     let mut actual = Vec::new();
     for item in &ext {
         actual.extend_from_slice(
@@ -284,13 +300,14 @@ pub fn validate_client_auth_tbs(bytes: &[u8]) -> Result<(), ClientAuthError> {
                 .map_err(|_| ClientAuthError::Invalid("extension"))?,
         );
     }
-    if actual != extensions(uri)? {
+    if actual != extensions(uri, identifier)? {
         return Err(ClientAuthError::Invalid("extension_profile"));
     }
     Ok(())
 }
 
-fn extensions(uri: &str) -> Result<Vec<u8>, ClientAuthError> {
+fn extensions(uri: &str, key_identifier: &[u8]) -> Result<Vec<u8>, ClientAuthError> {
+    check_key_identifier(key_identifier)?;
     let mut out = Vec::new();
     for (oid, critical, value) in [
         ("2.5.29.19", true, vec![0x30, 0]),
@@ -310,6 +327,11 @@ fn extensions(uri: &str) -> Result<Vec<u8>, ClientAuthError> {
             SAN_OID,
             true,
             encode_tlv(TAG_SEQUENCE, &encode_tlv(0x86, uri.as_bytes())),
+        ),
+        (
+            AKI_OID,
+            false,
+            encode_tlv(TAG_SEQUENCE, &encode_tlv(0x80, key_identifier)),
         ),
     ] {
         out.extend_from_slice(&tbs::encode_extension(oid, critical, &value)?);
@@ -359,6 +381,7 @@ struct IssuerParts {
     subject: Vec<u8>,
     spki: Vec<u8>,
     validity: Validity,
+    key_identifier: Vec<u8>,
 }
 
 // The issuing CA may have wide Tessera extension OIDs. Parse its standard fields
@@ -403,7 +426,7 @@ fn issuer_parts(bytes: &[u8]) -> Result<IssuerParts, ClientAuthError> {
     if !fields.is_empty() {
         return Err(ClientAuthError::Invalid("issuer_fields"));
     }
-    unique_extensions(contents(ext, 0xA3)?)?;
+    let key_identifier = issuer_key_identifier(contents(ext, 0xA3)?)?;
     if !extract_basic_constraints(bytes)
         .map_err(IssueError::from)?
         .is_some_and(|bc| bc.ca)
@@ -425,12 +448,14 @@ fn issuer_parts(bytes: &[u8]) -> Result<IssuerParts, ClientAuthError> {
         subject,
         spki,
         validity: window(validity),
+        key_identifier,
     })
 }
 
-fn unique_extensions(bytes: &[u8]) -> Result<(), ClientAuthError> {
+fn issuer_key_identifier(bytes: &[u8]) -> Result<Vec<u8>, ClientAuthError> {
     let mut extensions = sequence(bytes)?;
     let mut seen = BTreeSet::new();
+    let mut key_identifier = None;
     while !extensions.is_empty() {
         if seen.len() >= 64 {
             return Err(ClientAuthError::Invalid("issuer_extension_count"));
@@ -441,21 +466,41 @@ fn unique_extensions(bytes: &[u8]) -> Result<(), ClientAuthError> {
         if encode_oid(&oid).map_err(IssueError::from)? != oid_bytes {
             return Err(ClientAuthError::Invalid("issuer_oid_encoding"));
         }
-        if !seen.insert(oid) {
+        if !seen.insert(oid.clone()) {
             return Err(ClientAuthError::Invalid("duplicate_issuer_extension"));
         }
-        if fields.first() == Some(&TAG_BOOLEAN)
-            && !bool::from_der(take(&mut fields, TAG_BOOLEAN)?)
+        let critical = if fields.first() == Some(&TAG_BOOLEAN) {
+            if !bool::from_der(take(&mut fields, TAG_BOOLEAN)?)
                 .map_err(|_| ClientAuthError::Invalid("issuer_critical"))?
-        {
-            return Err(ClientAuthError::Invalid("default_issuer_critical"));
+            {
+                return Err(ClientAuthError::Invalid("default_issuer_critical"));
+            }
+            true
+        } else {
+            false
+        };
+        let value = contents(take(&mut fields, TAG_OCTET_STRING)?, TAG_OCTET_STRING)?;
+        if oid == SKI_OID {
+            if critical {
+                return Err(ClientAuthError::Invalid("issuer_ski_critical"));
+            }
+            let identifier = contents(value, TAG_OCTET_STRING)?;
+            check_key_identifier(identifier)?;
+            key_identifier = Some(identifier.to_vec());
         }
-        take(&mut fields, TAG_OCTET_STRING)?;
         if !fields.is_empty() {
             return Err(ClientAuthError::Invalid("issuer_extension"));
         }
     }
-    Ok(())
+    key_identifier.ok_or(ClientAuthError::Invalid("issuer_ski_missing"))
+}
+
+fn check_key_identifier(bytes: &[u8]) -> Result<(), ClientAuthError> {
+    if bytes.is_empty() || bytes.len() > MAX_KEY_IDENTIFIER_BYTES {
+        Err(ClientAuthError::Invalid("key_identifier_bound"))
+    } else {
+        Ok(())
+    }
 }
 
 fn check_issuer_algorithm(

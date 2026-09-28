@@ -38,6 +38,7 @@ must additionally enforce its own exact identity namespace and binding.
 | 2 | keyUsage, 2.5.29.15 | yes | digitalSignature only |
 | 3 | extendedKeyUsage, 2.5.29.37 | no | clientAuth, 1.3.6.1.5.5.7.3.2 only |
 | 4 | subjectAltName, 2.5.29.17 | yes | one uniformResourceIdentifier |
+| 5 | authorityKeyIdentifier, 2.5.29.35 | no | only keyIdentifier, copied exactly from issuer SKI |
 
 There are no Engine host-binding, allowed-role, integrity, delegation or
 profile-version extensions. The helper accepts no arbitrary Subject or
@@ -48,10 +49,18 @@ or changed during retry.
 
 The exact issuer Subject supplies the TBS issuer name. Public issuer inputs
 are bounded to 64 KiB and checked structurally: CA=true, keyCertSign, unique
-well-formed extensions, nonempty name, compatible issuer-key/signature algorithm
+well-formed extensions, a noncritical Subject Key Identifier containing 1–64
+bytes, nonempty name, compatible issuer-key/signature algorithm
 and containing validity window. These are shape checks, not verification of
 the issuer's signature, chain, current revocation or authorization to issue.
 The caller must enforce those and any narrower parent/policy lifetime limits.
+
+The Authority Key Identifier is derived from the selected issuer certificate,
+never supplied by the CSR or a separate caller field. A missing, duplicate,
+critical, empty, oversized or malformed issuer SKI refuses preparation. No
+replacement identifier is guessed. This follows [RFC 5280 sections 4.2.1.1–2](https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.1).
+The TBS validator checks the closed AKI shape; matching it to the actual trusted
+issuer remains part of comparing the prepared TBS and validating the signed path.
 
 `PreparedClientAuthTbs` is immutable and exposes exact TBS, CSR and issuer
 fingerprints, emitted SPKI and URI. Repeated identical inputs give identical
@@ -78,7 +87,7 @@ is a profile separation property, not a replacement for a receiver's own trust,
 identity, purpose, activation and revocation checks.
 
 Tests create a real signed public fixture certificate and verify its standard
-PKIX chain for SSL_CLIENT, while SSL_SERVER and the existing Engine checks
+PKIX chain for SSL_CLIENT with OpenSSL X509_STRICT, while SSL_SERVER and the existing Engine checks
 refuse it. They exercise distinct point representations, malicious CSR
 attributes, DER canonicality, malformed lengths, BIT STRING padding, serial
 boundaries and randomized inputs.

@@ -11,10 +11,11 @@ use openssl::pkey::{PKey, Private};
 use openssl::sign::Signer;
 use openssl::stack::Stack;
 use openssl::x509::extension::{
-    BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+    AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+    SubjectKeyIdentifier,
 };
 use openssl::x509::store::X509StoreBuilder;
-use openssl::x509::verify::X509VerifyParam;
+use openssl::x509::verify::{X509VerifyFlags, X509VerifyParam};
 use openssl::x509::{
     X509Extension, X509NameBuilder, X509PurposeId, X509Req, X509StoreContext, X509,
 };
@@ -102,6 +103,17 @@ fn ca(key: &PKey<Private>, issuer: Option<(&X509, &PKey<Private>)>, access: bool
                 .unwrap(),
         )
         .unwrap();
+    let ski = SubjectKeyIdentifier::new()
+        .build(&builder.x509v3_context(issuer.map(|(cert, _)| cert.as_ref()), None))
+        .unwrap();
+    builder.append_extension(ski).unwrap();
+    if let Some((parent, _)) = issuer {
+        let aki = AuthorityKeyIdentifier::new()
+            .keyid(true)
+            .build(&builder.x509v3_context(Some(parent), None))
+            .unwrap();
+        builder.append_extension(aki).unwrap();
+    }
     if access {
         builder
             .append_extension(custom(
@@ -237,6 +249,7 @@ fn pkix_client(root: &X509, intermediates: &[X509], leaf: &X509, purpose: X509Pu
     store.set_purpose(purpose).unwrap();
     let mut params = X509VerifyParam::new().unwrap();
     params.set_time(NOW);
+    params.set_flags(X509VerifyFlags::X509_STRICT).unwrap();
     store.set_param(&params).unwrap();
     let mut chain = Stack::new().unwrap();
     for cert in intermediates {
@@ -272,6 +285,10 @@ fn real_pkix_client_profile_is_deterministic_but_not_an_engine_credential() {
     let der = sign_fixture(&prepared, &f.issuer);
     let cert = X509::from_der(&der).unwrap();
     assert!(cert.verify(&f.issuer).unwrap());
+    assert_eq!(
+        cert.authority_key_id().unwrap().as_slice(),
+        f.ca.subject_key_id().unwrap().as_slice()
+    );
     assert!(pkix_client(&f.ca, &[], &cert, X509PurposeId::SSL_CLIENT));
     assert!(!pkix_client(&f.ca, &[], &cert, X509PurposeId::SSL_SERVER));
     assert_eq!(cert.subject_name().entries().count(), 0);
@@ -338,6 +355,58 @@ fn real_pkix_client_profile_is_deterministic_but_not_an_engine_credential() {
     // Optional export of this public fixture certificate for independent consumer tests.
     if let Some(path) = std::env::var_os("TESSERA_CLIENT_AUTH_TEST_CERT_DER") {
         std::fs::write(path, &der).unwrap();
+    }
+}
+
+#[test]
+fn issuer_key_identifier_and_leaf_authority_identifier_are_closed_and_bounded() {
+    let f = Fixture::new();
+    let ca_der = f.ca.to_der().unwrap();
+    for change in 0..6 {
+        let mut parent = x509_cert::Certificate::from_der(&ca_der).unwrap();
+        let extensions = parent.tbs_certificate.extensions.as_mut().unwrap();
+        let index = extensions
+            .iter()
+            .position(|item| item.extn_id.to_string() == "2.5.29.14")
+            .unwrap();
+        match change {
+            0 => {
+                extensions.remove(index);
+            }
+            1 => {
+                extensions[index].critical = true;
+            }
+            2 => {
+                extensions.push(extensions[index].clone());
+            }
+            value => {
+                let encoded = match value {
+                    3 => vec![0x04, 0x00],
+                    4 => tessera_ext::der::encode_tlv(0x04, &[1; MAX_KEY_IDENTIFIER_BYTES + 1]),
+                    _ => vec![0x04, 0x01, 0x01, 0x00],
+                };
+                extensions[index].extn_value = der::asn1::OctetString::new(encoded).unwrap();
+            }
+        }
+        assert!(prepare_client_auth_tbs(&f.request(&parent.to_der().unwrap())).is_err());
+    }
+    let prepared = prepare_client_auth_tbs(&f.request(&ca_der)).unwrap();
+    for change in 0..5 {
+        let mut tbs = x509_cert::TbsCertificate::from_der(prepared.tbs_der()).unwrap();
+        let aki = &mut tbs.extensions.as_mut().unwrap()[4];
+        if change == 0 {
+            aki.critical = true;
+        } else {
+            let fields = match change {
+                1 => vec![0x80, 0x00],
+                2 => tessera_ext::der::encode_tlv(0x80, &[1; MAX_KEY_IDENTIFIER_BYTES + 1]),
+                3 => vec![0x80, 0x01, 0x01, 0x82, 0x01, 0x01],
+                _ => vec![0x04, 0x01, 0x01],
+            };
+            aki.extn_value =
+                der::asn1::OctetString::new(tessera_ext::der::encode_tlv(0x30, &fields)).unwrap();
+        }
+        assert!(validate_client_auth_tbs(&tbs.to_der().unwrap()).is_err());
     }
 }
 
