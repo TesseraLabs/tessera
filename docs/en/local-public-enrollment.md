@@ -36,6 +36,25 @@ Codes pins, ticket signatures and public anchor are checked with the existing
 parsers. The application also preserves epoch and revocation monotonicity.
 Ticket time, scope and role eligibility still belong to the normal login path.
 
+`verify_public_material` exposes those same public-byte checks without local keys,
+filesystem reads or a returned leaf. Supply the exact raw manifest, a map of named
+public files excluding `manifest.toml`, the independently selected OS and Ed25519
+public key, an optional minimum bundle version and an optional accepted catalogue
+checkpoint. Adapters converting a list or frame to the map must reject duplicate
+names before insertion, rather than overwrite them. The verifier checks the exact
+declared file set and existing per-file/count/aggregate bounds before copying it.
+It rejects same-version different manifest bytes when an accepted checkpoint is
+supplied. `VerifiedPublicMaterial` exposes the unchanged verified bytes, manifest,
+checkpoint and actual public-key fingerprint through read-only getters.
+
+Verification does not advance a floor or establish source freshness. A supplied
+source checkpoint is not a remote device's installed checkpoint; omitting one is
+not evidence that the device has no prior state. The device wrapper reuses this
+verifier while retaining local key/leaf checks, safe filesystem reads and the
+aggregate bound including the leaf. Application still checks local accounts,
+paths, key custody, epoch/revocation state and the real device floor. An enclosing
+delivery must separately enforce its own encoded-size limit and certificate trust.
+
 A returned DER leaf must contain the actual local TLS public key. This check does
 **not** authenticate the server, certificate chain, issuer, purpose, identity or
 validity. The private protocol adapter must verify those facts and the outer signed
