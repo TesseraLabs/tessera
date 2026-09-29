@@ -106,6 +106,32 @@ impl Fixture {
         )
         .unwrap();
     }
+    fn material(&self) -> (Vec<u8>, BTreeMap<String, Vec<u8>>) {
+        let mut files = BTreeMap::new();
+        for entry in fs::read_dir(&self.source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name != "manifest.toml" {
+                files.insert(name, fs::read(entry.path()).unwrap());
+            }
+        }
+        (fs::read(self.source.join("manifest.toml")).unwrap(), files)
+    }
+    fn verify_public(
+        &self,
+        minimum: Option<u64>,
+        accepted: Option<&CatalogueCheckpoint>,
+    ) -> io::Result<VerifiedPublicMaterial> {
+        let (manifest, files) = self.material();
+        verify_public_material(
+            &manifest,
+            &files,
+            RoleOs::Linux,
+            &self.owner.public_key_to_pem().unwrap(),
+            minimum,
+            accepted,
+        )
+    }
     fn prepare(&self) -> io::Result<PreparedPublicEnrollment> {
         PreparedPublicEnrollment::prepare(
             &self.source,
@@ -241,6 +267,13 @@ fn invalid_public_inputs_never_touch_installation_or_floor() {
             _ => unreachable!(),
         }
         assert!(f.prepare().is_err(), "{kind}");
+        // The pure verifier shares public-material checks; local TLS possession
+        // remains a deliberate additional obligation of the device wrapper.
+        assert_eq!(
+            f.verify_public(None, None).is_ok(),
+            kind == "leaf",
+            "{kind}"
+        );
         assert!(!f.paths.roles_dir.exists());
         assert!(!f.paths.persist_dir.exists());
         assert!(!f.keys.root().join(STATE_FILE).exists());
@@ -479,4 +512,86 @@ fn shared_floor_parent_and_codes_files_beneath_state_remain_supported() {
         prepared.state(&paths, &f.keys).unwrap(),
         PublicApplyState::Complete
     );
+}
+
+#[test]
+fn byte_verification_preserves_exact_material_without_device_state() {
+    let f = Fixture::new();
+    let (manifest, files) = f.material();
+    let verified = f.verify_public(Some(7), None).unwrap();
+    assert_eq!(verified.manifest_bytes(), manifest);
+    assert_eq!(verified.files(), &files);
+    assert_eq!(verified.manifest().bundle_version, 7);
+    assert_eq!(verified.checkpoint().bundle_version(), 7);
+    let public = f.owner.public_key_to_der().unwrap();
+    assert_eq!(
+        verified.trust_sha256(),
+        <[u8; 32]>::from(Sha256::digest(&public))
+    );
+    let prepared = f.prepare().unwrap();
+    assert_eq!(prepared.manifest_bytes, verified.manifest_bytes());
+    assert_eq!(prepared.files, *verified.files());
+    assert!(!f.paths.persist_dir.exists());
+    assert!(!f.keys.root().join(STATE_FILE).exists());
+    // Once bytes were captured, their validation needs no local key/leaf or filesystem.
+    drop(f);
+    let key = PKey::public_key_from_der(&public)
+        .unwrap()
+        .public_key_to_pem()
+        .unwrap();
+    assert!(verify_public_material(&manifest, &files, RoleOs::Linux, &key, None, None).is_ok());
+}
+
+#[test]
+fn byte_verification_obeys_supplied_floor_and_exact_checkpoint() {
+    let f = Fixture::new();
+    let verified = f.verify_public(None, None).unwrap();
+    let checkpoint = verified.checkpoint();
+    assert!(f.verify_public(Some(7), Some(&checkpoint)).is_ok());
+    assert!(f.verify_public(Some(8), None).is_err());
+    let newer = CatalogueCheckpoint::new(8, [0; 32]);
+    assert!(f.verify_public(None, Some(&newer)).is_err());
+    f.sign(&format!(
+        "# Same semantic data, different signed bytes\n{}",
+        f.unsigned
+    ));
+    assert!(f.verify_public(None, None).is_ok());
+    assert!(f.verify_public(None, Some(&checkpoint)).is_err());
+    assert!(!f.paths.persist_dir.exists());
+}
+
+#[test]
+fn byte_verification_refuses_extra_missing_and_oversized_files() {
+    let f = Fixture::new();
+    let (manifest, original) = f.material();
+    let key = f.owner.public_key_to_pem().unwrap();
+    for kind in ["missing", "extra", "manifest-entry", "oversize", "renamed"] {
+        let mut files = original.clone();
+        match kind {
+            "missing" => {
+                files.remove("oper.toml");
+            }
+            "extra" => {
+                files.insert("extra.txt".into(), vec![]);
+            }
+            "manifest-entry" => {
+                files.insert("manifest.toml".into(), manifest.clone());
+            }
+            "oversize" => {
+                files.insert(
+                    "oper.toml".into(),
+                    vec![0; role::schema::MAX_SLICE_BYTES + 1],
+                );
+            }
+            "renamed" => {
+                let bytes = files.remove("oper.toml").unwrap();
+                files.insert("other.toml".into(), bytes);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_public_material(&manifest, &files, RoleOs::Linux, &key, None, None).is_err(),
+            "{kind}"
+        );
+    }
 }

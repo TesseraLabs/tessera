@@ -18,6 +18,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[path = "public_material_validation.rs"]
+mod validation;
+pub use validation::{verify_public_material, VerifiedPublicMaterial};
+
 const STATE_CAP: usize = 1024;
 const STATE_FILE: &str = "public-material.json";
 /// Maximum combined public package bytes, including the manifest and leaf.
@@ -111,9 +115,6 @@ impl PreparedPublicEnrollment {
         keys: &LocalEnrollmentKeys,
         tls_leaf_der: &[u8],
     ) -> io::Result<Self> {
-        if trusted_manifest_key.is_empty() || trusted_manifest_key.len() > 16 * 1024 {
-            return Err(disk::invalid("manifest key bound"));
-        }
         keys.recheck()?;
         keys.require_tls_leaf_key(tls_leaf_der)?;
         let raw = public_read(
@@ -121,47 +122,23 @@ impl PreparedPublicEnrollment {
             role::manifest::MAX_MANIFEST_BYTES,
         )?;
         let manifest = role::parse_manifest(&raw).map_err(other)?;
-        if manifest.os != os {
-            return Err(disk::invalid("foreign manifest OS"));
-        }
-        if manifest.p12_sha256.is_some()
-            || manifest
-                .codes
-                .as_ref()
-                .is_some_and(|c| c.key_container.is_some())
-        {
-            return Err(disk::invalid(
-                "public material contains private-delivery fields",
-            ));
-        }
         let files = read_declared_files(
             root,
             &manifest,
             raw.len().saturating_add(tls_leaf_der.len()),
         )?;
         let floor = role::last_accepted_bundle_version(persist_dir).map_err(other)?;
-        role::catalogue::verify_catalogue(
-            &raw,
-            &role_files(&manifest, &files)?,
-            trusted_manifest_key,
-            floor,
-            None,
-        )
-        .map_err(other)?;
-        if let Some(crl) = &manifest.crl {
-            hash_matches(required(&files, &crl.file)?, &crl.sha256)?;
-        }
+        let verified = verify_public_material(&raw, &files, os, trusted_manifest_key, floor, None)?;
         let result = Self {
-            manifest,
-            manifest_bytes: raw,
-            files,
+            manifest: verified.manifest,
+            manifest_bytes: verified.manifest_bytes,
+            files: verified.files,
             leaf: tls_leaf_der.to_vec(),
             trust: trusted_manifest_key.to_vec(),
             codes_point: keys.codes_public_key()?,
             tls_spki: keys.tls_spki()?,
             input_digest: [0; 32],
         };
-        result.delivery()?;
         let mut result = result;
         result.input_digest = result.hash_inputs();
         Ok(result)
@@ -367,53 +344,7 @@ impl PreparedPublicEnrollment {
     }
 
     fn delivery(&self) -> io::Result<CodesDelivery> {
-        let Some(section) = &self.manifest.codes else {
-            return Ok(CodesDelivery::default());
-        };
-        let get = |entry: &Option<role::ManifestCodesFile>| -> io::Result<Option<Vec<u8>>> {
-            entry
-                .as_ref()
-                .map(|e| {
-                    let bytes = required(&self.files, &e.file)?;
-                    hash_matches(
-                        bytes,
-                        e.sha256
-                            .as_deref()
-                            .ok_or_else(|| disk::invalid("unbound Codes file"))?,
-                    )?;
-                    Ok(bytes.to_vec())
-                })
-                .transpose()
-        };
-        let delivery = CodesDelivery {
-            key: None,
-            tickets: get(&section.tickets)?,
-            revocations: get(&section.ticket_revocations)?,
-            ticket_authority: get(&section.ticket_authority)?,
-            page_urls: get(&section.page_urls)?,
-        };
-        let tickets = TicketStore::parse(
-            text(delivery.tickets.as_deref())?,
-            text(delivery.revocations.as_deref())?,
-        )
-        .map_err(other)?;
-        let anchor = TicketAnchor::parse(
-            delivery
-                .ticket_authority
-                .as_deref()
-                .ok_or_else(|| disk::invalid("missing ticket anchor"))?,
-        )
-        .map_err(other)?;
-        tickets.verify_signatures(&anchor).map_err(other)?;
-        if crate::codes::store::parse_page_urls(
-            text(delivery.page_urls.as_deref())?
-                .ok_or_else(|| disk::invalid("missing addresses"))?,
-        )
-        .is_empty()
-        {
-            return Err(disk::invalid("empty page addresses"));
-        }
-        Ok(delivery)
+        codes_delivery(&self.manifest, &self.files)
     }
 
     fn installed(&self, paths: &PublicInstallPaths, keys: &LocalEnrollmentKeys) -> io::Result<()> {
@@ -606,6 +537,58 @@ impl Drop for Stage {
     }
 }
 
+fn codes_delivery(
+    manifest: &role::Manifest,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> io::Result<CodesDelivery> {
+    let Some(section) = &manifest.codes else {
+        return Ok(CodesDelivery::default());
+    };
+    let get = |entry: &Option<role::ManifestCodesFile>| -> io::Result<Option<Vec<u8>>> {
+        entry
+            .as_ref()
+            .map(|e| {
+                let bytes = required(files, &e.file)?;
+                hash_matches(
+                    bytes,
+                    e.sha256
+                        .as_deref()
+                        .ok_or_else(|| disk::invalid("unbound Codes file"))?,
+                )?;
+                Ok(bytes.to_vec())
+            })
+            .transpose()
+    };
+    let delivery = CodesDelivery {
+        key: None,
+        tickets: get(&section.tickets)?,
+        revocations: get(&section.ticket_revocations)?,
+        ticket_authority: get(&section.ticket_authority)?,
+        page_urls: get(&section.page_urls)?,
+    };
+    let tickets = TicketStore::parse(
+        text(delivery.tickets.as_deref())?,
+        text(delivery.revocations.as_deref())?,
+    )
+    .map_err(other)?;
+    let anchor = TicketAnchor::parse(
+        delivery
+            .ticket_authority
+            .as_deref()
+            .ok_or_else(|| disk::invalid("missing ticket anchor"))?,
+    )
+    .map_err(other)?;
+    tickets.verify_signatures(&anchor).map_err(other)?;
+    if crate::codes::store::parse_page_urls(
+        text(delivery.page_urls.as_deref())?.ok_or_else(|| disk::invalid("missing addresses"))?,
+    )
+    .is_empty()
+    {
+        return Err(disk::invalid("empty page addresses"));
+    }
+    Ok(delivery)
+}
+
 fn role_files(
     manifest: &role::Manifest,
     files: &BTreeMap<String, Vec<u8>>,
@@ -631,11 +614,7 @@ fn fault(at: &str) -> io::Result<()> {
 #[path = "public_material_tests.rs"]
 mod tests;
 
-fn read_declared_files(
-    root: &Path,
-    manifest: &role::Manifest,
-    initial_bytes: usize,
-) -> io::Result<BTreeMap<String, Vec<u8>>> {
+fn declared_files(manifest: &role::Manifest) -> io::Result<BTreeMap<String, usize>> {
     let mut declared = BTreeMap::new();
     for name in manifest.roles.keys() {
         declared.insert(format!("{name}.toml"), role::schema::MAX_SLICE_BYTES);
@@ -666,6 +645,15 @@ fn read_declared_files(
             ));
         }
     }
+    Ok(declared)
+}
+
+fn read_declared_files(
+    root: &Path,
+    manifest: &role::Manifest,
+    initial_bytes: usize,
+) -> io::Result<BTreeMap<String, Vec<u8>>> {
+    let declared = declared_files(manifest)?;
     let expected: BTreeSet<_> = declared
         .keys()
         .map(String::as_str)
