@@ -1,0 +1,52 @@
+name: developer signatures
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  developer-signatures:
+    name: developer signatures
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check trusted signatures and regression cases
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted="$(mktemp -d)"
+          trap 'rm -rf "$trusted"' EXIT
+          mkdir -p "$trusted/tests"
+          if git cat-file -e "$BASE_SHA:.ci/verify_commit_signatures.py" 2>/dev/null; then
+            git show "$BASE_SHA:.ci/verify_commit_signatures.py" > "$trusted/verify_commit_signatures.py"
+            git show "$BASE_SHA:.ci/allowed_signers" > "$trusted/allowed_signers"
+            git show "$BASE_SHA:.ci/publisher_signers" > "$trusted/publisher_signers"
+            git show "$BASE_SHA:.ci/tests/test_commit_signatures.py" > "$trusted/tests/test_commit_signatures.py"
+          else
+            # Frozen initial bootstrap only; every later PR uses protected-base trust.
+            test "$BASE_SHA" = "5acf24a6b815e9e016dd89718623114efbe23ef6"
+            test "$GITHUB_REPOSITORY" = "TesseraLabs/tessera"
+            for file in verify_commit_signatures.py allowed_signers publisher_signers tests/test_commit_signatures.py; do
+              git show "$HEAD_SHA:.ci/$file" > "$trusted/$file"
+            done
+            echo "9252d4a8a97f664112e313e4ab9ce72365714a3c1ea298c36d3bfc11a47b634a  $trusted/verify_commit_signatures.py" | sha256sum -c -
+            echo "24d2672b8afc366f5013be40de697e90c7015c2a04487388187c5c988f6ac6e1  $trusted/allowed_signers" | sha256sum -c -
+            echo "24d2672b8afc366f5013be40de697e90c7015c2a04487388187c5c988f6ac6e1  $trusted/publisher_signers" | sha256sum -c -
+            echo "df617a7eed3606d7144e733a6fb0ac6caf4e552c25437c803b380d8e8d35ca67  $trusted/tests/test_commit_signatures.py" | sha256sum -c -
+          fi
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$trusted/tests"
+          python3 "$trusted/verify_commit_signatures.py" --base "$BASE_SHA" --head "$HEAD_SHA" \
+            --signers "$trusted/allowed_signers" --publisher-signers "$trusted/publisher_signers" \
+            --sourcecraft-repo tessera-labs/tessera \
+            --publication-manifest .ci/sourcecraft-publication.json
