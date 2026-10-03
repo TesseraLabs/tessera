@@ -1,0 +1,8 @@
+branch_protection:
+  policies:
+    - target: default_branch
+      message: "Main changes require a PR; history rewrite and deletion are forbidden."
+      rules:
+        - prevent_deletion
+        - prevent_force_push
+        - prevent_non_pr_changes
