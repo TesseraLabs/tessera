@@ -16,3 +16,7 @@ from the deferred external contributor PR bridge.
 
 All three bootstrap gates passed, including protected Enterprise shared CI.
 This ordinary PR verifies the installed automatic mandatory workflows.
+
+Publication checks now bind the exact PR, input/base revisions and CI run in a
+trusted signature-workflow artifact. GitHub publication remains local and signed;
+no SourceCraft credential or private signing key is passed to GitHub CI.
