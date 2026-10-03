@@ -301,12 +301,37 @@ def publication_receipts(repo: Path, base: str, head: str, path: str,
     return receipts
 
 
-def verify(repo: Path, commits: list[str], signers: Path, receipts: dict[str, dict]) -> dict:
-    result = {"developer_signed": [], "sourcecraft_server_merges": []}
+def publication_owner(repo: Path, base: str, head: str, path: str,
+                      developers: Path, publishers: Path) -> set[str]:
+    """A separate publisher may sign only the exact source tree plus its receipt."""
+    owners = git(repo, "log", "--format=%H", base + ".." + head, "--", path).decode().splitlines()
+    if not owners:
+        raise VerificationError("A publication owner is required")
+    owner = commit_sha(owners[0])
+    if not signed(repo, owner, publishers):
+        raise VerificationError("Publication owner is not a trusted publisher")
+    if signed(repo, owner, developers):
+        return set()
+    manifest = json.loads(git(repo, "show", owner + ":" + path))
+    source = commit_sha(manifest.get("source_head"))
+    if parent_ids(repo, owner) != [base, source]:
+        raise VerificationError("Publisher-only commit must merge the exact source and GitHub base")
+    changed = git(repo, "diff", "--name-only", source, owner).decode().splitlines()
+    if changed != [path]:
+        raise VerificationError("Publisher-only commit may change only its publication manifest")
+    return {owner}
+
+
+def verify(repo: Path, commits: list[str], signers: Path, receipts: dict[str, dict],
+           publisher_commits: set[str] | None = None) -> dict:
+    result = {"developer_signed": [], "sourcecraft_server_merges": [], "publisher_signed": []}
     for sha in commits:
         commit_sha(sha)
         if signed(repo, sha, signers):
             result["developer_signed"].append(sha)
+            continue
+        if sha in (publisher_commits or set()):
+            result["publisher_signed"].append(sha)
             continue
         raw = git(repo, "cat-file", "commit", sha)
         # A bad/untrusted signature must not be treated as an unsigned server merge.
@@ -356,6 +381,7 @@ def main() -> int:
         if len(pieces) != 2 or any(not SLUG.fullmatch(p) or p in (".", "..") for p in pieces):
             raise VerificationError("Invalid SourceCraft repository")
         commits = introduced(args.repo_path, base, head)
+        publisher_commits = set()
         if args.sourcecraft_api:
             token = os.environ.get("SOURCECRAFT_TOKEN", "")
             validate_pr_revision(args.sourcecraft_repo, token, args.sourcecraft_pr, base, head)
@@ -371,10 +397,12 @@ def main() -> int:
                 raise VerificationError("Trusted publisher file is required")
             receipts = publication_receipts(args.repo_path, base, head, args.publication_manifest,
                                             args.publisher_signers, args.sourcecraft_repo)
+            publisher_commits = publication_owner(args.repo_path, base, head, args.publication_manifest,
+                                                  args.signers, args.publisher_signers)
         if args.sourcecraft_api or args.sourcecraft_export_main:
             prepare_squash_receipts(args.repo_path, commits, args.signers, receipts,
                                     args.sourcecraft_repo, token)
-        result = verify(args.repo_path, commits, args.signers, receipts)
+        result = verify(args.repo_path, commits, args.signers, receipts, publisher_commits)
         if args.export_receipts:
             # Do not attest an outdated selection if main changed during verification.
             validate_sourcecraft_main(args.sourcecraft_repo, token, head)

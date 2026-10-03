@@ -19,6 +19,9 @@ workflows:
     - name: developer-signatures
       cubes:
       - name: verify
+        artifacts:
+          paths:
+            - sourcecraft-ci-binding.json
         script:
         - |
           set -eu
@@ -34,6 +37,19 @@ workflows:
             --signers "$trusted/allowed_signers" \
             --sourcecraft-repo tessera-labs/tessera --sourcecraft-api \
             --sourcecraft-pr "$pr"
+          python3 - <<'BINDING'
+          import json, os, subprocess
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+          record = {"version": 1, "repository": "tessera-labs/tessera",
+                    "source_pr_id": os.environ.get("SOURCECRAFT_PR_ID", ""),
+                    "source_pr": os.environ.get("SOURCECRAFT_PR_SLUG") or os.environ["VALIDATION_PR"],
+                    "source_input": head,
+                    "source_target": os.environ.get("SOURCECRAFT_BASE_SHA") or os.environ["VALIDATION_BASE"],
+                    "run_slug": os.environ["SOURCECRAFT_RUN_ID"]}
+          with open("sourcecraft-ci-binding.json", "x") as output:
+              json.dump(record, output, sort_keys=True)
+          BINDING
+
   bootstrap-proof:
     inputs:
       BOOTSTRAP_BASE:

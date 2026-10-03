@@ -229,6 +229,35 @@ class SignaturesTests(unittest.TestCase):
             with self.assertRaisesRegex(V.VerificationError, "changed after"):
                 V.publication_receipts(Path("."), TARGET, COMMIT, "receipt.json", Path("keys"), REPO)
 
+    def test_distinct_publisher_key_is_accepted_only_for_metadata_merge(self):
+        import json
+        def fake_git(repo, *args, **kwargs):
+            if args[0] == 'log':return (COMMIT+'\n').encode()
+            if args[0] == 'show':return json.dumps({'source_head':SOURCE}).encode()
+            if args[0] == 'diff':return b'receipt.json\n'
+            return b''
+        with patch.object(V,'git',side_effect=fake_git), patch.object(V,'parent_ids',return_value=[TARGET,SOURCE]), \
+             patch.object(V,'signed',side_effect=lambda repo,sha,keys:keys==Path('publishers')):
+            owners=V.publication_owner(Path('.'),TARGET,COMMIT,'receipt.json',Path('developers'),Path('publishers'))
+            result=V.verify(Path('.'),[COMMIT],Path('developers'),{},owners)
+        self.assertEqual(result['publisher_signed'],[COMMIT])
+
+    def test_publisher_only_key_cannot_modify_source_code(self):
+        import json
+        with patch.object(V,'git',side_effect=[(COMMIT+'\n').encode(),json.dumps({'source_head':SOURCE}).encode(),b'code.rs\nreceipt.json\n']), \
+             patch.object(V,'parent_ids',return_value=[TARGET,SOURCE]), \
+             patch.object(V,'signed',side_effect=lambda repo,sha,keys:keys==Path('publishers')):
+            with self.assertRaisesRegex(V.VerificationError,'only its publication manifest'):
+                V.publication_owner(Path('.'),TARGET,COMMIT,'receipt.json',Path('developers'),Path('publishers'))
+
+    def test_publisher_only_key_cannot_change_merge_parents(self):
+        import json
+        with patch.object(V,'git',side_effect=[(COMMIT+'\n').encode(),json.dumps({'source_head':SOURCE}).encode()]), \
+             patch.object(V,'parent_ids',return_value=[SOURCE]), \
+             patch.object(V,'signed',side_effect=lambda repo,sha,keys:keys==Path('publishers')):
+            with self.assertRaisesRegex(V.VerificationError,'exact source and GitHub base'):
+                V.publication_owner(Path('.'),TARGET,COMMIT,'receipt.json',Path('developers'),Path('publishers'))
+
     def test_untrusted_publisher_is_rejected(self):
         with patch.object(V, "git", return_value=(COMMIT+"\n").encode()), patch.object(V, "signed", return_value=False):
             with self.assertRaisesRegex(V.VerificationError, "approved publisher"):

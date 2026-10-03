@@ -40,10 +40,10 @@ jobs:
             for file in verify_commit_signatures.py allowed_signers publisher_signers tests/test_commit_signatures.py; do
               git show "$HEAD_SHA:.ci/$file" > "$trusted/$file"
             done
-            echo "9252d4a8a97f664112e313e4ab9ce72365714a3c1ea298c36d3bfc11a47b634a  $trusted/verify_commit_signatures.py" | sha256sum -c -
+            echo "a8897033b4a2f42681545c6b84797a704b552248f6b11665264606d2de738dd6  $trusted/verify_commit_signatures.py" | sha256sum -c -
             echo "24d2672b8afc366f5013be40de697e90c7015c2a04487388187c5c988f6ac6e1  $trusted/allowed_signers" | sha256sum -c -
             echo "24d2672b8afc366f5013be40de697e90c7015c2a04487388187c5c988f6ac6e1  $trusted/publisher_signers" | sha256sum -c -
-            echo "df617a7eed3606d7144e733a6fb0ac6caf4e552c25437c803b380d8e8d35ca67  $trusted/tests/test_commit_signatures.py" | sha256sum -c -
+            echo "efc1d84bb655d4d45472edcf238d7e3ed8835600111734173cbcf4a244c6c0d8  $trusted/tests/test_commit_signatures.py" | sha256sum -c -
           fi
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$trusted/tests"
           python3 "$trusted/verify_commit_signatures.py" --base "$BASE_SHA" --head "$HEAD_SHA" \
