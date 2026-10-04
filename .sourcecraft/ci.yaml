@@ -176,6 +176,119 @@ workflows:
         artifacts:
           paths:
           - ci-compatibility
+  packages-linux:
+    inputs:
+      EXPECTED_SHA:
+        type: string
+        required: true
+      VALIDATION_BASE:
+        type: string
+        default: ''
+      VALIDATION_PR:
+        type: string
+        default: ''
+    env:
+      EXPECTED_SHA: ${{ inputs.EXPECTED_SHA }}
+      VALIDATION_BASE: ${{ inputs.VALIDATION_BASE }}
+      VALIDATION_PR: ${{ inputs.VALIDATION_PR }}
+      TESSERA_PLUGIN_PUBKEYS: "bdc5aeba2d1ea709980060312b9fd07fd9c4e5ad4d55d2c3b0b70ff9dc878f3b"
+      CARGO_BUILD_JOBS: '4'
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+      CARGO_PROFILE_RELEASE_LTO: thin
+    checkout:
+      fetch_depth: 0
+      remove_credentials: true
+    settings:
+      max_cube_duration: 60m
+    tasks:
+      - name: linux-release-artifacts
+        cubes:
+          - name: validate-source
+            script:
+              - |
+                set -eu
+                head="$(git rev-parse HEAD^{commit})"
+                python3 -c "import os,pathlib; p=pathlib.Path.cwd(); print('Package CI uid/gid:',os.geteuid(),os.getegid()); [(print('Checkout ancestor:',str(q),q.lstat().st_uid,q.lstat().st_gid,oct(q.lstat().st_mode & 0o7777))) for q in [p,*p.parents]]"
+                test "$head" = "$EXPECTED_SHA" || { echo 'Checkout does not match the reviewed expected SHA'; exit 1; }
+                python3 -c "import importlib.util,os; s=importlib.util.spec_from_file_location('v','.ci/verify_commit_signatures.py'); v=importlib.util.module_from_spec(s); s.loader.exec_module(v); r=v.sourcecraft_json('/repos/tessera-labs/tessera/cicd/runs/'+os.environ['SOURCECRAFT_RUN_ID'],os.environ['SOURCECRAFT_TOKEN']); ok=r.get('event_type')=='manual' and r.get('user',{}).get('id')=='01998020-b5d5-7ea4-8588-16682172e444'; print('Authoritative manual owner run:',ok); raise SystemExit(0 if ok else 1)"
+                if test -n "$VALIDATION_PR"; then
+                  trusted="$(mktemp -d)"
+                  trap 'rm -rf "$trusted"' EXIT
+                  git show "$VALIDATION_BASE:.ci/verify_commit_signatures.py" > "$trusted/verify.py"
+                  git show "$VALIDATION_BASE:.ci/allowed_signers" > "$trusted/signers"
+                  python3 "$trusted/verify.py" --base "$VALIDATION_BASE" --head "$head" \
+                    --signers "$trusted/signers" --sourcecraft-repo tessera-labs/tessera \
+                    --sourcecraft-api --sourcecraft-pr "$VALIDATION_PR"
+                else
+                  python3 -c "import importlib.util, os; s=importlib.util.spec_from_file_location('v','.ci/verify_commit_signatures.py'); v=importlib.util.module_from_spec(s); s.loader.exec_module(v); v.validate_sourcecraft_main('tessera-labs/tessera',os.environ['SOURCECRAFT_TOKEN'],os.environ['EXPECTED_SHA'])"
+                fi
+          - name: install-package-tools
+            script:
+              - |
+                set -eu
+                unset SOURCECRAFT_TOKEN
+                sudo apt-get update
+                sudo apt-get install -y debhelper dh-cargo dpkg-dev fakeroot lintian \
+                  libssl-dev libudev-dev libdbus-1-dev libpam0g-dev libsystemd-dev pkg-config clang libclang-dev llvm-dev
+                curl --proto '=https' --tlsv1.2 -fsSL \
+                  https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init -o /tmp/rustup-init
+                echo '20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c  /tmp/rustup-init' | sha256sum -c -
+                chmod +x /tmp/rustup-init
+                export CARGO_HOME="$HOME/.cargo"
+                /tmp/rustup-init -y --profile minimal --default-toolchain 1.95.0
+          - name: build-and-test-packages
+            script:
+              - |
+                set -eu
+                unset SOURCECRAFT_TOKEN
+                checkout_root="$PWD"
+                package_work="$(mktemp -d /opt/tessera-package.XXXXXX)"
+                trap 'rm -rf -- "$package_work"' EXIT
+                # Runner checkout ancestors are world-writable and owned by another uid.
+                # Build in an isolated copy; keep shared runner directories untouched.
+                cp -a --no-preserve=ownership . "$package_work/source"
+                chmod 0700 "$package_work/source"
+                cd "$package_work/source"
+                python3 -c "import os,pathlib; p=pathlib.Path.cwd(); safe=all(not q.is_symlink() and q.lstat().st_uid==os.geteuid() and q.lstat().st_mode & 0o022==0 for q in [p,*p.parents]); raise SystemExit(0 if safe else 'Untrusted package build root')"
+                export CARGO_HOME="$PWD/debian/cargo_home"
+                export PATH="$HOME/.cargo/bin:$PATH"
+                cargo test --workspace --locked
+                bash scripts/build-deb.sh --allow-dirty
+                deb="$(find .. -maxdepth 1 -type f -name 'tessera_*.deb' -print)"
+                test "$(printf '%s\n' "$deb" | wc -l)" -eq 1
+                test -f "$deb"
+                package_root="$(mktemp -d)"
+                trap 'rm -rf -- "$package_root" "$package_work"' EXIT
+                dpkg-deb -x "$deb" "$package_root"
+                IFS=',' read -r -a keys <<< "$TESSERA_PLUGIN_PUBKEYS"
+                test "${#keys[@]}" -gt 0
+                for binary in usr/bin/tessera lib/security/pam_tessera.so; do
+                  test -f "$package_root/$binary"
+                  for key in "${keys[@]}"; do
+                    key="${key//[[:space:]]/}"
+                    test -n "$key"
+                    grep -aqF -- "$key" "$package_root/$binary"
+                  done
+                done
+                version="$(dpkg-parsechangelog -S Version)"
+                bash scripts/build-docs-bundle.sh "$version"
+                mkdir -p build/release-linux
+                for file in ../tessera_*.deb ../tessera_*.changes ../tessera_*.buildinfo; do
+                  test -f "$file" && cp "$file" build/release-linux/
+                done
+                cp artifacts/release/tessera-docs-* build/release-linux/
+                test -n "$(find build/release-linux -name '*.deb' -print -quit)"
+                cd build/release-linux
+                sha256sum *.deb *.tar.gz > SHA256SUMS
+                sha256sum -c SHA256SUMS
+                printf '%s\n' "$EXPECTED_SHA" > source-sha.txt
+                mkdir -p "$checkout_root/build"
+                cp -a ../release-linux "$checkout_root/build/"
+            artifacts:
+              paths:
+                - build/release-linux
+
 'on':
   pull_request:
   - workflows:
