@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         if: steps.publication-context.outputs.owner == 'true'
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Verify owner-signed SourceCraft publication
@@ -50,6 +50,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Fetch publication objects without checking out or executing PR files.
+          git -c http.followRedirects=false fetch --no-tags origin "$HEAD_SHA"
           if ! git cat-file -e "$HEAD_SHA:.ci/sourcecraft-publication.json" 2>/dev/null; then
             exit 0
           fi

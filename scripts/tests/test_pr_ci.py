@@ -86,11 +86,13 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(checkout['uses'], 'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803')
         self.assertEqual(checkout['if'], "steps.publication-context.outputs.owner == 'true'")
         self.assertEqual(checkout['with']['persist-credentials'], 'false')
+        self.assertEqual(checkout['with']['ref'], '${{ github.event.pull_request.base.sha }}')
         verifier = next(step for step in steps if step.get('id') == 'publication')
         self.assertEqual(verifier['if'], checkout['if'])
         self.assertNotIn('secrets.', str(checkout) + str(verifier))
         for trusted_file in ['verify_commit_signatures.py', 'allowed_signers', 'publisher_signers']:
             self.assertIn('$BASE_SHA:.ci/' + trusted_file, verifier['run'])
+        self.assertIn('fetch --no-tags origin \"$HEAD_SHA\"', verifier['run'])
         self.assertIn('--publication-manifest .ci/sourcecraft-publication.json', verifier['run'])
         self.assertIn('--sourcecraft-repo tessera-labs/tessera', verifier['run'])
         action = steps[-1]
