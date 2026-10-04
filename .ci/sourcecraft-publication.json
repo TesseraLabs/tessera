@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "repository": "tessera-labs/tessera",
+  "source_head": "60fbab6206a3cf881cf0aee523bbf7fd56ea8f6b",
+  "server_merges": [
+    {
+      "commit": "60fbab6206a3cf881cf0aee523bbf7fd56ea8f6b",
+      "target": "5501f542ec1fe7459000320b909518351ffc5ab8",
+      "source": "70cd59da298741c96084c18c049ba81be9d0131d",
+      "pr": "117",
+      "strategy": "squash",
+      "tree": "ca351fa775f5011254f22334ea89c652ae263af6",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "5501f542ec1fe7459000320b909518351ffc5ab8",
+      "target": "d04c89cf62d1a0b567d6a8352e07ce020bc0b3ba",
+      "source": "d58893318504cb6b7597d29eed435939e7831c7e",
+      "pr": "116",
+      "strategy": "squash",
+      "tree": "f71aa6a039940e77f0cb672df925fbdd32a85798",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "d04c89cf62d1a0b567d6a8352e07ce020bc0b3ba",
+      "target": "f8165f19ad7fb3e88189b7a57e21bb1749f3a71b",
+      "source": "975d203b5331e74c91ee942ce531ced65efd7a3e",
+      "pr": "115",
+      "strategy": "squash",
+      "tree": "4eca54dda8aa2caa031b0fe5ce025dbd39e5bbdd",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "f8165f19ad7fb3e88189b7a57e21bb1749f3a71b",
+      "target": "5fcfec3dba390ba8d91ff5948ba17d6d5a15585d",
+      "source": "1c4effefb9ebb179f98e01bad117753c9b1a8346",
+      "pr": "114",
+      "strategy": "squash",
+      "tree": "b03f6e5cd0e8a2d9d438e705e348134f438907b1",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "5fcfec3dba390ba8d91ff5948ba17d6d5a15585d",
+      "target": "3c02085af2fc01dd5d14845fff0ff27a1a9f8f73",
+      "source": "7b5da1a3473f3334301f758b6910efde1e0c603f",
+      "pr": "113",
+      "strategy": "squash",
+      "tree": "7ac0ac0d23252b32b4452516002ffed2b5469142",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "3c02085af2fc01dd5d14845fff0ff27a1a9f8f73",
+      "target": "5a3257cb3ae9b3d3ebb290b1fca6efe15104007b",
+      "source": "426d37fb0dfb8001e78a16ebc96a64608a1164cb",
+      "pr": "112",
+      "strategy": "squash",
+      "tree": "ba2411ed570bd30ce63efcbe2bd42c3e7a53f9d1",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "5a3257cb3ae9b3d3ebb290b1fca6efe15104007b",
+      "target": "2df4f242580253c9c4911979bddf5240f7cfb6fd",
+      "source": "3de6d86192b6b2ed80b593c5e1f02b276b379493",
+      "pr": "111",
+      "strategy": "squash",
+      "tree": "d4b7c76623ca975ca83fe6440738f7501e593e24",
+      "source_signatures_verified": true
+    },
+    {
+      "commit": "2df4f242580253c9c4911979bddf5240f7cfb6fd",
+      "target": "5acf24a6b815e9e016dd89718623114efbe23ef6",
+      "source": "d725f835705c108367501c1eef7d94be64b9fb85",
+      "pr": "110",
+      "strategy": "squash",
+      "tree": "a80ab17b91d0dfa32b2fb23f3613238b07beb0bc",
+      "source_signatures_verified": true
+    }
+  ],
+  "quality": {
+    "repository": "tessera",
+    "source_main": "60fbab6206a3cf881cf0aee523bbf7fd56ea8f6b",
+    "source_pr": "117",
+    "source_input": "70cd59da298741c96084c18c049ba81be9d0131d",
+    "source_target": "5501f542ec1fe7459000320b909518351ffc5ab8",
+    "github_base": "a63605cdd691d1619820042d915694556e11ba49",
+    "workflows": {
+      "enterprise-compatibility": "29",
+      "pr-checks": "29",
+      "signatures": "29"
+    }
+  }
+}
