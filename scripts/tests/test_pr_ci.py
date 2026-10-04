@@ -78,13 +78,44 @@ class PolicyTests(unittest.TestCase):
         # The exact YAML conditional above gives a skipped foreign job a different name:
         # no required context exists for it, rather than a skipped required-context success.
 
-    def test_cla_remains_metadata_only_with_existing_contributor_action(self):
+    def test_cla_preserves_contributor_action_and_trusted_publication_boundary(self):
         w = workflow('cla.yml')
         self.assertEqual(set(w['on']), {'pull_request_target', 'issue_comment'})
-        steps = w['jobs']['cla']['steps']; self.assertEqual(len(steps), 1)
-        self.assertEqual(steps[0]['uses'], 'contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08')
-        self.assertEqual(steps[0]['with']['remote-repository-name'], 'cla-signatures')
-        self.assertNotIn('checkout', str(w)); self.assertNotIn('cargo', str(w))
+        steps = w['jobs']['cla']['steps']
+        checkout = next(step for step in steps if step.get('uses', '').startswith('actions/checkout@'))
+        self.assertEqual(checkout['uses'], 'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803')
+        self.assertEqual(checkout['if'], "steps.publication-context.outputs.owner == 'true'")
+        self.assertEqual(checkout['with']['persist-credentials'], 'false')
+        verifier = next(step for step in steps if step.get('id') == 'publication')
+        self.assertEqual(verifier['if'], checkout['if'])
+        self.assertNotIn('secrets.', str(checkout) + str(verifier))
+        for trusted_file in ['verify_commit_signatures.py', 'allowed_signers', 'publisher_signers']:
+            self.assertIn('$BASE_SHA:.ci/' + trusted_file, verifier['run'])
+        self.assertIn('--publication-manifest .ci/sourcecraft-publication.json', verifier['run'])
+        self.assertIn('--sourcecraft-repo tessera-labs/tessera', verifier['run'])
+        action = steps[-1]
+        self.assertEqual(action['if'], "steps.publication.outputs.verified != 'true'")
+        self.assertEqual(action['uses'], 'contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08')
+        self.assertEqual(action['with']['remote-repository-name'], 'cla-signatures')
+        self.assertEqual(action['with']['path-to-signatures'], 'signatures/version-1/cla.json')
+        self.assertNotIn('cargo', str(w))
+
+    def test_cla_publication_checkout_is_unavailable_to_forks_and_nonowners(self):
+        guard = workflow('cla.yml')['jobs']['cla']['steps'][0]['run']
+        for event, author, repo, approved in [
+            ('pull_request_target', 'RoboNET', 'TesseraLabs/tessera', True),
+            ('pull_request_target', 'RoboNET', 'outsider/fork', False),
+            ('pull_request_target', 'outsider', 'TesseraLabs/tessera', False),
+            ('issue_comment', 'RoboNET', 'TesseraLabs/tessera', False),
+        ]:
+            with tempfile.TemporaryDirectory(prefix='cla-boundary-') as directory:
+                output = Path(directory) / 'output'; output.touch()
+                result = subprocess.run(['bash', '-c', guard], env={**os.environ,
+                    'EVENT': event, 'AUTHOR': author, 'HEAD_REPO': repo,
+                    'EXPECTED_REPO': 'TesseraLabs/tessera', 'GITHUB_OUTPUT': str(output)},
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_text(), 'owner=true\n' if approved else '')
 
 class SmokeTests(unittest.TestCase):
     def run_smoke(self, mode):

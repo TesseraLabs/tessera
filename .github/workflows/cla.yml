@@ -23,7 +23,48 @@ jobs:
         (contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA') ||
          github.event.comment.body == 'recheck'))
     steps:
+      - name: Check owner publication context
+        id: publication-context
+        env:
+          EVENT: ${{ github.event_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          EXPECTED_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          if test "$EVENT" = pull_request_target && test "$AUTHOR" = RoboNET && test "$HEAD_REPO" = "$EXPECTED_REPO"; then
+            echo "owner=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        if: steps.publication-context.outputs.owner == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify owner-signed SourceCraft publication
+        id: publication
+        if: steps.publication-context.outputs.owner == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "$HEAD_SHA:.ci/sourcecraft-publication.json" 2>/dev/null; then
+            exit 0
+          fi
+          trusted="$(mktemp -d)"
+          trap 'rm -rf "$trusted"' EXIT
+          git show "$BASE_SHA:.ci/verify_commit_signatures.py" > "$trusted/verify.py"
+          git show "$BASE_SHA:.ci/allowed_signers" > "$trusted/developers"
+          git show "$BASE_SHA:.ci/publisher_signers" > "$trusted/publishers"
+          python3 "$trusted/verify.py" --base "$BASE_SHA" --head "$HEAD_SHA" \
+            --signers "$trusted/developers" --publisher-signers "$trusted/publishers" \
+            --sourcecraft-repo tessera-labs/tessera \
+            --publication-manifest .ci/sourcecraft-publication.json
+          echo "verified=true" >> "$GITHUB_OUTPUT"
       - name: CLA Assistant Lite
+        if: steps.publication.outputs.verified != 'true'
         # Pinned to a full commit SHA (not the mutable @v2.6.1 tag): this workflow
         # runs on pull_request_target with a PAT, so a moved/compromised tag must
         # not be able to swap the action under us.
