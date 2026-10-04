@@ -1,0 +1,13 @@
+codereview:
+  need_ships: 1
+  ignore_self_ship: true
+  ignore_non_reviewers_block: false
+  auto_assign: true
+  disable_trust: true
+  rules:
+    - patterns: ["**"]
+      reviewers:
+        usernames: ["michael443959"]
+        assign: 1
+        need_ships: 1
+        ignore_self_ship: true
