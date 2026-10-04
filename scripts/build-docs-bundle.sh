@@ -46,7 +46,7 @@ export SOURCE_DATE_EPOCH
 mkdir -p "${OUT_DIR}"
 
 # 1. Pack documentation.
-TAR_PATHS=(README.md README.en.md SECURITY.md docs)
+TAR_PATHS=(README.md README.ru.md docs)
 for p in "${TAR_PATHS[@]}"; do
     if [[ ! -e "${p}" ]]; then
         echo "ERROR: missing path '${p}' (run from repository root)" >&2
